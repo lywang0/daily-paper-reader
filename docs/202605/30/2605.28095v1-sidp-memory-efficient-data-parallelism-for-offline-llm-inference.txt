@@ -1,0 +1,541 @@
+Title: SiDP: Memory-Efficient Data Parallelism for Offline LLM Inference
+
+URL Source: https://arxiv.org/pdf/2605.28095v1
+
+Published Time: Thu, 28 May 2026 00:50:56 GMT
+
+Number of Pages: 14
+
+Markdown Content:
+# SiDP: Memory-Efficient Data Parallelism for Offline LLM Inference 
+
+# Alan Zhao 
+
+# scitix 
+
+# Cyril Y. He 
+
+# scitix 
+
+# Abstract 
+
+The rapid adoption of large language models (LLMs) has shifted a substantial portion of inference workloads into throughput-oriented offline regimes, where fully utilizing GPU compute requires large batch sizes. However, existing deployments face a structural tension. Data parallelism (DP) scales throughput well but replicates model weights, leaving limited GPU memory for key–value (KV) cache and con-straining batch size. Model parallelism reduces per-device weights, but requires fine-grained synchronization that erodes DP’s independence and scheduling flexibility. We present 
+
+SiDP , a memory-efficient data-parallel paradigm for offline LLM inference that treats weights as a bandwidth-backed shared resource inside a DP group. Instead of storing the full model on every GPU, SiDP organizes weights as a distributed pool: each layer is owned by a single GPU, and other replicas access its weights on demand via two complementary execu-tion modes—a Weight-as-a-Service (WaS) mode that streams remote weights over NVLink into a small cache in the large-batch regime, and a Compute-as-a-Service (CaS) mode that ships activations to owners in the small-batch tail. Evaluated on NVIDIA H20, H200, and B200 GPUs with Qwen3-32B, Qwen2.5-72B, and Llama-3.1-70B, SiDP increases usable KV capacity by up to 1.8× under the same configurations, and converts this into up to 1.5× higher end-to-end throughput over baselines (vLLM) for offline workloads. 
+
+# 1 Introduction 
+
+The meteoric rise of large language models (LLMs) [16, 18, 19, 26, 32] has split inference workloads into two regimes. 
+
+Online services —such as chatbots [22], coding assistants [2], and real-time agents [28]—are bound by strict latency require-ments to ensure fluid user interaction, but account for only a fraction of total compute demand. A massive and rapidly expanding volume of inference runs entirely offline over pre-collected datasets, e.g., large-scale benchmark evaluation [9], A/B testing of model variants [15], log and document pro-cessing [38], retrieval index construction [11], synthetic data generation for training [29], and reinforcement learning roll-outs [18]. These jobs operate on pre-collected datasets with no human in the loop: individual requests may wait in a queue for seconds or minutes as long as the overall job meets a target wall-clock time and cost budget. As a result, the primary per-formance metric shifts from latency to aggregate throughput 
+
+(tokens per second), exposing new optimization opportunities for existing inference systems. The throughput of an inference workload can be roughly characterized as B/T , where B is the effective batch size and T
+
+is the per-iteration decode time (offline jobs often spend most of their time in decoding [38]). Batching is therefore the pri-mary lever for improving throughput: when B is small, T (B)
+
+typically grows sub-linearly as B because larger batches amor-tize kernel launch overheads and memory accesses across more tokens, yielding higher arithmetic intensity and better overlap between compute and memory. As B increases, the GPU eventually reaches a saturation point beyond which T (B)
+
+grows roughly linearly with B; we denote this saturation batch size by Be (e.g., Be ≈ 256 for Qwen3-32B on H20 using ten-sor parallelism, see §3.1). In offline workloads, the goal is therefore not to grow B without bound, but to operate near this “efficient” regime around Be, where the hardware is well utilized and further batching yields little marginal benefit. However, pushing B toward Be is tightly constrained by GPU memory capacity ( M) because both static weights ( W )and dynamic key-value (KV) state ( K) must fit on each device. Under a fixed workload, the KV cache scales with the product of sequence length (S) and batch size ( K = BS )1. For modern multi-billion-parameter models, the weights alone already occupy a large fraction of M, so the remaining space for KV cache and other per-batch state quickly becomes the limiting factor for how far B can grow. This memory constraint poses a central challenge for dis-tributed inference. Modern serving stacks typically combine data parallelism (DP) and model parallelism (MP) to fit larger models and scale throughput across nodes. DP offers excel-    
+
+> 1We omit the constant per-token KV cache size in this equation and focus on the linear dependence on Band Sfor brevity.
+
+1
+
+> arXiv:2605.28095v1 [cs.DC] 27 May 2026
+
+lent scalability for throughput workloads because replicas run largely independently, synchronizing only on infrequent control-plane signals (ideally T ′ ≈ TN for N GPUs); however, each DP replica fully replicates all model weights, leaving less memory for KV cache and thus limiting the achievable batch size ( B ≈ N M−WS ). MP shards weights across GPUs, reducing per-device parameter memory and enabling a larger batch size (B ≈ NM −WS ), but introduces fine-grained, layer-wise commu-nication and requires participating GPUs to march in lock-step (i.e., T ′ ≈ α TN with α > 1 ). This tight coupling makes it difficult to exploit very large batches, and the gains from more aggressive MP can be offset by increased synchroniza-tion and reduced scheduling flexibility. What is missing is a parallelism paradigm that combines the scalability and inde-pendence of DP (smaller α) with the memory efficiency of sharded weights. Viewed through the lens of resource economics, this dilemma naturally suggests an opportunity for resource ar-bitrage : in inference deployments, high-speed interconnects often remain underutilized, while high-bandwidth GPU mem-ory (HBM) capacity is extremely scarce. Can we deliberately trade a modest amount of otherwise idle bandwidth to “buy back” HBM from redundant weight replicas without sacrific-ing the scalability and simplicity of DP? In this paper, we propose SiDP , Shared-weight Intra-node Data Parallelism tailored for offline LLM inference that re-duces redundant weight replicas within a DP group. SiDP 
+
+reorganizes the group into a distributed weight pool: instead of fully replicating all layers on every replica, each rank owns a disjoint subset of layers and exposes them to peers through one-sided, asynchronous access. Non-owner ranks fetch and cache these remote weights on demand, shrinking the per-GPU weight footprint and freeing HBM for KV cache and larger effective batches. To mitigate potential latency penalties when pulling weights in small-batch phases (whose preva-lence we discuss in §3.2), SiDP introduces a dual-mode exe-cution scheme based on this memory layout: a default Weight-as-a-Service (WaS) mode that keeps computation local and streams weights, and a Compute-as-a-Service (CaS) mode that instead ships activations to owners. The two modes are numerically equivalent but have different performance char-acteristics depending on arithmetic intensity. We implement a prototype of SiDP on top of vLLM [13] and evaluate it on several widely used GPU architectures, in-cluding H20, H200, and B200. Our experiments show that 
+
+SiDP enables up to 1.8× larger KV capacity under the same memory budget and achieves 1.5× higher throughout com-pared to strong data- and tensor-parallel baselines. 
+
+# 2 Background 
+
+In this section, we briefly review the architectural structure of modern LLMs, the execution model of offline inference, and the standard parallelism strategies used in practice to ground the design and analysis of SiDP in the rest of the paper. 
+
+# 2.1 Large Language Models 
+
+Modern large language models (LLMs) are predominantly based on decoder-only Transformers [27]. The network con-sists of an embedding layer, a stack of L identical Transformer blocks , and a final output projection. Each Transformer block (layer) is dominated by two sub-modules: (1) Self-attention , typically implemented as multi-head self-attention with learnable query, key, value, and output projection matrices. (2) Feed-forward network (FFN) , usu-ally a two-layer MLP and a non-linearity in between. The two dense linear layers in the FFN hold the majority of the weights within each block, and, by extension, a large fraction of the total model parameters (e.g., 77% in Qwen3-32B [32] and 82% in Llama-3.1-405B [4]). Mixture-of-experts (MoE) models extend this structure by replacing the single FFN in each block with a set of ex-pert MLPs and a router that selects a small subset of experts per token. In practice, however, offline workloads such as batch evaluation, log and document processing, synthetic data generation, and rollouts value stable behavior and still pre-dominantly use dense LLMs [10, 39, 40] because MoE incurs additional routing, load-balancing, and communication com-plexity. Accordingly, this paper focuses on dense Transformer models; we discuss implications and potential extensions to MoE architectures in §7. 
+
+# 2.2 Offline LLM Inference 
+
+An offline inference job consists of a large, pre-defined set of requests (e.g., evaluation prompts, documents to summarize, or rollout trajectories) that must be processed by a pool of 
+
+engines . Each engine is typically bound to a fixed parallel con-figuration and runs LLMs in two phases: a prefill phase that encodes the input context and populates the KV cache, and a 
+
+decode phase that generates tokens autoregressively. An infer-ence engine [13, 37] maintains per-request state as a sequence 
+
+containing prompt tokens and generated tokens. Generation proceeds in discrete iterations , each executing model forward 
+
+on GPUs and producing one new token per scheduled se-quence. Within an engine, a scheduler is responsible for token batching and iteration-level decisions: it admits new requests, groups them into batches, interleaves prefill and decode work, and manages per-request KV cache and termination condi-tions. Above the engines, a job orchestrator manages the job as a whole: it partitions the dataset into shards, assigns shards to engines, monitors progress and throughput, and may adjust global policies (e.g., target batch size and priority) based on runtime statistics. Offline workloads naturally expose opportunities for paral-lelism and batching, but also stress GPU memory and schedul-ing due to large KV caches and diverse request sizes. These 21 2 4 8 16 32 64 128 256 Batch size (a) Per-layer overhead        
+
+> 0.2
+> 0.5
+> 1.0
+> 2.0 Time per-layer (ms)  FFN Forward Prefetch
+> 64 256 512 768 1024 1280 1536 Batch size (b) TP8 vs DP8 throughput
+> 2.8
+> 6.2
+> 9.5
+> 12.8 Throughput (K tokens/s)
+> TP8 DP8
+
+Figure 1: (a) Per-iter time (TP=2) with Llama-3.1-70B vs. B;(b) Throughput with Qwen3-32B vs. B. Both on H20, S =1K. characteristics differentiate offline from online inference, where requests are sparse, latency-sensitive, and batching opportunities are limited. 
+
+# 2.3 Parallelism in LLM Inference 
+
+To serve large models efficiently on multi-GPU systems, mod-ern inference stacks employ a combination of data parallelism and model parallelism. We briefly summarize these strategies and the associated trade-offs. 
+
+Data parallelism (DP). In data parallelism, each group of GPUs (i.e., an engine) holds a full copy of the model param-eters. A batch of size B is partitioned into N shards for N
+
+replicas, and each replica independently processes its local mini-batch of size B/N. During inference, replicas exchange only lightweight control-plane information (e.g., request rout-ing, scheduling signals); the forward pass of each replica is otherwise independent. 
+
+Model parallelism (MP). Model parallelism [25] partitions a single model across multiple GPUs so that one replica spans several devices, typically via tensor or pipeline parallelism. In tensor parallelism (TP), individual weight matrices are sharded across devices, each GPU computes on its shard, and collective operations assemble the final result, reduc-ing per-device parameter memory at the cost of fine-grained, layer-wise synchronization. In pipeline parallelism (PP), the 
+
+L layers are split into contiguous stages assigned to different devices (or groups), and micro-batches flow through these stages in a pipeline, trading reduced per-device memory for additional inter-stage communication and pipeline bubbles. In practice, deployment stacks combine these techniques into a 2D or 3D parallelism configuration: (i) choose an MP layout (TP and, if necessary, PP) that leaves enough headroom for KV cache; then (ii) scale out with DP over such MP groups to increase throughput. 
+
+# 3 Motivation 
+
+To motivate SiDP , we first examine the main constraints of inference throughput, and then discuss why existing fully t8d1 t4d2 t2d4 t1d8 (a) Parallel    
+
+> 0
+> 20
+> 40
+> 60
+> 80
+> 100
+> KV cache (GB)
+> 0.3 0.5 0.7 0.9 (b) Memory utilization
+> 0
+> 2000
+> 4000
+> Throughput (tok/s)
+
+Figure 2: (a) KV cache size under different parallelism; (b) throughput under different memory utilization (TP=2, DP=4); on H20 with Qwen3-32B, B =1K, S =4K. sharded data-parallel schemes fail to address these constraints in inference. 
+
+# 3.1 Tradeoff in Scalability and Memory 
+
+We first discuss how batch size, compute scalability, and mem-ory capacity jointly shape the inference throughput. 
+
+Sub-linear scaling of per-iteration time with batch size. In principle, the arithmetic work of Transformers scales linearly with B: each matrix multiplication and attention operation is applied to B sequences at once. In practice, the measured per-iteration decode time T (B) grows sub-linearly with B over a wide regime. As shown in Figure 1(a), doubling B from a small starting point increases T (B) by less than 2×. This ef-fect arises from several sources: kernel launch overheads and framework runtime costs are largely independent of B; GPU cores and tensor units are often underutilized at tiny batch sizes and become better saturated as B grows; and memory accesses benefit from more efficient coalescing and higher arithmetic intensity when more tokens are processed together. As a result, the hardware moves from a latency-dominated regime to a more throughput-oriented regime as B increases. 
+
+Throughput improves with batch size until Be. Because throughput is roughly B/T (B), sub-linear growth of T (B)
+
+in B implies that B/T (B) increases with B over the same range. Figure 1(b) illustrates this effect: going from very small batches to moderate batches yields large gains in throughput, while further increases yield progressively smaller marginal improvements as GPUs approach saturation. For example, on H20 with DP = 8 , increasing B from 64 to around Be ≈ 1,024 improves throughput by ∼ 4×, whereas pushing B further from 1,024 to 1,536 only adds roughly 6% . Intuitively, higher DP degrees ( d) require a larger Be, because each replica only sees a local batch of size B/d, but across configurations the pattern is consistent: within a broad regime, increasing B
+
+is the dominant knob for improving throughput on a fixed hardware budget. 
+
+Throughput is constrained by available memory. The abil-ity to increase batch size is limited by GPU memory capacity. For a fixed model and sequence length S, the KV cache foot-3print ( K) grows linearly with BS (as in §1). Empirically, for modern LLMs, W already consumes a large fraction of M,so only a limited residual capacity is available for K; as B
+
+grows and K = BS approaches this residual capacity, the sys-tem enters a memory-pressure regime. Under data parallelism across d replicas, the total replicated W is d times larger, so the system exhausts its residual KV capacity at a smaller B.Figure 2(a) reveals this problem on an 8× H20 testbed: as DP degree increases, the available KV cache size decreases by up to 45%. That means even if S = 512 , this caps the ef-fective batch at roughly 500 sequences, which can still fall short of the saturation regime. Many production engines avoid hard out-of-memory (OOM) failures by sequence preemption, throttling prefill, or refusing new requests, but these defenses still waste work and lower effective concurrency. Operators can try to stay away from this regime by capping B or tighten-ing admission control, yet this also leaves compute throughput on the table. In other words, whether we proactively shrink B
+
+or let the runtime hover near the OOM cliff, effective through-put degrades when K is insufficient. Figure 2(b) illustrates this tension: for the same job, reducing GPU memory utilization from 0.9 to 0.3 erodes throughput by about 68%. These observations together illustrate a core tension in scal-ing LLM inference: from a compute perspective, we would like to keep increasing B to move along the sub-linear region of T (B) until Be; from a memory perspective, large W and 
+
+K tightly constrain how far B can grow before capacity and management overheads negate these gains. 
+
+# 3.2 Limited FSDP for inference 
+
+Fully sharded data parallel. A natural way to reduce weight redundancy along the data-parallel dimension is to shard pa-rameters across replicas, as in Fully Sharded Data Parallelism (FSDP) [35] and related ZeRO-style schemes [20]. Concep-tually, FSDP applies to inference much as it does to training: each rank stores only a shard of the parameters, and layers are materialized on demand via all-gathers before the forward pass. In high-throughput autoregressive serving, however, this mechanism faces two fundamental challenges. 
+
+Challenges. The first concerns independence . FSDP relies on group-wide collectives: all ranks participate in the same all-gather for a given layer at roughly the same time. How-ever, inference engines are intentionally desynchronized due to continuous batching and variable sequence lengths. En-forcing step-synchronous all-gathers either stalls fast ranks or constrains the scheduler to move all replicas in lockstep, undermining the very flexibility that makes DP attractive. The second challenge arises from the timescale and variability of iterations. Training iterations last seconds with large, fairly stable mini-batches, so per-layer all-gathers can often be hid-den under long forward–backward passes. Decode iterations, by contrast, are often only a few milliseconds and their ef-fective batch size naturally shrinks toward the tail. In offline workloads, such small-batch regimes are common near the end of large evaluation or generation jobs, when only a small fraction of sequences remain active due to uneven sharding, filtering, or long-tail output lengths; empirical studies report that even 10% of these long-tailed samples can account for up to half of total generation time [40]. In this regime, T (B)
+
+collapses but FSDP still pays essentially the same all-gather cost to rebuild full weights on every rank, which can fail to hide behind computation. Thus, even without global syn-chronization, a “rebuild full weights on every rank at every iteration” pattern is too heavy-weight for millisecond-scale, dynamically shrinking batches. These observations do not invalidate the core intuition of FSDP-style sharding—trading communication for mem-ory—but substantially narrow the design space in inference. Any viable weight-sharing mechanism for high-throughput serving must (i) respect per-replica independence , provid-ing asynchronous, on-demand access to remote parameters, and (ii) adapt its communication pattern to the millisecond timescale of decode iterations so that communication remains a small, overlap-friendly fraction of T (B).
+
+# 4 Design 
+
+The previous sections (§3.1 and §3.2) raise a central ques-tion: with bandwidth-backed resource in a DP group, how can we reduce redundant replicas to free HBM while pre-serving replica independence on the critical path of decoding iterations? 
+
+SiDP answers this question by decoupling the logical se-mantics of data parallelism from the physical placement of weights across GPUs. Each layer is assigned to an owner rank, and non-owner ranks access its FFN weights on demand through two complementary modes: WaS for the large-batch common case and CaS for small-batch tail phases. 
+
+# 4.1 Overview 
+
+SiDP is a thin wrapper around existing LLM serving frame-works (Figure 3). It treats each Transformer FFN as a plug-gable module: intercepting FFN forward passes, selecting WaS or CaS, and managing the corresponding weight/acti-vation movement before invoking the original implementa-tion. We focus on FFNs because attention weights are a much smaller parameter fraction, and remote attention is constrained by the locality and size of KV cache. During initialization, 
+
+SiDP parses the model to locate FFN layers, assigns an owner rank for each layer, and loads only the owner’s FFN weights on that GPU while allocating lightweight placeholders for non-owner layers. Owner ranks then register their FFN buffers and export the necessary handles so that peers can access the weights on demand, after which SiDP wraps the correspond-ing FFN forwards to enable transparent WaS/CaS execution at runtime. From the engine’s perspective, model architecture 4Original FFN Module       
+
+> Existing LLM
+> Serving Framework
+> (Main Thread)
+> GPU Physical Memory Plane (HBM)
+> Policy Check
+> (WaS or CaS?)
+> Manage Prefetch/Eviction
+> Track CUDA Events
+> Recycle Cache slots
+> Housekeeper Thread
+> (CPU Background)
+> Placeholder Tensor
+> (Layer L, matching shape)
+> (Saves HBM)
+> Pre -allocated Weight Cache
+> Activations
+> GPU Rank j(Non -Owner of Layer L)
+> Full FFN Weights
+> (Layer L)
+> Activations
+> CUDA IPC Exposed Address Initialization
+> GPU Rank i(Owner of Layer L)
+> CPU Control & Compute Plane
+> SiDP Wrapper (intercepted FFN)
+> Attention Layernorm Layernorm
+> Normal Forward Loop
+> Control
+> Cas Mode
+> WaS Mode
+> CUDA IPC Registration
+> Receive Results
+> Ship Activations
+> Remote Read (Prefetching)
+
+Figure 3: Overview of SiDP architecture and runtime workflow within a data-parallel groups. and numerics are unchanged; SiDP only changes where FFN weights reside and how they are accessed. 
+
+# 4.2 Weight as a Service 
+
+In the WaS mode, we exploit the fact that DP replicas on an NVLink-connected node share a high-bandwidth intercon-nect but do not actually need ownership of the full model to execute a forward pass. The key observation, supported by Figure 1(a), is that for a fixed layer the compute time domi-nates the cost of fetching that layer’s weights once the batch size is large enough. Instead of replicating a layer’s weights 
+
+d times across d replicas, we can assign layer ( ℓ) to a sin-gle owner rank r(ℓ) and allow the other replicas to fetch its parameters on demand over NVLink, while still performing the general matrix multiplications (GEMM) in FFN forward locally on their own activations, as shown in Figure 4. This preserves the independence and scheduling flexibility of data parallelism, while converting redundant weight replicas into a bandwidth-backed, shared resource inside the node. 
+
+Asynchronous one-sided reading. To avoid the coordina-tion and lockstep semantics of collective communication, WaS uses one-sided, asynchronous weight access. Initially, owner ranks register their weight buffers and expose device addresses that can be used by peer GPUs. When a non-owner rank needs layer ℓ, it directly issues non-blocking device-to-device copies from r(ℓ)’s HBM into its local cache. The owner is oblivious to the number and timing of these reads; it simply hosts the weights. Because the compute for layer ℓ is performed locally, these remote reads can be issued ahead of time and overlapped with ongoing computation for other layers or tokens. In prac-tice, the runtime maintains a small lookahead window and prefetches the next few layers while the GPU is executing for-ward for the current layer. This overlap hides NVLink latency and bandwidth fluctuations and avoids the “all-or-nothing” latency of reconstructing full layers via all-gathers. From the perspective of the serving engine, weight access becomes an asynchronous, per-rank operation that can be initiated when-ever a given layer will soon be needed for a particular batch. 
+
+Asynchronous buffer management. WaS relies on a small, fixed-capacity cache on each GPU to hold temporary remote weight. A naive implementation that repeatedly allocates and frees buffers per layer would quickly block the CPU con-trol path. Instead, SiDP pre-allocates a set of cache slots and manages them with a dedicated housekeeper thread that runs asynchronously with respect to the main decode loop. Each cache slot is associated with a particular set of tensor tiles 
+
+(e.g., MLP matrices of a layer). When the runtime decides to prefetch tiles for layer ℓ, it reserves one slot, issues asyn-chronous remote reads into the slot, and attaches notifications so that the compute thread can wait on the completion of transfers just before launching computation. Once compute using that tiles has finished, the housekeeper observes the completion signals from the compute thread and marks the slot as free, making it available for the next prefetch wave. Because layers are visited in a predictable order, and the num-ber of layers in flight is bounded by the computation progress, the cache can be dimensioned to keep only a small number of tiles per layer without risking thrashing. 
+
+Peak shifting. When the data-parallel degree exceeds two, WaS introduces a new potential hotspot: for a given layer ℓ,there is a single owner r(ℓ) that stores its weights, and all other DP ranks must fetch tiles from this owner. In the worst case, if d replicas progress at similar speeds—a common situation in offline inference—then d − 1 ranks may attempt to read the same weight tile from r(ℓ) at nearly the same time. This con-centrates traffic on the owner’s outgoing NVLink links and can reduce the effective bandwidth per reader to a small frac-5Owner Rank Rank 0      
+
+> Owner
+> Placeholder
+> Owner
+> Placeholder
+> weight cache
+> Local
+> Compute
+> Remote
+> Compute
+> Activa -
+> tions
+> Full
+> Weights
+> Non -Owner Rank
+> Results
+> Activa -
+> tions
+> Weight
+> Cache
+> Send
+> Return
+> Owner Rank
+> Local
+> Compute
+> Activa -
+> tions
+> Full
+> Weights
+> Non -Owner Rank
+> Results
+> Weight
+> Cache
+> Activa -
+> tions
+> Local
+> Compute
+> Send
+> Results
+> Rank 1
+> Placeholder
+> Owner
+> Placeholder
+> Owner
+> weight cache
+> Layer 1
+> Layer 2
+> Layer 3
+> Layer 4
+> Cache
+> NVLink
+> (a) Static Weight Distribution (b) WaS Workflow (Compute -Bound: Large Batch) (c) CaS Workflow (Transfer -Bound: Small/Tail Batch)
+> Condition: Large Batch (Compute -> Transfer) Condition: Small Batch (Transfer -> Compute)
+
+Figure 4: Memory layout and per-layer workflows of SiDP .tion of the theoretical peak (e.g., on DP = 8 , seven concurrent readers may each see less than 17 of the link capacity). To mitigate this, SiDP employs a decentralized, low-overhead peak shifting scheme that staggers weight pulls across ranks without extra coordination. Conceptually, we provide each rank with enough cache to hold (d − 1) remote layers. We then organize layers by their indices into consec-utive cycles of size d. For a cycle that starts at layer c, rank 
+
+r applies a fixed per-rank offset anchored at this cycle start: it begins prefetching from layer c + r and then proceeds in a wrap-around order within the same d-layer cycle (skipping its owner layer). This simple offsetting has two properties: (i) within each cycle, every rank can still obtain the full set of required non-owner tiles after at most (d − 1) prefetches, so it is never starved of weights; and (ii) at any given moment, dif-ferent ranks tend to prefetch different layers, avoiding many-to-one incast bursts. In effect, peak shifting distributes remote reads for each cycle over time and across ranks, preventing NVLink hotspots on owners while still ensuring that every replica fills up its cache with the remote weights it needs. 
+
+# 4.3 Compute as a Service 
+
+While WaS is well-suited to regimes where batch sizes are large enough to hide remote weight transfers, it becomes inefficient when the batch size B is small (as in Figure 1(a)). As discussed in § 3.2, such small-batch regimes arise naturally near the tail of jobs. In this phase, streaming full weight tiles to every non-owner rank can cost more bandwidth than is justified by the small amount of compute per rank. CaS operates precisely in this tail regime by inverting the direction of data movement: instead of bringing weights to where activations reside, non-owner ranks send their activa-tions to the owner of a layer, which performs the computation and returns the outputs, as shown in Figure 4. This introduces explicit point-to-point (P2P) interactions between replicas and therefore breaks the strict “everyone is fully independent” ideal of data parallelism. However, in the offline setting we target, CaS is only enabled when most replicas already have spare capacity—e.g., toward the end of a job when global con-currency is shrinking. In that regime, synchronizing a subset of ranks around shared compute is effectively a way of letting otherwise idle engines “help out” with the remaining work, rather than a restriction on progress in the throughput-critical bulk of the job. 
+
+Skipping dummy runs. Mainstream inference engines [13, 37] often keep all data-parallel replicas running dummy steps even when some of them have no active sequences. A com-mon pattern is to run a dummy iteration with batch size 1 on otherwise idle replicas so that internal schedulers, pipelines, and timing loops remain aligned across engines. In the tail of an offline job, this means that only a few replicas carry real work. Crucially, these dummy runs do not contribute any useful tokens and, in the context of CaS, should not trigger any real communication or compute. 
+
+SiDP makes this explicit by letting the job orchestrator de-clare whether engines are performing a dummy run. For each layer, the owner only serves non-dummy work. When collect-ing activations from replicas, it ignores both P2P transfers and computation for those replicas whose state is dummy. Even if the owner carries dummy tasks, it still executes the fused computation for received activations and returns outputs to the corresponding ranks. Non-owner ranks adopt the dual behavior. If their work is dummy, they immediately return from the layer without packing activations or initiating any communication; the dummy step is satisfied purely at the con-trol level, with no data movement. This design allows existing engines to retain their dummy-run rhythm for liveness, while ensuring that CaS pays no additional bandwidth or compute cost for those dummy iterations. 
+
+GEMM fusion. The effectiveness of CaS hinges on whether the owner can serve many non-owner requests without suf-fering from small-batch inefficiencies. Our motivation mea-surements (Figure 1(a)) show a crucial property: the FFN forward time at small batch sizes grows very slowly with B
+
+and quickly saturates once a modest batch size is reached. In other words, adding more rows has negligible marginal cost over a wide range until the GEMM reaches a certain utilization level. CaS exploits this by fusing activations from multiple ranks into larger owner-side GEMMs. Concretely, CaS maintains a staging buffer per layer ℓ into which it concatenates incoming activation chunks from all non-owner ranks (and its local activations). Once all activa-tions are ready, the owner launches a single GEMM and then partitions the output along the same boundaries and returns each slice to its originating rank. P2P transfers are issued 6by non-owners and can be overlapped with the computation of earlier steps in the decode iteration. Thus, CaS leverages both batch fusion at the owner and overlap between P2P trans-fers and upstream computation to make “compute sharing” efficient in the small-batch tail of offline jobs. 
+
+Consistent mode switching. Since CaS introduces cross-rank interactions, it must be enabled in a controlled, globally consis-tent way. In SiDP , the job orchestrator decides when to switch between WaS and CaS. The orchestrator monitors progress and load across all DP replicas—tracking, for example, how many sequences remain active per engine and the observed batch sizes in recent iterations. When it detects that a job has entered a tail regime where many engines are underutilized, it can broadcast a control-plane directive for all engines to operate in CaS mode. This centralized policy ensures that all ranks agree on the communication pattern for each layer and avoids inconsistent mode choices that could lead to deadlocks. Mode switches occur only at coarse-grained boundaries (em-pirically minute-level at the tail of a job) with hysteresis to avoid flapping so the high-throughput bulk of the job runs purely in WaS and preserves full DP independence. In practice, the orchestrator bases this decision on a hardware-specific batch-size threshold Bth derived from of-fline profiling. For each GPU and model type, we estimate the minimum batch size at which forward time can fully hide the cost of weight fetching in WaS, given the devices’ compute and NVLink bandwidth (as validated in §5). As long as the effective batch size stays above Bth , WaS remains preferable; when it persistently falls below Bth , the orchestrator switches the group into CaS mode. 
+
+# 4.4 Discussion 
+
+Implementation. SiDP is realized as a plugin for vLLM [13] without requiring any modifications to the original vLLM source code. The implementation is lightweight, comprising roughly 4,000 lines of Python, and integrates seamlessly as a drop-in extension. SiDP uses CUDA IPC to expose local GPU memory for remote access. All weight/activation copies happen on separate CUDA streams to avoid blocking main computation. Notifications between housekeepers and main compute threads are driven by CUDA events for explicit de-pendencies without synchronous CPU barriers. In practice, 
+
+SiDP maintains d − 1 slots for WaS mode and two slots for CaS mode, costing ≤ 1 GB GPU memory for mainstream LLMs. 
+
+Deployment scope. SiDP is designed as an intra-node primi-tive that operates within a DP group on NVLink-connected GPUs: ownership, WaS/CaS decisions, and weight sharing are all confined to a single node’s parallel group. However, this does not preclude multi-node deployments: large-scale serving stacks already structure clusters as collections of iden-tical 2D/3D-parallel groups and scale out by replicating these t4d2 t2d4 t1d8 (a) Qwen3-32B      
+
+> 0
+> 0.2
+> 0.4
+> 0.6
+> 0.8
+> 1.0
+> 1.2
+> 1.4
+> 1.6
+> 1.8
+> KV cache (M tokens)
+> t4d2 t2d4 t1d8 (b) Llama-3.1-70B
+> 0
+> 0.2
+> 0.4
+> 0.6
+> 0.8
+> 1.0
+> 1.2
+> t4d2 t2d4 t1d8 (c) Qwen-2.5-72B
+> 0
+> 0.2
+> 0.4
+> 0.6
+> 0.8
+> 1.0
+> 1.2
+> vLLM SiDP
+
+Figure 5: Available KV cache size (in tokens) of vLLM vs. 
+
+SiDP under different parallelism on H20. vLLM cannot run Llama-3.1-70B and Qwen2.5-72B with TP=1, DP=8. Table 1: Evaluation testbed overview. 
+
+Config H20 node H200 node B200 node 
+
+GPU model 8× H20 8× H200 8× B200 GPU memory 144 GB 144 GB 180 GB Interconnect NVLink 4 NVLink 4 NVLink 5 CUDA version 12.6 12.6 12.8 groups across machines without cross-group communication. In such settings, SiDP applies unchanged inside each node-local group and multi-node scaling is simply achieved by replicating SiDP -enabled groups at the job orchestrator level. 
+
+Robustness. From a robustness perspective, SiDP is closer to model parallelism than conventional DP: within a SiDP -enabled group, FFN weights are owned by specific ranks, so the failure domain resembles that of TP/PP where all par-ticipating GPUs are required for correctness. Consequently, replacing a TP degree with an equivalent SiDP degree does not materially change robustness, while applying SiDP to “convert” DP capacity can weaken the fault-isolation bene-fits that DP would otherwise provide. This trade-off remains local to each group and can be mitigated at cluster scale by increasing the number of replicated SiDP -enabled groups. 
+
+# 5 Evaluation 
+
+This section answers four questions: (i) How does KV cache capacity change under our design? (ii) Does SiDP improve end-to-end throughput across models and testbeds? (iii) How effective is the design of SiDP in practice? (iv) When does CaS outperform WaS, and how sensitive is overall perfor-mance to the WaS/CaS mode switch? 
+
+# 5.1 Evaluation Setup 
+
+Testbed. Our evaluation is conducted on the following testbeds: H20, H200, and B200, as shown in Table 1. 71K 2K 4K (a) Qwen3-32B        
+
+> 2.7
+> 5.9
+> 9.1
+> 12.3 Throughput (K tok/s)
+> 1K 2K 4K Sequence length (tokens) (b) Llama-3.1-70B
+> 1.8
+> 3.2
+> 4.5
+> 5.9
+> 1K 2K 4K (c) Qwen2.5-72B
+> 1.8
+> 3.1
+> 4.4
+> 5.7
+> vLLM-TP vLLM-TP+PP vLLM-TP+DP SiDP
+
+Figure 6: End-to-end throughput with different models, parallelisms, and sequence lengths on H20. 1K 2K 4K (a) Qwen3-32B        
+
+> 3.5
+> 10.3
+> 17.2
+> 24.0 Throughput (K tok/s)
+> 1K 2K 4K Sequence length (tokens) (b) Llama-3.1-70B
+> 3.0
+> 7.7
+> 12.4
+> 17.1
+> 1K 2K 4K (c) Qwen2.5-72B
+> 2.9
+> 7.2
+> 11.5
+> 15.8
+> vLLM-TP vLLM-TP+PP vLLM-TP+DP SiDP
+
+Figure 7: End-to-end throughput with different models, parallelisms, and sequence lengths on H200. 
+
+Baseline and models. We compare SiDP against vLLM 
+
+(0.10.1) [13]. We choose three popular models served in of-fline inference: Qwen3-32B [32], Qwen2.5-72B [31], and Llama-3.1-70B [4]. 
+
+Parallelism. We use three types of parallelism configurations: pure tensor parallelism, hybrid TP+DP, and hybrid TP+PP and report the best performance in each category. Since SiDP 
+
+reduces weight redundancy in data parallelism and supports DP8 for all evaluated models, we show its results at DP=8 by default. 
+
+Workload. We select three typical offline inference work-loads: summarization [23] (average S =1K), code genera-tion [2] ( S =2K), and conversation evaluation [12] ( S =4K). For each workload, we try two batching strategies: (1) a fixed large batch size to fully utilize GPU compute but may trig-ger OOM protection of engines; (2) an adaptive batch size (B ≈ M−WS ). We report the better of the two settings. 
+
+# 5.2 End-to-end Performance 
+
+KV cache capacity. Figure 5 quantifies the KV cache size each configuration can sustain (in tokens) under a fixed mem-ory budget, and directly tests the memory model from §3.1: reducing the per-device weight footprint W should enlarge the residual KV cache capacity. Across all three models and DP/TP settings, SiDP systematically increases the maxi-mum KV token budget compared to vLLM (∼1.7× with TP=2, DP=4. Even more strikingly, for the largest DP setting (TP=1, DP=8), vLLM cannot sustain Llama-3.1-70B or Qwen2.5-72B at all under our memory limit, while SiDP continues to support 
+
+≈1.0 M KV tokens. The gains are modest at low DP or smaller models (e.g., about 5% for Qwen3-32B at TP=4, DP=2) where redundant FFN replicas are not the dominant HBM consumer. As DP increases and weight replication becomes the main consumer of memory, the benefits grow rapidly, explaining the much larger gains at TP=2,DP=4 and TP=1,DP=8. These trends match the expectation that, as DP grows and weight replication becomes more dominant, sharding FFN weights along the DP axis frees a growing fraction of HBM for KV cache. The expanded KV capacity directly enables larger fea-sible batch sizes and/or longer supported sequences under the same hardware and model configuration. 
+
+Throughput. Figure 6, 7, and 8 show how SiDP converts its KV-capacity advantage into higher throughput across GPUs, models, and workload lengths. Compared to a TP-only baseline, adding DP in vLLM improves tokens/s by roughly 1.0∼1.8×; we also include a TP+PP baseline for complete-ness, which is generally below TP in our single-node setting. 
+
+SiDP further boosts the DP+TP configuration by expand-ing the residual KV capacity and enabling larger effective batches. The effect is most pronounced in the long-context, memory-stressed regime ( S=4K ): across H20/H200/B200, 81K 2K 4K (a) Qwen3-32B        
+
+> 4.9
+> 11.6
+> 18.3
+> 25.0 Throughput (K tok/s)
+> 1K 2K 4K Sequence length (tokens) (b) Llama-3.1-70B
+> 4.6
+> 9.7
+> 14.7
+> 19.7
+> 1K 2K 4K (c) Qwen2.5-72B
+> 4.4
+> 9.4
+> 14.3
+> 19.3
+> vLLM-TP vLLM-TP+PP vLLM-TP+DP SiDP
+
+Figure 8: End-to-end throughput with different models, parallelisms, and sequence lengths on B200. 
+
+SiDP achieves roughly 1.3 – 1.5× higher throughput than DP+TP. The benefit of SiDP grows with both model size and sequence length: at short sequences (1K), where the workload is already largely compute-bound, the DP baseline can sus-tain aggressive batching without hitting KV limits and SiDP 
+
+closely matches its throughput. As we move to 2K and espe-cially 4K workloads, the DP baseline enters a memory-bound regime and can no longer increase batch size without trigger-ing OOM protection or preemption, whereas SiDP can con-tinue to scale B and stay in the sub-linear region of T (B). The end result is that, for memory-bound offline workloads, the best-performing configuration with SiDP lies strictly above any TP/PP/DP combination available in the vLLM baseline under the same hardware and model. The consistent gains across three GPU generations suggest this advantage is not tied to a specific device. Looking ahead, even though future GPUs will likely offer larger HBM, they will also bring higher compute capability and better kernel efficiency, which can push the saturation batch size Be upward. In this light, SiDP should remain a useful way to expand the feasible batch-size region and preserve headroom for higher-throughput operating points. 
+
+# 5.3 Design Choice Validation 
+
+Prefetch is overlappable. Figure 9 tests a key assumption behind WaS: on modern GPUs, the time to fetch FFN weights can be overlapped with decode computation. For each batch size, we report the per-iteration decode time T (B) on H20 ,
+
+H200 , and B200 , alongside a pessimistic estimate of the time needed for SiDP to fetch all FFN weights across all layers (“Fetch-1”/“Fetch-2” for NVLink 4/5). As B grows from 64 to 512, T (B) increases while the fetch time remains essentially constant. On H20, T (B) already exceeds the full-weight fetch time at B=128 and is roughly 3∼5× larger at B=256 and 512 .On H200, T (B) slightly surpasses the fetch time at B=256 and reaches about 1.8× at B=512 . Even on the faster B200, 
+
+T (B) approaches or exceeds the B200 fetch time near B =
+
+256 . These trends corroborate our expectations from §3.1: in the large-batch regime where WaS is intended to operate, 
+
+Figure 9: Prefetch vs. T (B) (TP=2, S = 1K). Fetch-1 and 2 are the time to read entire FFN weights of Llama-3.1-70B on NVLink 4 and NVLink 5. decode iterations become compute-dominated, while the cost of weight prefetch stays bounded and can be hidden within 
+
+T (B) on all three GPU generations. The experiment is intentionally conservative: the “Fetch” lines reflect streaming all FFN weights once, whereas the runtime only fetches non-owner layers (a (d−1)/d fraction). The fact that T (B) is already comparable to or much larger than this worst-case full-fetch time indicates ample slack to overlap prefetch, even when NVLink bandwidth is shared with other traffic. 
+
+Impact of peak shifting. Figure 10 evaluates how peak shift-ing affects end-to-end throughput as we increase the DP de-gree under SiDP . This experiment directly targets the NVLink incast problem discussed in §4.2: without any staggering, all non-owner ranks tend to pull the same layer tiles from the same owner at roughly the same time, concentrating traffic on a single set of links. With peak shifting, we permute the order in which ranks prefetch tiles so that, at any instant, different ranks are typically reading tiles from different owners. The results show that this decentralized staggering is crucial once DP exceeds a small group size. At DP=4, peak shifting boosts throughput by roughly 2.5×, and at DP=8 the improvement 92 4 8DP degree  
+
+> 0
+> 4000
+> 8000
+> 12000 Throughput (tok/s) with shift without shift
+
+Figure 10: Impact of peak shifting with Qwen3-32B on H20, 
+
+S =1K. 1 2 8 32 128 Batch size 
+
+> 0
+> 40
+> 80
+> 120
+> Iteration time (ms) WaS CaS SiDP vLLM
+
+Figure 11: Iteration time of WaS/CaS/ SiDP /vLLM with Llama-3.1-70B on H20, TP=2, DP=2. grows to 3.4×. This confirms that avoiding incast on owners is necessary to translate WaS’s HBM savings into DP-scalable throughput on NVLink-connected nodes. 
+
+Mode switching mitigates tail inefficiency. Figure 11 re-ports per-iteration decode time under different batch sizes for WaS-only, CaS-only, the vLLM baseline, and SiDP (which effectively takes min {WaS , CaS } at each B). This experiment directly tests the design goal in §4.3: WaS should dominate in the large-batch interior of an offline job, while CaS should mitigate the small-batch tail where WaS can no longer hide weight transfers. The data shows a clear crossover. For small batches ( B ≤ 32 ), CaS is substantially faster than WaS, reflect-ing that moving activations to a shared owner is more efficient than streaming full weights to every rank when per-rank work is tiny. For large batches ( B=128 ), WaS matches the vLLM 
+
+baseline, while CaS pays extra P2P and fusion overhead. For users, the key takeaway is that a simple mode-switching policy suffices to capture the best of both worlds, as we dis-cussed in §4.3. There remain small gaps between SiDP and the 
+
+vLLM baseline at the tiniest batch sizes ( B=1 ): 12% slower due to the fixed control overhead of routing activations through the CaS wrapper and coordinating owner-side fusion. These 1K 2K 4K Sequence length (a) Llama-3.1-70B    
+
+> 4.8
+> 8.9
+> 13.0
+> 17.1 Throughput (K tok/s)
+> 1K 2K 4K Sequence length (b) Qwen2.5-72B
+> 4.2
+> 8.0
+> 11.9
+> 15.8
+> vLLM-TP+DP SiDP
+
+Figure 12: End-to-end throughput on H200 with GPU mem-ory utilization = 0.6. differences are confined to the extreme tail, where the number of active sequences—and thus the number of iterations spent in this regime—is small relative to the bulk of the job. 
+
+SiDP works for short-context scenarios. A natural concern is that SiDP might only help in long-context settings. To stress-test this, we run Llama-3.1-70B and Qwen2.5-72B with the same configuration as §5.2 but under a tighter memory budget: 0.6 GPU memory utilization (about 80 GB per GPU), roughly matching common A100/H100 deployments, as in Figure 12. For each model and sequence length, we sweep DP/TP config-urations and report the best throughput for the vLLM DP+TP baseline and for SiDP (we omit pure TP and TP+PP schemes for brevity). SiDP improves throughput by 24 ∼ 51% across all evaluated sequence lengths. These results show that SiDP 
+
+is not confined to extreme long-context workloads. Once the model is large enough that weights consume a substantial frac-tion of HBM under realistic budgets, reducing the effective weight footprint along the DP axis still enlarges the feasible batch-size region and translates into higher throughput—even when sequence lengths are only one or two thousand tokens. 
+
+# 5.4 Ablation 
+
+Impact of mode switch. Figure 13 quantifies how much of 
+
+SiDP ’s end-to-end gain comes from WaS alone versus the combined WaS+CaS design on H20 ( S=4K). With WaS only, 
+
+SiDP improves over vLLM by about 7% ∼9% , confirming that the overhead of weight transfer in small-batch cases can still erode overall performance. When we enable mode switching, the gains become substantially larger ( 27% ∼32% over vLLM ). These results show that WaS and CaS play complemen-tary roles at the job level. Adding CaS does not change the steady-state batch size in the interior—where WaS remains active—but it significantly reduces the cost of the tail phase, where effective batch size collapses and WaS can no longer hide weight transfers. Importantly, we do not observe any 10 0 1000 2000 3000 4000 5000 6000 7000 Throughput (tok/s)   
+
+> Qwen3-32B
+> Llama-3.1-70B
+> Qwen2.5-72B vLLM WaS WaS+CaS
+
+Figure 13: Throughput gain of SiDP with/without mode switch on H20 when running different models, DP=8. FSDP CaS V1 CaS V2 CaS V3 vLLM 
+
+> 0
+> 10
+> 20
+> 30
+> 40
+> E2E Time (s)
+> Async P2P
+> GEMM fusion
+> Skip dummy tasks
+
+Figure 14: End-to-end time of a single request under different implementations with Llama-3.1-70B on H20, TP=2, DP=2. configuration where enabling CaS reduces overall throughput relative to WaS-only on this 4K workload, indicating that the orchestrator’s coarse-grained, tail-triggered switching pol-icy is effective: CaS is invoked where it helps (small-batch regimes) and stays out of the way where WaS already matches or beats the baseline. This confirms that mode switching is not just a micro-optimization for per-iteration latency, but a meaningful contributor to end-to-end job throughput. 
+
+Impact of CaS optimizations. Figure 14 breaks down the impact of successive CaS optimizations in the most challeng-ing regime for weight sharing: batch size B=1 in the long tail of an offline job. A naive FSDP-style scheme that all-gathers full FFN weights for each layer on every rank (“FSDP”) takes 33 s to finish the tail workload, over 3× slower than the vLLM 
+
+baseline. This gap illustrates the limitation of FSDP in in-ference discussed in §3.2. Starting from this baseline, we progressively refine CaS while still using shared weights .The first variant (“CaS V1”) replaces collectives with asyn-chronous P2P, reducing tail time from 33 s to 25 s ( 24% faster). “CaS V2” adds fused GEMMs on the owner, concatenating activations from multiple ranks into a single large GEMM and 0 20 40 60 80 100 120 140 160 180 
+
+> Batch size
+> 0
+> 500
+> 1000
+> 1500
+> Count
+> CaS
+> WaS
+
+Figure 15: Batch/mode distribution of SiDP with Llama-3.1-70B on H20, DP=8, S=4K. cutting time further to 19 s (another 24% reduction). Finally, “CaS V3” incorporates dummy skipping (§4.3), avoiding any P2P or GEMM work for replicas that only execute dummy iterations and reducing the tail from 19 s to 12 s ( ∼37%). Taken together, these optimizations improve a straightfor-ward FSDP-like implementation by 2.8×. This experiment shows that SiDP is not only conceptually better suited to infer-ence than FSDP-style sharding, but that careful implementa-tion choices—asynchronous P2P, GEMM fusion, and dummy skipping—are all necessary to make weight sharing practical in the most challenging corner of offline serving. 
+
+Tail characteristics. We finally address a potential concern: does SiDP only accelerate offline jobs for a short period while leaving the long tail largely unoptimized? The answer is no. We profile a representative long-context job ( S=4K ) and record the effective batch size and selected mode at each it-eration in Figure 15. Using the hardware-specific threshold 
+
+Bth derived in §4.3, we find that more than 90% of iterations remain in the WaS-enabled regime. This clarifies an impor-tant distinction: a long tail does not imply a long CaS phase .Instead, CaS acts as a short but essential safety net for the tail-of-the-tail. Although this window is brief, keeping its perfor-mance close to vLLM is critical because small-batch iterations can contribute disproportionately to overall job completion time. This also explains why the combined WaS+CaS design outperforms WaS-only in §5, even though CaS is exercised for only a small fraction of the execution. 
+
+# 6 Related Work 
+
+Token batching. Token batching and scheduling are central to exploiting GPU parallelism in autoregressive LLM infer-ence. Orca [33] introduces continuous batching and iteration-level scheduling so that batches can evolve across decode iterations, substantially improving utilization under variable-length generation. Follow-up systems [1, 6, 8, 17] refine these ideas with phase-aware batching, speculative or hierarchical 11 schedulers, and cost-aware ordering to better handle mixed or bursty workloads. SiDP is orthogonal to these techniques: it focuses on weight memory, enabling larger per-GPU batches that token-batching schedulers such as Orca, vLLM, and their successors can exploit. 
+
+Weight memory management. Another line of work at-tacks weight memory pressure via slower memory tiers or cluster-level pooling. ZeRO-Infinity [21] and FlexGen [24] of-fload weights and activations to CPU or NVMe and carefully prefetch to compensate for limited device memory. More recently, Pie [30] pools CPU memory for inference, while KunServe [3] treats parameters as a cluster-level resource and elastically rebalances them across GPUs. Oneiros [14] instead optimizes KV cache for multi-tenant serving by remapping pa-rameters so that co-located models share KV space more effi-ciently. These systems primarily rely on CPU or storage band-width and sophisticated planning to make offloaded weights usable at scale. SiDP instead assumes a high-bandwidth in-terconnect and redistributes weights within the GPU group, converting redundant replicas into extra on-device capacity for KV/cache without paying PCIe/NVMe latency. 
+
+Offline serving optimization. Recent work has begun to treat offline, throughput-oriented serving as a first-class workload. Glinthawk [7] and TD-Pipe [34] decouple phases of the model (e.g., attention vs. MLP, or different pipeline stages) to better pack compute and KV/cache across heterogeneous resources, while BatchLLM [38] and BlendServe [36] use global prefix trees, resource-aware batching, and latency-relaxed reorder-ing to improve utilization. SamuLLM [5] uses a sampling-then-simulation planner to schedule multi-LLM offline ap-plications. These systems mostly optimize request ordering, prefix reuse, and KV/cache placement on top of a fixed par-allelism substrate. SiDP is complementary: it changes the weight-memory layout inside each DP group, enlarging the feasible batch-size regime that such offline schedulers can then leverage. 
+
+# 7 Conclusion 
+
+Offline LLM inference is dominated by throughput (tokens per second), but effective batch size is jointly constrained by compute saturation and memory: larger batches move the system toward a more efficient regime, yet KV cache 
+
+K ∝ BS and fully replicated weights W under data parallelism quickly exhaust HBM, while model parallelism reduces per-device W at the cost of DP-style scalability. SiDP addresses this tension by treating FFN weights as a bandwidth-backed shared resource inside each DP group, organizing them as a distributed pool where each layer is owned by a single GPU and other replicas access its parameters on demand via a Weight-as-a-Service mode for large batches and a Compute-as-a-Service mode for small-batch tails. On NVIDIA H20, H200, and B200, this design increases usable KV capacity by up to 1.8× under the same DP/TP configurations and translates that into up to 1 .5× higher end-to-end throughput. 
+
+Limitations and future work. This work focuses on dense, decoder-only Transformers deployed on NVLink-connected systems. Extending SiDP to heterogeneous clusters and slower interconnects (e.g., PCIe or Ethernet) will require re-visiting the balance between WaS and CaS, adapting prefetch policies to more constrained bandwidth, and co-designing with cross-node scheduling. Another promising direction is support for MoE architectures. Modern MoE systems often rely on expert-parallel load balancing (EPLB) to exploit re-dundancy and equalize load across experts; SiDP could com-plement these techniques by using WaS-style weight sharing to reduce redundant expert replicas within an expert-parallel group. We leave the design of such an SiDP -aware EPLB layer as promising future work. 
+
+# References 
+
+[1] Amey Agrawal, Nitin Kedia, Ashish Panwar, Jayashree Mohan, Nipun Kwatra, Bhargav Gulavani, Alexey Tu-manov, and Ramachandran Ramjee. Taming throughput-latency tradeoff in llm inference with sarathi-serve. In 
+
+18th USENIX Symposium on Operating Systems Design and Implementation (OSDI 24) , pages 117–134, Santa Clara, CA, July 2024. USENIX Association. [2] Mark Chen, Jerry Tworek, Heewoo Jun, Qiming Yuan, Henrique Ponde de Oliveira Pinto, Jared Kaplan, Harri Edwards, et al. Evaluating large language models trained on code, 2021. [3] Rongxin Cheng, Yifan Peng, Yuxin Lai, Xingda Wei, Rong Chen, and Haibo Chen. Kunserve: Elastic and efficient large language model serving with parameter-centric memory management. arXiv e-prints , pages arXiv–2412, 2024. [4] Abhimanyu Dubey, Abhinav Jauhri, Abhinav Pandey, Abhishek Kadian, Ahmad Al-Dahle, Aiesha Letman, Akhil Mathur, Alan Schelten, Amy Yang, Angela Fan, et al. The Llama 3 herd of models. arXiv preprint arXiv:2407.21783 , 2024. [5] Jingzhi Fang, Yanyan Shen, Yue Wang, and Lei Chen. Improving the end-to-end efficiency of offline inference for multi-llm applications based on sampling and simu-lation. arXiv preprint arXiv:2503.16893 , 2025. [6] Suyu Ge, Yunan Zhang, Liyuan Liu, Minjia Zhang, Ji-awei Han, and Jianfeng Gao. Model tells you what to discard: Adaptive KV cache compression for LLMs. In 
+
+International Conference on Learning Representations (ICLR) , 2024. 12 [7] Pouya Hamadanian and Sadjad Fouladi. Glinthawk: A two-tiered architecture for offline llm inference. arXiv preprint arXiv:2501.11779 , 2025. [8] Yongjun He, Yao Lu, and Gustavo Alonso. Deferred continuous batching in resource-efficient large language model serving. In Proceedings of the 4th Workshop on Machine Learning and Systems , pages 98–106, 2024. [9] Dan Hendrycks, Collin Burns, Saurav Kadavath, Akul Arora, Steven Basart, Eric Tang, Dawn Song, and Ja-cob Steinhardt. Measuring massive multitask language understanding. arXiv preprint arXiv:2009.03300 , 2020. [10] Jian Hu, Xibin Wu, Zilin Zhu, Xianyu, Weixun Wang, Dehao Zhang, and Yu Cao. Openrlhf: An easy-to-use, scalable and high-performance rlhf framework. arXiv preprint arXiv:2405.11143 , 2024. [11] Vladimir Karpukhin, Barlas Oguz, Sewon Min, Patrick Lewis, Ledell Wu, Sergey Edunov, Danqi Chen, and Wen-tau Yih. Dense passage retrieval for open-domain question answering. In Proceedings of the 2020 Con-ference on Empirical Methods in Natural Language Processing (EMNLP) , pages 6769–6781. Association for Computational Linguistics, 2020. [12] Wai-Chung Kwan, Xingshan Zeng, Yuxin Jiang, Yufei Wang, Liangyou Li, Lifeng Shang, Xin Jiang, Qun Liu, and Kam-Fai Wong. MT-eval: A multi-turn capabilities evaluation benchmark for large language models. In Pro-ceedings of the 2024 Conference on Empirical Methods in Natural Language Processing , pages 20153–20177, Miami, Florida, USA, 2024. Association for Computa-tional Linguistics. [13] Woosuk Kwon, Zhuohan Li, Siyuan Zhuang, Ying Sheng, Lianmin Zheng, Cody Hao Yu, Joseph Gonzalez, Hao Zhang, and Ion Stoica. Efficient memory man-agement for large language model serving with page-dattention. In Proceedings of the 29th Symposium on Operating Systems Principles , pages 611–626, 2023. [14] Ruihao Li, Shagnik Pal, Vineeth Narayan Pullu, Pra-soon Sinha, Jeeho Ryoo, Lizy K. John, and Neeraja J. Yadwadkar. Oneiros: Kv cache optimization through parameter remapping for multi-tenant LLM serving. In 
+
+Proceedings of the ACM Symposium on Cloud Comput-ing (SoCC ’25) , 2025. [15] Percy Liang, Rishi Bommasani, Tony Lee, Dimitris Tsipras, Giannis Daras, Deep Ganguli, Dario Amodei Hernandez, et al. Holistic evaluation of language models. 
+
+arXiv preprint arXiv:2211.09110 , 2022. [16] Aixin Liu, Bei Feng, Bing Xue, Bingxuan Wang, Bochao Wu, Chengda Lu, Chenggang Zhao, Chengqi Deng, Chenyu Zhang, Chong Ruan, et al. Deepseek-v3 techni-cal report. arXiv preprint arXiv:2412.19437 , 2024. [17] Microsoft. Deepspeed, 2024. https://github.com /microsoft/DeepSpeed .[18] Long Ouyang, Jeffrey Wu, Xu Jiang, Diogo Almeida, Carroll Wainwright, Pamela Mishkin, Chong Zhang, Sandhini Agarwal, Katarina Slama, Alex Ray, et al. Training language models to follow instructions with human feedback. Advances in Neural Information Pro-cessing Systems , 35:27730–27744, 2022. [19] David Patterson, Joseph Gonzalez, Urs Hölzle, Quoc Le, Chen Liang, Lluis-Miquel Munguia, Daniel Rothchild, David R So, Maud Texier, and Jeff Dean. The carbon footprint of machine learning training will plateau, then shrink. Computer , 55(7):18–28, 2022. [20] Samyam Rajbhandari, Jeff Rasley, Olatunji Ruwase, and Yuxiong He. Zero: Memory optimizations toward train-ing trillion parameter models. In SC20: International Conference for High Performance Computing, Network-ing, Storage and Analysis , pages 1–16. IEEE, 2020. [21] Jie Ren, Samyam Rajbhandari, Reza Yazdani Am-inabadi, Olatunji Ruwase, Shuangyan Yang, Minjia Zhang, Dong Li, and Yuxiong He. Zero-offload : Democ-ratizing billion-scale model training. In 2021 USENIX Annual Technical Conference (USENIX ATC 21) , pages 551–564, 2021. [22] Stephen Roller, Emily Dinan, Naman Goyal, Da Ju, Mary Williamson, Yinhan Liu, Jing Xu, Myle Ott, Kurt Shuster, Eric Michael Smith, Y-Lan Boureau, and Jason Weston. Recipes for building an open-domain chatbot. 
+
+Proceedings of the 16th Conference of the European Chapter of the Association for Computational Linguis-tics: Main Volume , pages 300–325, 2021. [23] Abigail See, Peter J. Liu, and Christopher D. Manning. Get to the point: Summarization with pointer-generator networks. In Proceedings of the 55th Annual Meeting of the Association for Computational Linguistics (Volume 1: Long Papers) , pages 1073–1083, Vancouver, Canada, 2017. Association for Computational Linguistics. [24] Ying Sheng, Lianmin Li, Lianmin Zheng, et al. Flexgen: High-throughput generative inference of large language models with a single GPU. CoRR , abs/2303.06865, 2023. [25] Mohammad Shoeybi, Mostofa Patwary, Raul Puri, Patrick LeGresley, Jared Casper, and Bryan Catanzaro. Megatron-lm: Training multi-billion parameter lan-guage models using model parallelism. arXiv preprint arXiv:1909.08053 , 2019. 13 [26] Gemma Team. Gemma: Open models based on gemini research and technology. CoRR , abs/2403.08295, 2024. [27] Ashish Vaswani, Noam Shazeer, Niki Parmar, Jakob Uszkoreit, Llion Jones, Aidan N Gomez, Łukasz Kaiser, and Illia Polosukhin. Attention is all you need. Advances in neural information processing systems , 30, 2017. [28] Guanzhi Wang, Yuqi Zhang, Hao Zhang, Haoyi Xu, Yu-tong Yang, Yuxiao Dong, Ziwei Liu, Yixin Wang, et al. Voyager: An open-ended embodied agent with large lan-guage models. arXiv preprint arXiv:2305.16291 , 2023. [29] Yizhong Wang, Yeganeh Kordi, Swaroop Mishra, Pe-gah Alipoormolabashi, Amirreza Mirzaei, Atharva Naik, Arjun Ashok, et al. Self-instruct: Aligning language models with self-generated instructions. arXiv preprint arXiv:2212.10560 , 2022. [30] Yi Xu, Ziming Mao, Xiangxi Mo, Shu Liu, and Ion Sto-ica. Pie: Pooling CPU memory for LLM inference. abs/2411.09317, 2024. [31] An Yang et al. Qwen2.5 technical report. CoRR ,abs/2412.15115, 2024. [32] An Yang, Baosong Yang, and et al. Zhi-wei Zhang. Qwen3 technical report. arXiv preprint arXiv:2505.09388 , 2025. [33] Gyeong-In Yu, Joo Seong Jeong, Geon-Woo Kim, Soo-jeong Kim, and Byung-Gon Chun. Orca: A distributed serving system for transformer-based generative mod-els. In 16th USENIX Symposium on Operating Systems Design and Implementation (OSDI 22) , pages 521–538, 2022. [34] Hongbin Zhang, Taosheng Wei, Zhenyi Zheng, Jiangsu Du, Zhiguang Chen, and Yutong Lu. TD-pipe: Temporally-disaggregated pipeline parallelism architec-ture for high-throughput llm inference. arXiv preprint arXiv:2506.10470 , 2025. [35] Yanli Zhao, Andrew Gu, Rohan Varma, Liang Luo, Chien-Chin Huang, Min Xu, Less Wright, Hamid Sho-janazeri, Myle Ott, Sam Shleifer, et al. Pytorch FSDP: experiences on scaling fully sharded data parallel. arXiv preprint arXiv:2304.11277 , 2023. [36] Yilong Zhao, Shuo Yang, Kan Zhu, Lianmin Zheng, Baris Kasikci, Yang Zhou, Jiarong Xing, and Ion Sto-ica. Blendserve: Optimizing offline inference for auto-regressive large models with resource-aware batching. 
+
+arXiv preprint arXiv:2411.16102 , 2024. [37] Lianmin Zheng, Liangsheng Yin, Zhiqiang Xie, Chuyue Sun, Jeff Huang, Cody Hao Yu, Shiyi Cao, Christos Kozyrakis, Ion Stoica, Joseph E Gonzalez, et al. Sglang: Efficient execution of structured language model pro-grams. arXiv preprint arXiv:2312.07104 , 2024. [38] Zhen Zheng, Xin Ji, Taosong Fang, Fanghao Zhou, Chuanjie Liu, and Gang Peng. Batchllm: Optimizing large batched llm inference with global prefix sharing and throughput-oriented token batching. arXiv preprint arXiv:2412.03594 , 2024. [39] Yinmin Zhong, Zili Zhang, Xiaoniu Song, Hanpeng Hu, Chao Jin, Bingyang Wu, Nuo Chen, Yukun Chen, Yu Zhou, Changyi Wan, Hongyu Zhou, Yimin Jiang, Yibo Zhu, and Daxin Jiang. StreamRL: Scalable, hetero-geneous, and elastic RL for LLMs with disaggregated stream generation. arXiv preprint arXiv:2504.15930 ,2025. [40] Yinmin Zhong, Zili Zhang, Bingyang Wu, Shengyu Liu, Yukun Chen, Changyi Wan, Hanpeng Hu, Lei Xia, Ranchen Ming, Yibo Zhu, and Xin Jin. RLHFuse: Effi-cient rlhf training for large language models with inter-and intra-stage fusion. In USENIX Symposium on Net-worked Systems Design and Implementation (NSDI) ,2025. arXiv:2409.13221. 14
