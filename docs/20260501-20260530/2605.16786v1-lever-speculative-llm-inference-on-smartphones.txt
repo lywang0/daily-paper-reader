@@ -1,0 +1,829 @@
+Title: Lever: Speculative LLM Inference on Smartphones
+
+URL Source: https://arxiv.org/pdf/2605.16786v1
+
+Published Time: Tue, 19 May 2026 00:31:40 GMT
+
+Number of Pages: 14
+
+Markdown Content:
+# Lever : Speculative LLM Inference on Smartphones 
+
+## Tuowei Wang 
+
+Tsinghua University Beijing, China 
+
+## Fengzu Li 
+
+Tsinghua University Beijing, China 
+
+## Yanfan Sun 
+
+Beihang University Beijing, China 
+
+## Wei Gao 
+
+University of Pittsburgh Pittsburgh, USA 
+
+## Ju Ren ∗
+
+Tsinghua University Beijing, China 
+
+## Abstract 
+
+Large language models (LLMs) are increasingly needed for in-teractive mobile applications, but high-quality models exceed the limited DRAM available on smartphones. Flash storage can hold larger models, yet flash-backed inference is slow be-cause autoregressive decoding repeatedly invokes the target model and incurs costly I/O. We observe that speculative de-coding is a natural fit for this setting: a small draft model can remain in DRAM, while a larger flash-resident target model verifies multiple candidate tokens per invocation. However, existing methods assume server-class accelerators and fail to account for prolonged I/O latency, limited computation parallelism, and irregular speculation execution. We present Lever , an end-to-end system for efficient flash-backed LLM inference on smartphones. Lever jointly opti-mizes the three stages of speculative decoding under mobile constraints. For drafting, it builds token trees using an I/O-and compute-aware gain-cost objective. For verification, it prunes low-value branches through early-exit prediction to reduce target-model computation. For execution, it maps speculation efficiently across mobile CPU-NPU hardware to improve utilization. Comprehensive evaluations show that 
+
+Lever reduces inference latency by an average of 2.93 ×
+
+over baseline flash-offloaded inference and 1.50 × over con-ventional speculative decoding, narrowing the latency gap between flash-backed and memory-resident LLM inference. 
+
+## 1 Introduction 
+
+As mobile applications become increasingly intelligent and interactive, there is a growing demand for running large lan-guage models (LLMs) directly on smartphones. Compared with cloud-based serving, on-device inference offers several important advantages. It improves privacy by keeping sensi-tive user data local [ 37 , 38 ], avoiding the need to transmit personal context to remote servers. It also reduces serving cost [ 12 , 39 ]: instead of issuing repeated cloud requests for every interaction, inference can run directly on the device, making high-frequency workloads such as typing assistance and interactive editing more economical to support. However, deploying high-quality LLMs on mobile devices remains fundamentally limited by memory. State-of-the-art models contain billions of parameters, while commodity 
+
+> ∗Corresponding author (renju@tsinghua.edu.cn).
+
+smartphones provide only modest DRAM capacity. This DRAM is also shared with the operating system and other applications, leaving far less memory for LLM inference than the physical capacity suggests. Although compression techniques such as quantization [ 10 , 17 , 25 , 33 ] and prun-ing [ 20 , 21 ] can reduce model footprint, they may sacrifice generation quality and are often insufficient to fit larger, higher-quality models within mobile memory budgets. A promising alternative is to exploit the heterogeneous storage hierarchy already available on smartphones [ 1 , 29 ,36 ]. Flash storage offers substantially higher capacity than DRAM and can therefore hold model parameters that can-not reside in memory. By offloading model weights to flash, a device can support larger LLMs beyond DRAM capacity. However, this approach shifts the bottleneck from capacity to performance. During autoregressive decoding, the model is invoked repeatedly, once per generated token. If each invoca-tion requires loading parameters from flash, I/O latency can dominate end-to-end inference time. Consequently, naively performing a flash-backed LLM inference yields latency far beyond what interactive mobile applications can tolerate. This paper starts from the observation that speculative decoding is well matched to mobile DRAM-flash heterogeneous inference . Specifically, speculative decoding separates LLM inference into two roles: a small speculative model (SSM) proposes draft tokens, while a larger target model verifies them. This separation aligns closely with the mobile memory hierarchy. The SSM can remain resident in DRAM and run with low latency, whereas the LLM can be stored in flash and invoked only intermittently. Instead of accessing the flash-resident LLM for every generated token, the system can use the SSM to generate multiple candidates and verify them with a single LLM invocation. When several candidates are accepted, the cost of loading and executing the LLM is amortized across several output tokens. Despite this opportunity, existing speculative decoding methods [ 4, 15 , 22 ] are largely designed for server-class de-ployments, where the target model resides in high-bandwidth accelerator memory and verification can exploit abundant hardware parallelism. In these settings, verification is rela-tively inexpensive, shifting the optimization focus toward maximizing the acceptance rate of drafted tokens. Mobile in-ference breaks these assumptions. Because the target model   
+
+> 1
+> arXiv:2605.16786v1 [cs.LG] 16 May 2026 Capability
+> Performance
+> Flash -based LLM
+> DRAM -based SLM
+> Scout
+> DRAM Flash
+> DRAM -based Flash -based Scout
+> memory
+> bottleneck
+> per -step per -token
+> I/O
+> bottleneck
+> speculative decoding SS M
+> LLM
+
+Figure 1. Lever utilizes speculative decoding to combine the capacity of flash-based inference with the performance of DRAM-based inference on smartphones. is stored in flash, each verification step may incur expensive I/O and can take substantially longer than draft generation itself. Moreover, mobile systems-on-chip (SoCs) offer far less parallelism than server GPUs, so verification compute also becomes a major contributor to end-to-end latency. As a result, performance is no longer determined by speculation quality alone, but by how speculation interacts with mobile I/O and compute constraints. These constraints reshape the design space and expose three system-level challenges: 
+
+Challenge #1: Drafting. The draft token tree must be re-designed for mobile flash-backed inference, where specu-lation interacts directly with both flash I/O and on-device compute constraints. If the tree is too small, the target model must be invoked frequently, causing repeated flash accesses and poor amortization of I/O latency. If the tree is too large, verification requires evaluating an excessive number of can-didate tokens, introducing substantial compute overhead on resource-constrained mobile SoCs. 
+
+Challenge #2: Verification. Fully verifying the tree can require substantial computation, especially when the tree contains many branches or candidate tokens. On mobile SoCs, where parallelism, memory bandwidth, and thermal headroom are limited, this verification step can easily be-come compute-bound. As a result, the latency saved by re-ducing flash-backed target invocations may be offset by the additional computation required for verification. 
+
+Challenge #3: Execution. Mobile NPUs provide significant parallel compute capability, but they are optimized for regu-lar tensor operations, predictable control flow, and hardware-aligned data layouts. Token-tree speculation, however, nat-urally introduces irregular branching, dynamic candidate structures, and fragmented computation. These properties can lead to inefficient kernel execution, poor data locality, and underutilization of NPU compute units. To address these challenges, we present Lever , an end-to-end LLM inference system based on speculative decoding with DRAM-flash heterogeneous storage on smartphones. As illustrated in Figure 1, Lever treats speculative decoding not merely as a decoding algorithm, but as a systems prob-lem spanning drafting policy, verification cost, and mobile accelerator execution. Lever consists of three components: 
+
+Mobile-Optimized Drafting Construction. Lever con-structs token trees by optimizing expected output tokens per speculative-cycle latency instead of acceptance rate alone. It estimates both the expected gain of candidate tokens and the mobile-specific cost of verifying them, then greedily ex-pands high-value branches only when they are expected to improve end-to-end throughput. This allows Lever to amortize expensive flash-backed target invocations without creating oversized trees that overload mobile compute. 
+
+Predictor-Based Verification Pruning. Lever reduces target-model verification cost by pruning low-value branches before they traverse the full target model. It attaches a light-weight predictor to an intermediate target layer to estimate which draft branches are likely to survive final verification. To preserve correctness and avoid overly aggressive pruning, 
+
+Lever uses a conservative score-based algorithm to remove unlikely branches, while final token acceptance remains de-termined by the full target model. 
+
+Hardware-Hybrid Execution Acceleration. Lever re-structures speculative decoding to better match CPU-NPU execution on smartphones. During drafting, it batches se-lected branch expansions to improve NPU utilization without disrupting the gain-cost tree construction objective. During verification, it executes batched transformer computation on the NPU, but performs output projection selectively on the CPU only along the actual acceptance path, avoiding unnecessary logits computation for unvisited branches. We evaluate Lever under mobile-oriented DRAM-flash deployment settings, covering multiple models, tasks, and de-coding configurations. The results show that Lever achieves an average speedup of 2.93 × over flash-offloaded autore-gressive inference. Compared with conventional speculative decoding, Lever reduces latency by 1.50 × on average. This paper makes the following contributions: 1. We identify speculative decoding as a key opportunity for mobile DRAM-flash LLM inference, and reveal the system-level challenges required to make it practical. 2. We present Lever , a system that combines drafting, verification, and execution optimizations for efficient flash-backed LLM inference on smartphones. 3. We extensively evaluate Lever , showing consistent latency reductions over flash-backed inference and conventional speculative decoding methods. 
+
+## 2 Background 
+
+2.1 Memory Hierarchy on Smartphones 
+
+Modern smartphones expose a heterogeneous memory hier-archy consisting of DRAM and flash storage, as illustrated in Figure 2(a). DRAM provides low-latency access and rel-atively high bandwidth, making it the preferred location for storing model weights during inference. However, two factors limit the amount of DRAM that can be used by on-device LLMs. First, due to power and cost constraints, mobile             
+
+> 2Compute Unit
+> DRAM (~10 GB)
+> Flash Storag e(~100 GB)
+> ~1GB/ s
+> ~100 GB/ s
+> Memory Hierarchy (a) Comput eUnits (b)
+> Unified DRAM
+> CPU GPU NPU
+
+Figure 2. Smartphone hardware overview: (a) memory hier-archy and (b) heterogeneous compute units. devices typically have much smaller memory capacity than server-class systems, on the order of 10 GB. This capacity is insufficient for many modern LLMs, even when their weights are quantized. Second, the memory available to an LLM can be substantially smaller than the physical DRAM capacity, since DRAM is shared among the operating system, back-ground services, and foreground applications. As a result, it is difficult to keep a high-quality multi-billion-parameter model fully resident in DRAM on smartphones. Flash storage offers much larger capacity than DRAM and can therefore store model weights that exceed the avail-able DRAM budget. This makes flash-backed inference a promising strategy for enabling larger LLMs on smartphones. However, flash storage provides much lower effective band-width than DRAM, typically 5 GB/s. Therefore, data transfers between flash and DRAM become a major performance bot-tleneck, particularly during autoregressive decoding, where weights are accessed repeatedly. As shown in Table 1, if the target model must be loaded from flash for every generated token, I/O latency can dominate end-to-end inference time. Consequently, exploiting the large capacity of flash storage while minimizing inference latency is a fundamental chal-lenge for an efficient mobile inference system. 
+
+2.2 Compute Units on Smartphones 
+
+As illustrated in Figure 2(b), smartphone SoCs integrate het-erogeneous compute units, including CPUs, GPUs, and NPUs, which typically operate over a unified memory system. These compute units have distinct characteristics and are suited to different types of workloads. CPUs provide flexible con-trol flow and are well-suited for system-level coordination and orchestration, but they offer limited throughput and energy efficiency for large-scale tensor operations. GPUs provide substantially higher parallel compute capability and can accelerate dense numerical workloads. On smartphones, however, GPUs are primarily designed for graphics render-ing, so sustained GPU use for LLM inference may contend with foreground applications. In contrast, NPUs are special-ized for neural network execution and provide better energy efficiency for dense tensor operations, making them an in-creasingly important backend for on-device LLM inference. Nevertheless, mobile compute units remain far less capa-ble and less flexible than server-class GPUs. This limitation … 
+
+> (a) token
+> sequence
+> (b) balanced
+> token tre e
+> (c) optimal
+> token tre e
+> input token s
+> speculativ etoken s
+
+Figure 3. Speculative decoding topologies: (a) single se-quence, (b) balanced tree, and (c) optimized tree (in Lever ). is especially important for speculative decoding: although target-model verification can process multiple candidate to-kens efficiently in parallel, the limited parallelism available on mobile devices diminishes this benefit. In addition, mo-bile NPUs typically execute compiled computation graphs, where operators, tensor shapes, and data layouts are opti-mized ahead of time. This execution model is suitable for regular tensor operations with static shapes, but is less ef-fective for dynamic speculation patterns such as variable drafting structures and input-dependent verification paths. 
+
+2.3 Speculative Decoding 
+
+Autoregressive LLM inference is inherently sequential, as each token depends on previously generated tokens. Stan-dard decoding is therefore severely memory-bound, since each step reads a large amount of model weights while per-forming limited computation for a single token. Speculative decoding [ 5, 13 , 24 ] accelerates this process by introducing two models with different roles: a lightweight draft model 
+
+proposes candidate tokens, and a larger target model verifies them while defining the final output distribution. At each step, the draft model generates a candidate continuation, which the target model checks in one forward pass and ac-cepts the longest prefix consistent with its own predictions. When multiple tokens are accepted, a single target-model in-vocation advances decoding by several positions, amortizing target-model cost across multiple output tokens. Tree-based speculative decoding [ 7 , 14 , 22 , 26 ] extends this idea by organizing draft candidates into a branching token tree rather than a single linear sequence. As depicted in Figure 3, instead of proposing only one continuation, the draft model explores multiple possible continuations from each position, and the target model verifies the entire tree in one forward pass. The accepted output then corresponds to a path in the tree that is consistent with the target model dis-tribution. By covering multiple likely continuations at once, tree-based drafting can increase the expected number of ac-cepted tokens. However, existing tree-based approaches pri-marily focus on algorithmic improvements and are typically studied in conventional server-side settings, whereas mobile inference introduces additional system-level constraints. 
+
+> 3
+
+## 3 Motivation and Challenges 
+
+3.1 Motivation 
+
+Speculative decoding is a natural fit for LLM inference on smartphones with DRAM-flash heterogeneous storage. In this setting, a small speculative model can serve as the draft model and remain resident in DRAM, while the flash-backed LLM serves as the target model. Rather than loading the target model from flash and decoding every token individu-ally, speculative decoding enables the DRAM-resident draft model to generate multiple tokens rapidly, invoking the tar-get model only periodically for verification. When multiple candidates are accepted, the flash I/O and target-model execu-tion costs are amortized over several output tokens, reducing average per-token latency. As a result, the I/O bottleneck between flash and DRAM on smartphones is alleviated. Despite this opportunity, existing speculative decoding methods [ 2 , 4 , 11 , 13 , 15 , 22 ] are largely designed for server-class deployments. In such settings, both the draft and the tar-get model reside in high-bandwidth memory, and abundant computation resources enable efficient parallel verification. Therefore, prior work has primarily focused on algorithm-level optimizations, such as improving draft quality and op-timizing verification schedules. However, speculative LLM inference on smartphones differs in two important ways: (1) Flash-Bound Communication. Given the limited DRAM capacity on smartphones, the target model is stored in flash, and each verification step requires loading its weights into DRAM. As shown in Table 1, this data transfer can dom-inate verification latency due to the constrained effective bandwidth. By making verification more expensive, this ad-ditional communication alters the speculation cost trade-off and renders server-side drafting strategies suboptimal. (2) Parallelism-Limited Computation. Beyond memory limitations, mobile SoCs provide fewer computational re-sources than server GPUs. As shown in Figure 4, verifica-tion latency on smartphones increases noticeably with the number of tokens being verified. Therefore, although specu-lative decoding can verify multiple drafted tokens in a single target-model pass, mobile accelerators are less effective at amortizing this cost through parallelism. 
+
+Table 1. Per-token verification latency (ms) breakdown of flash-resident target models on a OnePlus 12. 
+
+Model Compute I/O Total I/O Percentage 
+
+Llama-3.1-8B 93.2 990.6 1083.8 91.4% Qwen3-4B 131.5 474.4 605.9 78.3% Qwen3-8B 96.6 953.4 1050.0 90.8% Qwen3-14B 141.2 1967.1 2108.3 93.3% 1 2 4 8 16 32 64          
+
+> Verified tokens
+> 10
+> 100
+> 1000
+> Verify latency (ms)
+> 77x faster
+> (a)
+> 124816 32 64
+> Verified tokens
+> 0
+> 5
+> 10
+> 15
+> 20
+> Speedup (x)
+> 8.0x 20.6x
+> (b)
+> NPU Llama NPU Qwen GPU Llama GPU Qwen
+
+Figure 4. Verification parallelism on mobile and server hard-ware. We compare Llama-3.1-8B and Qwen3-8B on a Snap-dragon 8 Gen 3 NPU and an NVIDIA RTX 3090 GPU. (a) Verification latency under different numbers of verified to-kens. (b) Achieved speedup over single-token generation. 4 8 16 32 64     
+
+> Tree budget
+> 0
+> 2
+> 4
+> 6
+> Normalized cost (B=4=1)  (a)
+> Target calls Verify cost Decode latency
+> 4816 32 64
+> Tree budget
+> 1.50
+> 1.75
+> 2.00
+> 2.25
+> 2.50
+> 2.75
+> Decode speed (tok/s)  best
+> (b)
+> 1.5 2.0 2.5 3.0
+> Accepted length
+> Decode speed Accepted length
+
+Figure 5. Token-tree budget dilemma on a OnePlus 12. (a) Normalized target-model calls, verification cost, and decod-ing cost under different tree budgets. (b) Decoding speed and accepted length under different tree budgets. 
+
+3.2 Challenges 
+
+These mobile-specific constraints reshape speculative decod-ing from a purely algorithmic optimization into a problem of algorithm-system co-design. Through a comprehensive analysis, we identify three critical technical challenges: 
+
+Challenge #1: Drafting. Tree-based speculative decod-ing improves acceptance, but mobile systems require a re-designed draft token tree. A small token tree produces only a few candidates per verification step, causing frequent target-model invocations and poor I/O amortization. In contrast, an overly large token tree may accept more tokens, but it also increases the number of candidates that the target model must verify. As shown in Figure 5, mobile inference therefore faces a token-tree size dilemma: the drafting strategy must balance flash I/O accesses against verification compute cost, rather than optimizing acceptance rate alone. 
+
+Challenge #2: Verification. Even with a carefully con-structed token tree, each verification step requires computa-tion across multiple branches and positions. On mobile SoCs, limited parallelism makes this verification step compute-bound. As a result, the latency saved from fewer flash-backed target invocations can be offset by the additional target-model computation required for full-tree verification. More-over, pruning verification is difficult without compromising                      
+
+> 4Drafting Constructio nVerification Pruning Execution Acceleration
+> highest score
+> estimate
+> Gain Cost
+> ÷=
+> Scor eLayer #
+> branc h1branc h2
+> Layer #+1Predictor
+> branc h1
+> pruned
+> input tokens draft tokens candidat etokens
+> CP UNP U
+> CP UNP U
+> draft verificatio n
+> early -stage
+> draf t
+> later -stage
+> draft
+> transformer
+> verification
+> output
+> verificatio n
+> b1, b2
+> b2
+
+Figure 6. Overview of Lever .correctness, since every candidate that may affect the final accepted sequence must be faithfully checked. 
+
+Challenge #3: Execution. Efficient LLM inference on smart-phones further requires fully exploiting available hardware resources. However, hardware characteristics and workload patterns are often mismatched, requiring careful adaptation. NPUs provide high throughput for regular tensor operations, but tree-based draft generation involves irregular branching that can underutilize them. In contrast, verification maps naturally to NPUs, yet their fixed execution patterns can introduce wasted computation on tokens that are ultimately not accepted. As shown in Table 2, such wasted computation reaches 21.4% on average and increases latency. 
+
+## 4 System Design 
+
+4.1 Overview of Lever 
+
+We propose Lever , an efficient LLM inference system that combines speculative decoding with DRAM-flash heteroge-neous inference on smartphones. Lever uses a lightweight speculative model resident in DRAM to accelerate inference for a large target model stored in flash. As illustrated in Fig-ure 6, Lever introduces three key components that jointly optimize drafting, verification, and execution. 
+
+Drafting Construction (§ 4.2). During drafting, Lever 
+
+observes that the utility of each token depends on the cur-rent tree structure, along with both expected benefit and verification cost. To capture this trade-off, Lever estimates the marginal gain and marginal cost of each token, and ex-pands those with the highest gain-to-cost ratio. This enables 
+
+Lever to build compact token trees that prioritize high-value branches and maximize accepted tokens per unit latency. 
+
+Table 2. Wasted verification computation across models and token tree budgets on a OnePlus 12. 
+
+Target Model Budget Verify (ms) Waste (ms / %) 
+
+Llama-3.1-8B 16 828 188 / 22.7 Llama-3.1-8B 32 1255 256 / 20.4 Qwen3-8B 16 817 183 / 22.4 Qwen3-8B 32 1229 249 / 20.3 
+
+Verification Pruning (§ 4.3). For verification, Lever lever-ages the fact that intermediate representations in the target model provide early signals of final output [ 9 , 18 , 34 ]. This al-lows low-value draft branches to be identified before travers-ing all target layers. Lever inserts a lightweight predictor at an intermediate layer to score draft branches using hidden states. Branches with low predicted value are pruned, while accepted tokens are still decided by the full target model. 
+
+Execution Acceleration (§ 4.4). At the execution layer, 
+
+Lever exploits complementary strengths of the CPU and NPU on smartphones. Rather than simply assigning drafting to the CPU and verification to the NPU, Lever adopts a more hardware-aware strategy. It batches draft-model token generation to improve NPU utilization, and decouples output projection from NPU-based verification so that the CPU only computes logits along the actual acceptance path. 
+
+4.2 Mobile-Optimized Drafting Construction 
+
+Lever formulates token-tree construction as an optimization problem that captures the trade-off between accepted-token throughput and mobile-specific costs. Lever then estimates the key quantities in this objective through both analytical modeling and system profiling. Guided by these estimates, 
+
+Lever constructs the token tree using a greedy algorithm that can be efficiently executed at runtime. This design en-ables Lever to generate token trees that are adapted to mo-bile constraints and optimized for low inference latency. 
+
+Problem Formulation. To maximize speculative decoding performance, Lever adopts tree-based speculative decoding, where the draft is organized as a token tree 𝑇 . Each node rep-resents a draft token, and each branch represents a candidate output path. The entire token tree can be verified efficiently by the target model. During verification, if a draft token matches the target model output, it is accepted. Otherwise, the draft token is rejected, and the target-model output is emitted as the fallback token of the current speculative cycle. We use ˆ𝐺 (𝑇 ) to denote the expected number of tokens pro-duced in one speculative cycle, including both accepted draft tokens and the fallback token. We use ˆ𝐶 cycle (𝑇 ) to denote the estimated latency of completing one speculative decoding cycle with tree 𝑇 . The goal of construction is to make each cycle produce as many accepted tokens as possible under a limited latency budget. Based on this idea, Lever selects the token tree with the largest gain per unit latency: 
+
+𝑇 ∗ = arg max 
+
+> 𝑇
+
+ˆ𝐺 (𝑇 )
+
+ˆ𝐶 cycle (𝑇 ) (1) This objective directly corresponds to end-to-end decod-ing throughput. Compared with optimizing only for a larger number of accepted tokens, this formulation accounts for both accepted-token gain and additional system overhead. 
+
+Key Quantity Estimation. Before the token tree is con-structed, its actual gain and cost are unknown. Therefore,                               
+
+> 50
+> 1
+> 324
+> 89
+> input token
+> draft token
+> 56710
+> Candidate Set
+> (size = 3)
+> !()=1{324}
+> !()=3{657}
+> !()=4{9810}
+> Frontier Set
+> ℱ={
+> expand
+> 2
+> 657
+> 9810}
+> Token Tree !
+
+Figure 7. Key concepts in draft construction. Each expanded node generates a candidate set, and candidates whose parents are already in the tree form the frontier for greedy expansion. 
+
+Lever estimates the key quantities in the objective using lightweight runtime statistics and system-aware profiling. (1) Gain. The gain of a token tree depends on how far target verification is expected to progress within the tree. For a non-root node 𝑢 , let ˆ𝑏 (𝑢 ) denote the estimated probability that the target verification path reaches 𝑢 . Since 𝑢 contributes one accepted draft token exactly when it lies on the realized verification path, the expected number of accepted draft tokens is the sum of ˆ𝑏 (𝑢 ) over all non-root nodes. Therefore, the estimated gain of the token tree 𝑇 is: 
+
+ˆ𝐺 (𝑇 ) = 1 +∑︁    
+
+> 𝑢 ∈𝑇 \{ 𝜖 }
+
+ˆ𝑏 (𝑢 ), (2) where 𝜖 denotes the root node. The summation term repre-sents the expected number of accepted draft tokens, while the constant 1 corresponds to the fallback token generated by the target model when verification stops. As shown in Figure 7, for each node 𝑢 , the candidate set 
+
+𝐶 (𝑢 ) consists of a fixed-size set of tokens with the highest draft-model probabilities conditioned on 𝑢 . For a child 𝑣 =
+
+(𝑢, 𝑎 ), where 𝑎 ∈ 𝐶 (𝑢 ) is a draft token proposed from parent 
+
+𝑢 , Lever estimates ˆ𝑏 (𝑣 ) recursively as follows: 
+
+ˆ𝑏 (𝑣 ) = ˆ𝑏 (𝑢 ) · Calibrate (𝑝 𝑑 (𝑎 | 𝑢 ), 𝐶 (𝑢 ), 𝑟 ) (3) where 𝑝 𝑑 (𝑎 | 𝑢 ) is the draft probability of token 𝑎 . The operator Calibrate (·) maps this raw draft probability to the estimated probability that the target model also selects token 
+
+𝑎 after node 𝑢 . It preserves the draft model’s relative ranking within the candidate set, while using the reliability factor 
+
+𝑟 to adjust the overall confidence. The factor 𝑟 is updated from recent verification feedback: when target tokens often appear in the draft candidate sets, the calibrated value stays close to 𝑝 𝑑 (𝑎 | 𝑢 ); otherwise, it is down-weighted to avoid overestimating unreliable branches. (2) Cost. Lever estimates cost from two sources: the time required by the draft model to construct the tree and the time required by the target model to verify the tree: 
+
+ˆ𝐶 cycle (𝑇 ) = ˆ𝐶 draft (𝑇 ) + ˆ𝐶 verify (| 𝑇 |, 𝐿 𝑇 ), (4) where |𝑇 | denotes the number of nodes entering the tar-get verification batch, and 𝐿 𝑇 denotes the number of leaf sequences induced by the tree. The draft construction cost is relatively easy to estimate. Since the draft model is resident in memory and tree expan-sion is executed in small batches, Lever directly maintains a lightweight moving average from runtime measurements to estimate the draft-side latency of each node or expansion batch. This avoids the need to manually build a complex analytical model for draft computation. Target verification latency includes both verification com-putation and flash I/O. For a fixed target model and backend configuration, the flash I/O cost of one verification invoca-tion is mainly determined by the target weights streamed from flash, and is therefore approximately fixed across differ-ent token-tree shapes within a cycle. The tree-dependent cost mainly comes from batched verification computation and runtime management. Lever models this component using the verification shape (| 𝑇 |, 𝐿 𝑇 ): |𝑇 | determines the number of verification rows processed by the target model, while 𝐿 𝑇 
+
+approximates the overhead of KV-cache copying, temporary sequence management, and sequence merging, because each leaf induces an independent temporary sequence. To capture the combined verification cost, Lever main-tains an online latency profile indexed by (| 𝑇 |, 𝐿 𝑇 ). This profile records the measured end-to-end verification latency after computation-I/O overlap and is queried during tree construction to estimate verification cost. For unseen shapes, 
+
+Lever estimates latency from nearby observed shapes with a conservative penalty. When the profile is empty, Lever 
+
+initializes it using offline measurements. 
+
+Greedy Tree Construction. Based on the estimated quanti-ties above, Lever begins to construct the token tree. However, the exact optimization problem in Equation 1 is combinato-rial, and solving it exactly would be too expensive to perform during decoding. Lever adopts a lightweight greedy strategy, as outlined in Algorithm 1. As depicted in Figure 7, we use F to denote the frontier ,i.e., the set of generated candidate nodes whose parents are already in 𝑇 but which have not yet been inserted into the tree. This frontier differs from the candidate set C( 𝑢 ), which contains the draft tokens generated from a single node 𝑢 .Lines 1–3 initialize the tree with the root 𝜖 , set the running gain to one fallback token, and create the initial frontier. The helper procedure AddFrontier generates the candidate set 
+
+C( 𝑢 ) for a parent node 𝑢 , estimates the reach probability of each generated child, and inserts these children into F .For a frontier node 𝑣 ∈ F , inserting 𝑣 into the current tree 𝑇 increases the expected gain by ˆ𝑏 (𝑣 ), which is the esti-mated probability that the target verification path reaches 
+
+𝑣 . It also changes the cycle latency, mainly due to the addi-tional verification cost induced by the new tree shape and, if 
+
+𝑣 is expandable, the draft cost of generating its children. We denote this marginal latency increase by Δ ˆ𝐶 (𝑣 | 𝑇 ).At each iteration, Lines 5-6 compute the current cycle latency and select the frontier node with the largest marginal 
+
+> 6
+
+Algorithm 1 Greedy Token Tree Construction 
+
+Require: Context 𝑥 , draft model 𝑀 𝑑 , and reliability factor 𝑟 
+
+Ensure: Token tree 𝑇  
+
+> 1:
+
+𝑇 ← { 𝜖 }, ˆ𝑏 (𝜖 ) ← 1 
+
+> 2:
+
+ˆ𝐺 ← 1, ˆ𝐶 draft ← 0, F ← ∅  
+
+> 3:
+
+ˆ𝐶 draft ← ˆ𝐶 draft + AddFrontier (𝜖 ) 
+
+> 4:
+
+while F ≠ ∅ do  
+
+> 5:
+
+ˆ𝐶 cycle ← ˆ𝐶 draft + ˆ𝐶 verify (| 𝑇 |, 𝐿 𝑇 ) 
+
+> 6:
+
+𝑣 ★ ← arg max        
+
+> 𝑣 ∈ F
+> ˆ𝑏 (𝑣 )
+> Δˆ𝐶 (𝑣 |𝑇 )
+> 7:
+
+if ˆ𝑏 (𝑣 ★ )     
+
+> Δˆ𝐶 (𝑣 ★|𝑇 )
+
+≤ ˆ𝐺 
+
+> ˆ𝐶 cycle
+
+then  
+
+> 8:
+
+break  
+
+> 9:
+
+end if  
+
+> 10:
+
+𝑇 ← 𝑇 ∪ { 𝑣 ★}; F ← F \ { 𝑣 ★}; ˆ𝐺 ← ˆ𝐺 + ˆ𝑏 (𝑣 ★) 
+
+> 11:
+
+if 𝑣 ★ is expandable then  
+
+> 12:
+
+ˆ𝐶 draft ← ˆ𝐶 draft + AddFrontier (𝑣 ★) 
+
+> 13:
+
+end if  
+
+> 14:
+
+end while  
+
+> 15:
+
+return 𝑇  
+
+> 16:
+
+procedure AddFrontier (𝑢 ) 
+
+> 17:
+
+(𝐶 (𝑢 ), 𝑡 𝑢 ) ← DraftCandidates (𝑀 𝑑 , 𝑥, 𝑢 ) 
+
+> 18:
+
+for all 𝑎 ∈ 𝐶 (𝑢 ) with draft probability 𝑝 𝑑 (𝑎 | 𝑢 ) do  
+
+> 19:
+
+𝑣 ← ( 𝑢, 𝑎 ) 
+
+> 20:
+
+ˆ𝑏 (𝑣 ) ← ˆ𝑏 (𝑢 ) · Calibrate (𝑝 𝑑 (𝑎 | 𝑢 ), 𝐶 (𝑢 ), 𝑟 ) 
+
+> 21:
+
+F ← F ∪ { 𝑣 } 
+
+> 22:
+
+end for  
+
+> 23:
+
+return 𝑡 𝑢  
+
+> 24:
+
+end procedure 
+
+gain per unit latency as follows: 
+
+𝑣 ★ = arg max  
+
+> 𝑣 ∈ F
+
+ˆ𝑏 (𝑣 )
+
+Δ ˆ𝐶 (𝑣 | 𝑇 ) (5) After selecting 𝑣 ★, Lines 10-12 insert it into the token tree, invoke the draft model to generate the next-level candidate set 𝐶 (𝑣 ★) if the node is expandable, and add these new can-didate nodes to the frontier. Finally, Lever needs to decide when to stop expansion. The average gain rate of the current tree is ˆ𝐺 (𝑇 )/ ˆ𝐶 cycle (𝑇 ),which represents how many output tokens the tree is ex-pected to produce per unit latency. The marginal gain rate of the best candidate in the frontier is ˆ𝑏 (𝑣 )/ Δ ˆ𝐶 (𝑣 | 𝑇 ). If even the best remaining candidate cannot exceed the average gain rate of the current tree, adding it would only reduce the overall gain per unit latency. Therefore, Lines 7-8 stop ex-pansion when even the best remaining node cannot improve the current average gain rate: 
+
+max  
+
+> 𝑣 ∈ F
+
+ˆ𝑏 (𝑣 )
+
+Δ ˆ𝐶 (𝑣 | 𝑇 ) ≤ ˆ𝐺 (𝑇 )
+
+ˆ𝐶 cycle (𝑇 ) . (6) This condition serves as a stopping criterion to avoid adding nodes with low marginal gain. It allows Lever to avoid rely-ing on a fixed tree budget to determine the tree size. 
+
+4.3 Predictor-Based Verification Pruning 
+
+Due to the limited compute capability of mobile devices, fully verifying a branched token tree can easily become a new la-tency bottleneck. To reduce this overhead, Lever introduces predictor-based pruning during verification. By accurately identifying and removing low-value branches at an interme-diate layer of the target model, Lever reduces verification computation while preserving output quality. 
+
+Early-Exit Predictor. Lever introduces a lightweight neural-network predictor at a middle layer of the target model. Given the hidden states of tree nodes, the predictor esti-mates whether each branch is worth continuing through the remaining layers. Branches predicted to have low value are terminated early and removed from subsequent verification. (1) Model Structure. The predictor is implemented as a linear projection 𝑊 ∈ R| V | × 𝑑 , where |V | is the vocabulary size and 
+
+𝑑 is the hidden-state dimension. Each row of 𝑊 corresponds to the scoring vector of one token. The predictor takes the intermediate hidden state from the target model as input and outputs a score for each candidate token. When verification reaches layer 𝐿 , each node sent to the target model obtains an intermediate hidden state. Let ℎ𝐿 𝑢 
+
+denote the hidden state of node 𝑢 at layer 𝐿 . For a node 𝑢 and its candidate token 𝑎 , the predictor reads the corresponding row 𝑊 [𝑎 ] and computes the score as follows: 
+
+𝑠 (𝑢, 𝑎 ) = 𝑊 [𝑎 ]⊤ℎ𝐿 𝑢 . (7) This score estimates whether token 𝑎 is worth preserving based on the hidden state of its parent node. (2) Training Process. During offline training, the target model is frozen and only the predictor is updated. For each train-ing position 𝑡 , Lever records the intermediate hidden state 
+
+ℎ𝐿 𝑡 and the final logits 𝑧 𝑡 produced by the target model. To encourage the predictor to approximate the final output dis-tribution of the target model, the training objective consists of two components: a full-vocabulary knowledge-distillation loss LKD and a candidate-set distillation loss LCand . The final training objective is defined as: 
+
+L = LKD + 𝜆 Cand LCand , (8) where 𝜆 Cand controls the strength of candidate-set alignment. The first term is a knowledge-distillation loss. The final-layer softmax distribution of the target model serves as the teacher, while the early-exit distribution produced by the predictor serves as the student. This encourages the interme-diate predictor to approximate the final distribution of the                          
+
+> 70
+> 213
+> 687549
+> ancestor
+> token s
+> 1011 12
+> candidat e
+> tokens 1234567891011 12
+> 0128
+> scores
+> threshold !
+> S!S"S!" S!! S!# S$S%S&S'S(S)S*
+> normaliz e
+> draft token tre e
+> input tokens
+> draf ttokens
+> hidden states in target model
+> corresponding neurons in predictor
+> candidate
+> branches
+> shadow candidate
+
+Figure 8. Lever uses intermediate hidden states from the target model and a lightweight predictor to score candidate branches. Scores are normalized within each candidate set, including shadow candidates, and low-value branches are pruned before completing full target-model verification. target model without modifying the target model itself: 
+
+LKD = 𝜏 2KD ∑︁ 𝑡 
+
+KL 
+
+
+
+softmax 
+
+ 𝑧 𝑡 
+
+𝜏 KD 
+
+
+
+softmax 
+
+𝑊 ℎ 𝐿 𝑡 
+
+𝜏 KD 
+
+ 
+
+,
+
+(9) where 𝜏 KD is the distillation temperature. Furthermore, Lever adds a candidate-set distillation loss because inference-time pruning is not a full-vocabulary pre-diction problem. The predictor only needs to solve a local ranking problem: among the candidate tokens proposed by the draft model, it should identify which ones are more likely to match the final decision of the target model. Specifically, at each training position 𝑡 , the draft model produces a candidate set of node 𝑢 𝐶 𝑡 (𝑢 ). Let 𝑞 𝑇 (· | 𝑡 ) = softmax 𝐶 𝑡 (𝑢 ) (𝑧 𝑡 /𝜏 Cand )
+
+and 𝑞 𝐸 (· | 𝑡 ) = softmax 𝐶 𝑡 (𝑢 ) (𝑊 ℎ 𝐿 𝑡 /𝜏 Cand ) denote the target and early-exit distributions normalized only over 𝐶 𝑡 (𝑢 ). The resulting candidate-set distillation loss is: 
+
+LCand = 𝜏 2Cand ∑︁ 𝑡 
+
+KL (𝑞 𝑇 (· | 𝑡 ) ∥ 𝑞 𝐸 (· | 𝑡 )) . (10) 
+
+Score-Based Algorithm. Based on the trained predictor, 
+
+Lever scores the nodes and their candidate tokens in the token tree to decide which branches can be pruned, as shown in Figure 8. A threshold 𝜃 controls the pruning trade-off. If a token receives a score higher than 𝜃 , it is likely to match the final choice of the target model, making the corresponding edge valuable to preserve. Conversely, if a token is unlikely to be accepted by the target model, allowing it to pass through the remaining layers only wastes computation. (1) Candidate Normalization. Instead of directly using the raw predictor score, Lever first normalizes scores within each candidate set. This design is important when a parent node has only one inserted child: without additional comparison targets, that child would always receive the highest score, making the pruning decision meaningless. To address this issue, Lever scores not only the actual children in the token tree but also the draft-model candidate set 𝐶 (𝑢 ). Candidate tokens that are not inserted into the token tree are called 
+
+shadow tokens ; they serve only as comparison references. 
+
+Lever normalizes the scores within the candidate set of each node as follows: 
+
+𝑠 𝑛𝑜𝑟𝑚 (𝑢, 𝑎 ) = exp (𝑠 (𝑢, 𝑎 )/ 𝜏 𝐸 )
+
+Í𝑏 ∈𝐶 (𝑢 ) exp (𝑠 (𝑢, 𝑏 )/ 𝜏 𝐸 ) , (11) where 𝜏 𝐸 is the temperature parameter. This score is not a target probability over the full vocabulary. Instead, it is a local relative score: among the candidates proposed by the draft model for parent node 𝑢 , it measures how valuable it is to continue verifying token 𝑎 according to the predictor. Shadow tokens appear only in the denominator. They are not inserted into the token tree, do not enter subsequent target verification, and can never be directly accepted as output tokens. Their only role is to make the comparison meaningful for actual tree edges, including edges whose parent has only one inserted child. (2) Conservative Pruning. A basic threshold rule marks an edge (𝑢, 𝑎 ) as removable when 𝑠 𝑛𝑜𝑟𝑚 (𝑢, 𝑎 ) < 𝜃 , but the final keep set must satisfy several safeguards. First, if a node is kept, all of its ancestors must also be kept. Second, Lever 
+
+preserves a backbone path. Starting from the root, this path repeatedly selects the most reliable child at each depth un-til reaching either a leaf node or the maximum depth. The backbone path preserves a main progress path and prevents the predictor from eliminating the depth gain of the entire tree due to a local misprediction. Near the root, where next-token uncertainty is often higher, Lever may keep multiple high-scoring children to preserve necessary branch coverage. Finally, if pruning leaves too few nodes or too few leaves, 
+
+Lever rejects the pruning decision as overly aggressive. After the keep decisions are made, Lever compacts the remaining nodes into a new tree 𝑇 ′. The target model then continues from layer 𝐿 to the final layer only for the nodes preserved in 𝑇 ′. Therefore, for any accepted path in 𝑇 ′, the final token decisions remain aligned with the target model, preserving output quality while reducing computation. 
+
+4.4 Hardware-Hybrid Execution Acceleration 
+
+As illustrated in Figure 9, Lever adopts CPU-NPU coopera-tive execution and optimizes the two stages of speculative decoding separately. In the draft stage, Lever improves NPU utilization through batch-aware scheduling without violat-ing the construction objective of the token tree. In the veri-fication stage, Lever places the transformer layers that are suitable for batched execution on the NPU, while moving the output projection, which is only needed along the actual accepted path, to the CPU and executing it on demand. 
+
+Draft: Batch-Aware Scheduling. The draft stage is typi-cally executed on the CPU, because NPUs are optimized for tensor computation with regular shapes and sufficient arith-metic intensity. On the one hand, the draft stage involves the dynamic construction of a token tree: whether each branch                        
+
+> 80
+> 1
+> 32
+> 687549
+> Token Tree
+> 0123456789
+> 0
+> 1
+> 2
+> 3
+> 4
+> 5
+> 6
+> 7
+> 8
+> 9
+> (a) Draft Stage
+> embedding
+> output projection
+> transformer
+> blocks ×"
+> (b) Verification Stage
+> 1011 12
+> accepted path
+> input tokens existed draf ttokens new draft tokens
+> small batch on CPU
+> larg ebatch on NPU
+> candidat epaths on NPU
+> accepted path on CPU
+> Causal Mask
+
+Figure 9. (a) During drafting, Lever schedules small dy-namic expansions on the CPU and batches larger regular expansions on the NPU. (b) During verification, transformer computation is executed as batched NPU work, while output projection is performed on demand on the CPU only along the accepted path to avoid redundant logits computation. should be extended is determined online based on the cur-rent tokens. On the other hand, conventional token trees are usually small and therefore do not provide enough computa-tion to fully utilize the NPU. In such cases, additional kernel launch and data transfer overheads can dominate latency, offsetting the benefit of NPU execution. However, due to I/O bottlenecks and limited compute ca-pability on smartphones, verification is substantially more time-consuming than drafting. Consequently, the token tree is expanded to a larger size and gradually accumulates mul-tiple high-value nodes. Since the parents of these nodes are already included in the tree, they can be expanded together to generate next-level candidates. For such nodes, the draft model performs the same forward computation, differing only in the input node. With an appropriate causal mask, 
+
+Lever can organize these computations into a batch and execute them efficiently on the NPU. 
+
+Lever designs a batch-aware scheduling strategy. In the early phase of token tree construction, when the tree width is small and the computation shape changes frequently, Lever 
+
+executes nodes serially on the CPU. As the tree grows and more high-value candidates become available, Lever groups these candidates into batches and executes them on the NPU. Through this progressive scheduling strategy, Lever exploits the batching capability of the NPU while preserving the gain-cost optimization objective of token tree construction. 
+
+Verification: Layer-Wise Separation. In contrast to the draft stage, the verification stage is naturally suitable for NPU execution. After pruning, the remaining draft tokens can be organized into a compact batch for computation. However, because the vocabulary size is large, the output projection of-ten accounts for a substantial portion of verification latency and becomes a bottleneck that is difficult to hide through layer-wise compute/I/O overlap. Moreover, NPUs on smart-phones typically rely on a predefined compute graph with a fixed batch shape. When the number of candidate paths to be verified is large, all paths must participate in the full 
+
+Table 3. Hardware Configuration.         
+
+> Device SoC Flash Storage
+> OnePlus 12 Snapdragon 8 Gen 3 UFS 4.0 Honor 500 Pro Snapdragon 8 Elite UFS 3.1 Honor Magic V5 Snapdragon 8 Elite UFS 4.1
+
+Table 4. Model Configuration.          
+
+> Model Prompt Mode Model Prompt Mode
+> Llama-3.1-8B Instruct Qwen3-8B Thinking Qwen3-4B Non-Thinking Qwen3-14B Thinking
+
+output projection, even though only one path will eventually be accepted and the logits of the other paths will never be used. This introduces significant redundant computation. To address this issue, Lever separates the verification stage into two parts. The first part is transformer compu-tation. For the nodes preserved after pruning, Lever still organizes them into a verification batch and executes all transformer layers on the NPU. The second part is logits generation. After the transformer layers finish, Lever keeps only the final hidden state of each node. Since subsequent logits computation depends on the actual path taken by tar-get sampling, Lever removes this part from the fixed NPU graph and executes it on demand on the CPU. Specifically, after executing the target transformer layers and obtaining the final hidden state of each token, Lever 
+
+first computes logits only for the root token and performs target sampling. If the sampled token matches a candidate token, Lever then applies the output projection to the hidden state of that candidate. This process proceeds step by step along the accepted path until the sampled token no longer matches any candidate or the end of the path is reached. By eliminating logits computation for a large number of unaccepted paths, Lever reduces end-to-end verification latency even though this part is executed on the CPU. 
+
+## 5 Evaluation 
+
+5.1 Experimental Setup Hardware. We evaluate Lever on three commercial smart-phones, as summarized in Table 3. Unless otherwise stated, all ablation studies and sensitivity analyses are conducted on the OnePlus 12. The overall end-to-end evaluation is con-ducted on all three devices. 
+
+Models. Table 4 lists the target models used in the evalua-tion. For speculative decoding, we adopt EAGLE3 [ 16 ], one of the most widely used draft-model training methods, to construct the draft model paired with each target model. We use the same target-draft pairs across Lever and all specula-tive baselines for fairness, and quantize both target and draft models to Q4_0. Unless otherwise specified, target-model                
+
+> 90.0
+> 0.5
+> 1.0
+> Norm. TPS  2.72 4.92 1.62 1.17 2.92 5.20 1.75 1.17 2.23 3.82 1.74 1.16 2.13 3.33 1.52 0.98
+
+OnePlus 12                
+
+> 0.0
+> 0.5
+> 1.0
+> Norm. TPS  2.09 3.16 1.09 0.81 2.15 3.20 1.25 0.81 1.54 2.74 1.19 0.86 1.51 2.17 1.12 0.71
+
+Honor 500 Pro                   
+
+> Llama
+> 3.1-8B
+> Qwen3
+> 4B
+> Qwen3
+> 8B
+> Qwen3
+> 14B
+> Llama
+> 3.1-8B
+> Qwen3
+> 4B
+> Qwen3
+> 8B
+> Qwen3
+> 14B
+> Llama
+> 3.1-8B
+> Qwen3
+> 4B
+> Qwen3
+> 8B
+> Qwen3
+> 14B
+> Llama
+> 3.1-8B
+> Qwen3
+> 4B
+> Qwen3
+> 8B
+> Qwen3
+> 14B
+> 0.0
+> 0.5
+> 1.0
+> Norm. TPS  4.31 7.27 2.14 1.62 4.52 7.55 2.40 1.63 3.35 5.92 2.32 1.67 3.26 5.47 2.14 1.41
+> HumanEval MBPP GSM8K MT-Bench
+
+Honor Magic V5    
+
+> Flash-AR Chain-SD EdgeLLM Scout Lever
+
+Figure 10. End-to-end decode throughput across all 48 device-model-dataset configurations, normalized to Lever . Labels above the Lever bars indicate absolute throughput in tokens/s. weights are stored in flash and streamed layer by layer during decoding. For Qwen3 models, Thinking and Non-Thinking denote the prompt settings that enable or disable the model’s reasoning mode, respectively; for Llama-3.1, Instruct denotes the instruction-tuned chat template. 
+
+Datasets. We evaluate on four benchmarks: HumanEval [ 6 ], MBPP [ 3], GSM8K [ 8 ], and MT-Bench [ 40 ]. These datasets cover code generation, mathematical reasoning, and open-ended dialogue workloads. We use each benchmark to pro-vide representative decoding workloads rather than to eval-uate task accuracy. For each dataset, we randomly select 50 samples and measure generation speed. Unless other-wise specified, the maximum output length is 128 tokens. Although Lever supports stochastic sampling, our main eval-uation uses greedy decoding with temperature 0 to eliminate generation randomness and ensure reproducible compar-isons. Our primary metric is decode throughput in tokens per second. We exclude prefill time and measure only the decode phase. For aggregate results, we report the geometric mean across models, datasets, and devices. 
+
+Baselines. We compare Lever with three different baselines: 
+
+• Flash-AR is standard autoregressive decoding with a flash-backed target model. At each decoding step, it streams the target-model weights from flash layer by layer, runs the target model once to generate a single token, and then proceeds to the next step. 
+
+• Chain-SD uses standard sequence-based speculative decoding [ 13 ] with the same EAGLE3 draft model as 
+
+Lever . In each cycle, it drafts a fixed 8-token chain and verifies the chain with one flash-backed target-model invocation, accepting the longest valid prefix. 
+
+• EdgeLLM [ 35 ] applies a similar speculative decoding approach to accelerate flash-backed LLM inference on mobile devices. Compared with Lever , EdgeLLM focuses primarily on algorithm-level optimizations, including branch navigation and verification pacing. In addition to these end-to-end baselines, we include SpecIn-fer [ 22 ] and OPT-Tree [ 26 ] only in the token-tree construc-tion ablation. SpecInfer represents the tree-based speculative inference, while OPT-Tree optimizes the token-tree structure to improve expected acceptance. For fairness, all methods use the same target model, quan-tization format, prompt template, decoding configuration, and flash-backed weight-streaming mechanism. Speculative methods additionally use the same EAGLE3 draft model. 
+
+5.2 End-to-End Performance 
+
+Figure 10 reports end-to-end decode throughput across all 48 configurations. Lever achieves a geometric-mean speedup of 2.93 × over Flash-AR, 1.50 × over Chain-SD, and 1.27 × over EdgeLLM. The gain over Flash-AR comes from amortizing flash-backed target-model invocations, while the gains over Chain-SD and EdgeLLM show the importance of adapting            
+
+> 10 0.95
+> 1.00
+> 1.10
+> 1.20
+> TPS /
+> SpecInfer
+> 1.12x 1.14x
+> 1.06x 1.10x 1.14x 1.10x 1.11x
+> (a) Throughput gain
+> Llama
+> 3.1-8B
+> Qwen3
+> 8B
+> Llama
+> 3.1-8B
+> Qwen3
+> 8B
+> Llama
+> 3.1-8B
+> Qwen3
+> 8B
+> Geo.
+> mean
+> 1.0
+> 1.1
+> 1.2
+> Accepted len. /
+> SpecInfer
+> 1.11x
+> 1.16x
+> 1.08x
+> 1.01x
+> 1.14x 1.13x
+> 1.10x
+> MBPP GSM8K MT-Bench All
+> (b) Accepted-length gain
+> SpecInfer OPT-Tree Scout Lever
+
+Figure 11. Decode throughput and average accepted length across draft policies. Values are normalized to SpecInfer. speculation to mobile flash I/O, limited verification paral-lelism, and CPU-NPU execution costs. Lever consistently outperforms all the baselines. Its gains are larger on code-generation and reasoning workloads, where draft continu-ations are more reliable, and smaller on MT-Bench, where open-ended dialogue leads to weaker draft-target agreement. These results show that Lever generalizes across hardware, models, and workloads. 
+
+5.3 Ablation Study Mobile-Optimized Drafting Construction. Figure 11 com-pares different draft policies. Only the construction pol-icy has changed. Compared with SpecInfer, Lever achieves both higher decode throughput and longer average accepted length, showing that its gain estimate selects more useful speculative branches. Compared with OPT-Tree, Lever has slightly lower accepted length but higher throughput. This shows that maximizing accepted length alone can introduce extra verification overhead on mobile hardware. By optimiz-ing accepted tokens per unit latency, Lever builds a more cost-effective token tree and improves decode speed. 
+
+Predictor-Based Verification Pruning. Figure 12 com-pares pruning policies using the same token tree and execu-tion backend. A verification row corresponds to a token-tree node in the target verification batch; rows kept denotes the fraction of nodes that continue after the early-exit layer, and accepted-token retention denotes the accepted length relative to full verification on the same tree. Lever keeps about 48% of upper-layer rows, reduces verification latency by 12.2%, and still retains about 95% of accepted tokens. The results show that both components are necessary. Without shadow candidates, scores are less reliable when a parent has few children, limiting pruning opportunities. Without safeguards, pruning removes more rows but also discards useful paths. Overall, Lever reduces upper-layer verification work while preserving most accepted progress. 0.85               
+
+> 0.95
+> 1.00
+> Verify latency
+> (norm.)
+> 
+> 0
+> 50
+> 100
+> Rows kept
+> (%)
+> 
+> Llama
+> 3.1-8B
+> Qwen3
+> 8B
+> 80
+> 90
+> 100
+> Accepted
+> kept (%)
+> 
+> Llama
+> 3.1-8B
+> Qwen3
+> 8B
+> 1.0
+> 1.1
+> TPS
+> (norm.)
+> 
+> No Pruning w/o Shad. w/o Safe. Scout Lever
+
+Figure 12. Effect of pruning policies on verification latency, upper-layer rows kept, accepted-token retention, and decode throughput, normalized to no pruning where applicable. Llama 3.1-8B Qwen3 8B Qwen3 14B Llama 3.1-8B Qwen3 8B Qwen3 14B Geo. mean 010 20 30     
+
+> Draft-stage latency / cycle (ms)  MBPP GSM8K All
+> Single-node NPU Single-node CPU Batch-aware
+
+Figure 13. Draft-stage latency under Single-node NPU, Single-node CPU, and batch-aware NPU scheduling. Llama 3.1-8B Qwen3 8B Qwen3 14B Llama 3.1-8B Qwen3 8B Qwen3 14B Geo. mean 0200 400     
+
+> Output-projection latency (ms)  MBPP GSM8K All
+> Eager NPU on-demand NPU on-demand CPU
+
+Figure 14. Output-projection latency under eager NPU, on-demand NPU, and on-demand CPU projection. 
+
+Hardware-Hybrid Execution Acceleration. Figure 13 compares different schedules for draft expansion. Single-node NPU execution suffers from launch and synchroniza-tion overhead, while Single-node CPU execution cannot exploit tensor parallelism. Batch-aware scheduling groups high-value frontier expansions into regular NPU batches and 
+
+> 11
+
+Table 5. Decode throughput on Qwen3-8B with different draft models. Entries report decode speed (tokens/s).                              
+
+> Draft Method MBPP GSM8K MT-Bench Geo.
+> EAGLE3 Chain-SD 1.296 1.222 1.108 1.206 EdgeLLM 1.434 1.382 1.283 1.365
+> Lever 1.753 1.741 1.516 1.666
+> Qwen3 (0.6B) Chain-SD 0.860 0.840 0.820 0.840 EdgeLLM 1.010 0.940 0.890 0.945
+> Lever 1.250 1.220 1.110 1.192
+
+Table 6. Decode throughput as the fraction of target-model layers resident in DRAM varies. Entries report tokens/s. L8 and Q8 denote Llama-3.1-8B and Qwen3-8B, respectively.                               
+
+> Workload 0% 20% 40% 60% 80% 100%
+> Q8 / MBPP 1.753 2.010 2.473 2.812 3.120 3.401 L8 / MBPP 2.918 3.704 4.214 4.619 4.922 5.494 Q8 / GSM8K 1.741 1.996 2.453 2.791 3.099 3.377 L8 / GSM8K 2.225 2.821 3.203 3.508 3.736 4.194
+
+Table 7. Decode throughput under different maximum out-put lengths. Entries report tokens/s. L8 and Q8 denote Llama-3.1-8B and Qwen3-8B, respectively.                          
+
+> Workload 32 64 128 256 512
+> Q8 / MBPP 1.768 1.772 1.753 1.741 1.712 L8 / MBPP 3.082 3.110 2.918 2.890 2.854 Q8 / GSM8K 1.756 1.760 1.741 1.729 1.681 L8 / GSM8K 2.349 2.371 2.225 2.204 2.173
+
+reduces draft-stage latency without changing the token-tree construction policy. Figure 14 compares where and when out-put projection is executed. Eager NPU projection computes logits for all verified nodes, including branches that are never visited. On-demand projection computes logits only when target sampling reaches a node on the accepted path. Com-pared with on-demand NPU projection, on-demand CPU projection avoids repeated small NPU invocations and CPU-NPU synchronization, reducing output-projection latency while producing the same accepted tokens. 
+
+5.4 Sensitivity Analysis Draft-model quality. Table 5 evaluates Lever with differ-ent draft models for the same Qwen3-8B target. We compare the EAGLE3 draft model with a smaller Qwen3-0.6B draft model to test whether the design depends on a highly spe-cialized draft. Although the weaker draft reduces absolute throughput for all speculative methods, Lever consistently outperforms Chain-SD and EdgeLLM in both settings. This suggests that Lever generalizes across draft-model choices, rather than relying on one particular draft model. 
+
+DRAM budget. Table 6 varies the fraction of target-model layers pinned in DRAM. A budget of 𝑥 % means that the first 𝑥 % of target layers remain resident, while the rest are streamed from flash during each verification step. Through-put improves as the budget increases because each target invocation loads fewer weights from flash. More importantly, 
+
+Lever remains effective across all budgets, including the 0% fully flash-backed setting, showing that it can be configured for different memory-constrained deployments rather than relying on a fixed amount of available DRAM. 
+
+Output length. Table 7 varies the maximum output length. Decode throughput remains stable across output lengths, with only a mild decrease for longer generations. This in-dicates that the benefit of Lever is not limited to short re-sponses; after prefill, each speculative cycle continues to amortize flash-backed target execution. 
+
+## 6 Related Work 
+
+Memory-Constrained LLM Inference. Limited device memory has motivated model compression and hierarchy-aware inference. Quantization [ 10 , 17 , 25 , 33 ], pruning, and sparsity [ 20 , 21 , 27 , 31 ] reduce LLM memory or computation overhead, while KV-cache methods reduce runtime states through adaptive eviction, clustering, and storage-aware offloading [ 28 , 30 , 32 ]. Storage-aware systems such as Flex-Gen [ 23 ] and LLM in a Flash [ 1] offload model tensors across memory and storage hierarchies. Lever is complementary: instead of only fitting or streaming a large model, it reduces both the frequency and cost of flash-resident target invoca-tions through speculative decoding. 
+
+Speculative Decoding. Speculative decoding accelerates au-toregressive generation by using a lightweight draft model to propose tokens and a larger target model to verify them [ 13 ]. Prior work improves this process through tree verification, stronger draft models, and adaptive tree structures. SpecInfer verifies token trees in one target pass [ 22 ]; Medusa gener-ates candidates with multiple decoding heads [ 4]; EAGLE improves draft quality by predicting future features [ 16 ]; and OPT-Tree optimizes draft-tree structures for higher ex-pected acceptance [ 26 ]. These methods mainly assume that the target model is memory-resident and that verification can exploit server-class parallelism. In contrast, Lever tar-gets on-device LLM inference, where each verification step may incur flash I/O and mobile accelerators provide limited parallelism. Lever therefore constructs token trees with a gain-cost objective that accounts for mobile constraints. 
+
+On-Device LLM Inference. On-device LLM systems and model designs exploit mobile-specific architectures, sparsity, storage, and heterogeneous compute [ 19 ]. Neuralink accel-erates on-device inference using neuron co-activation [ 29 ], 
+
+> 12
+
+while PowerInfer-2 schedules LLM computation across smart-phone CPU, NPU, and storage resources [ 36 ]. EdgeLLM ap-plies speculative decoding to mobile LLM inference with branch navigation and verification pacing [ 35 ]. Lever dif-fers by focusing on the DRAM-flash hierarchy in speculative decoding: drafting, verification, and execution are jointly optimized for this deployment setting. 
+
+## 7 Conclusion 
+
+We propose Lever , a flash-backed speculative decoding sys-tem for smartphone LLM inference. By co-optimizing draft-ing, verification, and CPU-NPU execution, Lever reduces mobile I/O and compute overheads under tight DRAM bud-gets. Our results show that Lever enables efficient interactive inference for larger LLMs on smartphones. 
+
+## References 
+
+[1] Keivan Alizadeh, Seyed Iman Mirzadeh, Dmitry Belenko, S Khatam-ifard, Minsik Cho, Carlo C Del Mundo, Mohammad Rastegari, and Mehrdad Farajtabar. Llm in a flash: Efficient large language model inference with limited memory. In Proceedings of the 62nd Annual Meeting of the Association for Computational Linguistics (Volume 1: Long Papers) , pages 12562–12584, 2024. [2] Zachary Ankner, Rishab Parthasarathy, Aniruddha Nrusimha, Christo-pher Rinard, Jonathan Ragan-Kelley, and William Brandon. Hydra: Sequentially-dependent draft heads for medusa decoding. In Confer-ence on Language Modeling , 2024. [3] Jacob Austin, Augustus Odena, Maxwell Nye, Maarten Bosma, Henryk Michalewski, David Dohan, Ellen Jiang, Carrie Cai, Michael Terry, Quoc Le, and Charles Sutton. Program synthesis with large language models. arXiv preprint arXiv:2108.07732 , 2021. [4] Tianle Cai, Yuhong Li, Zhengyang Geng, Hongwu Peng, Jason D Lee, Deming Chen, and Tri Dao. Medusa: Simple llm inference ac-celeration framework with multiple decoding heads. arXiv preprint arXiv:2401.10774 , 2024. [5] Charlie Chen, Sebastian Borgeaud, Geoffrey Irving, Jean-Baptiste Lespiau, Laurent Sifre, and John Jumper. Accelerating large lan-guage model decoding with speculative sampling. arXiv preprint arXiv:2302.01318 , 2023. [6] Mark Chen, Jerry Tworek, Heewoo Jun, Qiming Yuan, Henrique Ponde de Oliveira Pinto, Jared Kaplan, et al. Evaluating large language models trained on code. arXiv preprint arXiv:2107.03374 , 2021. [7] Zhuoming Chen, Avner May, Ruslan Svirschevski, Yuhsun Huang, Max Ryabinin, Zhihao Jia, and Beidi Chen. Sequoia: Scalable and robust speculative decoding. In Advances in Neural Information Processing Systems , volume 37, 2024. [8] Karl Cobbe, Vineet Kosaraju, Mohammad Bavarian, Mark Chen, Hee-woo Jun, Lukasz Kaiser, Matthias Plappert, Jerry Tworek, Jacob Hilton, Reiichiro Nakano, Christopher Hesse, and John Schulman. Training verifiers to solve math word problems. arXiv preprint arXiv:2110.14168 ,2021. [9] Mostafa Elhoushi, Akshat Shrivastava, Diana Liskovich, Basil Hosmer, Bram Wasti, Liangzhen Lai, Anas Mahmoud, Bilge Acun, Saurabh Agarwal, Ahmed Roman, Ahmed Aly, Beidi Chen, and Carole-Jean Wu. LayerSkip: Enabling early exit inference and self-speculative decoding. In Proceedings of the 62nd Annual Meeting of the Association for Computational Linguistics (Volume 1: Long Papers) , pages 12622– 12642. Association for Computational Linguistics, 2024. [10] Elias Frantar, Saleh Ashkboos, Torsten Hoefler, and Dan Alistarh. GPTQ: Accurate post-training quantization for generative pre-trained transformers. In International Conference on Learning Representations ,2023. [11] Yichao Fu, Peter Bailis, Ion Stoica, and Hao Zhang. Break the se-quential dependency of LLM inference using lookahead decoding. In 
+
+Proceedings of the 41st International Conference on Machine Learning ,2024. [12] Hongpeng Jin and Yanzhao Wu. CE-CoLLM: Efficient and adap-tive large language models through cloud-edge collaboration. arXiv preprint arXiv:2411.02829 , 2024. [13] Yaniv Leviathan, Matan Kalman, and Yossi Matias. Fast inference from transformers via speculative decoding. In International Conference on Machine Learning , pages 19274–19286. PMLR, 2023. [14] Yuhui Li, Fangyun Wei, Chao Zhang, and Hongyang Zhang. EAGLE-2: Faster inference of language models with dynamic draft trees. In 
+
+Proceedings of the 2024 Conference on Empirical Methods in Natural Language Processing , pages 7421–7432. Association for Computational Linguistics, 2024. [15] Yuhui Li, Fangyun Wei, Chao Zhang, and Hongyang Zhang. EA-GLE: Speculative sampling requires rethinking feature uncertainty. In 
+
+International Conference on Machine Learning , 2024. [16] Yuhui Li, Fangyun Wei, Chao Zhang, and Hongyang Zhang. EAGLE-3: Scaling up inference acceleration of large language models via training-time test. arXiv preprint arXiv:2503.01840 , 2025. [17] Ji Lin, Jiaming Tang, Haotian Tang, Shang Yang, Wei-Ming Chen, Wei-Chen Wang, Guangxuan Xiao, Xingyu Dang, Chuang Gan, and Song Han. Awq: Activation-aware weight quantization for on-device llm compression and acceleration. Proceedings of machine learning and systems , 6:87–100, 2024. [18] Weijie Liu, Peng Zhou, Zhiruo Wang, Zhe Zhao, Haotang Deng, and Qi Ju. FastBERT: a self-distilling BERT with adaptive inference time. In Proceedings of the 58th Annual Meeting of the Association for Compu-tational Linguistics , pages 6035–6044. Association for Computational Linguistics, 2020. [19] Zechun Liu, Changsheng Zhao, Forrest Iandola, Chen Lai, Yuan-dong Tian, Igor Fedorov, Yunyang Xiong, Ernie Chang, Yangyang Shi, Raghuraman Krishnamoorthi, Liangzhen Lai, and Vikas Chandra. MobileLLM: Optimizing sub-billion parameter language models for on-device use cases. In International Conference on Machine Learning ,2024. [20] Zichang Liu, Jue Wang, Tri Dao, Tianyi Zhou, Binhang Yuan, Zhao Song, Anshumali Shrivastava, Ce Zhang, Yuandong Tian, Christopher Re, et al. Deja vu: Contextual sparsity for efficient llms at inference time. In International Conference on Machine Learning , pages 22137– 22176. PMLR, 2023. [21] Xinyin Ma, Gongfan Fang, and Xinchao Wang. Llm-pruner: On the structural pruning of large language models. Advances in neural information processing systems , 36:21702–21720, 2023. [22] Xupeng Miao, Gabriele Oliaro, Zhihao Zhang, Xinhao Cheng, Zeyu Wang, Zhengxin Zhang, Rae Ying Yee Wong, Alan Zhu, Lijie Yang, Xiaoxiang Shi, et al. Specinfer: Accelerating large language model serving with tree-based speculative inference and verification. In 
+
+Proceedings of the 29th ACM International Conference on Architectural Support for Programming Languages and Operating Systems, Volume 3 ,pages 932–949, 2024. [23] Ying Sheng, Lianmin Zheng, Binhang Yuan, Zhuohan Li, Max Ryabinin, Daniel Y. Fu, Zhiqiang Xie, Beidi Chen, Clark Barrett, Joseph E. Gonzalez, Percy Liang, Christopher Ré, Ion Stoica, and Ce Zhang. Flexgen: High-throughput generative inference of large language models with a single gpu. In Proceedings of the 40th Inter-national Conference on Machine Learning , pages 31094–31116. PMLR, 2023. [24] Mitchell Stern, Noam Shazeer, and Jakob Uszkoreit. Blockwise parallel decoding for deep autoregressive models. In Advances in Neural Information Processing Systems , volume 31, pages 10107–10116, 2018. 
+
+> 13
+
+[25] Hongyu Wang, Shuming Ma, Li Dong, Shaohan Huang, Huaijie Wang, Lingxiao Ma, Fan Yang, Ruiping Wang, Yi Wu, and Furu Wei. Bitnet: Scaling 1-bit transformers for large language models. arXiv preprint arXiv:2310.11453 , 2023. [26] Jikai Wang, Yi Su, Juntao Li, Qingrong Xia, Zi Ye, Xinyu Duan, Zhefeng Wang, and Min Zhang. OPT-tree: Speculative decoding with adaptive draft tree structure. Transactions of the Association for Computational Linguistics , 13:188–199, 2025. [27] Tuowei Wang, Xingyu Chen, Kun Li, Ting Cao, Ju Ren, and Yaoxue Zhang. JENGA: Enhancing LLM Long-Context fine-tuning with con-textual token sparsity. In 2025 USENIX Annual Technical Conference (USENIX ATC 25) , pages 123–141, Boston, MA, July 2025. USENIX Association. [28] Tuowei Wang, Liyun Chu, Ruwen Fan, and Ju Ren. SWARM: Co-activation aware KVCache offloading across multiple SSDs. arXiv preprint arXiv:2603.17803 , 2026. [29] Tuowei Wang, Ruwen Fan, Minxing Huang, Zixu Hao, Kun Li, Ting Cao, Youyou Lu, Yaoxue Zhang, and Ju Ren. Neuralink: Fast on-device llm inference with neuron co-activation linking. In Proceedings of the 30th ACM International Conference on Architectural Support for Programming Languages and Operating Systems, Volume 3 , pages 147– 162, 2025. [30] Tuowei Wang, Minxing Huang, Fengzu Li, Ligeng Chen, Jinrui Zhang, and Ju Ren. DynaKV: Enabling accurate and efficient long-sequence LLM decoding on smartphones. arXiv preprint arXiv:2511.07427 , 2025. [31] Tuowei Wang, Kun Li, Zixu Hao, Donglin Bai, Ju Ren, Yaoxue Zhang, Ting Cao, and Mao Yang. Long Exposure: Accelerating parameter-efficient fine-tuning for LLMs under shadowy sparsity. In SC24: In-ternational Conference for High Performance Computing, Networking, Storage and Analysis , pages 1–18. IEEE Press, 2024. [32] Tuowei Wang, He Zhou, Chengru Song, Qiushi Li, and Ju Ren. Mo-saic: Cross-modal clustering for efficient video understanding. arXiv preprint arXiv:2604.10060 , 2026. [33] Guangxuan Xiao, Ji Lin, Mickael Seznec, Hao Wu, Julien Demouth, and Song Han. SmoothQuant: Accurate and efficient post-training quantization for large language models. In Proceedings of the 40th International Conference on Machine Learning , 2023. [34] Ji Xin, Raphael Tang, Jaejun Lee, Yaoliang Yu, and Jimmy Lin. Dee-BERT: Dynamic early exiting for accelerating BERT inference. In 
+
+Proceedings of the 58th Annual Meeting of the Association for Compu-tational Linguistics , pages 2246–2251. Association for Computational Linguistics, 2020. [35] Daliang Xu, Wangsong Yin, Hao Zhang, Xin Jin, Ying Zhang, Shiyun Wei, Mengwei Xu, and Xuanzhe Liu. Edgellm: Fast on-device llm inference with speculative decoding. IEEE Transactions on Mobile Computing , 24(4):3256–3273, 2024. [36] Zhenliang Xue, Yixin Song, Zeyu Mi, Xinrui Zheng, Yubin Xia, and Haibo Chen. Powerinfer-2: Fast large language model inference on a smartphone. arXiv preprint arXiv:2406.06282 , 2024. [37] Huan Yang, Deyu Zhang, Yudong Zhao, Yuanchun Li, and Yunxin Liu. A first look at efficient and secure on-device LLM inference against KV leakage. In Proceedings of the 19th Workshop on Mobility in the Evolving Internet Architecture , pages 13–18. Association for Computing Machinery, 2024. [38] Junfei Zhan, Haoxun Shen, Zheng Lin, and Tengjiao He. Prism: Privacy-aware routing for adaptive cloud–edge llm inference via se-mantic sketch collaboration. In Proceedings of the AAAI Conference on Artificial Intelligence , volume 40, pages 28150–28158, 2026. [39] Mingjin Zhang, Xiaoming Shen, Jiannong Cao, Zeyang Cui, and Shan Jiang. Edgeshard: Efficient llm inference via collaborative edge com-puting. IEEE Internet of Things Journal , 12(10):13119–13131, 2024. [40] Lianmin Zheng, Wei-Lin Chiang, Ying Sheng, Siyuan Zhuang, Zhang-hao Wu, Yonghao Zhuang, Zi Lin, Zhuohan Li, Dacheng Li, Eric P. Xing, Hao Zhang, Joseph E. Gonzalez, and Ion Stoica. Judging llm-as-a-judge with mt-bench and chatbot arena. In Advances in Neural Information Processing Systems , 2023.

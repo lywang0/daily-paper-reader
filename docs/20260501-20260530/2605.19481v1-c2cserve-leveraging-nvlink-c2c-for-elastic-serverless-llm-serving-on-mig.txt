@@ -1,0 +1,859 @@
+Title: C2CServe: Leveraging NVLink-C2C for Elastic Serverless LLM Serving on MIG
+
+URL Source: https://arxiv.org/pdf/2605.19481v1
+
+Published Time: Wed, 20 May 2026 00:49:00 GMT
+
+Number of Pages: 14
+
+Markdown Content:
+# C2CServe: Leveraging NVLink-C2C for Elastic Serverless LLM Serving on MIG 
+
+Shutian Luo 
+
+University of Virginia USA 
+
+Ali Zafar Sadiq 
+
+University of Virginia USA 
+
+Rui Yang 
+
+University of Virginia USA 
+
+Mingye Zhang 
+
+Northwestern University USA 
+
+Haiying Shen 
+
+University of Virginia USA 
+
+Wei Wang 
+
+HKUST Hong Kong SAR, China 
+
+Yue Cheng 
+
+University of Virginia USA 
+
+Abstract 
+
+Modern LLM serving is increasingly serverless in shape: large model catalogs, long-tail invocations, and multi-tenant demand. Existing GPU serving systems face a tradeoff: dedicated-GPU allocation wastes scarce HBM under sparse traffic, while GPU time sharing places model initialization and weight loading on the cold-start path. Spatial GPU sharing such as multi-instance GPU (MIG) provides isolation and accounting, but each slice has too little HBM for modern LLM weights. We observe that high-bandwidth CPU–GPU interconnects, such as NVLink-C2C (C2C) in NVIDIA GH200 and GB200 Superchips, change the memory constraint: model weights can reside in CPU memory and be streamed on demand to MIG instances, shifting model residency from scarce HBM to abundant host memory. Leveraging this capability, we present C2CServe, a request-granularity serverless LLM serv-ing system that allows MIG instances to switch models across requests without reloading weights into HBM. C2CServe introduces HybridGEMM , a heterogeneous-memory-aware GEMM kernel that adapts data access patterns to balance HBM and C2C bandwidth across MIG partitions using a sin-gle tuning knob. To mitigate shared-C2C contention, C2CServe further uses a hierarchical scheduler that coordinates model placement, input chunking, and kernel selection with online feedback control. On GH200, C2CServe reduces cold-start latency by up to 7.1 × for dense models and 4.6 × for MoE models compared with state-of-the-art serverless LLM serv-ing systems, while maintaining over 95% TTFT and TPOT attainment under C2C contention. 
+
+1 Introduction 
+
+Large language model serving [ 16 , 28 , 38 , 39 ] is shifting from a small number of static deployments to large catalogs of dy-namically invoked model variants. A single cloud tenant may register domain-specialized fine-tunes [ 36 ], periodically re-freshed checkpoints [ 41 ], and request-routed expert mixtures behind a unified inference endpoint [ 44 ]. Public model hubs HBM       
+
+> (A)
+> GPU
+> Kernel
+> 4 TB/s
+> (a) Dedicated GPU
+> HBM
+> (B)
+> GPU
+> Kernel
+> 4 TB/s HBM
+> (Fits One
+> model Only)
+> GPU Kernel
+> CPU
+> Memory
+> (A, B, C, D)
+> PCIe
+> 60 GB/s
+> 4 TB/s
+> Weights Input
+> (b) GPU time sharing
+> HBM
+> NVLINK-C2C
+> 450 GB/s
+> 1 TB/s
+> (c) C2CServe (Our system)
+> Per-MIG
+> Kernel
+> GPU 1 GPU 2 GPU
+> AB
+> CPU
+> Memory
+> (A, B, C, D)
+> Model Pool: A, B, C and D
+> CD
+
+Figure 1. Multi-model serving approaches. already catalog over a million models [ 8 ], and production traces [ 1 , 33 ] from large-scale inference platforms show a pro-nounced long tail (detailed in § 2.1): a small fraction of models receives most requests, while the remaining models must still remain responsive to unpredictable invocations [ 33 ] (de-tails in § 2.1). This long-tail workload closely matches the serverless setting—long periods of inactivity punctuated by bursty, multi-tenant invocations [21, 35, 42, 48]. Serving long-tail workloads requires high elasticity: the system allocates resources at fine granularity for resource efficiency while keeping cold-start overhead low. Yet both requirements conflict with the characteristics of modern LLMs. Their large model footprints force coarse-grained placement, often requiring one or more GPUs per model due to limited HBM capacity. Meanwhile, LLM cold starts go beyond image loading and container startup: inference engines must also initialize runtime state, and construct CUDA graphs [ 48 ]. As model sizes continue to grow, high elasticity becomes increasingly difficult. Existing GPU-based serving systems struggle to provide both fine-grained allocation and low cold-start overhead. 
+
+Dedicated-GPU allocation assigns one or more GPUs to each model [ 23 , 26 ], as shown in Fig. 1(a). This keeps models warm and avoids cold starts, but wastes accelerator memory and compute when traffic is sparse. In contrast, GPU time shar-ing multiplexes multiple models on the same GPU through time sharing [ 18 , 19 , 25 , 29 , 42 , 46 ], as shown in Fig. 1(b). This improves utilization, but only the active model can be served at a time. When the active model changes, the system must initialize inference-engine state and load gigabytes of 
+
+1 
+
+> arXiv:2605.19481v1 [cs.OS] 19 May 2026 Conference’17, July 2017, Washington, DC, USA Shutian Luo, Ali Zafar Sadiq, Rui Yang, Mingye Zhang, Haiying Shen, Wei Wang, and Yue Cheng
+
+weights over PCIe, adding substantial overhead on the cold-start path [ 48 ]. Unlike conventional serverless functions, LLM cold starts are dominated by heavyweight GPU-side setup and weight materialization rather than lightweight container startup. This tension suggests the need for an allocation unit that is finer-grained than a full GPU, yet stable enough to keep serv-ing state warm across requests. NVIDIA Multi-Instance GPU (MIG) appears to offer such a middle ground for serverless LLM serving. MIG can partition a single accelerator into up to seven isolated instances [ 22 ], each with dedicated compute resources and a private fraction of HBM. This makes MIG attractive for multi-tenant inference [ 24 , 25 , 37 , 40 ]: each instance can serve a separate model, reduce model-switch frequency to mitigate cold-start requirement, and provide a natural per-instance accounting unit, as shown in Fig. 1(c). However, its scalability is limited by partitioned HBM capac-ity: modern LLMs already strain full-GPU memory, and MIG further divides HBM across instances. As a result, each slice is often too small to keep the model weights it is expected to serve resident in HBM. MIG therefore provides the appro-priate execution and accounting abstraction, but its memory granularity is ill-suited for modern LLM footprints. This limitation motivates using CPU memory as the weight store for MIG instances. Integrated CPU–GPU accelerators alleviate the MIG memory bottleneck by coupling GPU com-pute with high-bandwidth host memory. NVIDIA Superchips such as GH200 [ 13 ] and GB200 [ 12 ] provide up to ∼450 GB/s per-direction NVLink-C2C (C2C) bandwidth, about 7× higher than PCIe 5.0 x16 ( ∼64 GB/s per direction). Existing sys-tems [ 30 , 43 , 47 ] treat CPU memory as a faster HBM backing tier, similar in spirit to PCIe-based offloading. In contrast, we observe that C2C enables CPU memory to act as an ac-tive extension of HBM: model weights can remain in host memory [ 6 , 10 ] and be consumed directly by GPU kernels via zore-copy access [7], without being staged into HBM. 
+
+Together, MIG and C2C make LLM serverless practical: MIG provides fine-grained compute, while C2C extends each MIG instance beyond its private HBM partition to a larger CPU-memory weight store. We observe that their combination changes the cost structure of serverless LLM serving as shown in Fig. 1(c): cold starts no longer require copying model weights into HBM, and inactive models no longer occupy scarce GPU memory. Instead, long-tail models can reside in CPU memory and be streamed on demand by any MIG instance. This shifts the admission bottleneck from HBM capacity to host-memory capacity, enabling substan-tially higher model density while reserving HBM for active per-request state such as activations and KV cache. Realizing this design requires rethinking two assumptions in today’s GPU software stack. First, existing general matrix multiplication (GEMM) kernels such as cuBLAS [ 14 ] and CUTLASS [ 11 ] assume HBM-resident operands. When di-rectly used with CPU-resident weights, they can repeatedly fetch the same weight blocks over NVLink-C2C, amplifying C2C traffic. This mismatch is more pronounced under MIG, where HBM bandwidth is partitioned across instances but C2C bandwidth remains shared. Second, C2C sharing weak-ens MIG isolation. Co-resident MIG instances may stream CPU-resident weights concurrently, so each tenant’s effec-tive C2C bandwidth depends on aggregate demand rather than its own partition. This creates a scheduling challenge: coordinating shared C2C bandwidth with partitioned MIG-local compute and HBM resources. We present C2CServe, a request-granularity serverless LLM serving system that decouples model residency from GPU HBM. By keeping model weights in CPU memory and streaming them on demand over C2C without staging them in HBM, C2CServe allows each MIG instance to switch mod-els at request granularity. Specifically, C2CServe introduces HybridGEMM with key insight to trade C2C traffic for HBM traffic. HybridGEMM splits execution between an output-stationary path that preserves GEMM efficiency and a weight-stationary path that reuses CPU-resident weights to reduce repeated C2C fetches. A single knob adapts this tradeoff to each MIG slice’s HBM–C2C balance and runtime contention. On top of HybridGEMM, C2CServe designs a C2C-aware scheduler for serverless LLM serving. For each request, the scheduler considers the model size, selects the input chunk size, and chooses a precompiled HybridGEMM variant whose HBM– C2C ratio matches the slice’s live bandwidth profile. At run-time, C2CServe monitors serving performance and further tunes the HybridGEMM knob through feedback control, en-abling efficient support for long-tail models with diverse memory footprints and bursty traffic. We evaluate C2CServe on GH200 Superchips using multi-tenant production workloads across model sizes. By eliminat-ing expensive weight loading, C2CServe reduces cold-start latency by up to 7.1 × on dense models and 4.6 × on MoE models. Even under multi-tenant C2C contention, C2CServe maintains over 95% attainment for both Time-To-First-Token (TTFT) and Time-Per-Output-Token (TPOT) targets. This paper makes three contributions. 
+
+• We identify the opportunity for serverless LLM infer-ence on Superchips: MIG provides fine-grained com-pute isolation, while C2C enables CPU-resident model weights. To our knowledge, C2CServe is the first sys-tem to make MIG practical for serverless LLM serving by decoupling model residency from scarce HBM ca-pacity. 
+
+• We design HybridGEMM, a heterogeneous-memory-aware GEMM kernel that adapts to each MIG slice’s HBM/C2C bandwidth profile through a single tuning knob, rather than relying on one fixed tiling strategy. 
+
+• We design a hierarchical scheduling policy across model placement, input chunking, and kernel selection to  
+
+> 2C2CServe: Leveraging NVLink-C2C for Elastic Serverless LLM Serving on MIG Conference’17, July 2017, Washington, DC, USA
+
+mitigate C2C contention in multi-tenant serverless serving. 
+
+2 Background 
+
+2.1 LLM Workload Characterization 
+
+We characterize LLM serving behavior using a three-week Al-ibaba production trace [ 1, 33 ] containing 89 models as shown in Fig. 2. Three observations stand out. First, per-model traf-fic is highly bursty: requests arrive in short bursts separated by long idle periods, and the median active model is idle for 96% of observed hours as shown in Fig. 2(a). Second, bursts are not perfectly aligned across models; one model’s peak often coincides with another model’s idle period, making aggregate demand smoother than individual demand. Third, activity is strongly long-tailed: 83% of models are active in fewer than 20% of observed hours as depicted in Fig. 2(b), yet these models must still remain responsive to unpredictable requests. These properties match the canonical serverless workload pattern and expose a structural mismatch with existing GPU serving systems. 
+
+2.2 Elastic LLM Serving under Long-Tail Demand 
+
+Serverless LLM serving targets long-tail workload scenar-ios [ 32 ] where models may remain inactive for long periods but must respond quickly when requests arrive. To achieve high elasticity, existing systems commonly rely on parameter offloading and model switching. Parameter offloading moves model weights out of scarce GPU HBM, typically to CPU memory or storage, and loads them back when the model is invoked. Model switching allows multiple models to share the same GPU over time, improving utilization under sparse demand. However, these mechanisms also introduce new overheads. When a request arrives for an inactive model, the system must reload model weights, initialize inference-engine state, and prepare GPU execution resources before serving the request. As a result, serverless LLM systems must balance two competing goals: supporting many rarely used models with limited GPU memory, while keeping cold-start latency low enough for interactive serving. 
+
+2.3 MIG Partitioning 
+
+NVIDIA MIG technology [ 22 ], introduced with A100 and extended to H100 and GH200, partitions a GPU into up to seven hardware-isolated instances. Each instance receives dedicated GPU resources, including HBM capacity, HBM bandwidth and SMs. As summarized in Table 1, GH200 sup-ports configurations ranging from one full-GPU instance with 96 GB HBM and 132 SMs to seven small instances, each with 12 GB HBM and 16 SMs. This partitioning exposes a fundamental tradeoff: higher instance concurrency comes at the cost of lower per-instance compute capacity, HBM capacity, and HBM bandwidth. While Day 1 
+
+> Day 2
+> Day 3
+> Day 4
+> Time
+> 0
+> 10 0
+> 10 1
+> 10 2
+> Requests per hour (log)
+> Model popularity rank
+> # 1
+> # 10
+> # 20
+> # 30
+> # 40
+> # 50
+> 0
+> 50
+> 100
+> Hours active (%)
+> 0
+> 20
+> 40
+> 60
+> 80
+> 100
+> CDF of models (%)
+> 79% active
+> in <20% of hours
+> idle
+
+Figure 2. LLM workload fluctuation in an Alibaba produc-tion cluster. Left: Hourly request rates of representative models. Right: Per-model active-time distribution across 59 active models. 
+
+Table 1. GH200 MIG configs: [instances, HBM per instance], SM count, and partitioned HBM bandwidth.                
+
+> Config. [1, 96GB] [2, 48GB] [3, 24GB] [4, 24GB] [7, 12GB] SMs per instance 132 56 28 16 16 HBM BW per instance 4.0 TB/s 2.0 TB/s 1.0 TB/s 1.0 TB/s 0.5 TB/s
+
+this makes MIG attractive for isolation, accounting, and multi-tenant serving, it also tightly bounds each instance by its private HBM resources. This limitation is particularly severe for LLM inference: a 70B-parameter model in BF16 re-quires roughly 140 GB for weights alone, exceeding even the 96 GB HBM capacity of a full GH200 GPU and far exceeding the capacity of smaller MIG instances. As a result, serving large models on MIG requires quantization, tensor-parallel sharding, or offloading, leaving MIG underused for produc-tion LLM serving despite its natural fit for fine-grained GPU partitioning. 
+
+2.4 Superchip Memory Hierarchy 
+
+NVIDIA GH200 [ 13 ] and GB200 [ 12 ] Superchips integrate a Grace CPU with a Hopper GPU and a Blackwell GPU, re-spectively, over C2C. This exposes a heterogeneous memory hierarchy: high-bandwidth GPU HBM for latency-critical state, and a larger CPU memory pool accessible to GPU kernels through the high-bandwidth C2C interconnect. This hierarchy differs from a discrete-GPU system in both capacity and bandwidth. First, CPU memory provides a much larger and cheaper storage tier that can hold many model snapshots that would not fit in HBM, either individually or collectively. Second, C2C provides enough bandwidth for GPU kernels to read CPU-resident operands directly, without first staging them through HBM. As a result, CPU memory can act as an active operand store rather than merely a slow backing store. This changes model serving from an HBM-residency problem into a heterogeneous-memory scheduling problem: model weights can remain in CPU memory, while scarce HBM is reserved for latency-critical per-request state. 
+
+> 3
+
+Conference’17, July 2017, Washington, DC, USA Shutian Luo, Ali Zafar Sadiq, Rui Yang, Mingye Zhang, Haiying Shen, Wei Wang, and Yue Cheng (a) SymGEMM     
+
+> X
+> W
+> O
+> (b) AsymGEMM
+> OXOXO
+> (c) HybriGEMM
+> WWW
+> X
+
+Figure 3. Comparison of data access patterns across different GEMM tiling strategies. 
+
+3 Motivation for C2CServe 
+
+3.1 Opportunity of Combining MIG and C2C 
+
+Serverless LLM serving requires high elasticity: low cold-start latency and fine-grained resource allocation. However, both are difficult when model weights must remain resident in scarce HBM. High-bandwidth CPU–GPU interconnects such as C2C change this tradeoff. MIG provides lightweight, isolated GPU slices for multi-tenant execution and account-ing, while C2C allows GPU kernels to stream CPU-resident model weights at high bandwidth. Thus, model parameters can remain in CPU memory, and each MIG instance can reserve its limited HBM for active execution state such as activations and KV cache. 
+
+3.2 GEMM on MIG-Partitioned Superchips 
+
+Efficiently combining MIG with Superchip memory requires GPU kernels that are aware of operand placement and band-width asymmetry across the memory hierarchy. We use GEMM as a representative kernel to illustrate our MIG-specific kernel design. 
+
+3.2.1 Symmetric GEMM and Asymmetric GEMM. Given a GEMM operation 𝑂 = 𝑋 × 𝑊 , conventional kernels use a 
+
+symmetric GEMM (SymGEMM ) dataflow that treats 𝑋 and 
+
+𝑊 with roughly balanced access cost, as shown in Fig. 3(a). In contrast, asymmetric GEMM (AsymGEMM ) keeps 𝑊 sta-tionary and streams 𝑋 and 𝑂 , reducing repeated accesses to CPU-resident weights at the cost of additional HBM traffic for output accumulation, as shown in Fig. 3(b). Since the HBM-to-C2C bandwidth ratio varies across MIG partitions, neither dataflow is always optimal. We therefore introduce 
+
+HybridGEMM , which partitions SMs between SymGEMM 
+
+and AsymGEMM to adapt the aggregate data movement to the available HBM and C2C bandwidth as shown in Fig. 3(c) and detailed in § 5. We evaluate a representative LLM-inference GEMM where activations reside in HBM and parameters reside in CPU memory. As shown in Fig. 4(a), AsymGEMM is highly effec-tive on a full GPU, reducing latency from 16.4 ms to 4.0 ms by cutting CPU–GPU traffic. Under MIG, however, this ad-vantage diminishes: SymGEMM and AsymGEMM perform similarly with 3 MIG instances, while AsymGEMM becomes slower with 7 instances. This is because MIG partitions HBM bandwidth across instances while C2C bandwidth remains Full GPU 1/3 MIG 1/7 MIG    
+
+> 0
+> 5
+> 10
+> 15
+> 20
+> 25
+> 30
+> Latency (ms)
+> (a) GEMM latency
+> 16.4 16
+> 22.9
+> 8.2
+> 15.4
+> 26
+> 4
+> 15
+> 30
+> SymGEMM
+> HybridGEMM
+> AsymGEMM
+> SymGEMM HybridGEMM AsymGEMM
+> 0
+> 1
+> 2
+> 3
+> 4
+> 5
+> 6
+> Data Traffic (GB)
+> (b) Data traffic
+> 5.37
+> 2.75
+> 0.13
+> 1.23
+> 3.21
+> 5.18 CPU-GPU
+> HBM
+
+Figure 4. Comparison of symGEMM, asymGEMM, and Hy-bridGEMM on a representative LLM inference GEMM shape (𝐴 : 10240 × 4096 , 𝐵 : 16384 × 4096 ). 0  
+
+> 20
+> 40
+> 60
+> 80
+> 100
+> Utilization (%)
+> 0
+> 20
+> 40
+> 60
+> 80
+> 100
+> Utilization (%)
+> 128
+> 256
+> 512
+> 1024
+> 2048
+> 4096
+> 8192
+> 16384
+> a) Dimension N
+> 0
+> 80
+> 160
+> 240
+> 320
+> 400
+> TFLOPS
+> 128
+> 256
+> 512
+> 1024
+> 2048
+> 4096
+> 8192
+> 16384
+> b) Dimension M
+> 0
+> 50
+> 100
+> 150
+> 200
+> 250
+> TFLOPS
+> TFLOPS HBM utilization (%) C2C utilization (%)
+
+Figure 5. Shape-dependent performance and bandwidth utilization on asymGEMM. shared, narrowing the effective HBM-over-C2C bandwidth advantage. Figure 4(b) explains this shift: AsymGEMM reduces CPU– GPU transfers from 5.37 GB to 0.13 GB, but increases HBM traffic from 1.23 GB to 5.18 GB. Thus, SymGEMM stresses C2C by repeatedly streaming CPU-resident weights, whereas 
+
+AsymGEMM shifts traffic to HBM by reusing weights and accumulating output updates there. HybridGEMM interpo-lates between these extremes by adjusting the fraction of SMs assigned to each dataflow, making GEMM on Superchip systems bandwidth-adaptive rather than fixed. Overall, these results suggest that GEMM on superchip systems should be bandwidth-adaptive rather than fixed. Hy-bridGEMM provides such adaptability by tuning the balance between HBM traffic and CPU–GPU traffic to match the effective resource regime under each MIG configuration. 
+
+3.2.2 Shape-dependent Bottlenecks. Directly accessing CPU-resident parameters is efficient only when the GEMM shape provides enough reuse to amortize CPU–GPU traf-fic. We study GEMMs 𝑂 𝑀 ×𝑁 = 𝑋 𝑀 ×𝐾 × 𝑊 𝐾 ×𝑁 , where 𝑋 
+
+resides in HBM and 𝑊 resides in CPU memory. Because the two operands come from different memory domains, matrix shape determines both HBM traffic and C2C pressure. Figure 6 shows two distinct effects. Increasing 𝑁 improves TFLOPS but sharply increases C2C utilization, pushing exe-cution toward a C2C-bound regime. In contrast, increasing 𝑀 
+
+improves TFLOPS while reducing C2C utilization, because 
+
+4C2CServe: Leveraging NVLink-C2C for Elastic Serverless LLM Serving on MIG Conference’17, July 2017, Washington, DC, USA 5 9 13 22 32 44             
+
+> Total Size of Two Models (GB)
+> 0
+> 50
+> 100
+> 150
+> 200
+> 250
+> Throughput (tokens/s)
+> (a) Varying model size
+> 28%
+> 32%
+> 37%
+> 43% 40% 42%
+> 512 1024 2048 4096 8192 Full
+> Chunk Size
+> 0
+> 10
+> 20
+> 30
+> 40
+> Throughput (tokens/s)
+> (b) Varying chunk size
+> 2%
+> 10%
+> 28% 34% 39% 42%
+> Sum of Solo Runs Concurrent Execution Interference Gap
+
+Figure 6. Interference on shared C2C bandwidth. more activation rows reuse the same parameter tiles and better amortize CPU-memory fetches. Thus, 𝑁 primarily in-creases interconnect pressure, whereas 𝑀 improves compute efficiency through higher parameter reuse. These results re-veal a shape-dependent bottleneck shift: small shapes under-utilize the GPU, large 𝑁 makes execution C2C-bound, and large 𝑀 makes direct CPU-parameter access more efficient by increasing reuse. 
+
+Takeaway. Superchip GEMM performance is bottleneck-dependent: MIG partitioning changes the effective HBM– C2C bandwidth balance, while matrix shape determines how well C2C traffic is amortized. High performance therefore requires an adaptive GEMM dataflow that jointly manages HBM and C2C traffic. 
+
+3.3 Cross-Instance C2C Contention 
+
+Although CPU offloading makes MIG-based multi-model serving practical, it also introduces a new source of inter-ference: the shared CPU–GPU interconnect. In C2CServe, different MIG instances are isolated in on-chip compute re-sources and HBM allocation, but they still share the C2C path used to fetch CPU-resident model parameters. As a re-sult, MIG isolation is only partial: computation is spatially partitioned on the GPU, whereas parameter access remains a shared off-chip resource. When multiple instances issue pa-rameter fetches concurrently, contention on C2C can become a first-order performance bottleneck. To understand this interference, we study two factors that directly shape C2C demand: parameter footprint and execu-tion granularity . The former captures the volume of model data fetched from CPU memory, while the latter reflects how aggressively each instance utilizes the shared interconnect during execution. 
+
+3.3.1 Impact of Parameter Footprint. We first exam-ine how the CPU-resident parameter footprint affects cross-instance contention. In C2CServe, model parameters are not staged in HBM; instead, they are fetched from CPU memory over C2C on demand during inference. As a result, parameter footprint becomes a first-order determinant of C2C traffic intensity: larger models generate more off-chip parameter transfers per forward pass and therefore place greater pres-sure on the shared interconnect. We use a series of Llama 3 models and evaluate different colocated model pairs to compare solo-run throughput with co-run throughput, as shown in Fig. 6(a). We quantify cross-instance interference as the gap between the sum of solo-run throughput and the co-run throughput. As the total size of the two colocated models increases from 5 GB to 44 GB, throughput decreases in both the solo-run and co-run set-tings. However, the co-run case degrades much more sharply than the solo baseline, and the interference gap widens from 28% to 42%. This is because larger colocated models generate more concurrent parameter-fetch traffic over C2C, increas-ing the likelihood of overlapping fetch streams across MIG instances. The resulting contention on the shared intercon-nect leads to substantially greater throughput degradation under co-run execution. This trend shows that larger parameter footprints cre-ate greater pressure on the shared C2C link, making model footprint a useful signal for scheduling. An intelligent sched-uler should therefore avoid co-locating models with large CPU-resident parameters on the same GPU, and instead use footprint-aware placement to reduce C2C contention and improve aggregate throughput. 
+
+3.3.2 Impact of Execution Granularity. We next study how execution granularity affects cross-instance contention. In chunk-based execution, each chunk contains a group of prompt tokens whose activations reside in HBM and are computed against CPU-resident weights during prefill [ 17 ]. Thus, chunk size does not affect where prompts are stored; instead, it determines how much reuse each C2C-fetched weight tile receives and how long each MIG instance occu-pies the shared C2C link. Figure 6(b) illustrates this tradeoff. At a small chunk size of 512, concurrent execution nearly matches the solo baseline, with only a 2% interference gap. As chunk size increases, solo-run throughput continues to improve, indicating higher single-instance efficiency. In contrast, co-run throughput improves much more slowly, and the interference gap widens to 42% at the full-chunk setting. The underlying reason is that larger chunks amortize each CPU-resident weight fetch across more HBM-resident prompt activations, improving per-instance efficiency. How-ever, they also create longer C2C streaming phases, occupy-ing the shared interconnect for longer periods and increasing overlap across colocated instances. Thus, chunk size is not only a local efficiency knob; it also controls the C2C inter-ference imposed on neighboring instances. 
+
+Takeaway. To mitigate shared C2C contention, the sched-uler jointly optimizes placement and execution granularity. It avoids colocating models with high parameter-fetch de-mand and dynamically adjust chunk size under contention to smooth C2C traffic across MIG instances.   
+
+> 5Conference’17, July 2017, Washington, DC, USA Shutian Luo, Ali Zafar Sadiq, Rui Yang, Mingye Zhang, Haiying Shen, Wei Wang, and Yue Cheng Online Scheduler
+> MIG
+> Instance
+> Online
+> Profiler
+> Requests
+> 2
+> Model Assigner
+> Kernel Selector
+> Chunk Controller
+> Kernel
+> Tuner
+> 3
+> Runtime Controller
+> Model
+> Active
+> Yes
+> No
+> Model Pool
+> Kernel Repo
+> 1Offl ine Storage
+
+Figure 7. System architecture of C2CServe. 
+
+4 Overview of C2CServe Architecture 
+
+C2CServe is a Superchip-native serverless LLM serving sys-tem, with the overall architecture shown in Fig. 7. For each incoming request with an SLO requirement, C2CServe sched-ules the request to a suitable MIG instance and selects the corresponding execution configuration including the model placement, chunk size and kernel knob for high performance. 
+
+C2CServe is a Superchip-native serverless LLM serving sys-tem, as shown in Fig. 7. For each request, C2CServe selects the MIG instance, model placement, chunk size, and Hy-bridGEMM kernel knob for high performance. The Offline Storage ❶ maintains a CPU-resident Model Pool 
+
+and an offline Kernel Repository . The model pool stores multi-ple LLMs in host memory to reduce HBM residency pressure, while the kernel repository provides pre-compiled kernel variants for different parameter precisions, layer shapes, and MIG configurations. The Online Scheduler ❷ coordinates three decisions: the 
+
+Model Assigner places models onto MIG instances according to model footprint and expected C2C traffic; the Chunk Con-troller adjusts chunk size to trade off GPU efficiency and C2C burstiness; and the Kernel Selector chooses the appropriate kernel. The incoming request is then executed on a MIG Instance, where activations and KV cache remain in HBM while model weights can be streamed from CPU memory over NVLink-C2C. The Runtime Controller ❸ closes the feedback loop: the 
+
+Online Profiler monitors latency, HBM usage, C2C bandwidth, and cross-instance interference, while the Kernel Tuner re-fines kernel choices and tuning parameters. This runtime feedback enables C2CServe to adapt scheduling and kernel execution under dynamic multi-model workloads. 
+
+5 HybridGEMM Kernel Design 
+
+This section introduces HybridGEMM as shown in Algo-rithm 1, a GEMM kernel that adapts to the dynamic band-width gap between CPU–GPU interconnects and HBM on MIG-enabled Superchips. 
+
+Algorithm 1: HybridGEMM with split ratio 𝛼 ∈ [ 0, 1].
+
+𝑊 ∈ R𝐾 ×𝑁 , 𝑋 ∈ R𝑀 ×𝐾 , 𝑂 ∈ R𝑀 ×𝑁 .                                                                                                   
+
+> 1Procedure HybridGEMM (𝑋 ,𝑊 ,𝑂 ,𝛼 ):
+> 2𝑁 sym ← ⌊ 𝛼 ·𝑁 ⌋;𝑁 asym ←𝑁 −𝑁 sym
+> 3Partition 𝑊 =[𝑊 sym |𝑊 asym ]and 𝑂 =[𝑂 sym |𝑂 asym ]along
+> 𝑁
+> 4/* SM-level parallelism */
+> 5SymmetricKernel (𝑋 , 𝑊 sym , 𝑂 sym )
+> 6AsymmetricKernel (𝑋 , 𝑊 asym , 𝑂 asym )
+> 7Procedure SymmetricKernel (𝑋 , 𝑊 , 𝑂 ):
+> 8/* SM owns one output tile 𝑂 𝑚,𝑛 per iteration */
+> 9Allocate SM shared-memory buffers sX ,sW
+> 10 Allocate register accumulator acc
+> 11 for 𝑘 ←1to 𝑇 𝐾 do
+> 12 TMA .Load (sX , 𝑋 𝑚,𝑘 )
+> 13 TMA .Load (sW ,𝑊 𝑛,𝑘 )
+> 14 /* Compute the tile using tensor-core MMA */
+> 15 WMMA (acc ,sX ,sW )
+> 16 /* Write accumulated output tile back to HBM */
+> 17 TMA .Store (𝑂 𝑚,𝑛 ,acc )
+> 18 Procedure AsymmetricKernel (𝑋 , 𝑊 , 𝑂 ):
+> 19 Allocate SM shared-memory buffers sX ,sW
+> 20 Allocate register tmp
+> 21 /* Each SM pins one weight tile 𝑊 𝑛,𝑘 */
+> 22 sW ←TMA .Load (𝑊 𝑛,𝑘 )
+> 23 for 𝑚 ←1to 𝑇 𝑀 do
+> 24 sX ←TMA .Load (𝑋 𝑚,𝑘 )
+> 25 WMMA (tmp ,sX ,sW )
+> 26 /* TMA fuses accumulation and HBM writeback */
+> 27 TMA .Reduction (𝑂 𝑚,𝑛 ,tmp )
+
+5.1 Existing Kernels Fall Short 
+
+GEMM kernels commonly use tiling to partition large ma-trices into smaller blocks that fit within the GPU memory hierarchy, such as shared memory and registers. By load-ing each tile once and reusing it across multiple multiply– accumulate operations, tiling reduces redundant memory traffic and improves compute efficiency. For GEMM 𝑂 = 𝑋𝑊 , tiling strategies mainly differ in which tiles remain stationary during computation. A con-ventional symmetric GEMM follows an output-stationary dataflow as shown in Fig. 3(a): it keeps an 𝑂 tile in registers and repeatedly updates it while loading the corresponding 
+
+𝑋 and 𝑊 tiles into shared memory. These operand tiles are brought from HBM to shared memory (Step 11 and 12) using Tensor Memory Accelerator (TMA), a hardware engine for asynchronous tiled transfers, and are then consumed by ten-sor cores for matrix multiply–accumulate operations (Step 7). In contrast, an asymmetric GEMM is weight-stationary as shown in Fig. 3(b): it keeps a CPU-resident 𝑊 tile in shared memory (Step 22) and reuses it across multiple 𝑀 -dimension iterations (Step 23), reducing repeated CPU–GPU transfers. This dataflow, however, introduces additional HBM overhead  
+
+> 6C2CServe: Leveraging NVLink-C2C for Elastic Serverless LLM Serving on MIG Conference’17, July 2017, Washington, DC, USA
+
+because partial outputs are accumulated in HBM-resident 𝑂 
+
+tiles rather than entirely in registers. The asymmetric kernel mitigates this overhead with TMA reduction (Step 26), which fuses partial accumulation with HBM writeback. When 𝑋 
+
+and 𝑂 reside in HBM while 𝑊 resides in CPU memory, the two designs are complementary: symmetric tiling is HBM-frugal but C2C-fragile because it repeatedly fetches CPU-resident weights, whereas asymmetric tiling is C2C-frugal but HBM-heavy because it accumulates partial outputs re-peatedly in HBM. Neither tiling strategy is uniformly optimal on MIG-enabled Superchips. MIG partitioning reshapes the HBM–C2C band-width balance: HBM bandwidth is partitioned across MIG instances, whereas C2C bandwidth remains shared. With more MIG instances, per-instance HBM bandwidth drops and the HBM–C2C gap narrows, favoring symmetric GEMM. With fewer MIG instances, per-instance HBM bandwidth is more abundant, making C2C the bottleneck; in this regime, asymmetric GEMM is preferable because it reduces repeated CPU–GPU weight transfers. 
+
+5.2 Efficient HybridGEMM 5.2.1 Tiling Pattern Analysis. The above tradeoff makes a fixed tiling choice fragile: a pattern tuned for one MIG partition or contention level can become suboptimal under another. HybridGEMM avoids this fixed choice by exposing a continuous knob that controls the fraction of work assigned to the symmetric and asymmetric paths, balancing HBM and C2C traffic under the current MIG configuration (Step 2). This knob is necessary because the two paths stress differ-ent resources. The symmetric path preserves the optimized conventional GEMM structure but is sensitive to repeated C2C weight fetches. The asymmetric path reduces C2C traffic by increasing weight reuse, but shifts overhead to HBM-side partial-output accumulation. HybridGEMM therefore selects an execution mix that matches the current HBM–C2C band-width balance. 
+
+5.2.2 Runtime-Tunable HybridGEMM. Rather than com-mitting to a single tiling pattern, HybridGEMM exposes a split between SymGEMM and AsymGEMM, as shown in Fig. 3(c). Specifically, HybridGEMM partitions the out-put along the 𝑁 dimension using a ratio 𝛼 ∈ [ 0, 1] (Step 2): the first region of width 𝑁 sym = ⌊𝛼𝑁 ⌋ uses the symmetric path, while the remaining region of width 𝑁 asym = 𝑁 − 𝑁 sym 
+
+uses the asymmetric path. The two paths run on different SMs and write disjoint columns of 𝑂 , so they require no inter-stream synchronization. This allows the HBM-sensitive and C2C-sensitive execution paths to run concurrently and over-lap their respective stalls. Importantly, neither path stages 𝑊 
+
+into HBM; weights remain CPU-resident and are streamed on demand, making the optimization transparent to the user and requiring no explicit weight management. X O         
+
+> W
+> XO
+> W
+> XO
+> W
+> XO
+> W
+> XO
+> W
+> O
+> W
+> X
+> (a) Small M-tile
+> Iteration 1 Iteration 2 Iteration 3 Iteration 4 Iteration 1 Iteration 2
+> (b) Large M-tile
+
+Figure 8. Impact of 𝑀 -dimension tile size in asymmetric GEMM. The optimal 𝛼 is runtime-dependent. Beyond workload shape and MIG partitioning, it must account for live C2C con-tention from co-resident tenants. As multiple MIG instances stream CPU-resident weights concurrently, each instance’s effective C2C bandwidth changes over time, making a static 
+
+𝛼 fragile. C2CServe therefore treats 𝛼 as a runtime tuning knob; its selection is handled by the online tuning module (detailed in § 7). 
+
+5.2.3 Tiling Tradeoff in HybridGEMM. The two exe-cution paths in HybridGEMM prefer different tiling choices. The symmetric path follows conventional GEMM tiling and performs well when the cache hierarchy provides sufficient reuse of streamed weight tiles [11]. The asymmetric path requires a different tiling strategy. It reduces C2C traffic by reusing a CPU-resident 𝑊 tile in shared memory, but shifts overhead to HBM because partial outputs must be repeatedly accumulated in HBM. To reduce this HBM overhead, the asymmetric path favors a larger output tile along the 𝑀 dimension, as illustrated in Fig. 8. A larger 𝑀 -tile allows each loaded 𝑊 tile to be reused across more rows of 𝑋 before partial outputs are written back, re-ducing the number of HBM accumulation steps. This trades additional on-chip resource usage for fewer HBM transac-tions. HybridGEMM therefore exposes flexible tiling choices to balance shared-memory usage, HBM traffic, and C2C traf-fic under the current MIG configuration. 
+
+6 Contention-aware Online Scheduling 
+
+In this section, we introduce the policy used by the Online Scheduler module ( ❷ in Fig. 7) for serving CPU-resident mod-els on MIG-partitioned Superchips. The scheduler jointly manages shared C2C bandwidth, per-MIG HBM bandwidth, and TTFT/TPOT targets through three decisions: model placement, chunk-size selection, and HybridGEMM kernel selection. 
+
+6.1 Scheduling Workflow 
+
+For each incoming request, the scheduler performs four steps, as shown in Fig. 7. First, it checks whether the re-quested model is already active on a MIG instance. If so, the request is directly routed to that instance, avoiding inference-engine initialization and model setup overheads. Second, if the model is not active, the scheduler decides where to place it. If an idle MIG instance is available, the scheduler chooses  
+
+> 7Conference’17, July 2017, Washington, DC, USA Shutian Luo, Ali Zafar Sadiq, Rui Yang, Mingye Zhang, Haiying Shen, Wei Wang, and Yue Cheng
+
+the placement that fits the MIG-local HBM bandwidth budget while respecting the aggregate C2C bandwidth budget shared by all MIG instances on the Superchip. Otherwise, it trig-gers model switching by evicting an inactive or low-priority model instance and reusing the released MIG partition for the new model. Third, after placement, the scheduler selects the request chunk size using the offline profiling table. The selected chunk size must satisfy the TTFT/TPOT target while keeping the estimated HBM demand below the MIG-local bandwidth limit. This decision is made per model and per MIG size (detailed in Table 1), since different MIG partitions provide different compute capacity and HBM bandwidth. Finally, the scheduler selects an initial HybridGEMM ratio from the profiling table and refines it online using feedback from measured latency, C2C utilization, and HBM utilization. 
+
+6.2 Bandwidth-Aware Model Placement 
+
+At initialization, the scheduler first determines which CPU-resident models can be served concurrently on MIG instances without oversubscribing the shared NVLink-C2C link. Since model weights remain in pinned CPU memory, C2CServe treats each active model as a C2C bandwidth consumer rather than an HBM-capacity consumer. For each model 𝑚 , the scheduler estimates the C2C band-width required to meet its decode target 𝑇 𝑃𝑂𝑇 𝑚 . Since model weights are streamed from CPU memory during execution, weight-fetch latency forms a lower bound on the achievable per-token latency. In contrast, TTFT depends on the execu-tion time of the scheduled prefill chunk, which we handle through MIG-aware chunk sizing (§ 6.3). Given the CPU-resident weight footprint 𝑆 𝑚 and target 𝑇 𝑃𝑂𝑇 𝑚 , the required C2C bandwidth is estimated as: 
+
+𝐵𝑊 𝐶 2𝐶 𝑚 = 𝑆 𝑚 
+
+𝑇 𝑃𝑂𝑇 𝑚 
+
+,
+
+where the weight footprint 𝑆 𝑚 can be obtained from the model configuration. The scheduler uses this estimate as a feasibility constraint during both initial active-set construction and request-driven model switching described in § 6.1. Specifically, the active model set 𝑀 is valid only if its aggregate C2C demand fits within the available link bandwidth: ∑︁ 
+
+> 𝑚 ∈𝑀
+
+𝐵𝑊 𝐶 2𝐶 𝑚 ≤ 𝐵𝑊 𝐶 2𝐶 𝑎𝑣𝑎𝑖𝑙 .
+
+This constraint prevents C2C oversubscription across MIG instances. Under-packing leaves the shared C2C link idle and reduces model concurrency, while over-packing causes C2C contention and degrades TTFT/TPOT. 
+
+6.3 MIG-Aware Chunk Sizing 
+
+After assigning a model to a MIG instance, the scheduler selects the prefill chunk size for that instance, which mainly affect TTFT. Larger chunks improve tensor-core utilization and reduce scheduling overhead, but increase activation traf-fic and output accumulation pressure within the MIG parti-tion. Smaller chunks reduce per-step HBM pressure, but may underutilize compute resources and require more execution steps to complete prefill. Since the parameter-heavy computation in LLM inference is dominated by GEMMs, especially in MLP layers, we use a representative operation 𝑂 = 𝑋𝑊 to illustrate chunk-size selection, where 𝑋 and 𝑂 reside in GPU memory and 𝑊 
+
+resides in pinned CPU memory. For each candidate chunk size, the scheduler estimates the HBM bandwidth demand required to satisfy the TTFT target 𝐿 TTFT :
+
+𝐵𝑊 𝐻 𝐵𝑀 = 𝛾 𝑋 · 𝑆 𝑋 + 𝛾 𝑂 · 𝑆 𝑂 
+
+𝐿 TTFT 
+
+,
+
+where 𝑆 𝑋 is the activation size and 𝑆 𝑂 is the output size for the candidate chunk. The coefficients 𝛾 𝑋 and 𝛾 𝑂 capture the effective number of HBM reads/writes induced by the se-lected HybridGEMM dataflow. They depend on the GEMM tiling shape and are calibrated through offline profiling. In-tuitively, 𝛾 𝑋 · 𝑆 𝑋 captures the activation traffic inside the MIG instance, while 𝛾 𝑂 · 𝑆 𝑂 captures the output traffic and accumulation traffic introduced by the selected dataflow. Chunk-size selection is constrained by both MIG-local HBM bandwidth and compute capacity. Offline, C2CServe profiles candidate chunk sizes for each model and MIG con-figuration, and records the smallest chunk size that satis-fies the TTFT target without exceeding the instance’s HBM and compute budgets. At runtime, the scheduler looks up this profiling table to select the chunk size for each request. C2CServe then uses online feedback control to adjust the HybridGEMM ratio under bandwidth contention, keeping TTFT and TPOT within their required ranges. 
+
+6.4 Kernel Selection 
+
+During initialization, C2CServe selects a set of candidate kernels based on the model configuration, including model precision, tensor shape, and the target MIG partition. Since different precisions and tile sizes require different kernel variants, the runtime first maps each model to a prebuilt Hy-bridGEMM kernel family that matches its execution format. For each selected kernel family, C2CServe initializes the HybridGEMM ratio 𝛼 to 0, favoring the C2C-frugal dataflow to minimize NVLink-C2C contention when a model is first activated. This conservative starting point is important be-cause the C2C interconnect is shared across MIG instances, and aggressive CPU-memory streaming can interfere with co-located models. Once requests arrive, C2CServe tunes 𝛼 
+
+online using observed HBM bandwidth, C2C bandwidth, and latency: it shifts toward a more C2C-efficient dataflow when C2C is saturated, and toward a more HBM-efficient dataflow when HBM becomes the bottleneck. Thus, kernel selection  
+
+> 8C2CServe: Leveraging NVLink-C2C for Elastic Serverless LLM Serving on MIG Conference’17, July 2017, Washington, DC, USA
+
+provides a safe initial configuration, while runtime feed-back adapts HybridGEMM to the available heterogeneous-memory bandwidth. 
+
+7 Online Fine-tuning 
+
+To control under C2C contention, it will be better to fine-tune the kernel to meet the performance requirement. 
+
+7.1 Why Static Tuning Fails 
+
+As discussed in § 5.2.2, HybridGEMM uses a tuning knob 
+
+𝛼 to balance work between SymGEMM and AsymGEMM . A static 𝛼 assumes stable bandwidth for each MIG slice, but NVLink-C2C is shared across all instances. Thus, each ten-ant’s effective C2C bandwidth changes with co-resident mod-els. An offline-optimal 𝛼 can therefore become suboptimal at runtime. C2CServe tunes 𝛼 online, providing a lightweight control mechanism to adapt performance without changing the request chunk size. 
+
+7.2 Runtime Signals for HybridGEMM Control 
+
+HybridGEMM exposes a control knob 𝛼 (§ 5.2.2) that sets the fraction of output columns executed by the symmetric GEMM path. Larger 𝛼 reduces HBM-side output accumula-tion but increases repeated accesses to CPU-resident weights, while smaller 𝛼 improves CPU-weight reuse but increases HBM traffic for partial-output updates. Since the HBM–C2C bandwidth balance varies across MIG profiles and co-tenant activity, C2CServe tunes 𝛼 online with lightweight feedback control. The controller is applied to parameter-heavy GEMM oper-ators in each transformer layer, such as the MLP projections, where CPU-resident weights dominate C2C traffic. For each GEMM, C2CServe assigns a latency budget 𝐿 budget by dis-tributing the request-level TTFT or TPOT target across the profiled execution time of the model’s GEMM operators. At runtime, the controller periodically observes the measured GEMM latency 𝐿 , HBM bandwidth utilization 𝑈 HBM , and NVLink-C2C bandwidth utilization 𝑈 C2C . The bandwidth utilizations are normalized by the available bandwidth of the corresponding MIG profile and Superchip link: 
+
+𝑈 HBM = 𝐵𝑊 HBM measured 
+
+𝐵𝑊 HBM avail 
+
+, 𝑈 C2C = 𝐵𝑊 C2C measured 
+
+𝐵𝑊 C2C avail 
+
+.
+
+7.3 Feedback Update for HybridGEMM Tuning 
+
+Algorithm 2 summarizes the feedback control loop. At each control interval, C2CServe computes the bandwidth imbal-ance: 
+
+Δ = 𝑈 C2C − 𝑈 HBM .
+
+If Δ > 𝜏 , C2C is more saturated and the controller decreases 
+
+𝛼 , shifting more work to AsymGEMM . If Δ < −𝜏 , HBM is more saturated and the controller increases 𝛼 , shifting more work to SymGEMM . Otherwise, 𝛼 remains unchanged. The 
+
+Algorithm 2: C2CServe feedback control for Hy-bridGEMM ratio                                                                    
+
+> Input: Current ratio 𝛼 𝑡 , latency 𝐿 , target 𝐿 slo , HBM utilization
+> 𝑈 HBM , C2C utilization 𝑈 C2C
+> Output: Updated ratio 𝛼 𝑡 +1
+> 1Smooth 𝐿 ,𝑈 HBM , and 𝑈 C2C using EMA;
+> 2Δ←𝑈 C2C −𝑈 HBM ;
+> 3if |Δ|<𝜏 then
+> 4𝛼 𝑡 +1←𝛼 𝑡 ;
+> 5else
+> 6if 𝐿 >𝐿 slo then
+> 7𝜂 ←𝜂 fast ;
+> 8else
+> 9𝜂 ←𝜂 slow ;
+> 10 if Δ>0then
+> 11 // C2C is more saturated; shift toward AsymGEMM
+> 12 𝛼 𝑡 +1←max (0, 𝛼 𝑡 −𝜂 );
+> 13 else
+> 14 // HBM is more saturated; shift toward SymGEMM
+> 15 𝛼 𝑡 +1←min (1, 𝛼 𝑡 +𝜂 );
+> 16 return 𝛼 𝑡 +1;
+
+update is: 
+
+𝛼 𝑡 +1 = clip [0,1] (𝛼 𝑡 − 𝜂 𝑡 · sign (Δ)) ,
+
+where 𝜏 is the imbalance threshold, 𝜂 𝑡 is a latency-aware step size, and clip [0,1] (·) bounds 𝛼 within [0, 1].To avoid oscillation, C2CServe smooths latency and band-width measurements with an exponential moving average, updates 𝛼 only when |Δ| > 𝜏 , and bounds the maximum step size per interval. The controller runs at layer or request boundaries for each active MIG instance, avoiding changes inside an in-flight kernel. Since 𝛼 only changes the selected prebuilt HybridGEMM variant or the SM partition ratio, the controller does not modify chunk size, model placement, or weight layout, keeping runtime tuning lightweight. Specifically, at each control interval, C2CServefirst smooths the measured latency and bandwidth utilization to filter out short-term noise. It then compares normalized C2C and HBM utilization to identify the dominant bottleneck. If the two paths are balanced, the controller keeps 𝛼 unchanged. Other-wise, it adjusts 𝛼 toward the less-contended dataflow, using a larger step when the GEMM latency exceeds its budget and a smaller step when the operator already meets the target. 
+
+8 Implementation 
+
+C2CServe is implemented with approximately 5K lines of CUDA/C++ and 4K lines of Python, with a fork delta of about 3K lines against upstream Mini-SGLang [ 2 ]. CPU-resident weights are allocated using cudaHostAlloc [ 10 ]with the cudaHostAllocMapped flag, which provides pinned and device-mapped host memory. Kernels access these weights through device pointers. These accesses use ordinary global-memory load instructions and are transparently routed over  
+
+> 9Conference’17, July 2017, Washington, DC, USA Shutian Luo, Ali Zafar Sadiq, Rui Yang, Mingye Zhang, Haiying Shen, Wei Wang, and Yue Cheng
+
+C2C through the unified address space; no specialized intrin-sics or driver-level mechanisms are required. We integrate C2CServe into a fork of Mini-SGLang [ 2]. The HybridGEMM dispatcher replaces Mini-SGLang’s cuBLAS calls in the projection operators of attention and MLP layers, while the C2CServe scheduler replaces Mini-SGLang’s re-quest batcher. KV-cache management, continuous batching, and the API frontend remain unchanged. 
+
+9 Evaluation 
+
+9.1 Experimental Setup Hardware. We evaluate C2CServe on an NVIDIA GH200 Grace Hopper Superchip with 480 GB Grace LPDDR5X mem-ory, 96 GB HBM3, and C2C interconnect with up to ∼900 GB/s peak bandwidth. We evaluate both full-GPU execution and partitioned MIG execution. The MIG configurations are sum-marized in Table 1. 
+
+Software. Our evaluation server runs Ubuntu 22.04.5 LTS on an aarch64 Linux platform. We use CUDA 12.8 [ 3 ], Py-Torch 2.7.0 [ 4 ] and CUTLASS 4.3.5 [ 11 ]. C2CServe is imple-mented on top of mini-sglang [2]. 
+
+Workloads. We use GenTD26 [ 1 , 33 ], an anonymized pro-duction generative-AI serving trace from Alibaba that con-tains 3.5 million requests across 87 models over three weeks on 300+ GPUs. We use ShareGPT [ 9] to derive prompt and output length distributions for latency microbenchmarks. 
+
+Baselines. 
+
+• ServerlessLLM (SLLM) [ 21 ]: Reduces LLM cold-start latency with multi-tier checkpoint loading, live migra-tion, and locality-aware scheduling. 
+
+• Aegaeon [ 42 ]: Enables multi-model GPU pooling through token-granularity scheduling and auto-scaling with low scaling overhead. 
+
+• MoE-Infinity [44 ]: Exploits sparse expert reuse in batch-one MoE inference to guide expert caching and prefetching on memory-limited machines. 
+
+• FineMoE [46 ]: Reduces MoE memory usage via fine-grained expert offloading guided by expert-selection patterns and prompt hints. 
+
+Models. We evaluate dense and MoE models [ 8 ] according to the scope of each baseline. For dense-model baselines, including ServerlessLLM and Aegaeon, we use Llama-3 [ 20 ]models with Llama-3B, Llama-8B and Llama-70B parameters. For MoE baselines, including ServerlessLLM, MoE-Infinity, and FineMoE, we use Mixtral-8x7B [ 27 ] and Qwen3-30B-A3B [45]. All models use BF16 precision. 
+
+Performance Metrics. We measure LLM serving per-formance using the 95th-percentile TTFT and TPOT, and evaluate serving elasticity using cold-start latency and model-switch latency. Llama-3B Llama-8B Llama-70B               
+
+> 10 2
+> 10 3
+> TTFT (ms)
+> 19
+> 42
+> 426
+> 31 32
+> OOM
+> 76
+> 152
+> OOM
+> (a) Dense TTFT
+> Llama-3B Llama-8B Llama-70B
+> 10 2
+> 10 3
+> TPOT (ms)
+> 18
+> 41
+> 366
+> 29 30
+> OOM
+> 30
+> 53
+> OOM
+> (b) Dense TPOT
+> Qwen3-30B-A3B Mixtral-8x7B
+> 10 0
+> 10 1
+> TTFT (s)
+> 0.6
+> 0.4
+> 1.8
+> 0.2
+> 1.8
+> 0.3
+> 4.4
+> 0.5
+> (c) MoE TTFT
+> Qwen3-30B-A3B Mixtral-8x7B
+> 10 2
+> 10 3
+> TPOT (ms)
+> 286
+> 100
+> 196
+> 57
+> 270
+> 99
+> 340
+> 149
+> (d) MoE TPOT
+> C2CServe SLLM Aegaeon MoE-Infinity FineMoE
+
+Figure 9. TTFT and TPOT comparison across baselines. 
+
+9.2 End-to-End Evaluation 9.2.1 Full-GPU Serving Performance. We evaluate serv-ing performance on the full GPU, as shown in Fig. 9. For dense models, C2CServe is competitive with ServerlessLLM on the commonly supported models, achieving the same average TPOT and slightly lower average TTFT. Compared with Aegaeon, C2CServe reduces TTFT and TPOT by 3.8 ×
+
+and 1.5 × on average, respectively. In addition, C2CServe en-ables Llama-70B execution, where both ServerlessLLM and Aegaeon run out of memory. For MoE models, C2CServe provides substantial TTFT re-duction on Qwen3-30B-A3B, improving over ServerlessLLM, MoE-Infinity, and FineMoE by 3.0 ×, 2.9 ×, and 7.2 ×, respec-tively. On Mixtral-8x7B, ServerlessLLM achieves the lowest TTFT, while C2CServe still outperforms FineMoE. For TPOT, C2CServe remains competitive with MoE-specific baselines: it nearly matches MoE-Infinity on Mixtral-8x7B and reduces TPOT over FineMoE by 1.2–1.5 ×, though ServerlessLLM achieves lower TPOT on both MoE models. Overall, these results show that shifting model residency from HBM to CPU memory primarily removes cold-start and capacity bottlenecks, while HybridGEMM keeps the runtime streaming overhead low enough to preserve competitive per-token performance. 
+
+9.2.2 Cold-Start Overhead under MIG Partitioning. 
+
+We measure end-to-end cold-start latency when the requested model is not resident in any active inference engine. This includes loading model parameters from disk and initializing the inference runtime from scratch, with latency measured from request arrival to the generation of the first token. Figure 10 compares cold-start latency across dense and MoE models. For dense models, C2CServe reduces latency over ServerlessLLM by 1.15–1.37 × on commonly supported models and enables Llama-70B, where both ServerlessLLM 
+
+> 10
+
+C2CServe: Leveraging NVLink-C2C for Elastic Serverless LLM Serving on MIG Conference’17, July 2017, Washington, DC, USA Llama-3B Llama-8B Llama-70B             
+
+> 10 1
+> 10 2
+> 10 3
+> Cold-start Overhead (s)
+> 13 15
+> 92 71 97 87
+> 280
+> OOM
+> OOM
+> (a) Dense models
+> Mixtral-8x7B Qwen3-30B-A3B
+> 10 1
+> 10 2
+> 10 3
+> Cold-start Overhead (s)
+> 22 28
+> 129 128
+> 40
+> 78
+> 182 198
+> (b) MoE models
+> C2CServe SLLM Aegaeon MoE-Infinity FineMoE
+
+Figure 10. Cold-start latency C2CServe SLLM Aegaeon        
+
+> 10 2
+> 10 1
+> 10 0
+> 10 1
+> Model Switch Overhead (s)
+> 50ms
+> 1.7s
+> 119ms
+> (a) Dense Model
+> C2CServe SLLM MoE-Inf FineMoE
+> 10 1
+> 10 0
+> 10 1
+> 10 2
+> 10 3
+> Model Switch Overhead (s)
+> 318ms
+> 12s
+> 105s 128s
+> (b) MoE Model
+
+Figure 11. Model-switch Overhead. 0 10 20 30 40                
+
+> Time (minutes)
+> 0
+> 10 0
+> 10 1
+> Request Rate (Req/s)
+> (a) Workload pattern
+> 010 20 30 40
+> Time (minutes)
+> 10 3
+> TTFT (ms)
+> (b) Dense Models
+> 010 20 30 40
+> Time (minutes)
+> 10 3
+> TTFT (ms)
+> (c) MoE Models
+> Llama-3B Llama-8B Mixtral-8x7B Qwen3-30B-A3B
+> C2CServe SLLM Aegaeon MoE-Inf FineMoE
+
+Figure 12. MoE and Dense Models trace replay. and Aegaeon run out of memory. Compared with Aegaeon, C2CServe improves latency by up to 7.1 ×. For MoE models, C2CServe reduces cold-start latency over MoE-Infinity and FineMoE by 4.6–5.0 ×, and outperforms ServerlessLLM by 1.95 × on Qwen3-30B-A3B. Overall, C2CServe avoids HBM-capacity failures while maintaining low cold-start latency across dense and MoE workloads. 
+
+9.2.3 Model Switch under MIG Partitioning. We eval-uate warm-runtime model-switch latency in Fig. 11, where the model has been loading into pinned CPU memory rather the in the disk before the switching. Compared with existing systems, C2CServe reduces model-switch overhead by one to three orders of magnitude. On dense models, it lowers switching overhead from 1.7 s in ServerlessLLM and 119 ms in Aegaeon to 50 ms. On MoE models, it reduces switching overhead from 12 s in Serverless-LLM, 105 s in MoE-Infinity, and 128 s in FineMoE to 318 ms. These results show that CPU-resident model weights turn model switching from a heavyweight reload path into a light-weight runtime operation. Aegaeon FineMoE MoE-Inf SLLM   
+
+> 0
+> 1
+> 2
+> 3
+> TTFT (s)
+> OOM
+> 0.48
+> 2.58
+> 2.17
+> 0.15
+> 1.36 1.40
+> 0.57
+> Original +HybridGEMM
+
+Figure 13. Baseline integrated with HybridGEMM. 
+
+9.3 Dynamic Workload 
+
+We replay a production-derived dynamic workload using open-source models, as shown in Fig. 12(a). The trace is bursty and time-varying, stressing model switching and la-tency stability. Figures 12(b) and 12(c) report TTFT over time. On dense models,C2CServe keeps TTFT around 0.2– 0.7 s, compared with 2–7 s for ServerlessLLM and 0.3–2 s for Aegaeon. On MoE models,C2CServe stays around 0.5– 0.8 s, while ServerlessLLM, MoE-Infinity, and FineMoE often reach several seconds and occasionally exceed 10 s. Under a 1 s TTFT target, C2CServe meets the latency requirement for 95% of requests. These results show that CPU-resident weights reduce model-switching overhead and queueing pressure under bursty demand. 
+
+9.4 Component-Level Evaluation 
+
+In this section, we will study how each component in C2CServe contribute to the end-to-end performance. 
+
+9.4.1 Benefits of HybridGEMM. The key advantage of C2CServe is that it keeps model parameters in CPU mem-ory and accesses them directly during execution, avoiding expensive GPU weight loading on the cold-start path. To ex-amine whether existing systems can benefit from this mecha-nism alone, we integrate HybridGEMM into several baselines, as shown in Fig. 13. With HybridGEMM, Aegaeon reduces TTFT from 0.48 s to 0.15 s, a 68% reduction. HybridGEMM also reduces TTFT from 2.58 s to 1.36 s for FineMoE and from 2.17 s to 1.40 s for MoE-Infinity, corresponding to 47% and 36% reductions, respectively. In addition, HybridGEMM en-ables ServerlessLLM to serve Llama-70B, which otherwise runs out of HBM, achieving 0.57 s TTFT. These results show that direct CPU-memory execution can substantially reduce weight-loading overhead while enabling larger models to be served. 
+
+9.4.2 Bandwidth-aware Placement. We evaluate the ef-fectiveness of bandwidth-aware placement by comparing C2CServe’s smart scheduler with a random placement pol-icy. As shown in Fig. 14(a), random placement results in a p99 TTFT of 1.24 s, because mismatched model–MIG as-signments can overload either the shared C2C link or the MIG-local HBM bandwidth. In contrast, the smart scheduler matches each model to a MIG slice whose remaining HBM 
+
+11 Conference’17, July 2017, Washington, DC, USA Shutian Luo, Ali Zafar Sadiq, Rui Yang, Mingye Zhang, Haiying Shen, Wei Wang, and Yue Cheng Random BW Aware   
+
+> 0.00
+> 0.25
+> 0.50
+> 0.75
+> 1.00
+> 1.25
+> 1.50
+> TTFT (s)
+> 1.24
+> 0.64
+> (a) Model Placement
+> Default MIG Aware
+> 0.0
+> 0.5
+> 1.0
+> 1.5
+> 2.0
+> TTFT (s)
+> 1.81
+> 0.64
+> (b) Chunk Sizing
+> GEMM HybridGEMM
+> 0.0
+> 0.2
+> 0.4
+> 0.6
+> 0.8
+> 1.0
+> 1.2
+> TTFT (s)
+> 0.95
+> 0.64
+> (c) Fine Tuning
+
+Figure 14. Component-level comparison. and C2C bandwidth budgets fit its runtime demand, reduc-ing p99 TTFT to 0.64 s, a 1.94 × improvement. This benefit appears even when the chunk controller and HybridGEMM are already active, showing that bandwidth-aware placement is essential for controlling tail latency under multi-tenant MIG execution. 
+
+9.4.3 Chunk-size Control. We evaluate the effectiveness of the chunk controller by comparing the default chunk configuration with C2CServe’s tuned chunk size. As shown in Fig. 14(b), the default configuration leads to a p99 TTFT of 1.81 s, while the tuned chunk controller reduces it to 0.64 s, a 2.83 × improvement. The key mechanism is that chunking controls the per-step C2C burst size: without proper tuning, peak bandwidth demand spikes during prefill, causing SLO-bound requests on small MIG slices to miss their latency targets. By selecting chunk sizes that fit the available C2C and MIG-local HBM bandwidth budgets, C2CServe smooths bandwidth demand and substantially reduces tail latency. 
+
+9.4.4 HybridGEMM Knob Tuning. We evaluate the ef-fectiveness of tuning the HybridGEMM dataflow knob 𝛼 by comparing a static GEMM configuration with C2CServe’s HybridGEMM configuration. As shown in Fig. 14(c), the static configuration results in a p99 TTFT of 0.95 s, while Hy-bridGEMM reduces it to 0.64 s, a 1.48 × improvement. This im-provement comes from adapting the GEMM dataflow to the runtime bandwidth balance: a fixed configuration can over-load either C2C or HBM bandwidth, whereas HybridGEMM balances C2C and HBM pressure across MIG slices. This re-sult shows that HybridGEMM must be tuned jointly with placement and chunk sizing rather than configured statically. 
+
+9.5 Projection to Future Superchips 
+
+We use a simple hardware-projection model to examine whether C2CServe follows the Superchip hardware trend. As summarized in Table 2, we use GH200 [ 13 ] as the baseline and assume the GEMM data-access pattern remains unchanged across generations. The key tradeoff is that conventional HBM-resident GEMM mainly benefits from higher HBM bandwidth, whereas HybridGEMM is primarily bounded by C2C bandwidth when streaming CPU-resident weights. On GB200 [ 12 ], CPU memory and C2C bandwidth remain simi-lar to GH200, while HBM bandwidth increases by about 2×,
+
+Table 2. Superchip hardware information.                 
+
+> Platform CPU mem. HBM HBM BW C2C BW GH200 [13] 480 GB 96 GB 4.0 TB/s 900 GB/s GB200 [12] 480 GB 192 GB 8.0 TB/s 900 GB/s Rubin [15] 1.5 TB 288 GB 22 TB/s 1.8 TB/s
+
+so conventional GEMM benefits more from the hardware upgrade than HybridGEMM. For Rubin-class hardware [ 15 ], the trend becomes more favorable to C2CServe: CPU memory, HBM bandwidth, and C2C bandwidth increase by about 3.2×, 5.5×, and 2× over GH200, respectively. Although HybridGEMM scales with C2C bandwidth and therefore improves more slowly than HBM-resident GEMM, the 3.2× larger CPU memory tier can expand the CPU-resident model pool enough to offset the rel-ative GEMM performance gap. This suggests that C2CServe is aligned with the Superchip roadmap, where CPU memory becomes a larger active weight tier that GPUs can directly access through high-bandwidth C2C links. 
+
+10 Related Work 
+
+Serverless LLM serving. Recent systems improve LLM serving elasticity by reducing cold-start overhead, improv-ing model multiplexing, or offloading model states. Server-lessLLM [ 21 ] uses multi-tier checkpoint loading, live mi-gration, and locality-aware scheduling to reduce cold starts, while Aegaeon [ 42 ] improves multi-model GPU pooling with token-granularity scheduling and autoscaling. Medusa [ 48 ]and Foundry [ 34 ] reduce startup overhead by materializing CUDA graph states offline and restoring them online. For MoE serving, MoE-Infinity [ 44 ] and FineMoE [ 46 ] reduce GPU memory pressure through expert caching, prefetching, and offloading. These systems optimize model loading, run-time state reconstruction, or expert placement, but generally rely on staging weights or experts into GPU memory be-fore computation. C2CServe instead keeps weights in CPU memory and executes over them directly through NVLink-C2C, enabling request-granularity model switching on MIG instances without reloading weights into HBM. 
+
+GPU resource multiplexing. GPU sharing improves uti-lization by multiplexing workloads in time or space. Tempo-ral multiplexing [ 5 ] shares GPU time through context switch-ing, whereas spatial sharing allows concurrent execution on the same GPU to reduce switching overhead [ 40 ]. NVIDIA MIG [ 22 ] provides hardware-supported spatial sharing by partitioning a GPU into isolated instances with dedicated compute and memory resources. Orion [ 37 ] improves fine-grained spatial sharing by co-scheduling operators according to compute and memory demand, REEF [ 24 ] improves tem-poral sharing with microsecond-scale kernel preemption and controlled concurrency, and LLMStation [ 25 ] combines spatial and temporal multiplexing for concurrent LLM fine-tuning and inference. Unlike these systems, C2CServe targets 
+
+> 12
+
+C2CServe: Leveraging NVLink-C2C for Elastic Serverless LLM Serving on MIG Conference’17, July 2017, Washington, DC, USA 
+
+MIG-based LLM serving on CPU–GPU Superchips, where the key challenge is coordinating MIG-local HBM resources with the shared NVLink-C2C bandwidth used to stream CPU-resident weights. 
+
+Superchip-based LLM systems. CPU–GPU Superchips such as NVIDIA GH200 have motivated new designs for LLM offloading and memory management. SuperOffload [ 31 ] opti-mizes LLM training by jointly using the GPU, Grace CPU, and NVLink-C2C. For inference, SuperInfer [ 47 ] improves TTFT SLO attainment with SLO-aware request rotation and full-duplex NVLink-C2C KV transfer, Pie [ 43 ] expands effective memory with performance-transparent CPU–GPU swap-ping, and Oneiros [ 30 ] remaps memory from inactive model parameters to KV cache to reduce swapping. C2CServe is complementary: rather than optimizing training offload, KV transfer, or memory swapping, it targets MIG-based server-less serving and uses NVLink-C2C to execute directly over CPU-resident model weights across isolated MIG instances. 
+
+11 Conclusion 
+
+We present C2CServe, a request-granularity serverless LLM serving system that enables MIG instances to switch models across requests without loading weights into HBM. C2CServe combines HybridGEMM, a heterogeneous-memory GEMM kernel that balances HBM and NVLink-C2C traffic, with a hierarchical scheduler that jointly controls model placement, chunk sizing, and runtime kernel selection. 
+
+References 
+
+[1] Genai in alibaba cloud:. https://github.com/alibaba/clusterdata/tree/ master/cluster-trace-v2026-GenAI .[2] mini-sglang:. https://github.com/sgl-project/mini-sglang .[3] Nvidia cuda toolkit:. https://developer.nvidia.com/cuda/toolkit .[4] pytorch:. https://pytorch.org/ .[5] Time-slicing gpus:. https://docs.nvidia.com/datacenter/cloud-native/ gpu-operator/latest/gpu-sharing.html .[6] Nvidia pinned memory. https://docs.nvidia.com/cuda/cuda-c-programming-guide/#page-locked-host-memory , 2022. [7] Nvidia zero copy memory. https://docs.nvidia.com/cuda/cuda-c-programming-guide/#zero-copy-memory , 2022. [8] Huggingface dataset. https://huggingface.co/datasets , 2023. [9] Sharegpt. https://sharegpt.com/ , 2023. [10] Cuda memory management. https://docs.nvidia.com/cuda/cuda-runtime-api/group__CUDART__MEMORY.html , 2025. [11] Nvidia cutlass. https://github.com/NVIDIA/cutlass , 2025. [12] Nvidia gb200. https://www.nvidia.com/en-us/data-center/dgx-gb200/ ,2025. [13] Nvidia gh200. https://www.nvidia.com/en-us/data-center/grace-hopper-superchip/ , 2025. [14] cublas: Basic linear algebra on nvidia gpus. https://developer.nvidia. com/cublas , 2026. [15] Nvidia vera rubin platform. https://www.nvidia.com/en-us/data-center/technologies/rubin/ , 2026. [16] Josh Achiam, Steven Adler, Sandhini Agarwal, Lama Ahmad, Ilge Akkaya, Florencia Leoni Aleman, Diogo Almeida, Janko Altenschmidt, Sam Altman, Shyamal Anadkat, et al. Gpt-4 technical report. arXiv preprint arXiv:2303.08774 , 2023. [17] Amey Agrawal, Nitin Kedia, Ashish Panwar, Jayashree Mohan, Nipun Kwatra, Bhargav Gulavani, Alexey Tumanov, and Ramachandran Ram-jee. Taming {Throughput-Latency } tradeoff in {LLM } inference with 
+
+{Sarathi-Serve }. In Proceedings of OSDI , 2024. [18] Seungbeom Choi, Sunho Lee, Yeonjae Kim, Jongse Park, Youngjin Kwon, and Jaehyuk Huh. Serving heterogeneous machine learning models on {Multi-GPU } servers with {Spatio-Temporal } sharing. In 
+
+Proceedings of USENIX ATC , 2022. [19] Jiangfei Duan, Runyu Lu, Haojie Duanmu, Xiuhong Li, Xingcheng Zhang, Dahua Lin, Ion Stoica, and Hao Zhang. Muxserve: flexible spatial-temporal multiplexing for multiple llm serving. 2024. [20] Abhimanyu Dubey, Abhinav Jauhri, Abhinav Pandey, Abhishek Ka-dian, Ahmad Al-Dahle, Aiesha Letman, Akhil Mathur, Alan Schelten, Amy Yang, Angela Fan, et al. The llama 3 herd of models. arXiv e-prints , 2024. [21] Yao Fu, Leyang Xue, Yeqi Huang, Andrei-Octavian Brabete, Dmitrii Ustiugov, Yuvraj Patel, and Luo Mai. {ServerlessLLM }:{Low-Latency }
+
+serverless inference for large language models. In Proceedings of OSDI ,2024. [22] Multi Instance GPU. https://www.nvidia.com/en-us/technologies/ multi-instance-gpu/ , 2022. [23] Tyler Griggs, Xiaoxuan Liu, Jiaxiang Yu, Doyoung Kim, Wei-Lin Chi-ang, Alvin Cheung, and Ion Stoica. M \’elange: Cost efficient large language model serving by exploiting gpu heterogeneity. arXiv preprint arXiv:2404.14527 , 2024. [24] Mingcong Han, Hanze Zhang, Rong Chen, and Haibo Chen. Microsecond-scale preemption for concurrent {GPU-accelerated } { DNN } inferences. In Proceedings of OSDI , 2022. [25] Yongjun He, Haofeng Yang, Yao Lu, Ana Klimovic, and Gustavo Alonso. Resource multiplexing in tuning and serving large language models. In Proceedings of ATC , 2025. [26] Junhao Hu, Jiang Xu, Zhixia Liu, Yulong He, Yuetao Chen, Hao Xu, Jiang Liu, Jie Meng, Baoquan Zhang, Shining Wan, et al. 
+
+{DEEPSERVE }: Serverless large language model serving at scale. In 
+
+Proceedings of USENIX ATC , 2025. [27] Albert Q Jiang, Alexandre Sablayrolles, Antoine Roux, Arthur Mensch, Blanche Savary, Chris Bamford, Devendra Singh Chaplot, Diego de las Casas, Emma Bou Hanna, Florian Bressand, et al. Mixtral of experts. 
+
+arXiv preprint arXiv:2401.04088 , 2024. [28] Jared Kaplan, Sam McCandlish, Tom Henighan, Tom B Brown, Ben-jamin Chess, Rewon Child, Scott Gray, Alec Radford, Jeffrey Wu, and Dario Amodei. Scaling laws for neural language models. arXiv preprint arXiv:2001.08361 , 2020. [29] Jie Li, Laiping Zhao, Yanan Yang, Kunlin Zhan, and Keqiu Li. Tetris: Memory-efficient serverless inference through tensor sharing. In 
+
+Proceedings of USENIX ATC , 2022. [30] Ruihao Li, Shagnik Pal, Vineeth Narayan Pullu, Prasoon Sinha, Jeeho Ryoo, Lizy K John, and Neeraja J Yadwadkar. Oneiros: Kv cache opti-mization through parameter remapping for multi-tenant llm serving. In Proceedings of the 2025 ACM Symposium on Cloud Computing , pages 88–101, 2025. [31] Xinyu Lian, Masahiro Tanaka, Olatunji Ruwase, and Minjia Zhang. Superoffload: Unleashing the power of large-scale llm training on superchips. In Proceedings of ASPLOS , 2026. [32] Yanying Lin, Shijie Peng, Chengzhi Lu, Chengzhong Xu, and Kejiang Ye. Flexpipe: Adapting dynamic llm serving through inflight pipeline refactoring in fragmented serverless clusters. In Proceedings of EuroSys ,2026. [33] Yanying Lin, Shuaipeng Wu, Shutian Luo, Hong Xu, Haiying Shen, Chong Ma, Min Shen, Le Chen, Chengzhong Xu, Lin Qu, et al. Under-standing diffusion model serving in production: A top-down analysis of workload, scheduling, and resource efficiency. In Proceedings of ACM SoCC , 2025. 13 Conference’17, July 2017, Washington, DC, USA Shutian Luo, Ali Zafar Sadiq, Rui Yang, Mingye Zhang, Haiying Shen, Wei Wang, and Yue Cheng 
+
+[34] Xueshen Liu, Yongji Wu, Yuncheng Yao, Danyang Zhuo, Ion Stoica, and Z Morley Mao. Foundry: Template-based cuda graph context material-ization for fast llm serving cold start. arXiv preprint arXiv:2604.06664 ,2026. [35] Ziming Mao, Tian Xia, Zhanghao Wu, Wei-Lin Chiang, Tyler Griggs, Romil Bhardwaj, Zongheng Yang, Scott Shenker, and Ion Stoica. Sky-serve: Serving ai models across regions and clouds with spot instances. In Proceedings of EuroSys , 2025. [36] Ying Sheng, Shiyi Cao, Dacheng Li, Coleman Hooper, Nicholas Lee, Shuo Yang, Christopher Chou, Banghua Zhu, Lianmin Zheng, Kurt Keutzer, et al. S-lora: Serving thousands of concurrent lora adapters. 2023. [37] Foteini Strati, Xianzhe Ma, and Ana Klimovic. Orion: Interference-aware, fine-grained gpu sharing for ml applications. In Proceedings of EuroSys , pages 1075–1092, 2024. [38] Hugo Touvron, Thibaut Lavril, Gautier Izacard, Xavier Martinet, Marie-Anne Lachaux, Timothée Lacroix, Baptiste Rozière, Naman Goyal, Eric Hambro, Faisal Azhar, et al. Llama: Open and efficient foundation language models. arXiv preprint arXiv:2302.13971 , 2023. [39] Ashish Vaswani, Noam Shazeer, Niki Parmar, Jakob Uszkoreit, Llion Jones, Aidan N Gomez, Łukasz Kaiser, and Illia Polosukhin. Attention is all you need. 2017. [40] Nandita Vijaykumar, Kevin Hsieh, Gennady Pekhimenko, Samira Khan, Ashish Shrestha, Saugata Ghose, Adwait Jog, Phillip B Gibbons, and Onur Mutlu. Zorua: A holistic approach to resource virtualization in gpus. In Proceedings of MICRO , 2016. [41] Borui Wan, Mingji Han, Yiyao Sheng, Yanghua Peng, Haibin Lin, Mo-fan Zhang, Zhichao Lai, Menghan Yu, Junda Zhang, Zuquan Song, et al. {ByteCheckpoint }: A unified checkpointing system for large foundation model development. In Proceedings of NSDI , 2025. [42] Yuxing Xiang, Xue Li, Kun Qian, Yufan Yang, Diwen Zhu, Wenyuan Yu, Ennan Zhai, Xuanzhe Liu, Xin Jin, and Jingren Zhou. Aegaeon: Effective gpu pooling for concurrent llm serving on the market. In 
+
+Proceedings of SOSP , 2025. [43] Yi Xu, Ziming Mao, Xiangxi Mo, Shu Liu, and Ion Stoica. Pie: Pooling cpu memory for llm inference. arXiv preprint arXiv:2411.09317 , 2024. [44] Leyang Xue, Yao Fu, Zhan Lu, Luo Mai, and Mahesh Marina. Moe-infinity: Efficient moe inference on personal machines with sparsity-aware expert cache. arXiv preprint arXiv:2401.14361 , 2024. [45] An Yang, Anfeng Li, Baosong Yang, Beichen Zhang, Binyuan Hui, Bo Zheng, Bowen Yu, Chang Gao, Chengen Huang, Chenxu Lv, et al. Qwen3 technical report. arXiv preprint arXiv:2505.09388 , 2025. [46] Hanfei Yu, Xingqi Cui, Hong Zhang, and Hao Wang. Taming latency-memory trade-off in moe-based llm serving via fine-grained expert offloading. In Proceedings of EuroSys , 2026. [47] Jiahuan Yu, Mingtao Hu, Zichao Lin, and Minjia Zhang. Superinfer: Slo-aware rotary scheduling and memory management for llm inference on superchips. 2026. [48] Shaoxun Zeng, Minhui Xie, Shiwei Gao, Youmin Chen, and Youyou Lu. Medusa: Accelerating serverless llm inference with materialization. In 
+
+Proceedings of ASPLOS , 2025. 14
