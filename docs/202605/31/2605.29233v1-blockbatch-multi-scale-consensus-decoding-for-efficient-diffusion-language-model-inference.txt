@@ -1,0 +1,1365 @@
+Title: BlockBatch: Multi-Scale Consensus Decoding for Efficient Diffusion Language Model Inference
+
+URL Source: https://arxiv.org/pdf/2605.29233v1
+
+Published Time: Fri, 29 May 2026 00:32:12 GMT
+
+Number of Pages: 23
+
+Markdown Content:
+# BlockBatch: Multi-Scale Consensus Decoding for Efficient Diffusion Language Model Inference 
+
+Xiaoyou Wu Cheng-Jhih Shih Binfei Ji Yong Liu Yingyan (Celine) Lin 
+
+Georgia Institute of Technology 
+
+xwu488@gatech.edu 
+
+Abstract 
+
+Diffusion language models (dLLMs) generate text by iteratively denoising multiple token po-sitions in parallel, offering an attractive alter-native to strictly autoregressive decoding. In practice, however, block-wise dLLM inference exposes a difficult granularity trade-off: small blocks preserve local conditioning but require many denoising steps, whereas large blocks ex-pose more parallelism but can make premature commitments and accumulate cache error. Ex-isting acceleration methods typically choose a single block size per request, leaving the com-plementarity among block sizes unused. We show that block size itself is a useful branch-ing dimension. Different block sizes induce related but non-identical KV-cache trajectories: branches often share an initial prefix, bifurcate at semantically decisive positions, and later agree on syntactically lightweight tokens. Moti-vated by this structure, we propose BlockBatch, a training-free online inference framework that executes multiple block-size branches for the same request inside a batched forward pass. BlockBatch coordinates these branches through confidence-gated token merging, leader-based synchronization, and periodic full-sequence re-freshes that re-anchor local block updates to a globally consistent KV state. Across 3 repre-sentative dLLMs and 4 datasets, BlockBatch reduces denoising NFEs by 26.6% on aver-age and achieves a 1.33 × average end-to-end speedup over Fast-dLLM while preserving ac-curacy. These results identify block-size diver-sity as a practical and previously underexplored axis for branch-parallel dLLM inference. 
+
+1 Introduction 
+
+Diffusion language models (dLLMs) (Gong et al., 2025) replace left-to-right factorization with iter-ative masked denoising (Campbell et al., 2022, 2024; Chen et al., 2023; Vignac et al., 2023): at  
+
+> GitHub code available at BlockBatch .
+
+Figure 1: BlockBatch speedup against Fast-dLLM and the vanilla baseline on MBPP. 
+
+each generation round, the model predicts distri-butions over many token positions and commits a subset of tokens in parallel. Recent masked dLLMs (Ye et al., 2025; Nie et al., 2025b) have substantially narrowed the gap to autoregressive language models and, in several regimes, exhibit competitive scaling, instruction-following, and flex-ible generation behavior (Sahoo et al., 2024; Nie et al., 2025b; Ye et al., 2025; Prabhudesai et al., 2025). This parallelism is attractive for inference, but it is not free. Committing too few tokens pre-serves local conditioning but requires many denois-ing rounds; committing too many tokens increases apparent parallelism but can make premature de-cisions and degrade cache consistency (Ma et al., 2025). Efficient dLLM inference hence depends on finding the right granularity at which to trade off parallel token updates, confidence, and state reuse. A central mechanism for making this trade-off practical is block-wise inference with approx-imate KV reuse (Jiang et al., 2026). Instead of recomputing the full sequence at every denoising step, block-wise methods update a local decod-ing window while reusing, delaying, or selectively refreshing cached KV states outside the active re-  
+
+> arXiv:2605.29233v1 [cs.LG] 28 May 2026 Figure 2: Per-sample block-size oracle versus fixed block-size decoding. Bars report average NFE and curves/markers report accuracy for fixed confidence-decoding block sizes, block batching, and an oracle that selects the best block size per prompt. The oracle improves the accuracy–NFE tradeoff across models and tasks, motivating block size as a per-sample branching dimension rather than a fixed hyperparameter.
+
+gion (Wu et al., 2026; Liu et al., 2025; Jiang et al., 2026). The block size determines the granularity of this process. Small blocks are conservative: they more closely approximate sequential conditioning but require more denoising function evaluations (NFEs) (Cheng et al., 2025). Large blocks expose more parallel work per model invocation, but they weaken intra-block conditioning, accumulate larger cache discrepancies, and may require downstream correction (Nie et al., 2025a; Zhang et al., 2025). Existing systems therefore typically select a single block size for a request, either as a fixed hyperpa-rameter or through a local adaptation rule. This single-trajectory view leaves a natural opportunity unused: different block sizes may be useful for different parts of the same generation. Our starting point is that block size is not merely an inference hyperparameter, but a source of complementary decoding trajectories. In our experiments shown in Fig. 2, a per-sample oracle that chooses among block sizes achieves a better accuracy–NFE tradeoff than any single fixed block-size configuration. This indicates that there is no globally optimal block size across prompts, tasks, or models. The observation suggests a different form of branch-parallel decoding. Prior acceler-ation methods for autoregressive language mod-els often branch along the token-candidate axis, producing speculative or tree-structured continua-tions that are later verified, accepted, or discarded (Leviathan et al., 2023; Cai et al., 2024a). In con-trast, we branch along the block-size axis. All branches share the same prompt and initial KV cache, but they advance with different denoising granularities and therefore trace different trajec-tories through the space of partially decoded se-quences and KV-cache states. These block-size branches are neither indepen-dent generations nor redundant copies. At the token level, they often agree on an initial prefix, bifurcate at a small number of semantically decisive posi-tions, and later re-agree at positions with low local ambiguity. Our token-category analysis shows that such later-stage agreement is concentrated on syn-tactically lightweight tokens (see Appendix B.1). In contrast, bifurcation positions tend to carry the semantic content that determines the final answer. At the KV-cache level, block denoising acts as a local update: it modifies only the active region while relying on cached context elsewhere, where a full-sequence refresh re-anchors the branch to a globally consistent KV state. Together, these obser-vations suggest that useful multi-branch dLLM in-ference should preserve branch diversity around bi-furcation points, exchange information only when branches are compatible, and periodically repair stale cache states. Motivated by the above findings, we propose BlockBatch, a training-free online inference frame-work for efficient dLLM decoding. For each re-quest, BlockBatch instantiates multiple branches with different block sizes and executes their ac-tive windows inside a single batched model invo-cation. The branches are coordinated by three im-portant operations. First, a confidence-gated merge transfers token proposals only between compati-ble branches and only when the destination branch assigns sufficient probability to the proposed to-ken. Second, a leader-based synchronization rule prevents lagging branches from wasting computa-tion by copying the sequence state and KV cache of a sufficiently advanced branch. Third, periodic full-sequence refreshes recompute KV states for active branches, correcting accumulated drift from local block updates. Large-block branches pro-vide aggressive progress, small-block branches pro-vide conservative alternatives, and merge/sync/full-sequence refresh operations prevent the search from degenerating into unrelated or stale trajec-tories. In summary, our contributions are as follows: • Block-size diversity as branch parallelism. 
+
+We identify block size as an underexplored axis for multi-branch dLLM inference and show that different block sizes provide complementary accuracy–efficiency tradeoffs across samples. • Token- and KV-level characterization. We analyze how block-size branches relate to one another, revealing token-level bifurcation and later-stage consensus as well as KV-cache dy-namics in which local block updates are peri-odically corrected by full-sequence refreshes. • A training-free inference framework. We introduce BlockBatch, which executes multi-ple block-size branches in parallel and coor-dinates them through confidence-gated merg-ing, leader-based synchronization, and full-sequence KV refresh. • Empirical validation. Experiments on three dLLMs (LLaDA-1.5-8B, LLaDA-Instruct-8B, Dream-7B) across four benchmarks (GSM8K, MATH, HumanEval, MBPP) show that Block-Batch reduces denoising steps by 26.6% and achieves a 1.33 × end-to-end speedup on av-erage over Fast-dLLM while preserving accu-racy. 
+
+2 Preliminaries 
+
+2.1 Diffusion LLMs as a Discrete Markov Process 
+
+Unlike continuous diffusion models that operate on Gaussian noise (Sohl-Dickstein et al., 2015; Song and Ermon, 2019; Ho et al., 2020; Song et al., 2021a,b), Masked Diffusion Language Mod-els (MDLMs) operate in a discrete, categorical state space (Hoogeboom et al., 2021a; Austin et al., 2021a; Nie et al., 2025b; Hoogeboom et al., 2021b). Let V denote the vocabulary and let [M] denote the special [MASK] token. The extended vocabulary is 
+
+˜V = V ∪ { [M] }. For a sequence of length L, the state at generative step t is represented as Xt ∈ ˜VL.The generative reverse process transitions from a fully masked state XT = [ [M] , . . . , [M] ] to a decoded state X0 ∈ V L (Sahoo et al., 2024; Ho et al., 2020). At each step t, the network ob-serves Xt and outputs a categorical distribution 
+
+pθ(x(i) = v | Xt) for each position i. Standard diffusion LLMs decode this distribution using a confidence-based mechanism. The top-1 confi-dence score is ct,i = max v∈V pθ(v | Xt). Given a confidence threshold τconf and the most confident masked index i∗, the deterministic transition for position i is                   
+
+> xt−1,i =
+> 
+> arg max
+> v∈V pθ(v|Xt),if xt,i =[M] and (ct,i ≥τconf ∨i=i∗),xt,i ,otherwise.
+
+(1) We can formalize the overall transition proba-bility as P (Xt−1 | Xt). The sequence therefore forms a discrete-time Markov chain: 
+
+P (Xt−1 | Xt, Xt+1 , . . . , XT ) = P (Xt−1 | Xt).
+
+(2) 
+
+2.2 KV Cache in Diffusion LLMs 
+
+For batched inputs, prefix caching provides the first source of reuse by sharing the KV states of identical prompt prefixes across requests. This reuse pattern is standard in autoregressive Transformer serving, where KV caching avoids recomputing previous key–value activations during decoding (Vaswani et al., 2017; Shazeer, 2019; Dao et al., 2022; Kwon et al., 2023). Modern LLM serving systems further improve prefix reuse and cache sharing through paged cache allocation, radix-tree or prefix-tree cache layouts, and shared-prefix attention kernels. Under the semi-autoregressive decoding paradigm, Fast-dLLM (Wu et al., 2026) introduces block-wise approximate KV caching: previously decoded blocks are reused, while the current block is recomputed during denoising. Several follow-up methods refine which cache entries should be recomputed and which should be retained across steps. dLLM-Cache (Liu et al., 2025) observes that dLLM inference contains a mostly static prompt and a partially dynamic response, and applies long-interval prompt caching together with feature-similarity-guided response updates. dKV-Cache exploits token-dependent representation dynamics through delayed KV reuse, storing decoded-token KV states one step later and providing decode and greedy variants that trade quality for speed (Ma et al., 2025). d 2Cache selects masked tokens using confidence and a certainty prior, then selects prompt and decoded tokens using attention-aware importance before updating only the selected KV states (Jiang et al., 2026). Related dLLM acceleration methods also exploit guided unmasking, local determinism, block-diffusion schedules, or hierarchical caching to reduce denoising cost (Hu et al., 2025; Kong et al., 2025; Fu et al., 2025; Wu et al., 2025). More broadly, these dLLM cache designs are connected to a larger body of KV-cache manage-ment work in autoregressive LLM inference. Prior systems retain important tokens, evict or com-press stale cache entries, quantize KV states, or fetch only query-relevant cache pages (Zhang et al., 2023; Liu et al., 2023; Xiao et al., 2024; Li et al., 2024; Cai et al., 2024b; Tang et al., 2024; Liu et al., 2024; Lee et al., 2024). These methods can be viewed through a common systems lens: selecting which KV states to reuse and which to refresh, then balancing stale and refreshed cache states to trade accuracy against latency. 
+
+3 KV-Level and Token-Level Characterizations of dLLM Inference 
+
+3.1 Block-Size Diversity as a Branching Axis 
+
+Existing dLLM inference systems pick a single block size per request, treating it as a hyperparam-eter. However, this design choice is suboptimal, as the accuracy-maximizing block size varies substan-tially across prompts. To quantify this, we evaluate a per-sample oracle that selects, for each prompt, the block size in {4, 8, 16 , 32 , 64 , 128 } that yields the highest accuracy under confidence-based de-coding in Fig. 2. The oracle is not realizable at inference time, but it upper-bounds any sample-wise block-size selection policy built on top of confidence decoding. Fig. 2 reports NFE and accuracy on MATH (Hendrycks et al., 2021) and MBPP (Austin et al., 2021b) for LLaDA-Instruct-8B (Nie et al., 2025b) and Dream-Base-7B (Ye et al., 2025). The oracle outperforms every fixed block size on both models and tasks while using fewer NFEs than the smaller block-size configurations, confirming that block-size diversity carries genuine per-sample information. These observations motivate treating 
+
+block size as a branching dimension rather than a hyperparameter. Notably, BlockBatch achieves even lower NFE while preserving accuracy through                  
+
+> Figure 3: KV-cache trajectory diagnostic on
+> HumanEval sample 3. Both panels visualize logged KV-cache states in the same tangent coordinate system around the prompt anchor c0. The horizontal axes are the tangent projections (⟨r, e 1⟩,⟨r, e 2⟩), where e1and
+> e2are the leading SVD directions of the centered residu-als. Left: True KV Geometry. The vertical axis shows axial displacement from the prompt anchor. As gen-eration progresses, different block-size branches bifur-cate and spread across the tangent plane, supporting the tangent-space bifurcation behavior described in Proposi-tion 3 / Sec. C.4. Right: Step-Aligned Evolution. The vertical axis is replaced by generation step, revealing the temporal structure of the same trajectories. Adjacent block-denoise updates remain locally clustered, whereas large trajectory jumps are introduced by full-sequence refreshes. This pattern indicates that refresh operations, rather than local block denoising alone, are the main source of large KV-cache trajectory displacement, con-sistent with Proposition 1 / Sec. C.2.
+
+a per-step policy of sync and merge, which is a finer granularity version of the per sample policy, demonstrating that branching dimension is still an exploitable dimension. 
+
+3.2 KV-Level Characterization: KV-Cache Trajectory Diagnostics 
+
+While Fig. 2 shows that block size is a useful branching axis, the block-size parameter itself is not the final explanation for the observed differ-ences. Instead, we show that the underlying mech-anism through which block size changes NFE and accuracy is the trajectory induced in KV-cache space. Different block sizes change how many token positions are updated under a shared cached con-text, how long a branch relies on local cache reuse, and how frequently the branch is re-anchored by a full-sequence refresh. Thus, the effect of block size is expressed through the sequence of KV-cache states visited during inference. Let K(b) 
+
+> t
+
+denote the flattened KV-cache state of branch b at event t. At the KV level, block-wise dLLM inference alternates between a block-denoise update, K(b) 
+
+> t+1
+
+= K(b) 
+
+> t
+
++∆blk (K(b) 
+
+> t
+
+, x (b) 
+
+> t
+
+, B (b) 
+
+> t
+
+), and a full-sequence refresh ,
+
+K(b) 
+
+> t+1
+
+= F (x(b) 
+
+> t
+
+). In the first operation, only the active block is recomputed while the model attends to cached KV states outside the current window. In the second operation, the KV cache is recomputed from the entire current sequence. Appendix C for-malizes these operations. In particular, Proposi-tion 1 (Sec. C.2) shows that block-denoise updates should produce smaller local movements in KV-cache vector space than full-sequence refreshes, because the direct update is restricted to the active block. This distinction is visible in Fig. 3. The pro-jected trajectories show that adjacent block-denoise steps move locally within a compact region of the KV space, whereas full-sequence refreshes produce larger global corrections between clusters. This supports the interpretation that block-size branches are not independent generations but rather differ-ent local traversals of a shared KV-cache geometry. Larger blocks tend to make more aggressive local progress under reused cache states, while smaller blocks follow more conservative trajectories with finer-grained conditioning. The same view also explains why periodic re-fresh is necessary. A block-denoise step is efficient but may increase this error because only a local win-dow is updated. A full-sequence refresh is more expensive but contracts the error by recomputing the cache from the full token state. Proposition 2 (Sec. C.3) shows that if a refresh is applied every 
+
+R block-denoise steps, the cache-consistency er-ror remains bounded when β(1 + λb)R < 1. This gives a KV-space explanation for the refresh inter-val used by BlockBatch: full-sequence refreshes are not merely an implementation detail, but rather the mechanism that prevents local block updates from drifting too far from the model-consistent KV manifold. 
+
+3.3 Token-Level Characterization: Bifurcation Tokens and Later-Stage Consensus 
+
+During block-batched inference, branches initial-ized with different block sizes begin from the same prompt and prefill cache, so their early decoded tokens often remain identical (though the length of the shared prefill varies across block sizes; see Tab. 5 in Appendix B). Divergence typically occurs at specific bifurcation tokens : once two branches    
+
+> Figure 4: Block-size branch consensus on HumanEval sam-ple 3. Branches share an identical prefix for 37 tokens, after which BS = 128 bifurcates first and smaller blocks split off later. Isolated green columns inside red regions (e.g. pos 43, 150, 170) are later-stage consensus events — previously diverged branches briefly re-agree on a token while their KV trajectories remain distinct, as shown in Fig. 3.
+
+commit different tokens at the same position, their subsequent token distributions and KV-cache tra-jectories begin to separate, since later predictions are conditioned on the current partially decoded sequence and its associated cache state. Interestingly, this token-level divergence does not always persist monotonically. Even after an early bifurcation, branches may later produce the same token at the same position. We refer to this phenomenon as later-stage consensus . As shown in Fig. 4, later-stage consensus appears around token position 190, highlighted in a deeper green. However, later-stage consensus should not be interpreted as full trajectory convergence. Agree-ment on a later token only indicates that different branches selected the same discrete token at that position. Their underlying KV states, token his-tories, and conditional distributions may still dif-fer substantially. In this sense, it is a token-level agreement event rather than a guarantee of KV-level convergence. This distinction is important: branches can agree on individual high-confidence tokens while still following different inference tra-jectories in KV-cache vector space. 
+
+4 Method 
+
+Inspired by the characterizations in Sec. 3, we observe that the main opportunity in block-wise dLLM inference is not to choose a single glob-ally optimal block size, but to exploit the com-plementary trajectories induced by multiple block sizes during the same decoding process. We there-fore propose BlockBatch (Fig. 5), a training-free framework that runs multiple block-size branches for a single request in one batched forward pass. Each branch alternates cheap local block denoising 
+
+with periodic full-sequence refreshes that re-anchor them to a consistent KV state, while a confidence-gated merge and leader-based sync operations ex-change compatible tokens and prune stale branches around bifurcation points. 
+
+4.1 Exploiting Bifurcation 
+
+Block-wise denoising may enter low-progress re-gions where local updates do not advance enough tokens. Instead of treating multiple branches only as redundant work, we use their diversity as a source of useful proposals. Branches can share tokens and KV states when their decoded prefixes are compatible. The detailed algorithm is shown in Algorithm 2 (Appendix D), where the overview is shown in Fig. 5. 
+
+Confidence-Gated Merge The merge operation transfers high-confidence token proposals across compatible branches. A source branch is com-patible with a destination branch if all positions decoded in both branches are exactly the same. For a masked position in the destination branch, we inspect tokens proposed by compatible source branches and accept the best candidate only when the destination branch’s own probability map as-signs that token confidence above a fixed threshold. This gives lagging branches free progress without forcing them to accept tokens inconsistent with their local state. 
+
+Leader-Based Sync The sync operation handles larger progress gaps. If the leading branch has decoded more than a threshold number of tokens beyond a lagging branch (this number is controlled by the sync threshold, see Appendix A for ablation Tab. 2), the lagging branch copies the leader’s se-quence state and KV cache row. Its block window is then realigned to the first remaining masked po-sition. Sync therefore acts as a controlled reset: it preserves the fastest reliable trajectory while pre-venting slow branches from wasting computation within stale regions of the KV space. 
+
+4.2 System-Level Optimization 
+
+Fig. 6-(a) shows per-step block denoising latency on an H200 across varying batch size × block size combinations. Latency stays nearly flat in the memory-bound regime but rises sharply once the total token count exceeds roughly 256, where de-noising becomes compute-bound. We exploit this observation so that multi-branch denoising costs about the same as denoising a single branch. 
+
+BlockBatch Denoise Optimization. At each de-noise step, only the unmasked positions in each branch’s current block produce queries. We pack these queries from all branches into a single variable-length buffer and issue one forward pass, supplying the cumulative offsets that FlashAtten-tion’s varlen kernel requires. The same packed tensor flows through every transformer block, so both attention and the FFN operate on this compact buffer end-to-end (Fig. 6-(b)). 
+
+5 Experiments 
+
+5.1 Setup 
+
+We evaluate BlockBatch on LLaDA-1.5-8B, LLaDA-Instruct-8B (Nie et al., 2025b), and Dream-Base-7B (Ye et al., 2025). We compare against Vanilla diffusion decoding, Fast-dLLM dual cache (Wu et al., 2026), and LocalLeap (Kong et al., 2025). Unless stated otherwise, all meth-ods generate up to 256 tokens with batch size 1 and confidence threshold 0.9. For Fast-dLLM dual cache, we use block size 32. For Local-Leap, we use the default script settings: anchor threshold 0.9, radius 4, and relaxed threshold 0.75 for LLaDA and 0.8 for Dream. For BlockBatch, we run block sizes {4, 8, 16 , 32 , 64 , 128 } in one fused generation pass. Each branch owns an inde-pendent sequence row and KV-cache row; batch-ing only changes execution shape. We count one batched model forward as one NFE: NFE total =NFE init + NFE block + NFE refresh . We evaluate on GSM8K (Cobbe et al., 2021), MATH (Hendrycks et al., 2021), HumanEval (Chen et al., 2021), and MBPP (Austin et al., 2021b). Accuracy is computed with the official task-specific evaluation logic; for code tasks, generated code is postpro-cessed with the model-specific sanitization pipeline before execution-based evaluation. Additional prompt, baseline, and ablation settings are provided in Appendix E.3. 
+
+5.2 Main Results 
+
+Tab. 1 reports latency, NFE, and accuracy across twelve model–task settings. The main result is that BlockBatch is the most NFE-efficient method in every setting: it achieves the lowest or tied-lowest NFE across all twelve comparisons, with 47.7–82.3% fewer denoising NFEs than Vanilla and 1.7–5.8 × end-to-end speedup. Beyond the Vanilla baseline, BlockBatch consistently improves over Fast-dLLM, reducing NFE in all twelve settings by 26.6% on average and up to 33.6% on LLaDA-Instruct-8B/MBPP. It is also faster than or tied with Figure 5: Overview of BlockBatch. The left and bottom parts illustrate confidence-gated merge and leader-based synchronization. The upper-right panel summarizes the global denoising state transition: each step performs merge, sync, and periodic refresh. If a branch predicts EOS before all preceding positions are decoded, it enters an EOS cycle until the prefix before EOS is continuous, preventing premature termination before final output.     
+
+> Figure 6: (a) Per-step denoise latency on H200 vs. total token count. (b) BlockBatch Denoise Step. Unmasked query positions from all branches are packed into one variable-length buffer consumed by both varlen atten-tion and the FFN, while a shared unified KV cache preserves per-branch attention semantics exactly.
+
+Fast-dLLM in all settings, reaching up to 2.05 ×
+
+additional speedup on LLaDA-1.5-8B/HumanEval. Compared with LocalLeap, BlockBatch obtains lower or tied NFE in all settings. 
+
+5.3 Ablation Studies 
+
+BlockBatch depends on three main design choices: the synchronization threshold, the refresh interval, and the set of block sizes used for parallel explo-ration. These parameters control the central trade-off of the method: allowing enough branch diver-sity to discover efficient trajectories while limiting computational overhead. 
+
+Synchronization Threshold. The synchroniza-tion threshold determines how far the leading branch is allowed to advance before a lagging branch is synchronized to it (See Appendix A, Tab. 2). This threshold is important because it con-trols the balance between exploration and stabil-ity. If synchronization is triggered too aggressively, branches are forced to follow the current leader too early, falling back to a greedy regime that does not guarantee a globally optimal trajectory. On the other hand, if the threshold is too large, lagging branches can remain trapped in slow or stale block-denoising regions. In the KV-space view, these branches may continue accumulating lo-cal cache drift without contributing useful progress. Synchronization therefore acts as a branch-space contraction mechanism: it preserves useful explo-ration within a bounded window while preventing slow branches from wasting computation after they have fallen too far behind. The ablation results show that the best performance is obtained at an intermediate threshold, where branch diversity is maintained but unproductive drift is controlled. 
+
+Refresh Interval. The refresh interval R con-trols how often a full-sequence refresh is applied. (See appendix A, table 3) From the refresh con-traction bound, stability requires β(1 + λb)R < 1,which implies R < log(1 /β )log(1+ λb) . Thus, R cannot be too large: if refresh is too infrequent, accumulated block-denoise error can dominate the contraction effect of full-sequence refresh. However, R also cannot be too small in practice, because frequent full-sequence refreshes increase model-call over-head and end-to-end latency. Therefore, the re-fresh interval must lie in a feasible window: small enough to control KV-cache drift, but large enough to amortize the cost of global recomputation. The ablation results in Tab. 3 confirm this behavior, showing that the optimal refresh setting is neither overly frequent nor overly sparse. Table 1: Benchmark results for Vanilla, Fast-dLLM Dual Cache, LocalLeap, and BlockBatch across LLaDA-1.5-8B, LLaDA-Instruct-8B, and Dream-Base-7B. For Fast-dLLM Dual Cache, we report only the block size 32 setting. 
+
+Notation: Fast-dLLM denotes Fast-dLLM Dual Cache with block size 32 . Green cells indicate BlockBatch results. Subscripts on Latency show speedup over Vanilla; subscripts on NFE show reduction percentage relative to Vanilla. 
+
+LLaDA-1.5-8B LLaDA-Instruct-8B Dream-Base-7B 
+
+Task Method Lat. (s) ↓ NFE ↓ ACC (%) ↑ Lat. (s) ↓ NFE ↓ ACC (%) ↑ Lat. (s) ↓ NFE ↓ ACC (%) ↑
+
+GSM8K Vanilla 12.5 256.0 79.91 13.1 256.0 77.10 10.4 256.0 75.13 
+
+Fast-dLLM 4.9 ↓2.6 × 84.7 ↓67% 79.68 2.7 ↓4.9 × 86.4 ↓66% 78.70 3.7 ↓2.8 × 162.3 ↓37% 73.62 LocalLeap 4.7 ↓2.7 × 72.5 ↓72% 81.27 2.3 ↓5.7 × 64.4 ↓75% 78.16 6.5 ↓1.6 × 142.9 ↓44% 72.71 BlockBatch 4.2 ↓3.0 × 63.6 ↓75% 77.56 2.4 ↓5.5 × 63.2 ↓75% 77.48 3.7 ↓2.8 × 133.8 ↓48% 72.48 MATH Vanilla 9.04 256.0 34.78 9.7 256.0 40.14 8.1 256.0 40.10 
+
+Fast-dLLM 5.5 ↓1.6 × 104.4 ↓59% 33.20 3.3 ↓2.9 × 107.8 ↓58% 37.12 2.5 ↓3.2 × 121.9 ↓52% 39.34 LocalLeap 3.6 ↓2.5 × 80.3 ↓69% 31.74 2.8 ↓3.5 × 85.3 ↓67% 32.18 3.3 ↓2.5 × 92.8 ↓64% 37.98 BlockBatch 3.4 ↓2.7 × 77.6 ↓70% 32.24 2.4 ↓4.0 × 80.4 ↓69% 37.20 2.2 ↓3.7 × 92.8 ↓64% 39.44 HumanEval Vanilla 5.77 256.0 43.29 5.7 256.0 40.24 4.7 256.0 50.00 Fast-dLLM 4.3 ↓1.3 × 88.7 ↓65% 39.02 2.6 ↓2.2 × 90.4 ↓65% 36.59 3.1 ↓1.5 × 156.1 ↓39% 52.44 
+
+LocalLeap 2.0 ↓2.9 × 75.8 ↓70% 42.07 2.1 ↓2.7 × 69.8 ↓73% 35.98 2.6 ↓1.8 × 123.9 ↓52% 48.78 BlockBatch 2.1 ↓2.7 × 63.0 ↓75% 39.63 2.0 ↓2.9 × 64.6 ↓75% 38.41 2.8 ↓1.7 × 112.5 ↓56% 52.44 
+
+MBPP Vanilla 9.50 256.0 43.40 9.9 256.0 41.40 8.0 256.0 55.80 
+
+Fast-dLLM 4.2 ↓2.3 × 76.1 ↓70% 38.00 2.2 ↓4.5 × 68.2 ↓73% 38.40 2.6 ↓3.1 × 111.9 ↓56% 53.20 LocalLeap 2.7 ↓3.5 × 58.0 ↓77% 40.20 1.9 ↓5.2 × 56.1 ↓78% 41.40 2.9 ↓2.8 × 82.8 ↓68% 54.60 BlockBatch 2.6 ↓3.7 × 54.5 ↓79% 40.00 1.7 ↓5.8 × 45.3 ↓82% 39.60 2.3 ↓3.5 × 81.1 ↓68% 52.00 
+
+Block-Size Configuration. The choice of block sizes determines the diversity of decoding trajec-tories explored by BlockBatch (Shown in Fig. 7). Using multiple block sizes allows the method to exploit idle GPU capacity by evaluating several denoising schedules in parallel. Smaller blocks provide conservative, locally stable progress, while larger blocks can decode more aggressively when the model is confident. Combining them increases the probability that at least one branch follows an efficient trajectory within the synchronization win-dow. However, adding more branches is not free. Al-though more block sizes can reduce NFE by in-creasing exploration and enabling useful synchro-nization, each additional branch also increases batching, cache-management, and refresh overhead. Therefore, the best block-size configuration must balance NFE reduction against end-to-end latency. The ablation results in Fig. 7 show that multi-scale block-size sets are more effective than narrow con-figurations, but also that the benefit saturates once the additional branches no longer provide enough useful trajectory diversity to justify their overhead. 
+
+6 Conclusion 
+
+We presented BlockBatch, a training-free frame-work that treats block size as a branching axis for dLLM inference. By coordinating multiple block-
+
+Figure 7: Each point represents one LLaDA Block-Batch candidate block-size set S ⊆ B , where B =
+
+{4, 8, 16 , 32 , 64 , 128 }. Colors encode the set cardinal-ity |S|. Thus, the singleton group contains  61
+
+ = 6 fixed block-size configurations, the two-block-size group con-tains  62
+
+ = 15 pairwise configurations, and in general the k-block-size group contains  6
+
+> k
+
+ candidate sets. 
+
+size branches through confidence-gated merging, leader-based synchronization, and periodic full-sequence refresh within a single fused forward pass, BlockBatch consistently reduces NFEs and latency on LLaDA and Dream across four bench-marks while preserving accuracy over state-of-the-art dLLM inference frameworks. Block-size diver-sity is a practical, underexplored axis for branch-parallel diffusion decoding. 7 Limitations 
+
+BlockBatch is designed as a training-free inference-time acceleration method, and its effectiveness de-pends on a decoding regime in which block-size diversity produces compatible but non-identical trajectories. In low-diversity regimes, such as near-deterministic or extremely easy prompts where all selected block sizes converge to the same de-coded sequence with little or no bifurcation, ad-ditional branches contribute limited new informa-tion while still introducing coordination overhead. Conversely, BlockBatch also assumes that the se-lected block sizes are individually stable enough to provide useful candidate trajectories. If a model becomes unreliable under large block sizes, such branches may reduce accuracy and should be adap-tively deselected during inference rather than re-tained throughout the full decoding process. 
+
+References 
+
+Jacob Austin, Daniel D. Johnson, Jonathan Ho, Daniel Tarlow, and Rianne van den Berg. 2021a. Structured denoising diffusion models in discrete state-spaces. In Advances in Neural Information Processing Sys-tems .Jacob Austin, Augustus Odena, Maxwell Nye, Maarten Bosma, Henryk Michalewski, David Dohan, Ellen Jiang, Carrie Cai, Michael Terry, Quoc Le, and Charles Sutton. 2021b. Program synthesis with large language models. arXiv preprint arXiv:2108.07732 .Tianle Cai, Yuhong Li, Zhengyang Geng, Hongwu Peng, Jason D. Lee, Deming Chen, and Tri Dao. 2024a. Medusa: Simple LLM inference acceleration frame-work with multiple decoding heads. In Proceedings of the 41st International Conference on Machine Learning , volume 235 of Proceedings of Machine Learning Research , pages 5209–5235. PMLR. Zefan Cai, Yichi Zhang, Bofei Gao, Yuliang Liu, Tianyu Liu, Keming Lu, Wayne Xiong, Yue Dong, Baobao Chang, Junjie Hu, and Wen Xiao. 2024b. Pyramidkv: Dynamic kv cache compression based on pyramidal information funneling. Preprint , arXiv:2406.02069. Andrew Campbell, Joe Benton, Valentin De Bortoli, Tom Rainforth, George Deligiannidis, and Arnaud Doucet. 2022. A continuous time framework for dis-crete denoising models. Preprint , arXiv:2205.14987. Andrew Campbell, Jason Yim, Regina Barzilay, Tom Rainforth, and Tommi Jaakkola. 2024. Genera-tive flows on discrete state-spaces: Enabling mul-timodal flows with applications to protein co-design. 
+
+Preprint , arXiv:2402.04997. Mark Chen, Jerry Tworek, Heewoo Jun, Qiming Yuan, Henrique Ponde de Oliveira Pinto, Jared Kaplan, Harri Edwards, Yuri Burda, Nicholas Joseph, Greg Brockman, Alex Ray, Raul Puri, Gretchen Krueger, Michael Petrov, Heidy Khlaaf, Girish Sastry, Pamela Mishkin, Brooke Chan, Scott Gray, and 39 others. 2021. Evaluating large language models trained on code. arXiv preprint arXiv:2107.03374 .Ting Chen, Ruixiang Zhang, and Geoffrey Hinton. 2023. Analog bits: Generating discrete data using diffusion models with self-conditioning. Preprint ,arXiv:2208.04202. Shuang Cheng, Yihan Bian, Dawei Liu, Linfeng Zhang, Qian Yao, Zhongbo Tian, Wenhai Wang, Qipeng Guo, Kai Chen, Biqing Qi, and Bowen Zhou. 2025. Sdar: A synergistic diffusion-autoregression paradigm for scalable sequence generation. Preprint ,arXiv:2510.06303. Karl Cobbe, Vineet Kosaraju, Mohammad Bavarian, Mark Chen, Heewoo Jun, Lukasz Kaiser, Matthias Plappert, Jerry Tworek, Jacob Hilton, Reiichiro Nakano, Christopher Hesse, and John Schulman. 2021. Training verifiers to solve math word prob-lems. Preprint , arXiv:2110.14168. Tri Dao, Daniel Y. Fu, Stefano Ermon, Atri Rudra, and Christopher Ré. 2022. Flashattention: Fast and memory-efficient exact attention with io-awareness. In Advances in Neural Information Processing Sys-tems .Hengyu Fu, Baihe Huang, Virginia Adams, Charles Wang, Venkat Srinivasan, and Jiantao Jiao. 2025. From bits to rounds: Parallel decoding with explo-ration for diffusion language models. Shansan Gong, Shivam Agarwal, Yizhe Zhang, Ji-acheng Ye, Lin Zheng, Mukai Li, Chenxin An, Peilin Zhao, Wei Bi, Jiawei Han, Hao Peng, and Lingpeng Kong. 2025. Scaling diffusion language models via adaptation from autoregressive models. Preprint ,arXiv:2410.17891. Dan Hendrycks, Collin Burns, Saurav Kadavath, Akul2 Arora, Steven Basart, Eric2 Tang, Dawn Song, and Jacob Steinhardt. 2021. Measuring mathematical problem solving with the math dataset. NeurIPS .Jonathan Ho, Ajay Jain, and Pieter Abbeel. 2020. De-noising diffusion probabilistic models. In Advances in Neural Information Processing Systems .Emiel Hoogeboom, Didrik Nielsen, Priyank Jaini, Patrick Forr ’e, and Max Welling. 2021a. Argmax flows and multi-nomial diffusion: Learning categorical distributions. In Advances in Neural Information Processing Sys-tems .Emiel Hoogeboom, Didrik Nielsen, Priyank Jaini, Patrick Forré, and Max Welling. 2021b. Argmax flows and multinomial diffusion: Learning categori-cal distributions. Preprint , arXiv:2102.05379. Zhanqiu Hu, Jian Meng, Yash Akhauri, Mohamed S. Ab-delfattah, Jae-sun Seo, Zhiru Zhang, and Udit Gupta. 2025. Accelerating diffusion language model infer-ence via efficient kv caching and guided diffusion. 
+
+Preprint , arXiv:2505.21467. Yuchu Jiang, Yue Cai, Xiangzhong Luo, Jiale Fu, Jiarui Wang, Chonghan Liu, and Xu Yang. 2026. d2Cache: Accelerating diffusion-based LLMs via dual adaptive caching. In International Conference on Learning Representations . Poster. Fanheng Kong, Jingyuan Zhang, Yahui Liu, Zirui Wu, Yu Tian, and Guorui Zhou. 2025. Accelerating diffu-sion llm inference via local determinism propagation. Woosuk Kwon, Zhuohan Li, Siyuan Zhuang, Ying Sheng, Lianmin Zheng, Cody Hao Yu, Joseph E. Gon-zalez, Hao Zhang, and Ion Stoica. 2023. Efficient memory management for large language model serv-ing with pagedattention. In Proceedings of the ACM SIGOPS Symposium on Operating Systems Princi-ples .Wonbeom Lee, Jungi Lee, Junghwan Seo, and Jaewoong Sim. 2024. Infinigen: Efficient generative inference of large language models with dynamic kv cache management. Preprint , arXiv:2406.19707. Yaniv Leviathan, Matan Kalman, and Yossi Matias. 2023. Fast inference from transformers via spec-ulative decoding. In Proceedings of the 40th Inter-national Conference on Machine Learning , volume 202 of Proceedings of Machine Learning Research ,pages 19274–19286. PMLR. Yuhong Li, Yingbing Huang, Bowen Yang, Bharat Venkitesh, Acyr Locatelli, Hanchen Ye, Tianle Cai, Patrick Lewis, and Deming Chen. 2024. Snapkv: Llm knows what you are looking for before genera-tion. Preprint , arXiv:2404.14469. Zhiyuan Liu, Yicun Yang, Yaojie Zhang, Junjie Chen, Chang Zou, Qingyuan Wei, Shaobo Wang, and Lin-feng Zhang. 2025. dLLM-Cache: Accelerating dif-fusion large language models with adaptive caching. 
+
+arXiv preprint arXiv:2506.06295 .Zichang Liu, Aditya Desai, Fangshuo Liao, Weitao Wang, Victor Xie, Zhaozhuo Xu, Anastasios Kyril-lidis, and Anshumali Shrivastava. 2023. Scis-sorhands: Exploiting the persistence of importance hypothesis for llm kv cache compression at test time. 
+
+Preprint , arXiv:2305.17118. Zirui Liu, Jiayi Yuan, Hongye Jin, Shaochen Zhong, Zhaozhuo Xu, Vladimir Braverman, Beidi Chen, and Xia Hu. 2024. Kivi: A tuning-free asymmetric 2bit quantization for kv cache. In International Confer-ence on Machine Learning .Xinyin Ma, Runpeng Yu, Gongfan Fang, and Xinchao Wang. 2025. dKV-Cache: The cache for diffusion language models. In Advances in Neural Information Processing Systems . Poster. Shen Nie, Fengqi Zhu, Chao Du, Tianyu Pang, Qian Liu, Guangtao Zeng, Min Lin, and Chongxuan Li. 2025a. Scaling up masked diffusion models on text. Shen Nie, Fengqi Zhu, Zebin You, Xiaolu Zhang, Jingyang Ou, Jun Hu, Jun Zhou, Yankai Lin, Ji-Rong Wen, and Chongxuan Li. 2025b. Large language diffusion models. In The Thirty-ninth Annual Con-ference on Neural Information Processing Systems .Mihir Prabhudesai, Mengning Wu, Amir Zadeh, Kate-rina Fragkiadaki, and Deepak Pathak. 2025. Diffu-sion beats autoregressive in data-constrained settings. 
+
+arXiv preprint arXiv:2507.15857 .Subham Sekhar Sahoo, Marianne Arriola, Yair Schiff, Aaron Gokaslan, Edgar Mariano Marroquin, Justin T. Chiu, Alexander M. Rush, and Volodymyr Kuleshov. 2024. Simple and effective masked diffusion lan-guage models. In Advances in Neural Informa-tion Processing Systems , volume 37, pages 130136– 130184. Noam Shazeer. 2019. Fast transformer decod-ing: One write-head is all you need. Preprint ,arXiv:1911.02150. Jascha Sohl-Dickstein, Eric A. Weiss, Niru Mah-eswaranathan, and Surya Ganguli. 2015. Deep un-supervised learning using nonequilibrium thermody-namics. In International Conference on Machine Learning .Jiaming Song, Chenlin Meng, and Stefano Ermon. 2021a. Denoising diffusion implicit models. In Inter-national Conference on Learning Representations .Yang Song and Stefano Ermon. 2019. Generative mod-eling by estimating gradients of the data distribution. In Advances in Neural Information Processing Sys-tems .Yang Song, Jascha Sohl-Dickstein, Diederik P. Kingma, Abhishek Kumar, Stefano Ermon, and Ben Poole. 2021b. Score-based generative modeling through stochastic differential equations. In International Conference on Learning Representations .Jiaming Tang, Yilong Zhao, Kan Zhu, Guangxuan Xiao, Baris Kasikci, and Song Han. 2024. Quest: Query-aware sparsity for efficient long-context llm inference. 
+
+Preprint , arXiv:2406.10774. Ashish Vaswani, Noam Shazeer, Niki Parmar, Jakob Uszkoreit, Llion Jones, Aidan N. Gomez, Lukasz Kaiser, and Illia Polosukhin. 2017. Attention is all you need. In Advances in Neural Information Pro-cessing Systems .Clement Vignac, Igor Krawczuk, Antoine Siraudin, Bo-han Wang, Volkan Cevher, and Pascal Frossard. 2023. Digress: Discrete denoising diffusion for graph gen-eration. Preprint , arXiv:2209.14734. Chengyue Wu, Hao Zhang, Shuchen Xue, Shizhe Diao, Yonggan Fu, Zhijian Liu, Pavlo Molchanov, Ping Luo, Song Han, and Enze Xie. 2025. Fast-dllm v2: Efficient block-diffusion llm. Preprint ,arXiv:2509.26328. Chengyue Wu, Hao Zhang, Shuchen Xue, Zhijian Liu, Shizhe Diao, Ligeng Zhu, Ping Luo, Song Han, and Enze Xie. 2026. Fast-dLLM: Training-free acceler-ation of diffusion LLM by enabling KV cache and parallel decoding. In International Conference on Learning Representations . Poster. Guangxuan Xiao, Yuandong Tian, Beidi Chen, Song Han, and Mike Lewis. 2024. Efficient streaming lan-guage models with attention sinks. In International Conference on Learning Representations .Jiacheng Ye, Zhihui Xie, Lin Zheng, Jiahui Gao, Zirui Wu, Xin Jiang, Zhenguo Li, and Lingpeng Kong. 2025. Dream 7b: Diffusion large language models. 
+
+Preprint , arXiv:2508.15487. Siyue Zhang, Yilun Zhao, Liyuan Geng, Arman Cohan, Anh Tuan Luu, and Chen Zhao. 2025. Diffusion vs. autoregressive language models: A text embedding perspective. Preprint , arXiv:2505.15045. Zhenyu Zhang, Ying Sheng, Tianyi Zhou, Tianlong Chen, Lianmin Zheng, Ruisi Cai, Zhao Song, Yuan-dong Tian, Christopher Ré, Clark Barrett, Zhangyang Wang, and Beidi Chen. 2023. H2o: Heavy-hitter oracle for efficient generative inference of large lan-guage models. In Advances in Neural Information Processing Systems .
+
+Appendix 
+
+• Sec. A: Ablation Tables • Sec. B: Token level characterization 
+
+– Later-Stage Consensus Token Analysis 
+
+– Token Bifurcation Case studies • Sec. C: KV level characterization: proofs and more case studies 
+
+– Basic Operations 
+
+– Proposition 1: Block Denoise vs. Full Refresh 
+
+– Proposition 2: Periodic Refresh Stabi-lizes Block Denoising 
+
+– Proposition 3: Branch Bifurcation as Tangent-Space Separation 
+
+– Case Study: KV Cache Vector Space Properties • Sec. D: Block Batching Algorithm 
+
+– Fused Block Batching with a Unified KV Cache 
+
+– Merge and Synchronization Policy • Sec. E: Reproducibility, Artifacts and Com-puter Details 
+
+– Scientific Artifacts 
+
+– Artifact Licenses and Intended Use 
+
+– Evaluation Setup 
+
+– Computational Infrastructure and Budget 
+
+A Appendix: Ablation Tables 
+
+Table 2: Sync-threshold τ ablation. Bold indicates the best value within each column.                                                     
+
+> LLaDA 8B-Inst. Dream Base-7B GSM8K HumanEval GSM8K HumanEval
+> τAcc. NFE Acc. NFE Acc. NFE Acc. NFE 40.773 67.6 0.354 69.6 0.726 138.2 0.494 122.7 80.770 68.6 0.378 69.9 0.732 138.7 0.494 120.5 16 0.784 69.9 0.384 69.4 0.725 139.4 0.470 114.6
+> 32 0.780 70.6 0.415 70.5 0.719 140.6 0.476 117.3 64 0.780 73.1 0.384 71.6 0.703 143.9 0.427 116.7
+
+Table 3: Refresh-interval R ablation. Bold indicates the best value within each column.                                                             
+
+> LLaDA 8B-Inst. Dream Base-7B GSM8K HumanEval GSM8K HumanEval
+> RAcc. NFE Acc. NFE Acc. NFE Acc. NFE 40.778 59.0 0.372 56.8 0.780 143.0 0.543 120.8 80.784 59.9 0.378 58.9 0.780 138.9 0.512 110.1
+> 16 0.770 61.1 0.402 62.4 0.752 137.5 0.476 111.8 32 0.776 62.7 0.384 64.6 0.730 134.7 0.524 112.5 64 0.788 64.6 0.348 67.1 0.744 134.2 0.494 112.8 128 0.752 65.6 0.354 71.2 0.746 135.2 0.500 117.2
+
+B Appendix: Token-Level Characterization 
+
+B.1 Later-Stage Consensus and Bifurcation Tokens 
+
+We further analyze token-level branch behavior by separating two phenomena: later-stage consensus ,where previously diverged branches produce the same token again at a later position, and bifurcation ,where two block-size trajectories first commit dif-ferent tokens after a shared prefix. These two phe-nomena play different roles. Later-stage consensus indicates local token agreement, but does not imply that the full trajectories have re-converged. Bifur-cation tokens, by contrast, mark the positions at which block-size branches begin to follow distinct conditional generation paths. Fig. 8 and Fig. 9 characterize generated token positions by linguistic category—digit, operator, whitespace, word, and other—and by cross-block-size agreement. Each stacked bar reports the av-erage number of positions per sequence in that category, while the shading indicates how many of the six block-size configurations produced the same token. The overlaid curve shows the mean agreement score for each category. A clear domain-specific pattern appears. In Hu-manEval (Fig. 8), whitespace and operator tokens achieve the highest agreement and are dominated by 6/6 agreement, reflecting the syntactic regu-larity of code generation. In GSM8K (Fig. 9), digit tokens are more frequent (avg. 61 .2 posi-tions per sequence, compared with 23 .7 in Hu-manEval) and also show high agreement, con-sistent with the repeated numerical structure of arithmetic reasoning traces. Across both domains, the highest-agreement categories are mostly low-semantic-weight tokens: they control formatting, syntax, or local surface structure rather than the main reasoning content. 
+
+Figure 8: Token-category agreement profile for Hu-manEval. Each stacked bar shows the average number of generated-token positions in a category, shaded by the fraction of block-size configurations that produce the same token at that position ( 6/6 = darkest green; 1/6
+
+= lightest). The blue curve gives the mean agreement score per category. Whitespace and operator tokens dominate later-stage consensus, reflecting the syntactic regularity of code generation. 
+
+Figure 9: Token-category agreement profile for GSM8K. Digit tokens are substantially more prevalent than in HumanEval (avg. 61 .2 positions per sequence) and exhibit high mean agreement, consistent with the repetitive numerical structure of arithmetic reasoning chains. Word tokens are the most frequent category over-all (avg. 74 .7 positions per sequence) but show lower per-position agreement, indicating that they more com-monly mark bifurcation points where block-size trajec-tories diverge. 
+
+This category-level pattern explains why later-stage consensus is useful but limited. Although branches may re-agree on individual tokens after an earlier split, those tokens are often formatting or locally constrained tokens rather than seman-tically decisive reasoning steps. To test whether such tokens can meaningfully steer generation, we perform a seeded-consensus experiment. For each sample, we identify token positions with strict 6/6
+
+cross-block-size agreement after the initial shared prefix and pre-fill those positions before normal denoising begins. 
+
+Table 4: Effect of seeding later-stage consensus to-kens on Dream-v0-Instruct-7B. Seeded pre-fills later-stage consensus positions before denoising, where con-sensus is defined as 6/6 cross-block-size agreement after the initial shared prefix. On average, this seeds 
+
+4.6 tokens per GSM8K sample and 3.5 tokens per Hu-manEval sample. ∆Acc. is Seeded minus Baseline; 
+
+∆NFE is Baseline minus Seeded, so positive ∆NFE indicates reduced denoising cost.                                                                                             
+
+> Task Block size Accuracy (%) Average NFE Baseline Seeded ∆Acc. Baseline Seeded ∆NFE GSM8K 476.04 74.75 −1.29 154.2 152.9 1.3 GSM8K 876.04 74.91 −1.13 104.3 102.3 2.0 GSM8K 16 74.98 73.62 −1.36 80.0 77.5 2.5 GSM8K 32 73.69 73.24 −0.45 67.9 65.4 2.5 GSM8K 64 70.58 70.13 −0.45 64.8 61.6 3.2 GSM8K 128 41.77 42.61 +0 .84 81.8 79.0 2.8 HumanEval 454.88 50.00 −4.88 174.3 173.7 0.6 HumanEval 855.49 54.27 −1.22 129.0 125.3 3.7 HumanEval 16 55.49 55.49 +0 .00 102.6 100.1 2.5 HumanEval 32 55.49 56.71 +1 .22 86.4 85.8 0.6 HumanEval 64 53.05 52.44 −0.61 82.7 81.9 0.8 HumanEval 128 33.54 34.15 +0 .61 67.0 64.1 2.9
+
+Table 4 shows that seeding later-stage consensus tokens produces only small NFE reductions and does not systematically improve accuracy. On aver-age, only 4.6 GSM8K tokens and 3.5 HumanEval tokens per sample satisfy the strict post-prefix 6/6
+
+agreement criterion. This supports the view that later-stage consensus tokens are locally reusable but usually not strong enough to determine the global denoising trajectory. Therefore, the semanti-cally important variation between branches is better captured by where they first bifurcate, rather than by the small number of tokens on which they later re-agree. We therefore measure the average bifurcation length between every pair of single-block-size gen-erations. For a pair of block sizes, bifurcation length is the length of the common generated-token prefix before the two outputs first differ. Smaller values indicate earlier trajectory separation. 
+
+Table 5: Average bifurcation length between single-block-size generations. For each pair of block sizes, bifurcation length is defined as the length of the com-mon generated-token prefix before the two outputs first differ, following analyze_bifurcation.py . When the two outputs have different lengths, the shorter gener-ated sequence is used. Lower values indicate earlier trajectory divergence. Bold entries denote the earliest bifurcation within each model–dataset row.                                                                                                                               
+
+> Model Dataset Block-size pair 4–8 4–16 4–32 4–64 4–128 8–16 8–32 8–64 8–128 16–32 16–64 16–128 32–64 32–128 64–128 Dream GSM8K 23.4 18.0 16.0 15.9 15.6 25.5 20.4 19.0 18.5 27.1 23.3 22.1 32.1 29.8 44.3 Dream HumanEval 34.9 22.0 17.9 17.8 16.4 37.1 20.9 22.6 19.0 28.1 23.3 23.1 34.5 29.6 47.2 Dream MATH 32.6 23.4 22.0 21.8 22.0 34.1 27.5 26.5 26.2 40.3 34.5 33.4 47.5 43.1 59.9 Dream MBPP 33.3 21.6 20.9 21.7 21.7 32.6 27.0 25.6 26.9 36.7 33.1 29.0 53.8 43.5 56.7 LLaDA GSM8K 35.2 24.8 22.0 21.2 20.6 32.7 26.4 25.0 23.4 34.2 28.0 25.8 38.9 33.0 48.7 LLaDA HumanEval 64.5 48.5 42.6 31.3 32.5 52.2 39.0 30.0 30.5 53.7 38.0 37.4 52.6 44.0 54.3 LLaDA MATH 34.0 24.7 22.4 22.2 22.2 34.5 28.0 25.4 25.5 38.0 30.6 29.7 43.4 39.0 54.7 LLaDA MBPP 31.6 21.9 17.9 19.1 18.9 28.3 20.8 19.5 21.1 26.7 22.3 23.3 26.2 25.5 37.7
+
+Table 5 shows that substantially different block-size pairs generally bifurcate earlier than nearby block-size pairs. For example, pairs involving small and large blocks, such as 4–128 or 8–128 ,often split earlier than adjacent pairs such as 32 –64 
+
+or 64 –128 . This pattern suggests that block-size di-versity is not merely redundant decoding. Different block sizes expose distinct token-level trajectories, while still often preserving enough shared structure to support synchronization and selective merging. The exact bifurcation position depends on both the dataset and the model. Code-generation tasks often share long syntactic prefixes before diverging in implementation details, while arithmetic reason-ing tasks can bifurcate through small changes in wording, intermediate computation, or final-answer formatting. Table 6, 7, 8 provides case studies us-ing raw output spans. Rather than summarizing each generation abstractly, the table shows the first visible split after the shared reasoning prefix and the final answer span for each inference regime. 
+
+B.2 Token Bifurcation Case studies 
+
+This subsection reports three GSM8K examples from 
+
+LLaDA-8B-Instruct . For each example, we show the first raw output bifurcation among the six single block-size branches and the terminal answer span generated by each method. The bifurcation posi-tion is computed after whitespace normalization for readability. The reported continuation is the raw branch-local text beginning at the first divergent token. 
+
+GSM8K sample 1. Target answer: 18 . The six sin-gle block-size branches share the prefix ... total number of eggs laid and first bifurcate at token posi-tion 26. 
+
+Table 6: Token bifurcation on GSM8K sample 1. Sev-eral branches compute the correct value 18 , but strict exact match depends on whether the terminal span con-tains the required #### answer marker. 
+
+Method First divergent continuation Terminal answer span Pred. EM NFE Vanilla by Janet’s ducks per day farmers’ market. #### 18 
+
+18 Y 256 BS=4 by Janet’s ducks per day The final answer is: \boxed{18} invalid N 154 BS=8 by the ducks per day farmers’ market. #### 18 
+
+18 Y 120 BS=16 by Janet’s ducks per day farmers’ market. #### 18 
+
+18 Y 121 BS=32 by Janet’s ducks per day The final answer is: \boxed{18} invalid N 123 BS=64 per day. 2. Subtract farmers’ market. #### 18 
+
+18 Y 111 BS=128 by Janet’s ducks per day Janet makes $18 every day at the farmers’ market. invalid N 105 BlockBatch by Janet’s ducks per day farmers’ market. #### 24 
+
+24 N 557 
+
+GSM8K sample 2. Target answer: 3. The six single block-size branches share the prefix ... robe takes 2 bolts of blue fiber and half that and first bifurcate at token position 11. Table 7: Token bifurcation on GSM8K sample 2. Most branches preserve the correct arithmetic trajectory. Fail-ures are mainly strict-format failures caused by missing terminal #### extraction.                            
+
+> Method First divergent continuation Terminal answer span Pred. EM NFE Vanilla much white fiber. To find total of 3 bolts. #### 3
+> 3Y256 BS=4 much white fiber. First, calculate it takes is 3. #### 3
+> 3Y110 BS=8 much white fiber. So, the = 3 \text{ bolts} \] #### 3
+> 3Y78 BS=16 amount of white fiber. So, = 3 \text{ bolts} \] #### 3
+> 3Y66 BS=32 amount of white fiber. First, robe takes a total of 3 bolts. invalid N76 BS=64 amount of white fiber. First, 2 bolts + 1 bolt = 3 bolts. #### 3
+> 3Y87 BS=128 amount of white fiber. blue fiber and half that amount of white fiber. invalid N77 BlockBatch amount of white fiber. Half white fiber = 3 bolts. #### 3
+> 3Y192
+
+GSM8K sample 3. Target answer: 70 ,000 . The six single block-size branches share the prefix ... need to follow these steps: 1. Calculate the and first bifurcate at token position 13. 
+
+Table 8: Token bifurcation on GSM8K sample 3. This example shows a semantic bifurcation. Branches that continue with total cost are more likely to preserve the repair-cost term, while branches that continue with new value often omit it and terminate near 120 ,000 .                           
+
+> Method First divergent continuation Terminal answer span Pred. EM NFE Vanilla new value of the house Therefore, Josh’s profit is $120,000. invalid N256 BS=4 total cost of the house incurred a loss. #### -10,000
+> −10 ,000 N133 BS=8 total cost of the house Josh’s profit is $70,000. #### 70000
+> 70000 Y96 BS=16 new value of the house Josh made a profit of $120,000. invalid N106 BS=32 new value of the house Josh’s profit is $120,000. invalid N96 BS=64 new value of the house Josh made a profit of $10,000. invalid N123 BS=128 new value of the house Therefore, Josh’s profit is $120,000. invalid N101 BlockBatch total cost of the house Josh made a profit of $100,000. invalid N330
+
+Takeaway. Across the three examples, the first bifurcation occurs early: token positions 26, 11, and 13 after whitespace normalization. Samples 1 and 2 show mostly formatting bifurcation: sev-eral branches compute the correct terminal num-ber but fail strict exact match because they emit  
+
+> \boxed{}
+
+or omit the #### marker. Sample 3 shows reasoning bifurcation: the first divergent continua-tion already separates branches that track total cost from branches that focus on new value, and this early split determines whether the repair cost is pre-served in the terminal answer. Therefore, raw token bifurcation is useful for distinguishing extraction artifacts from genuine reasoning drift. BlockBatch benefits from branch diversity only when the se-lected terminal branch preserves the correct arith-metic trajectory and emits an extractor-compatible final answer. 
+
+C Appendix: KV Cache Vector Space Formulation 
+
+C.1 Basic Operations 
+
+We model each branch cache as a fixed vector-ization of all key and value tensors across layers, heads, and sequence positions. Thus, at event step 
+
+t, branch b has 
+
+K(b)
+
+t ∈ RD.
+
+All norms below are Euclidean norms on this fixed vectorization. The event index t ranges over block-denoise and full-refresh events. Let 
+
+x(b)
+
+t ∈ eVL
+
+be the current token state, where eV contains the vocabulary and the mask token. Let 
+
+F (x(b)
+
+t ) ∈ RD
+
+denote the full-sequence KV-cache map obtained by recomputing the cache from the complete cur-rent sequence. We distinguish two cache-update operations. 1. Full-sequence refresh. A full refresh recom-putes the cache from the complete current to-ken state: 
+
+K(b)
+
+t+1 = F (x(b)
+
+t ).
+
+The corresponding cache correction is 
+
+∆(b)full ,t = F (x(b)
+
+t ) − K(b)
+
+t .
+
+2. Block denoise. A block-denoise step up-dates an active block B(b)
+
+t ⊆ { 1, . . . , L }, with 
+
+|B(b)
+
+t | = sb, while reusing cached context out-side the block: 
+
+K(b)
+
+t+1 = K(b)
+
+t + ∆ (b)blk ,t .This appendix analyzes how the active block size affects the expected magnitude of the local KV correction. Synchronization and branch selection are policy operations in BlockBatch and are not needed for the following KV-norm bounds. 
+
+C.2 Proposition 1: Expected Block-Local KV Movement 
+
+The following result formalizes the average-case locality of block denoising. The pm/L factor does not hold for every fixed block and every fixed vector. It holds in expectation when a block of size 
+
+m covers an m/L fraction of positions on average. 
+
+Positional KV-energy notation. For a flattened KV-cache perturbation v ∈ RD, write 
+
+v = ( v1, . . . , v L),
+
+where vp contains all key/value coordinates asso-ciated with sequence position p, across all lay-ers, heads, and key/value channels. For a block 
+
+B ⊆ { 1, . . . , L }, let PB be the orthogonal projec-tion that keeps coordinates associated with posi-tions in B and zeros all other coordinates. Then 
+
+∥PB v∥22 = X
+
+> p∈B
+
+∥vp∥22.
+
+Here “energy” means squared Euclidean norm of the KV perturbation. 
+
+Lemma 1 (Expected block-projection energy) . Let 
+
+B be a random block of size m such that every position has the same inclusion probability: 
+
+Pr( p ∈ B) = mL , p = 1 , . . . , L. 
+
+Then, for any fixed KV perturbation v ∈ RD,
+
+EB
+
+∥PB v∥22
+
+ = mL ∥v∥22.
+
+Consequently, 
+
+EB [∥PB v∥2] ≤
+
+r mL ∥v∥2.
+
+Proof. By definition, 
+
+∥PB v∥22 =
+
+> L
+
+X
+
+> p=1
+
+1{p ∈ B}∥ vp∥22.
+
+Taking expectation over B,
+
+EB
+
+∥PB v∥22
+
+ =
+
+> L
+
+X
+
+> p=1
+
+EB [1{p ∈ B}]∥vp∥22
+
+=
+
+> L
+
+X
+
+> p=1
+
+Pr( p ∈ B)∥vp∥22
+
+= mL
+
+> L
+
+X
+
+> p=1
+
+∥vp∥22
+
+= mL ∥v∥22.
+
+By Jensen’s inequality, 
+
+EB [∥PB v∥2] ≤
+
+q
+
+EB [∥PB v∥22] = 
+
+r mL ∥v∥2.
+
+Proposition 1 (Expected block-local KV update bound) . Let m = |B(b) 
+
+> t
+
+| and let L be the sequence length. Consider the full-refresh correction 
+
+∆(b)full ,t = F (x(b) 
+
+> t
+
+) − K(b) 
+
+> t
+
+.
+
+Decompose the block-denoise correction as 
+
+∆(b)blk ,t = PB(b)
+
+> t
+
+∆(b)full ,t + r(b) 
+
+> t
+
+.
+
+The residual r(b) 
+
+> t
+
+is defined by this equation and captures the part of the block-denoise correction that is not explained by the block-restricted full-refresh correction. If the active block satisfies 
+
+Pr( p ∈ B(b) 
+
+> t
+
+) = mL , p = 1 , . . . , L, 
+
+then 
+
+EB
+
+
+
+PB(b)
+
+> t
+
+∆(b)full ,t 
+
+> 22
+
+
+
+= mL ∆(b)full ,t  
+
+> 22
+
+.
+
+Therefore, 
+
+EB
+
+h
+
+PB(b)
+
+> t
+
+∆(b)full ,t 2
+
+i
+
+≤
+
+r mL ∆(b)full ,t 2 .
+
+With the residual included, 
+
+EB
+
+h
+
+∆(b)blk ,t 2
+
+i
+
+≤
+
+r mL ∆(b)full ,t 2+EB
+
+h
+
+r(b) 
+
+> t2
+
+i
+
+.Proof. Apply the expected block-projection lemma to v = ∆ (b)full ,t :
+
+EB
+
+
+
+PB(b)
+
+> t
+
+∆(b)full ,t 
+
+> 22
+
+
+
+= mL ∆(b)full ,t  
+
+> 22
+
+.
+
+Jensen’s inequality gives 
+
+EB
+
+h
+
+PB(b)
+
+> t
+
+∆(b)full ,t 2
+
+i
+
+≤
+
+r mL ∆(b)full ,t 2 .
+
+Using 
+
+∆(b)blk ,t = PB(b)
+
+> t
+
+∆(b)full ,t + r(b)
+
+> t
+
+and the triangle inequality, 
+
+∆(b)blk ,t 2 ≤ PB(b)
+
+> t
+
+∆(b)full ,t 2 + r(b)  
+
+> t2
+
+.
+
+Taking expectation over B yields 
+
+EB
+
+h
+
+∆(b)blk ,t 2
+
+i
+
+≤
+
+r mL ∆(b)full ,t 2+EB
+
+h
+
+r(b) 
+
+> t2
+
+i
+
+.
+
+Comparison with full refresh. A full refresh applies the complete correction 
+
+∆(b)full ,t = F (x(b) 
+
+> t
+
+) − K(b) 
+
+> t
+
+.
+
+A block-denoise step applies only the active-block component of this correction, up to residual effects. Therefore, if 
+
+EB
+
+h
+
+r(b) 
+
+> t2
+
+i
+
+<
+
+
+
+1 −
+
+r mL
+
+
+
+∆(b)full ,t 2 ,
+
+then 
+
+EB
+
+h
+
+∆(b)blk ,t 2
+
+i
+
+< ∆(b)full ,t 2 .
+
+Interpretation. This proposition uses one aver-aging condition: each token position is included in an active block with probability m/L . Under that condition, the direct block-local component contains an m/L fraction of squared KV-update energy in expectation. The norm therefore scales by pm/L . The residual r(b) 
+
+> t
+
+covers effects not captured by a pure projection of the full-refresh correction, such as attention spillover outside the active block. Thus the result gives an average-case explanation for why block-denoise events pro-duce smaller KV movements than full-sequence refreshes, without requiring extra concentration, smoothness, or interpolation assumptions. 
+
+C.3 Proposition 2: Periodic Refresh Stabilizes Block Denoising 
+
+Let 
+
+F : eVL → RD
+
+denote the full-sequence KV-cache map on discrete token states. The reachable full-refresh cache set is 
+
+C = {F (x) : x ∈ eVL}.
+
+We call C the reachable full-refresh cache set rather than a smooth manifold, since eVL is discrete. For branch b, define the ideal cache associated with its current token state: 
+
+K(b) 
+
+> ⋆,t
+
+= F (x(b) 
+
+> t
+
+),
+
+and define the cache-consistency error: 
+
+E(b) 
+
+> t
+
+= K(b) 
+
+> t
+
+− K(b)  
+
+> ⋆,t 2
+
+= K(b) 
+
+> t
+
+− F (x(b) 
+
+> t
+
+) 2 .
+
+This measures the deviation between the main-tained approximate cache and the cache obtained by a full forward pass on the same token state. 
+
+Proposition 2 (Refresh-stabilized cache error un-der bounded drift) . Suppose each block-denoise step satisfies 
+
+E(b) 
+
+> t+1
+
+≤ (1+ λb)E(b) 
+
+> t
+
++ϵB , λb ≥ 0, ϵB ≥ 0,
+
+and each full refresh satisfies 
+
+E(b) 
+
+> t+1
+
+≤ βE (b) 
+
+> t
+
++ ϵF , 0 ≤ β < 1, ϵF ≥ 0.
+
+For an exact full refresh with unchanged token state and exact arithmetic, this corresponds to the spe-cial case β = 0 and ϵF = 0 .Suppose one full refresh is applied after every R
+
+block-denoise steps. Let tn denote the event index immediately after the n-th full refresh and define 
+
+Yn = E(b) 
+
+> tn
+
+. Let 
+
+ab = 1 + λb, ρ = βa Rb ,
+
+and 
+
+c = βϵ BR−1X
+
+> i=0
+
+aib + ϵF .
+
+If 
+
+ρ = β(1 + λb)R < 1,
+
+then the refresh-boundary errors satisfy 
+
+Yn ≤ ρnY0 + c 1 − ρn
+
+1 − ρ .Consequently, 
+
+lim sup 
+
+> n→∞
+
+Yn ≤ c
+
+1 − ρ .
+
+Furthermore, for any within-cycle step 0 ≤ r < R ,
+
+E(b) 
+
+> tn+r
+
+≤ arb Yn + ϵBr−1X
+
+> i=0
+
+aib.
+
+Proof. Starting immediately after a refresh at time 
+
+tn, after R block-denoise steps, 
+
+E(b) 
+
+> tn+R
+
+≤ aRb E(b) 
+
+> tn
+
++ ϵBR−1X
+
+> i=0
+
+aib.
+
+Applying one refresh gives 
+
+E(b) 
+
+> tn+1
+
+≤ βE (b) 
+
+> tn+R
+
++ ϵF
+
+≤ βa Rb E(b) 
+
+> tn
+
++ βϵ BR−1X
+
+> i=0
+
+aib + ϵF .
+
+Thus, 
+
+Yn+1 ≤ ρY n + c. 
+
+Iterating the scalar recurrence yields 
+
+Yn ≤ ρnY0 + c
+
+> n−1
+
+X
+
+> j=0
+
+ρj = ρnY0 + c 1 − ρn
+
+1 − ρ .
+
+Since ρ < 1, taking n → ∞ gives 
+
+lim sup 
+
+> n→∞
+
+Yn ≤ c
+
+1 − ρ .
+
+The within-cycle bound follows by applying the block-denoise recurrence for r steps starting from 
+
+Yn.
+
+Interpretation. This result is a stability lemma conditional on bounded block drift and refresh con-traction. It states a sufficient condition under which periodic full refreshes prevent cache-consistency error from growing without bound. 
+
+C.4 Proposition 3: Projected Cache Separation Diagnostics 
+
+We now define the projected coordinate system used in the KV-cache diagnostics. Let c0 ∈ RD
+
+be a fixed nonzero reference cache vector, such as the shared prefill cache or the mean initial branch cache. Define 
+
+u0 = c0
+
+∥c0∥2
+
+.
+
+Let e1, e 2 ∈ u⊥ 
+
+> 0
+
+be orthonormal tangent direc-tions. In practice, e1, e 2 may be chosen by PCA, a deterministic sketch, or another fixed branch-independent projection rule. Let 
+
+U = [ u0, e 1, e 2] ∈ RD×3.
+
+For each branch cache, decompose 
+
+K(b) 
+
+> t
+
+− c0 = z(b) 
+
+> t
+
+u0 + a(b) 
+
+> t
+
+e1 + q(b) 
+
+> t
+
+e2 + h(b) 
+
+> t
+
+. (3) 
+
+where 
+
+z(b) 
+
+> t
+
+= ⟨K(b) 
+
+> t
+
+− c0, u 0⟩, a(b) 
+
+> t
+
+= ⟨K(b) 
+
+> t
+
+− c0, e 1⟩,q(b) 
+
+> t
+
+= ⟨K(b) 
+
+> t
+
+− c0, e 2⟩, h(b) 
+
+> t
+
+= ( I − U U ⊤)( K(b) 
+
+> t
+
+− c0).
+
+(4) 
+
+By construction, 
+
+h(b) 
+
+> t
+
+⊥ span {u0, e 1, e 2}. (5) 
+
+For two branches i, j , define the full cache dis-tance 
+
+d2 
+
+> ij,t
+
+= K(i) 
+
+> t
+
+− K(j)
+
+> t
+> 22
+
+and the projected cache distance 
+
+d2proj ,ij,t = z(i) 
+
+> t
+
+− z(j)
+
+> t
+> 2
+
++ a(i) 
+
+> t
+
+− a(j)
+
+> t
+> 2
+
++ q(i) 
+
+> t
+
+− q(j)
+
+> t
+> 2
+
+.
+
+(6) 
+
+Proposition 3 (Orthogonal cache-distance decom-position) . Under the orthogonal decomposition above, 
+
+K(i) 
+
+> t
+
+− K(j) 
+
+> t
+> 22
+
+= z(i) 
+
+> t
+
+− z(j)
+
+> t
+> 2
+
++ a(i) 
+
+> t
+
+− a(j)
+
+> t
+> 2
+
++ q(i) 
+
+> t
+
+− q(j)
+
+> t
+> 2
+
++ h(i) 
+
+> t
+
+− h(j) 
+
+> t
+> 22
+
+.
+
+Therefore, 
+
+dproj ,ij,t ≤ dij,t .
+
+Proof. The vectors u0, e 1, e 2 are orthonormal and each residual h(b) 
+
+> t
+
+lies in the orthogonal comple-ment of their span. The result therefore follows from the Pythagorean theorem. We define average branch dispersion as 
+
+Dt = 1
+
+B(B − 1) 
+
+X
+
+> i̸=j
+
+K(i) 
+
+> t
+
+− K(j) 
+
+> t
+> 22
+
+.
+
+The projected coordinates (z, a, q ) provide a low-dimensional view of one component of the full branch dispersion. Therefore, separation in the plotted (e1, e 2, z ) coordinates is a diagnostic for KV-cache trajectory divergence, not a proof by it-self that token predictions must differ. C.5 Case Study: KV Cache Vector Space Properties 
+
+To examine whether the geometric claims of Sec. C hold across prompts, we present three HumanEval 
+
+case studies: samples 2, 15, and 19. For each sample, we show two paired diagnostics: (i) the projected KV-cache trajectory in the (e1, e 2, z ) co-ordinate system of Sec. C.1, where the axial coordi-nate is z = ⟨K − c0, u 0⟩ with u0 = c0/∥c0∥2; and (ii) the token-level consensus heatmap across the six block-size branches that share the prompt and prefill cache. The KV diagnostic reflects geometric behavior of the cache vector, while the consensus heatmap exposes the token-level outcome of that geometry at decoded positions. Across the three prompts, we observe the same three phenomena predicted by Props. C.2–C.4: ad-jacent block-denoise events remain confined to small tangent-plane neighborhoods; every large axial excursion in z is initiated by a full-sequence refresh rather than by local denoising; and branches that share a common prefix fan out in (e1, e 2) at the same generation step where the consensus heatmap records the first divergent token. This consistency suggests that the conic-manifold view of KV-cache evolution is not an artifact of a single prompt and that token-level bifurcation can be read off the KV geometry directly. (a) KV-cache trajectory: true KV geometry and step-aligned evolution. 
+
+(b) Block-size branch consensus heatmap. 
+
+Figure 10: Case study: HumanEval sample 2. States from all six block-size branches concentrate along a low-dimensional locus dominated by u0. Block-denoise events form dense tangent clusters, whereas large axial jumps are initiated only by full-sequence refreshes (Prop. C.2). The consensus heatmap shows that all branches share an identical prefix and then bifurcate at the dashed line, matching the tangent-plane separation visible in the KV trajectory (Prop. C.4). (a) KV-cache trajectory: true KV geometry and step-aligned evolution. 
+
+(b) Block-size branch consensus heatmap. 
+
+Figure 11: Case study: HumanEval sample 15. The same local-region-with-refresh-jumps pattern appears on a longer prompt. Tangent spread accumulates with generation step, while the consensus panel shows progressive divergence of larger block sizes first, consistent with the Lipschitz block bound of Prop. C.2. (a) KV-cache trajectory: true KV geometry and step-aligned evolution. 
+
+(b) Block-size branch consensus heatmap. 
+
+Figure 12: Case study: HumanEval sample 19. This harder prompt exhibits earlier bifurcation. The tangent-plane fan-out in the KV trajectory and the early color split in the consensus heatmap occur at the same generation step, again confirming that branch bifurcation is the token-level signature of tangent-space separation (Prop. C.4). Algorithm 1 BLOCK BATCH : Fused Block Batch-ing with Row-Owned KV Cache 
+
+Require: Model fθ , prompt p, generation length G, block sizes B =
+
+{b1, . . . , b N }, mask token [M] , decode threshold τdec , merge thresh-old τconf , sync threshold τsync , refresh interval R
+
+Ensure: Generated sequence ˆx
+
+1: Lp ← | p|, L ← Lp + G
+
+2: Initialize X ∈ NN ×L with [M] 
+
+3: Set Xk, 1: Lp ← p for all k
+
+4: Initialize branch states Sk ← (k, b k , start = Lp, end = Lp +
+
+bk , done = false) 
+
+5: (K, V), {ℓ(k)}Nk=1 ← INITIAL FULL FORWARD (fθ , X, {Sk }) {one full forward; KV broadcast to all rows} 
+
+6: for each active branch Sk do 
+
+7: DECODE CURRENT BLOCK (Xk , ℓ(k), S k , τ dec )
+
+8: end for 
+
+9: ADVANCE COMPLETED BLOCKS (X, {Sk })
+
+10: MERGE SYNC (X, K, V, {Sk }, τ conf , τ sync )
+
+11: (K, V) ← REFRESH IFNEEDED (fθ , X, K, V, {Sk }, R )
+
+12: while there exists Sk such that Sk .done = false do 
+
+13: A ← GET ACTIVE BRANCHES (X, {Sk }) {unfinished branches with masked tokens in the current block} 
+
+14: Q ← PACK ACTIVE BLOCKS (X, A) {varlen packing removes padded query tokens} 
+
+15: {ℓ(k)}Sk ∈A ← BATCHED BLOCK FORWARD (fθ , Q, K, V, A)
+
+16: for each Sk ∈ A do 
+
+17: DECODE CURRENT BLOCK (Xk , ℓ(k), S k , τ dec )
+
+18: UPDATE PROBABILITY MAP (Sk , ℓ(k))
+
+19: CHECK EOS (Sk , Xk , ℓ(k))
+
+20: end for 
+
+21: if there exists an EOS-ready branch then 
+
+22: return SELECT EOSW INNER ({Sk }, X)
+
+23: end if 
+
+24: ADVANCE COMPLETED BLOCKS (X, {Sk })
+
+25: MERGE SYNC (X, K, V, {Sk }, τ conf , τ sync )
+
+26: (K, V) ← REFRESH IFNEEDED (fθ , X, K, V, {Sk }, R )
+
+27: end while 
+
+28: k⋆ ← arg max k Sk .progress 
+
+29: return Xk⋆
+
+Summary. The three case studies provide consis-tent empirical support for the step / axial decompo-sition used throughout Sec. C. The axial direction 
+
+u0 is moved almost exclusively by full-sequence refreshes (Prop. C.2), the bounded recurrence of Prop. C.3 is visible as tight axial banding between refresh cycles, and the tangent-plane separation predicted by Prop. C.4 aligns step-for-step with the position of first token-level divergence reported by the consensus heatmaps. Together, these ob-servations justify treating block-size branches as competing local traversals of a shared KV-cache geometry rather than independent generations. 
+
+D Appendix: Block Batching Algorithm 
+
+D.1 Fused Block Batching with a Unified KV Cache 
+
+Let [M] denote the mask token, Lp the prompt length, and G the generation length. For each block size bk ∈ B , BlockBatch maintains one branch state Sk and one row in the unified token tensor and KV cache.Each branch owns its own token row and KV-cache row; rows are copied across branches only through the merge-and-sync policy. 
+
+Algorithm 2 MERGE SYNC : Cross-branch merge and synchronization 
+
+Input: Branch states S = {S1, . . . , S N }, token matrix X, unified cache 
+
+(K, V)
+
+Parameters: merge threshold τconf , sync threshold τsync 
+
+1: Slead ← arg max Sk ∈S Sk .tokens _decoded 
+
+2: if Slead .tokens _decoded = 0 then 
+
+3: return 
+
+4: end if 
+
+5: O ← SORT ACTIVE BRANCHES (S)
+
+6: Merge step: fill masked positions using compatible branches. 
+
+7: for each destination branch Sd ∈ O do 
+
+8: Cd ← COMPATIBLE SOURCES (Sd, O)
+
+9: for each position i ∈ WINDOW UNION (Cd) do 
+
+10: if Xd,i ̸ = [M] then 
+
+11: continue 
+
+12: end if 
+
+13: Cd,i ← { Ss ∈ C d : Xs,i ̸ = [M] }
+
+14: if Cd,i ̸ = ∅ then 
+
+15: Ss⋆ ← arg max Ss ∈C d,i Pd(i, Xs,i )
+
+16: v⋆ ← Xs⋆,i , p⋆ ← Pd(i, v ⋆)
+
+17: if p⋆ > τ conf then 
+
+18: Xd,i ← v⋆
+
+19: Sd.tokens _merged ← Sd.tokens _merged + 1 
+
+20: end if 
+
+21: end if 
+
+22: end for 
+
+23: if CURRENT BLOCK DECODED (Sd, X) then 
+
+24: ADVANCE BLOCK (Sd)
+
+25: end if 
+
+26: end for 
+
+27: Hard synchronization: copy the leader into lagging branches. 
+
+28: for each active branch Sd ∈ S with Sd̸ = Slead do 
+
+29: if Slead .tokens _decoded − Sd.tokens _decoded > τsync 
+
+then 
+
+30: Xd, : ← Xlead ,:
+
+31: (Kd, Vd) ← (Klead , Vlead )
+
+32: REALIGN BLOCK WINDOW (Sd, Xd, :)
+
+33: Sd.tokens _decoded ← Slead .tokens _decoded 
+
+34: end if 
+
+35: end for 
+
+D.2 Merge and Synchronization Policy 
+
+E Appendix: Reproducibility, Artifacts, and Compute Details 
+
+E.1 Scientific Artifacts 
+
+We use publicly available diffusion language mod-els, benchmark datasets, and evaluation proto-cols.The model artifacts include LLaDA-Instruct-8B (Nie et al., 2025b) and Dream-Base-7B (Ye et al., 2025). The benchmark artifacts include GSM8K (Cobbe et al., 2021), MATH (Hendrycks et al., 2021), HumanEval (Chen et al., 2021), and MBPP (Austin et al., 2021b). We cite the origi-nal creators of all models and datasets in the main paper and use them only for research evaluation. 
+
+E.2 Artifact Licenses and Intended Use 
+
+We use existing models and datasets according to their stated research and evaluation purposes.No new human-subject dataset is collected in this work. The experiments are limited to inference-time eval-uation and do not involve training on private, per-sonal, or newly collected user data. E.3 Evaluation Setup 
+
+We evaluate GSM8K, MATH, HumanEval, and MBPP using the standard task prompts and metrics. GSM8K uses 5-shot prompting, MATH uses 4-shot prompting, MBPP uses 3-shot prompting, and Hu-manEval uses 0-shot prompting. HumanEval and MBPP are evaluated with execution-based correct-ness after code sanitization. Unless otherwise stated, all methods use greedy decoding with G = 256 , batch size =1, τconf = 0 .9. We report accuracy, average NFE, and average latency. Latency is measured as per-example generation wall-clock time and ex-cludes model loading and metric post-processing. For Vanilla decoding, NFE is 256. For Fast-dLLM and LocalLeap, NFE is the average number of model forwards used by the decoding procedure. For BlockBatch, one batched forward pass counts as one NFE; the reported NFE includes initial block denoising, block denoising, and full refresh for-wards. Table 1 compares Vanilla decoding, Fast-dLLM dual cache, LocalLeap, and BlockBatch on LLaDA-1.5-8B, LLaDA-Instruct-8B, and Dream-Base-7B. Fast-dLLM dual cache is evaluated with block size 
+
+32 . BlockBatch uses B = {4, 8, 16 , 32 , 64 , 128 },
+
+τsync = 8, R = 32 , and τmerge = 0.5.LocalLeap uses its default script configuration: 
+
+threshold = 0.9, radius = 4, with 
+
+relaxed_threshold = 0 .75 for LLaDA models and relaxed_threshold = 0 .8 for Dream-Base-7B. For Table 2, we ablate the BlockBatch synchro-nization threshold over τsync ∈ { 4, 8, 16 , 32 , 64 }.
+
+All other decoding settings match the Table 1 BlockBatch configuration. The table reports GSM8K and HumanEval results for LLaDA-Instruct-8B and Dream-Base-7B. For Table 3, we ablate the full-refresh inter-val over R ∈ { 4, 8, 16 , 32 , 64 , 128 }, while fixing 
+
+τsync = 8 , B = {4, 8, 16 , 32 , 64 , 128 }.
+
+E.4 Computational Infrastructure and Budget 
+
+Latency and throughput profiling experiments were run on NVIDIA H200 GPUs.

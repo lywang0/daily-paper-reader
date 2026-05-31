@@ -1,0 +1,1356 @@
+Title: Towards Cost-effective LLMs Routing with Batch Prompting
+
+URL Source: https://arxiv.org/pdf/2605.28268v1
+
+Published Time: Thu, 28 May 2026 01:03:55 GMT
+
+Number of Pages: 13
+
+Markdown Content:
+# Towards Cost-effective LLMs Routing with Batch Prompting 
+
+# Haotian Xu 
+
+haotianxu@bit.edu.cn Beijing Institute of Technology Beijing, China 
+
+# Kangfei Zhao ∗
+
+zkf1105@gmail.com Beijing Institute of Technology Beijing, China 
+
+# Jiadong Xie 
+
+jdxie@se.cuhk.edu.hk The Chinese University of Hong Kong Hong Kong SAR, China 
+
+## Abstract 
+
+Large Language Model (LLM) serving systems must balance task performance against monetary cost. Two prominent optimization techniques have emerged independently: LLM routing, which di-rects each query to the most cost-effective model in a model pool, and batch prompting, which packs multiple queries into a single invocation to amortize the fixed cost of the shared system prompt. These two techniques are logically complementary; i.e., routing op-timizes the model assignment dimension while batching optimizes the query aggregation dimension, jointly reshaping the landscape of model utility and monetary cost. However, existing approaches explore only one side of this decision space. On the basis of empiri-cal studies on their impacts, we are motivated to jointly optimize these two dimensions in this paper. We formulate the Route with Batching Problem , which jointly determines the target model and batch size for each query under a total cost budget, and prove it NP-hard. To solve this challenging problem, we propose RoBatch , a unified two-stage framework. In the modeling stage, RoBatch constructs a batch-aware proxy utility model that decomposes combinatorial utility estimation into utility estimation without batching and recalibration of model-specific utility degradation with batching. In the routing stage, 
+
+RoBatch employs a greedy scheduling algorithm that progressively upgrades the assignment of the target model and batch size for queries along the cost-utility Pareto frontier until the budget is exhausted. Extensive experiments on six benchmarks across two LLM families (Qwen3 and Gemma3) demonstrate that RoBatch 
+
+consistently achieves a superior cost–performance Pareto frontier compared with LLM routing and batch prompting baselines. 
+
+## 1 Introduction 
+
+Large Language Models (LLMs) are rapidly becoming a founda-tional component of modern data- and AI-intensive applications. They power a wide spectrum of applications, including question answering [ 40 ], content understanding [ 10 , 19 ], classification [ 22 ], reasoning [ 33 ], recommendation [ 26 , 39 ], code assistance [ 32 ], and increasingly, agentic workflows [ 4 , 27 , 35 ] that invoke models as part of data-processing pipelines. As LLMs move from standalone demos to production-level services, the focus is no longer merely on how to obtain a good answer from a single model invocation, but how to serve large volumes of query instances economically and reliably. This means that LLM serving systems must balance task serving quality, monetary expenditure, and response efficiency, etc. under practical workloads and budget constraints. A typical LLM serving pipeline follows a simple paradigm that for each incoming query, the system constructs a prompt comprising the task-specific system prompt followed by the query, and submits 
+
+> ∗Corresponding author.
+
+the full prompt to a target model. In practice, instead of relying on a single model, LLM serving systems often maintain a pool of models with different capabilities and prices [ 2, 25 , 28 , 36 ]. Smaller models are cheaper and faster, and often sufficient for simple queries; larger models are more expensive but more reliable for difficult reason-ing or knowledge-intensive queries. This heterogeneity creates an opportunity for LLM routing [ 16 ]: if the system can identify, for each query, the cheapest model that achieves quality comparable to the best available model, it can reduce cost while preserving overall quality of the answers. The key idea of LLM routing is to learn a routing strategy that predicts the most appropriate model for each query, as shown in Fig. 1(a). For example, FrugalGPT [7 ]and RouteLLM [ 24 ] send an easy query to cheaper models and reserve stronger and more expensive models for hard queries via query-level model selection. However, routing only optimizes the dimension of model assignment for LLM serving. It still invokes the LLM once per query, and thus leaves the repeated fixed cost of the system prompt paid again and again across the query workload. A second line of work called batch prompting [ 8 ] addresses this cost-inefficiency. Rather than issuing an LLM call per query, as illustrated in Fig. 1(b), batch prompting packs multiple independent queries into an LLM invocation so that they share one common system prompt. Therefore, this amortizes the fixed input cost of the system prompt and can substantially reduce per-query cost. Recent frameworks, such as BATCHER [ 13 ] and OBP [ 17 ], explore grouping queries into batches by semantic similarity, diversity, or adaptive clustering. Intuitively, the longer the system prompt and the larger the batch size, the more cost expenditure can be saved. However, batching also introduces its own trade-off between batch size and result quality. As the batch sizes grow, the result quality can degrade, especially when the input prompt exceeds the effective context window of the model [21]. These two techniques, LLM routing and batch prompting, are logically complementary. Routing optimizes which model processes each query, operating along the dimension of model assignment, while batching optimizes how multiple queries share an LLM invo-cation, operating along the dimension of query aggregation. The real deployment lies not in either technique alone, but in their joint optimization. Unfortunately, existing approaches only explore one side of this decision space. Routing methods assume non-batched prompting and estimate query performance under single-query in-vocations, as shown in Fig. 1(a), whereas batching methods typically assume a fixed model and optimize only how queries are grouped, as shown in Fig. 1(b). A natural idea is to combine them in one pipeline: first perform routing, then batch the queries assigned to each model; or first construct batches, then choose a model for each batch. Another straightforward extension is to equip the pipeline with dynamic, adaptive batch sizes for each model. However, these adaptations are only coarse-grained and suboptimal, treating one      
+
+> arXiv:2605.28268v1 [cs.DB] 27 May 2026 Haotian Xu, Kangfei Zhao, and Jiadong Xie 𝑞 !Sys.
+> Sys. 𝑞 "
+> Sys. 𝑞 #
+> Sys. 𝑞 $
+> Sys. 𝑞 %
+> Sys. 𝑞 &
+
+LLM 1 
+
+LLM 2                    
+
+> 𝑞 "
+> 𝑞 $
+> 𝑞 #
+> 𝑞 !
+> 𝑞 %
+> 𝑞 &
+> 𝑞 '
+> 𝑞 (
+> Sys. 𝑞 (
+> Sys. 𝑞 '
+> (a) LLM Routing Sys. 𝑞 "𝑞 $
+> Sys. 𝑞 #𝑞 !
+> Sys. 𝑞 %𝑞 &
+> LLM
+> batch size=2 𝑞 "
+> 𝑞 $
+> 𝑞 #
+> 𝑞 !
+> 𝑞 %
+> 𝑞 &
+> 𝑞 '
+> 𝑞 (
+> Sys. 𝑞 '𝑞 ((b) Batch Prompting LLM 1
+> LLM 2
+> Sys. 𝑞 #𝑞 !
+> Sys. 𝑞 "𝑞 $
+> 𝑞 %𝑞 &
+> batch size=2
+> batch size=4
+> Sys. 𝑞 '𝑞 (
+> batch size=2
+> 𝑞 "
+> 𝑞 $
+> 𝑞 #
+> 𝑞 !
+> 𝑞 %
+> 𝑞 &
+> 𝑞 '
+> 𝑞 ((c) Route with Batching
+
+Figure 1: LLM Routing vs. Batch Prompting vs. Route with Batching 
+
+technique as a loosely coupled add-on to the other instead of jointly optimizing the two-dimensional decisions. The core difficulty of the joint optimization is that, once batch-ing is introduced, the cost and utility of a configuration can no longer be characterized by the model alone. Instead, they are jointly determined by the model, the batch size, and even the workload in a complicated way. Specifically, a larger and more expensive model prompted with a larger batch size may spend either less or more monetary cost per query than a smaller and cheaper model prompted with a smaller batch size. Likewise, a larger model with a larger batch size may achieve either lower or higher utility than the smaller model with a smaller batch size. As a result, this intricate and intertwined effect of model choice and batch size makes naive composition fundamentally inadequate, where either the router is batch-unaware, or the batching strategy is model-unaware. This motivates a new perspective in which routing and batching should be treated as a single decision problem, where each query is assigned to an execution state specifying both the model choice and the batch size. From this perspective, the serving system must re-profile a joint cost-utility landscape spanning both the model space and the batch size space and then determine an effective state assignment over the landscape. This task is challenging for three reasons. First, the decision space is inherently combinatorial, and exhaustively profiling utility for every model–batch-size combi-nation, especially in a workload-specific manner, is prohibitively expensive. Second, the system should determine a principled can-didate batch-size set for each model. Third, the state assignment algorithm must remain efficient for practical online deployment. To address these challenges, we propose a framework for cost-effective LLM serving that jointly optimizes routing and batch prompting. We first formulate the Route with Batching Problem 
+
+under a budget limit as a constrained combinatorial optimization problem and prove that it is NP-hard. With an in-depth analysis of the impact of model routing and batch prompting on cost and utility, we propose an integrated solution dubbed RoBatch , which resolves the problem in two stages: modeling and routing. In the model-ing stage, RoBatch constructs a batch-aware proxy utility model that captures how each model’s utility varies with batch size. To efficiently learn a proxy model over the combinatorial space of mod-els and batch sizes, RoBatch decomposes the modeling into two sub-tasks: building a router that estimates query utility under non-batched execution, and fitting model-specific scaling functions that characterize the relative utility degradation as batch size increases. In the routing stage, RoBatch treats each model–batch-size pair as a candidate state for a query, and performs fine-grained query-level scheduling over the candidate space, as Fig. 1(c) displays. Specifi-cally, we propose a greedy algorithm that progressively climbs the Pareto frontier of all queries under the budget constraint by up-grading the most cost-effective states. We conduct comprehensive experiments on six benchmarks across two LLM families, Qwen3 and Gemma3, comparing RoBatch with four adapted routing and batching baselines. The results demonstrate that RoBatch consis-tently achieves a better Pareto frontier in the cost-utility landscape, while incurring modest scheduling overhead. 
+
+Roadmap. The rest of the paper is organized as follows. §2 presents the background on LLM routing and batch prompting together with empirical observations that motivate our study. §3 formulates the route with batching problem and overviews our solution RoBatch .§4 and §5 elaborate on the modeling stage and routing stage of 
+
+RoBatch , respectively. §6 reports the experimental studies. We review the related works in §7 and conclude the paper in §8. 
+
+## 2 Background & Empirical Studies 
+
+In this section, we first provide background on LLM routing and batch prompting, and then present respective empirical observa-tions that motivate our study. 
+
+## 2.1 LLM Routing & the Impact 
+
+LLM routing is a model-serving technique that improves the cost-performance trade-off by dynamically assigning each query to the cheapest model predicted to answer it correctly. In a conventional LLM serving pipeline, every incoming query is dispatched to a sin-gle, pre-selected model. This one-size-fits-all strategy is inherently suboptimal: a smaller, cheaper model may suffice for simple queries, whereas complex queries may demand a larger, more powerful, yet more expensive model. LLM routing addresses this inefficiency with a learned router that examines, for each incoming query, dy-namically assigns it to the most suitable model from a model pool 
+
+M = {𝑚 1, · · · ,𝑚 𝐾 }. The router is typically trained on historical query–result pairs to estimate the probability that each candidate model will correctly resolve a given query. At inference time, the router’s prediction determines the target model for each query. By directing each query to the cheapest model expected to answer it correctly, routing can substantially reduce total monetary cost while preserving, or even improving, the overall task performance. Towards Cost-effective LLMs Routing with Batch Prompting 0 0.05 0.10 0.15 0.20 0.25   
+
+> 0.70
+> 0.75
+> 0.80
+> 0.85 Qwen3-14B
+> Qwen3-32B
+> Qwen3-4B
+> MLP Router
+> KNN Router
+> Total Cost ($)
+> Avg. Acc.
+> (a)
+
+AGNews 0 0.2 0.4 0.6 0.8   
+
+> 0.1
+> 0.2
+> 0.3
+> 0.4
+> 0.5
+> Qwen3-14B
+> Qwen3-32B
+> Qwen3-4B
+> MLP Router
+> KNN Router
+> Total Cost ($)
+> Avg. Acc. (b)
+
+GSM 8K
+
+Figure 2: The Impact of Routing on Avg. Acc. and Cost 8 16 24 32 40 48 56 64  
+
+> 0.1
+> 0.3
+> 0.5
+> 0.7
+> 0.9
+> batch size
+> Avg. Acc.
+> Qwen3-4B
+> Qwen3-14B
+> Qwen3-32B
+> (a)
+
+AGNews 8 16 24 32 40 48 56 64   
+
+> 0.1
+> 0.2
+> 0.3
+> 0.4
+> 0.5
+> batch size
+> Avg. Acc.
+> Qwen3-4B
+> Qwen3-14B
+> Qwen3-32B (b)
+
+GSM 8K
+
+Figure 3: The Impact of Batching on Avg. Acc. Impact on Query Accuracy and Monetary Cost. To explore the impact of routing on accuracy and cost, we compare two vanilla routers, a Multi-layer Perceptron (MLP)-based router, and a K-nearest neighbor (KNN)-based router, with the single-model base-lines in the Qwen3 family. Fig. 2 presents each strategy as a point in the cost-accuracy space, on a topic classification query set AGNews 
+
+and a mathematical reasoning query set GSM 8K. In general, rout-ing consistently achieves favorable trade-offs in the cost-accuracy landscape. Simultaneously, by saving the costs from easier queries, routers selectively spend the saved budget on expensive models for hard queries, yielding a controllable mechanism under a fixed total budget. It is worth mentioning that the larger the model, the higher the cost, but larger models do not universally dominate the Accu-racy for all tasks, which depends on task-specific characteristics. 
+
+## 2.2 Prompt Batching & the Impact 
+
+Batch prompting reduces the cost of LLM invocations by packing multiple independent queries into a single context of invocation. In standard non-batched invocations, every invocation pairs the system prompt, comprising task instructions, formatting guidelines, and optional few-shot demonstrations with exactly one user query. Because the system prompt is identical across queries, its token cost is incurred repeatedly, constituting a fixed and structurally redundant overhead that scales linearly with the number of queries. Batch prompting amortizes this redundant cost by concatenating 𝑏 
+
+queries with a single, shared system prompt in one invocation. 
+
+Impact on Query Accuracy and Monetary Cost. To investigate the impact of batch size 𝑏 on result quality and cost for different LLMs, we gradually increase 𝑏 from 1 to 64 by randomly grouping queries and report the average Accuracy of the three Qwen3 LLMs on the two datasets in Fig. 3. We observe that when the batch size is small, e.g., 𝑏 < 16 for AGNews and 𝑏 < 8 for GSM 8K, accu-racy remains stable or declines only marginally compared with single-query invocations (i.e., 𝑏 = 1), with the tolerance depending on the tasks and the capacity of LLMs. This stability persists as System Prompt Cost User Query Cost Output Cost Total Cost 16 32 48 64        
+
+> batch size
+> 0.00
+> 0.01
+> 0.02
+> 0.03
+> Cost ($)
+> Qwen3-4B
+> 16 32 48 64
+> batch size
+> 0.00
+> 0.04
+> 0.08
+> 0.12
+> Qwen3-14B
+> 16 32 48 64
+> batch size
+> 0.00
+> 0.08
+> 0.16
+> 0.24
+> Qwen3-32B
+> (b)
+
+AGNews 16 32 48 64         
+
+> batch size
+> 0.00
+> 0.02
+> 0.04
+> 0.06
+> Cost ($)
+> Qwen3-4B
+> 16 32 48 64
+> batch size
+> 0.00
+> 0.08
+> 0.16
+> 0.24 Qwen3-14B
+> 16 32 48 64
+> batch size
+> 0.00
+> 0.15
+> 0.30
+> 0.45
+> Qwen3-32B
+> (c)
+
+GSM 8K
+
+Figure 4: The Impact of Batching on Cost 
+
+long as the concatenated input remains within the LLM’s reasoning capability and its effective attention span, a.k.a., effective context length. However, as the batch size continues increasing, the ex-cessive complexity of the concatenated prompt overwhelms the model’s reasoning capability and effective context length, and the Accuracy drastically degrades to a low regime. This degradation is especially severe for the smaller Qwen3-4B, while the larger models, such as Qwen3-14B and Qwen3-32B, exhibit greater resilience. We further investigate the impact of different batch sizes on the cost. Fig. 4 shows the total cost of system prompt, query, and the generated output across the three Qwen3 LLMs. We observe that the cost of query prompt and output remains stable except in the cases of 𝑏 > 50 on Qwen3-4B and larger batch sizes on the reasoning-intensive task GSM 8K where inference degeneration causes the LLM to produce repetitive or malformed outputs. As 𝑏 
+
+increases from 1, the cost of system prompt is amortized by a factor of 1/𝑏 . When 𝑏 = 1, the cost of system prompt occupies around 59.5% and 90.1% total cost for AGNews and GSM 8K, respectively, while for 𝑏 = 16 on AGNews and 𝑏 = 8 on GSM 8K, the shares are amortized to 8.4% and 53.2% , respectively, demonstrating that the amortization results in a significant cost reduction. 
+
+## 2.3 Takeaway & Motivations 
+
+The empirical studies in §2.1 and §2.2 shed light on two complemen-tary insights. First, routing optimizes which model processes each query, but not how queries are processed. LLM routing provides a controllable mechanism for navigating the cost–accuracy Pareto frontier at the granularity of individual queries. However, routing processes each query as an individual LLM invocation, leaving the structurally redundant cost from the repetitive system prompt unoptimized, which grows linearly with the number of queries, re-gardless of the routing strategy. Second, batch prompting optimizes 
+
+how queries share an invocation, but not which model they are as-signed to. Batch prompting amortizes the cost of the system prompt by packing multiple queries into one LLM invocation. Exceeding a model’s effective batch size degrades accuracy and may inflate Haotian Xu, Kangfei Zhao, and Jiadong Xie 
+
+costs, indicating that the batch size should be carefully calibrated for each model based on the specific task. 
+
+Motivation. These two findings reveal a fundamental comple-mentarity: routing controls the model choice dimension 𝑚 𝑘 while batching controls the query aggregation dimension 𝑏 , but neither technique alone explores the joint optimization space (𝑚 𝑘 , 𝑏 ). More significantly, the two dimensions interact non-trivially. As shown in Fig. 3, the effective batch size depends on both model capability and task characteristics. The cost reduction from batching changes the per-query pricing of each model, and the accuracy degrada-tion from batching affects different models by different degrees, which jointly reshape the cost-accuracy landscape. This motivates us to a unified formulation where model selection and batch size assignment are jointly optimized. 
+
+## 3 Problem Formulation & Overview 
+
+We use Q = {𝑞 1, · · · , 𝑞 𝑛 } to represent 𝑛 queries to be solved by LLMs, and use M = {𝑚 1, · · · , 𝑚 𝐾 } to represent a pool of 𝐾 LLMs. Each LLM 𝑚 𝑘 ∈ M is associated with distinct per-token costs for input and output, denoted as 𝑐 𝑖𝑛 𝑘 and 𝑐 𝑜𝑢𝑡 𝑘 , respectively. Considering solving a single query 𝑞 𝑖 by LLM 𝑚 𝑘 in one LLM invocation, we characterize the monetary cost of this invocation as Eq. (1): 
+
+𝐶 sys (𝑚 𝑘 ) + 𝐶 𝑞 𝑖 (𝑚 𝑘 ), (1) 
+
+𝐶 sys (𝑚 𝑘 ) = 𝑡 sys · 𝑐 𝑖𝑛 𝑘 , 𝐶 𝑞 𝑖 (𝑚 𝑘 ) = 𝑡 𝑖𝑛 𝑞 𝑖 · 𝑐 𝑖𝑛 𝑘 + 𝑡 𝑜𝑢𝑡 𝑞 𝑖 · 𝑐 𝑜𝑢𝑡 𝑘 (2) where 𝐶 sys (𝑚 𝑘 ) is the system prompt cost, determined by a fixed number of tokens 𝑡 sys , and 𝐶 𝑞 𝑖 (𝑚 𝑘 ) is the cost incurred purely by the query 𝑞 𝑖 , including the cost of 𝑡 𝑖𝑛 𝑞 𝑖 tokens from the input query and 𝑡 𝑜𝑢𝑡 𝑞 𝑖 tokens from the generated output. In this paper, we assume that the number of output tokens is easy to estimate, e.g., the response of a multi-class classification problem where output tokens are fixed, or by restricting the largest number of output tokens in the system prompt. Without loss of generality, we assume the 𝐾 models in M are indexed in ascending order of size and capability, i.e., 𝑚 1 < · · · < 𝑚 𝐾 , with their per-token costs ordered 
+
+𝑐 𝑖𝑛  
+
+> 1
+
+< · · · < 𝑐 𝑖𝑛 𝐾 and 𝑐 𝑜𝑢𝑡  
+
+> 1
+
+< · · · < 𝑐 𝑜𝑢𝑡 𝐾 accordingly. Batch prompting packs multiple queries into a single LLM in-vocation. Given the query workload Q, each LLM 𝑚 𝑘 is charac-terized by a set of valid batch sizes B𝑘 = {1, · · · , 𝑏 max  
+
+> 𝑘
+
+} in as-cending order where 𝑏 max  
+
+> 𝑘
+
+is the largest batch size, determined by the average query length in Q and the effective context length of 𝑚 𝑘 . When a batch size 𝑏 ∈ B 𝑘 is adopted, the system prompt of 
+
+𝐶 sys (𝑚 𝑘 ) is amortized by 1/𝑏 for each query, while the per-query cost 𝐶 𝑞 𝑖 (𝑚 𝑘 ) remains unchanged. Consider that a query in Q is simultaneously routed to an LLM in M and assigned a batch size from the space of the batch size of that LLM. We assign each query a state 𝑠 (𝑞 𝑖 ) = (𝑚 𝑘 , 𝑏 ), denoting that 𝑞 𝑖 will be routed to LLM 𝑚 𝑘 
+
+and packed into a batch with a size of 𝑏 ∈ B 𝑘 . A binary decision variable 𝑥 𝑖 ,𝑘 ,𝑏 ∈ { 0, 1 } for 𝑖 ∈ { 1, · · · , 𝑛 }, 𝑘 ∈ { 1, · · · , 𝐾 }, 𝑏 ∈ B 𝑘 
+
+encodes this assignment: 
+
+𝑥 𝑖 ,𝑘 ,𝑏 = 1 ⇐⇒ 𝑠 (𝑞 𝑖 ) = (𝑚 𝑘 , 𝑏 ), and 0 otherwise . (3) Given a specific assignment of the decision variables 𝑥 𝑖 ,𝑘 ,𝑏 , the total cost from model 𝑚 𝑘 under batch size 𝑏 is 
+
+𝐶 (𝑚 𝑘 , 𝑏 ) =
+
+&
+
+1
+
+𝑏 
+
+> 𝑛
+
+∑︁ 
+
+> 𝑖 =1
+
+𝑥 𝑖 ,𝑘 ,𝑏 
+
+'
+
+· 𝐶 sys (𝑚 𝑘 ) + 
+
+> 𝑛
+
+∑︁ 
+
+> 𝑖 =1
+
+𝑥 𝑖 ,𝑘 ,𝑏 · 𝐶 𝑞 𝑖 (𝑚 𝑘 ). (4) The first term of Eq. (4) captures the total system prompt cost across all batches of size 𝑏 , where the ceiling operator ⌈·⌉ accounts for the number of physical invocations, including partially filled batches. The second term captures the cumulative input and output token cost of all queries assigned to the state (𝑚 𝑘 , 𝑏 ).It is worth noting that a single LLM may simultaneously serve batches of different sizes. As shown in Fig. 2 and Fig. 3, query accuracy is influenced by both the routed model and the batch size. We therefore let 𝑢 𝑖 ,𝑘 ,𝑏 denote the utility score of query 𝑞 𝑖 in state 
+
+(𝑚 𝑘 , 𝑏 ), e.g., whether 𝑞 𝑖 is correctly classified in a classification task. Given a monetary cost budget 𝐶 𝑏𝑑𝑔 , the cost-effective LLM routing with batch prompting is formally defined as the following constrained combinatorial optimization problem: 
+
+Definition 3.1. (Route with Batching Problem ) Given a query workload Q = {𝑞 1, · · · , 𝑞 𝑛 }, a set of LLMs M = {𝑚 1, · · · ,𝑚 𝐾 },and a total cost budget 𝐶 𝑏𝑑𝑔 . Suppose each model 𝑚 𝑘 is associated with a set of valid batch sizes B𝑘 . The problem is to seek a binary assignment 𝑥 𝑖 ,𝑘 ,𝑏 ∈ { 0, 1 } that solves: 
+
+max 
+
+> 𝑛
+
+∑︁ 
+
+> 𝑖 =1
+> 𝐾
+
+∑︁ 
+
+> 𝑘 =1
+
+∑︁ 𝑏 ∈ B 𝑘 
+
+𝑥 𝑖 ,𝑘 ,𝑏 · 𝑢 𝑖 ,𝑘 ,𝑏 , (5) 
+
+𝑠 .𝑡 .
+
+> 𝐾
+
+∑︁ 
+
+> 𝑘 =1
+
+∑︁ 𝑏 ∈ B 𝑘 
+
+𝑥 𝑖 ,𝑘 ,𝑏 = 1 ∀𝑖 ∈ { 1, . . . , 𝑛 }, (6) ∑︁  
+
+> 𝑚 𝑘 ∈ M
+
+∑︁ 𝑏 ∈ B 𝑘 
+
+𝐶 (𝑚 𝑘 , 𝑏 ) ≤ 𝐶 𝑏𝑑𝑔 . (7) The objective (Eq. (5) ) is to maximize the total utility of all processed queries, subject to two constraints: Eq. (6) ensures that each query 
+
+𝑞 𝑖 is routed to exactly one LLM with exactly one batch size, and Eq. (7) ensures that the total cost does not exceed the given budget. 
+
+The NP-hardness of Route with Batching Problem. We analyze the computational hardness of the problem as follows. 
+
+Theorem 3.2. The Route with Batching Problem is NP-hard. 
+
+Proof Sketch: We reduce the maximum coverage (MC) problem [ 18 ], which is known to be NP-hard, to the route with batching prob-lem. Given an integer 𝐵 and a collection of sets where each set contains some elements, the MC problem is to find at most 𝐵 
+
+sets that cover the largest number of elements. Consider an ar-bitrary instance 𝐻 of MC with 𝐾 sets 𝑇 1, · · · ,𝑇 𝐾 and 𝑛 elements 
+
+{𝑒 1, · · · , 𝑒 𝑛 } = Ð1≤𝑘 ≤𝐾 𝑇 𝑘 . We construct a corresponding instance of the route with batching problem as follows. Each query 𝑞 𝑖 corre-sponds to an element 𝑒 𝑖 (1 ≤ 𝑖 ≤ 𝑛 ), and each LLM 𝑚 𝑘 corresponds to a set 𝑇 𝑘 (1 ≤ 𝑘 ≤ 𝐾 ). For each LLM 𝑚 𝑘 , we let its valid batch-size space contain only one batch size: B𝑘 = {𝑛 }. We set the system prompt cost of each model to 𝐶 sys (𝑚 𝑘 ) = 1, and the query-specific cost to 𝐶 𝑞 𝑖 (𝑚 𝑘 ) = 0 for every 𝑞 𝑖 and 𝑚 𝑘 . For each query-model pair, we define the utility as 𝑢 𝑖 ,𝑘 ,𝑛 = 1 if 𝑒 𝑖 ∈ 𝑇 𝑘 and 𝑢 𝑖 ,𝑘 ,𝑛 = 0
+
+otherwise. Additionally, we set the total budget to 𝐶 𝑏𝑑𝑔 = 𝐵 . For any model 𝑚 𝑘 , let 𝑁 𝑘 be the number of queries assigned to 𝑚 𝑘 .Towards Cost-effective LLMs Routing with Batch Prompting 
+
+Since the only valid batch size is 𝑛 , the total cost incurred by 𝑚 𝑘 
+
+is 𝐶 (𝑚 𝑘 , 𝑛 ) =
+
+l 𝑁 𝑘 
+
+> 𝑛
+
+m
+
+· 𝐶 sys (𝑚 𝑘 ) =
+
+l 𝑁 𝑘 
+
+> 𝑛
+
+m
+
+. Because 0 ≤ 𝑁 𝑘 ≤ 𝑛 , we have 𝐶 (𝑚 𝑘 , 𝑛 ) = 1 if 𝑁 𝑘 > 0, and 𝐶 (𝑚 𝑘 , 𝑛 ) = 0 otherwise. Thus, the total routing cost is exactly the number of used models. Consider any feasible solution to the constructed instance. Let 𝐼 be the set of used models. Since the total cost equals the number of used models and is bounded by 𝐶 𝑏𝑑𝑔 = 𝐵 , we have |𝐼 | ≤ 𝐵 . For each query 𝑞 𝑖 , its utility contribution is at most 1, and it can achieve utility 1 if and only if it is assigned to a model 𝑚 𝑘 ∈ 𝐼 such that 𝑒 𝑖 ∈ 𝑇 𝑘 . Therefore, the maximum total utility obtainable by the set 𝐼 is exactly the number of elements covered by the corresponding set collection 
+
+{𝑇 𝑘 | 𝑚 𝑘 ∈ 𝐼 }. Hence, an optimal solution to the constructed rout-ing instance yields an optimal solution to the MC instance, and vice versa. Since the MC problem is NP-hard, the route with batching problem is NP-hard. □
+
+The Overview of RoBatch . Our cost-effective routing with batch prompting framework, RoBatch , operates in two stages: a modeling stage that constructs a batch-aware proxy model for each LLM in M and a routing stage that employs a greedy algorithm to assign each query 𝑞 𝑖 ∈ Q to a state 𝑠 (𝑞 𝑖 ) = (𝑚 𝑘 , 𝑏 ) based on the batch-aware proxy model. In the modeling stage, the principal task of RoBatch is to estimate query utility in each LLM 𝑚 𝑘 regarding different batch sizes in the valid space of B𝑘 , profiling the landscape of query utility changes regarding different models and batch sizes. Recall that typical LLM routing approaches estimate query utility under a batch size of 1, whereas RoBatch needs to further account for the impact of batching. However, directly constructing a proxy model that jointly models the query space, the model space, and the batch size space faces a combination explosion. Thereby, RoBatch 
+
+introduces the batch-aware proxy model as Eq. (8) , decoupling the proxy model for single query invocation with a query-agnostic scaling function parametrized by batch size: 
+
+b𝑢 𝑖 ,𝑘 ,𝑏 = b𝑢 𝑖 ,𝑘 ,1 · 𝜌 𝑘 (𝑏 ), (8) where b𝑢 𝑖 ,𝑘 ,𝑏 is the estimated utility score of query 𝑞 𝑖 from LLM 
+
+𝑚 𝑘 with batch size 𝑏 ∈ B 𝑘 , and b𝑢 𝑖 ,𝑘 ,1 is the estimated utility of 𝑞 𝑖 
+
+from LLM 𝑚 𝑘 without batching, i.e., 𝑏 = 1. The term 𝜌 𝑘 (𝑏 ) is a model-specific scaling function that captures the general relative decay in utility as the batch size increases from 1 to 𝑏 . During the construction of the scaling function 𝜌 𝑘 (𝑏 ) and the proxy model 
+
+b𝑢 𝑖 ,𝑘 ,𝑏 , RoBatch also calibrates the effective batch size 𝑏 effect  
+
+> 𝑘
+
+for each LLM 𝑚 𝑘 as the maximum batch size in B𝑘 to use. We provide the details of the modeling stage in §4. In the routing stage, Ro-Batch begins by assigning every query an initial state, which is the cheapest LLM in the model pool with that model’s effective batch size. Then, RoBatch iteratively upgrades the states of queries in a greedy manner, prioritizing queries whose per-unit-cost utility can be improved by the largest margin. The iteration continues until either the total cost budget is exhausted or all queries have reached their best states. We elaborate on the greedy algorithm in §5. 
+
+## 4 The Modeling Stage 
+
+The modeling stage constructs a batch-aware proxy model for each LLM 𝑚 𝑘 , which estimates the utility score of query 𝑞 𝑖 from 𝑚 𝑘 with a batch size of 𝑏 , denoted as b𝑢 𝑖 ,𝑘 ,𝑏 . Constructing such a model poses two challenges. First, the LLM inference is context-dependent; the practical utility of a query 𝑞 𝑖 is also influenced by the other (𝑏 − 1)
+
+queries sharing the same invocation, which cannot be determined beforehand. Second, jointly modeling the query space, the model space, and the batch size space leads to a combinatorial explosion. To address these challenges, RoBatch adopts a simple yet effective formulation based on the observation that queries in one workload are different problem instances of one general task. Consequently, as 𝑏 increases from 1, different queries tend to exhibit a similar trend of utility degradation on an LLM 𝑚 𝑘 . RoBatch factorizes this trend into a query-agnostic scaling function 𝜌 𝑘 (𝑏 ), separating it from the utility score without batching b𝑢 𝑖 ,𝑘 ,1 , as shown in Eq. (8) . The scaling function 𝜌 𝑘 (𝑏 ) is expected to also encapsulate the complex influence of the 𝑏 − 1 co-batched random queries. As a result, estimating b𝑢 𝑖 ,𝑘 ,𝑏 
+
+reduces to independently estimating 𝜌 𝑘 (𝑏 ) and b𝑢 𝑖 ,𝑘 ,1 . We introduce how each is obtained below. 
+
+Fitting the Utility Scaling Function. Profiling the scaling func-tion 𝜌 𝑘 (𝑏 ) for each LLM 𝑚 𝑘 is a novel and critical task in RoBatch .Before fitting 𝜌 𝑘 (𝑏 ), RoBatch first calibrates two quantities for each LLM: the largest batch size 𝑏 max  
+
+> 𝑘
+
+and the effective batch size 
+
+𝑏 effect  
+
+> 𝑘
+
+. Here, 𝑏 max  
+
+> 𝑘
+
+serves as the upper limit for the calibration of 
+
+𝑏 effect  
+
+> 𝑘
+
+and 𝑏 effect  
+
+> 𝑘
+
+is the most important hyper-parameter for batch prompting, as it further determines the upper bound of the valid batch size space B𝑘 of model 𝑚 𝑘 . Both quantities depend on the query workload Q, but in different ways. 𝑏 max  
+
+> 𝑘
+
+is determined by the average query token length and the system prompt length, while 
+
+𝑏 effect  
+
+> 𝑘
+
+is jointly governed by the query difficulty and the capabil-ity of model 𝑚 𝑘 . To derive the largest batch size 𝑏 max  
+
+> 𝑘
+
+, RoBatch 
+
+introduces a threshold 𝜖 ∈ ( 0, 1 ) that bounds the fraction of system prompt cost in the batched prompt for each model 𝑚 𝑘 :
+
+𝜖 ≤ 𝐶 sys (𝑚 𝑘 )
+
+𝐶 sys (𝑚 𝑘 ) + 𝑏 𝑘 · E𝑞 𝑖 ∈ Q [𝐶 𝑞 𝑖 (𝑚 𝑘 )] , (9) where 𝐶 sys (𝑚 𝑘 ) is the system prompt cost, 𝐶 𝑞 𝑖 (𝑚 𝑘 ) is the cost of an individual input query, and E𝑞 𝑖 ∈ Q [𝐶 𝑞 𝑖 (𝑚 𝑘 )] is the expected per-query cost over Q. Rearranging the inequality of Eq. (9) yields the upper bound on 𝑏 𝑘 :
+
+𝑏 𝑘 ≤ 𝑏 max  
+
+> 𝑘
+
+=
+
+ 𝐶 sys (𝑚 𝑘 )( 1 − 𝜖 )
+
+𝜖 · E𝑞 𝑖 ∈ Q [𝐶 𝑞 𝑖 (𝑚 𝑘 )] 
+
+
+
+. (10) Given a threshold 𝜖 , RoBatch can compute 𝑏 max  
+
+> 𝑘
+
+for each model 𝑚 𝑘 
+
+directly via Eq. (10) without extra profiling. Subsequently, RoBatch 
+
+calibrates the effective batch size 𝑏 effect  
+
+> 𝑘
+
+in the range of [1, 𝑏 max  
+
+> 𝑘
+
+] for each model 𝑚 𝑘 , respectively, and simultaneously fits the scaling function 𝜌 𝑘 (𝑏 ) over its valid batch size space B𝑘 = [1, · · · , 𝑏 effect  
+
+> 𝑘
+
+].Given the significance of 𝑏 effect  
+
+> 𝑘
+
+and 𝜌 𝑘 (𝑏 ), we re-utilize the training query set Q′ to profile each model’s performance under batch prompting with a batch size 𝑏 ∈ B 𝑘 .Although the ground-truth utility of Q′ under 𝑏 = 1 has already been obtained, evaluating the full-scale training set for every model 
+
+𝑚 𝑘 in its remaining batch size space B𝑘 \ { 1} via LLM invocations is time and cost consuming. To reduce this overhead, we first ex-tract a coreset from Q′ that serves as a compact summary of Q′.Specifically, by applying the 𝑘 -center algorithm [ 14 ] on the vector-ized embeddings of Q′, a smaller yet semantically diverse set of Haotian Xu, Kangfei Zhao, and Jiadong Xie 
+
+queries, Q′′ , is extracted as the representative of the entire training set Q′. On the coreset Q′′ , we search for a ‘sweet point’ in the range [1, 𝑏 max  
+
+> 𝑘
+
+] for each model 𝑚 𝑘 as the effective batch size that minimizes the ratio of cost to utility (RCU) as below: RCU (𝑏 ) = 𝐶 sys (𝑚 𝑘 ) + 𝑏 · E𝑞 𝑖 ∈ Q ′′ [𝐶 𝑞 𝑖 (𝑚 𝑘 )] 
+
+E𝑞 𝑖 ∈ Q ′′ [𝑢 𝑖 ,𝑘 ,𝑏 ] . (11) Here, the numerator of RCU in Eq. (11) is the expected cost of a batched prompt of size 𝑏 for model 𝑚 𝑘 , computed by averaging the cost over the coreset Q′′ , while the denominator is the expected utility of that batched prompt for model 𝑚 𝑘 , computed by averag-ing the evaluated utilities over Q′′ via LLM invocations. Intuitively, RCU quantifies the monetary cost spent on unit utility at a specific batch size 𝑏 . RoBatch uses it as a profiling criterion for selecting 
+
+𝑏 effect  
+
+> 𝑘
+
+, since it follows an inherent consistency with our optimiza-tion objective (Eq. (5) ) and constraint (Eq. (7) ). In general, as 𝑏 
+
+increases from 1 to 𝑏 max  
+
+> 𝑘
+
+, the RCU first decreases and then increases, exhibiting a ‘V’-shape. This behavior is because, at small batch sizes, the cost amortization from batching is substantial while the utility degrades only slightly. As 𝑏 continues to grow into a large regime, the cost amortization benefit becomes marginal while the utility drops significantly. Fig. 5 illustrates this trend of RCU (in red lines) on the two datasets, AGNews and GSM 8K, using the Qwen3 family LLMs. Since the RCU curve is uni-modal, RoBatch performs an efficient ternary search over [1, 𝑏 max  
+
+> 𝑘
+
+] to locate the batch size with minimal RCU for each model, as shown in Fig. 5. This batch size is calibrated as the effective batch size 𝑏 effect  
+
+> 𝑘
+
+. Intuitively, 𝑏 effect  
+
+> 𝑘
+
+is the most economical batch size for the workload within the effective context length of the LLM, a point at which the utility (e.g., Avg. Accuracy in the blue lines in Fig. 5) is largely preserved. With 𝑏 effect  
+
+> 𝑘
+
+determined, we model the utility scaling function 
+
+𝜌 𝑘 (𝑏 ) regarding batch size 𝑏 ∈ [ 1, · · · , 𝑏 effect  
+
+> 𝑘
+
+]. There are multiple ways to fit the decaying curves shown in Fig. 3 and Fig. 5. By de-fault, RoBatch adopts piecewise linear interpolation on the utilities obtained from the training coreset Q′′ , as it is numerically stable and parameter-free. Specifically, for each batch size 𝑏 𝑗 ∈ [ 1, 𝑏 effect  
+
+> 𝑘
+
+]
+
+and model 𝑚 𝑘 , we compute the scaling factor at 𝑏 𝑗 as follows: 
+
+𝜌 𝑘 (𝑏 𝑗 ) = 1
+
+𝑢 𝑘 ,1 
+
+
+
+𝑢 𝑘 ,𝑏 𝑗 −1 + ( 𝑏 𝑗 − 𝑏 𝑗 −1) · 𝑢 𝑘 ,𝑏 𝑗 +1 − 𝑢 𝑘 ,𝑏 𝑗 −1
+
+𝑏 𝑗 +1 − 𝑏 𝑗 −1
+
+
+
+, (12) where 𝑏 𝑗 and 𝑏 𝑗 +1 are the two nearest batch sizes such that 𝑏 𝑗 −1 ≤
+
+𝑏 𝑗 ≤ 𝑏 𝑗 +1, and 𝑢 𝑘 ,𝑏 is the average utility of all queries in Q′′ by model 𝑚 𝑘 at batch size 𝑏 . We investigate alternative formulations for fitting 𝜌 𝑘 (𝑏 ) in §6.4. 
+
+Estimation of the Utility Without Batching. Existing routers serve as performance estimators that map a query to its estimated utility scores of all candidate models in M without batch prompting. To train such a router, we first establish a training dataset Q′ =
+
+{𝑞 ′
+
+> 1
+
+, · · · , 𝑞 ′ 
+
+> 𝑛
+
+}. For each training query 𝑞 ′ 
+
+> 𝑖
+
+∈ Q ′, we perform an offline evaluation by invoking all 𝐾 models with 𝑏 = 1 and collecting the real utility score 𝑢 𝑖 ,𝑘 ,1 ∈ { 0, 1 }, which indicates whether model 
+
+𝑚 𝑘 correctly resolves query 𝑞 ′ 
+
+> 𝑖
+
+. This process generates the ground-truth binary vector 𝒖 𝑖 = [𝑢 𝑖 ,𝑘 ,1 , · · · , 𝑢 𝑖 ,𝐾 ,1 ] for each 𝑞 ′ 
+
+> 𝑖
+
+. The input features of the router are vectorized embeddings of queries in Q′,extracted offline by a sentence embedding model [ 31 ]. We formulate routing as a multi-label classification task and train an MLP or KNN-based classifier. The MLP classifier is trained by minimizing RCU Accuracy Effective Batch Size 8 12 20 36                  
+
+> Batch Size
+> 0.012
+> 0.016
+> 0.020
+> RCU
+> Qwen3-4B
+> 812 20 36
+> Batch Size
+> 0.03
+> 0.04
+> 0.05
+> 0.06
+> Qwen3-14B
+> 812 20 36
+> Batch Size
+> 0.050
+> 0.075
+> 0.100
+> 0.125
+> Qwen3-32B
+> 0.30
+> 0.45
+> 0.60
+> 0.5
+> 0.6
+> 0.7
+> 0.5
+> 0.6
+> 0.7
+> Avg. Acc.
+> (a) AGNews 812 20 36
+> Batch Size
+> 0.08
+> 0.12
+> 0.16
+> RCU
+> Qwen3-4B
+> 812 20 36
+> Batch Size
+> 0.12
+> 0.18
+> 0.24
+> Qwen3-14B
+> 812 20 36
+> Batch Size
+> 0.2
+> 0.3
+> 0.4
+> Qwen3-32B
+> 0.05
+> 0.10
+> 0.15
+> 0.20
+> 0.16
+> 0.24
+> 0.32
+> 0.40
+> 0.2
+> 0.3
+> 0.4
+> 0.5
+> Avg. Acc.
+> (b) GSM 8K
+
+Figure 5: RCU and Avg. Acc. Curves of Different Batch Sizes. The Effective Batch Size Is Identified Via Ternary Search. 
+
+the binary cross entropy (BCE) loss over the training dataset Q′.Once trained, the classifier estimates the likelihood that each model 
+
+𝑚 𝑘 ∈ M can correctly resolve a test query 𝑞 𝑖 , i.e., b𝑢 𝑖 ,𝑘 ,1 ∈ [ 0, 1 ].To minimize the overhead of router training and training query annotation, RoBatch utilizes a simple three-layer MLP or KNN classifier. Studies on the design space of router architectures are orthogonal to the RoBatch framework. With the utility estimation for 𝑏 = 1 and the scaling value for 
+
+𝑏 ∈ [ 1, 𝑏 effect  
+
+> 𝑘
+
+], RoBatch combines them via multiplication as in Eq. (8) to obtain utility estimations under batch prompting. These batch-aware estimations serve as the basis for decision-making during query routing. We conclude this section by analyzing the complexity of the modeling stage. 
+
+Complexity Analysis. The offline modeling stage incurs an over-all time complexity of O(|Q ′ ||Q ′′ | + 𝐶 API 
+
+Í𝐾 𝑘 =1 log (𝑏 max  
+
+> 𝑘
+
+) + |Q ′ |𝑑 ),where 𝐶 API denotes the complexity introduced by LLM calls on the coreset data and 𝑑 denotes the dimension of the query embeddings. The overall complexity comprises three parts: coreset selection, model profiling, and router training. First, coreset selection applies the 𝑘 -center algorithm to extract a representative subset Q′′ from the full training set Q′ in O(|Q ′ ||Q ′′ |) time. Due to |Q ′′ | ≪ |Q ′ |,this step remains efficient even for large-scale datasets. Second, 
+
+RoBatch calibrates the effective batch size 𝑏 effect  
+
+> 𝑘
+
+for each of the 𝐾 
+
+models by performing a ternary search over the batch size space 
+
+[1, 𝑏 max  
+
+> 𝑘
+
+]. This search entails O( Í𝐾 𝑘 =1 log 𝑏 max  
+
+> 𝑘
+
+) configuration evalu-ations, each of which requires ⌈| 𝑄 ′′ |/ 𝑏 𝑘 ⌉ LLM invocations at a total complexity of 𝐶 API , contributing O( 𝐶 API 
+
+Í𝐾 𝑘 =1 log 𝑏 max  
+
+> 𝑘
+
+) to the total complexity. The third part, router training, trains the router on the full training dataset. This step scales linearly with the dataset size and embedding dimensionality, requiring O(|Q ′ |𝑑 ) time. 
+
+## 5 The Routing Stage 
+
+With the proxy utility b𝑢 𝑖 ,𝑘 ,𝑏 for batch prompting over each model 
+
+𝑚 𝑘 prepared, in the routing stage, RoBatch assigns each test query in Q to a state (𝑚 𝑘 , 𝑏 ), thereby constructing a scheduling mapping 
+
+S : 𝑞 𝑖 ↦ → ( 𝑚 𝑘 , 𝑏 ), where 𝑏 ∈ B 𝑘 . For each query 𝑞 𝑖 , unlike standard routing without batching that only considers 𝐾 candidate models, the batch-aware setting introduces Í𝐾 𝑘 =1 |B 𝑘 | candidate states in Towards Cost-effective LLMs Routing with Batch Prompting 5e-5 1e-4 5e-4     
+
+> Cost (log scale)
+> 0.475
+> 0.500
+> 0.525
+> 0.550
+> 0.575
+> 0.600
+> Estimated utility score
+> s0
+> s1 s2
+> s3
+> s4
+> s5
+> s6 s7 s8 s9
+> s10
+> Qwen3-4B
+> Qwen3-14B
+> Qwen3-32B
+> bs=16
+> bs=12
+> bs=8
+> bs=4
+> bs=1
+
+Figure 6: The Candidate States and Pareto Frontier of a Query 
+
+total. We first define a dominance relation of states and then show that it can be exploited to prune candidate states. 
+
+Definition 5.1. (Dominance of States ) Given a query 𝑞 𝑖 , let 𝑠 =
+
+(𝑚 𝑘 , 𝑏 ) and 𝑠 ′ = (𝑚 𝑘 ′ , 𝑏 ′) denote two candidate states. Let 𝐶 𝑞 𝑖 (𝑠 )
+
+and 𝐶 𝑞 𝑖 (𝑠 ′) denote the cost of 𝑞 𝑖 in states 𝑠 and 𝑠 ′, respectively, where: 
+
+𝐶 𝑞 𝑖 (𝑠 ) = 𝐶 sys /𝑏 + 𝐶 𝑞 𝑖 (𝑚 𝑘 ), 𝐶 𝑞 𝑖 (𝑠 ′) = 𝐶 sys /𝑏 ′ + 𝐶 𝑞 𝑖 (𝑚 𝑘 ′ ). (13) Formally, state 𝑠 is dominated by 𝑠 ′ on 𝑞 𝑖 , denoted as 𝑠 ⪯𝑞 𝑖 𝑠 ′, iff 
+
+(1) 𝐶 𝑞 𝑖 (𝑠 ) ≥ 𝐶 𝑞 𝑖 (𝑠 ′) and (2) b𝑢 𝑖 ,𝑘 ,𝑏 ≤ b𝑢 𝑖 ,𝑘 ′,𝑏 ′ .For a query 𝑞 𝑖 , a state 𝑠 is called a dominated state if there exists a state 𝑠 ′ ≠ 𝑠 in the candidate space satisfying 𝑠 ⪯𝑞 𝑖 𝑠 ′; otherwise, 
+
+𝑠 is an undominated state of 𝑞 𝑖 . All the undominated states of 𝑞 𝑖 
+
+form the Pareto frontier in the cost-utility landscape, and dominated states can be pruned during scheduling. Fig. 6 illustrates an example where each node represents a candidate state in the cost-utility space. The non-dominated nodes form the Pareto frontier shown as the blue line, and the remaining two nodes are dominated. We will discuss the safety of this pruning later in this section. 
+
+RoBatch employs a greedy algorithm to perform routing with batch prompting. Initially, every query 𝑞 𝑖 ∈ Q is assigned to the initial state 𝑠 (0) := (𝑚 1, 𝑏 effect  
+
+> 1
+
+), where 𝑚 1 is the cheapest model in the model pool M, and 𝑏 effect  
+
+> 1
+
+is its effective batch size. Notably, for any query, the initial state 𝑠 (0) always lies on the cost-utility Pareto frontier since it attains the globally lowest cost 𝐶 𝑞 𝑖 (𝑠 (0) ) among all candidate states. The scheduling algorithm then iteratively up-grades query states along the Pareto frontier by allocating more cost, until either the cost budget 𝐶 𝑏𝑑𝑔 is exhausted or all queries reach their highest-utility states. To formalize this process, let 
+
+[𝑠 (0) , 𝑠 (1) , · · · , 𝑠 (𝑇 ) ] denote the sequence of non-dominated states of query 𝑞 𝑖 , ordered by ascending per-query cost i.e., 𝐶 𝑞 𝑖 (𝑠 (0) ) <
+
+𝐶 𝑞 𝑖 (𝑠 (1) ) ≤ · · · 𝐶 𝑞 𝑖 (𝑠 (𝑇 ) ). In each iteration, the algorithm selects the query 𝑞 𝑖 whose next state upgrade yields the maximum utility gain per unit cost, Δ(𝑡 ) 
+
+> 𝑞 𝑖
+
+, defined as: 
+
+Δ(𝑡 +1) 
+
+> 𝑞 𝑖
+
+= b𝑢 𝑖 ,𝑠 (𝑡 +1) − b𝑢 𝑖 ,𝑠 (𝑡 )
+
+𝐶 𝑞 𝑖 (𝑠 (𝑡 +1) ) − 𝐶 𝑞 𝑖 (𝑠 (𝑡 ) ) , (14) where, with a slight abuse of notation, b𝑢 𝑖 ,𝑠 (𝑡 ) denotes the estimated utility of 𝑞 𝑖 in state 𝑠 (𝑡 ) = (𝑚 𝑘 , 𝑏 ), i.e., b𝑢 𝑖 ,𝑠 (𝑡 ) = b𝑢 𝑖 ,𝑘 ,𝑏 , as predicted by the budget-aware proxy utility model constructed in §4. In other words, the algorithm greedily allocates the remaining budget to the query whose utility can be improved to the greatest extent per unit of cost. An acute reader may find that Δ(𝑡 +1) 
+
+> 𝑞 𝑖
+
+is the discrete slope of the inverse of the RCU (Eq. (11) ) along the Pareto frontier at the query level. In essence, the algorithm optimizes the total utilities by following the direction of steepest RCU improvement, 
+
+Algorithm 1: Greedy Scheduling 
+
+Input: queries Q = {𝑞 1, . . . , 𝑞 𝑛 }, total budget 𝐶 𝑏𝑑𝑔 , proxy utility model b𝑢 𝑖 ,𝑘 ,𝑏 
+
+Output: Final State Assignment Mapping S : 𝑞 𝑖 → ( 𝑚 𝑘 , 𝑏 ) 
+
+> 1
+
+Initialize Priority Queue 𝑃𝑄 ← { } ; 
+
+> 2
+
+for 𝑞 𝑖 ∈ Q do  
+
+> 3
+
+𝑠 (0) ← ( 𝑚 1, 𝑏 effect  
+
+> 1
+
+) ; 
+
+> 4
+
+S ( 𝑞 𝑖 ) ← 𝑠 (0) ; 
+
+> 5
+
+𝐶 𝑏𝑑𝑔 ← 𝐶 𝑏𝑑𝑔 − 𝐶 𝑞 𝑖 (𝑠 (0) ) ; 
+
+> 6
+
+Identify the next state 𝑠 (1) for 𝑞 𝑖 ; 
+
+> 7
+
+Compute Δ(1) 
+
+> 𝑞 𝑖
+
+for 𝑞 𝑖 by Eq. (14) ;  
+
+> 8
+
+𝑃𝑄 .push (𝑞 𝑖 , 𝑠 (1) , Δ(1) 
+
+> 𝑞 𝑖
+
+) ; 
+
+> 9
+
+while 𝑃𝑄 is not empty and 𝐶 bdg > 0 do  
+
+> 10
+
+(𝑞 𝑗 , 𝑠 (𝑡 ) , Δ(𝑡 )  
+
+> 𝑞 𝑗
+
+) ← 𝑃𝑄 .pop () ; 
+
+> 11
+
+if 𝐶 𝑏𝑑𝑔 − 𝐶 𝑞 𝑗 (𝑠 (𝑡 ) ) + 𝐶 𝑞 𝑗 (𝑠 (𝑡 −1) ) < 0 then  
+
+> 12
+
+continue ; 
+
+> 13
+
+S ( 𝑞 𝑗 ) ← 𝑠 (𝑡 ) ; 
+
+> 14
+
+𝐶 𝑏𝑑𝑔 ← 𝐶 𝑏𝑑𝑔 − 𝐶 𝑞 𝑗 (𝑠 (𝑡 ) ) + 𝐶 𝑞 𝑗 (𝑠 (𝑡 −1) ); 
+
+> 15
+
+Identify the next state 𝑠 (𝑡 +1) for 𝑞 𝑗 ; 
+
+> 16
+
+if 𝑠 (𝑡 +1) exists for 𝑞 𝑗 then  
+
+> 17
+
+Compute Δ(𝑡 +1)  
+
+> 𝑞 𝑗
+
+for 𝑞 𝑗 by Eq. (14) ;  
+
+> 18
+
+𝑃𝑄 .push (𝑞 𝑗 , 𝑠 (𝑡 +1) , Δ(𝑡 +1)  
+
+> 𝑞 𝑗
+
+) ; 
+
+> 19
+
+return S
+
+while ensuring that the cumulative cost remains within the budget constraint. Algorithm 1 illustrates this greedy scheduling algorithm. The algorithm takes the proxy utility model b𝑢 𝑖 ,𝑘 ,𝑏 , the query set Q to be processed, and the total budget 𝐶 𝑏𝑑𝑔 as input, and outputs the query-to-state mapping S : 𝑞 ↦ → ( 𝑚 𝑘 , 𝑏 ). First, we assign the state 
+
+(𝑚 1, 𝑏 effect  
+
+> 1
+
+) as the initial state 𝑠 (0) for every query in Q (line 2-8), where 𝑚 1 is the cheapest model in the pool and 𝑏 effect  
+
+> 1
+
+is the effective batch size of 𝑚 1, as calibrated in §4. The budget is updated for each query-state assignment in line 5, and we compute Δ(1)
+
+> 𝑞 𝑖
+
+for each query 𝑞 𝑖 via Eq. (14) , which is the priority of 𝑞 𝑖 for state upgrading (line 7). In line 8, we push the triplet consisting of the query, its next state 𝑠 (1) , and the priority Δ(1) 
+
+> 𝑞 𝑖
+
+into a priority queue 
+
+𝑃𝑄 . Subsequently, while the budget remains, the query 𝑞 𝑗 with the largest Δ(𝑡 ) 
+
+> 𝑞 𝑗
+
+is popped from the priority queue (line 10), as the candidate for state upgrading along the Pareto frontier. As 𝑠 (𝑡 ) is an upgrade of 𝑠 (𝑡 −1) , its cost 𝐶 𝑞 𝑗 (𝑠 (𝑡 ) ) must be larger than 𝐶 𝑞 𝑗 (𝑠 (𝑡 −1) ).The upgrade is committed only if the remaining budget is affordable for the incremental cost (line 13-18). Here, the state of 𝑞 𝑗 is updated to 𝑠 (𝑡 ) in line 13 and the remaining budget is deducted in line 14. In addition, the algorithm identifies the potential next state 𝑠 (𝑡 +1)
+
+of 𝑞 𝑗 on its Pareto frontier (line 15) and computes its cost at this state 𝐶 𝑞 𝑗 (𝑠 (𝑡 +1) ). The algorithm computes Δ(𝑡 +1) 
+
+> 𝑞 𝑖
+
+for 𝑞 𝑖 and pushes the next state triplet of 𝑞 𝑗 into the priority queue (line 16-18). This process continues until no further upgrades are available for any query or the budget is exhausted. 
+
+Example 5.2. (Running Example of Algorithm 1 ) Tables 1 and 2 present a running example of Algorithm 1. Table 1 lists the Pareto Haotian Xu, Kangfei Zhao, and Jiadong Xie 
+
+frontier for each query in the cost–utility space ordered by ascend-ing state cost, while Table 2 tracks snapshots of the priority queue 
+
+𝑃𝑄 and the remaining budget 𝐶 𝑏𝑑𝑔 across four successive steps. Initially (Step 0), all queries are assigned to their initial state 
+
+(𝑚 1, 4 ). Given a total budget of 100, the algorithm deducts the aggregate initial cost of all queries, i.e., Í6 
+
+> 𝑖 =1
+
+𝐶 𝑞 𝑖 (( 𝑚 1, 4 )) = 9.8 +
+
+10.1 + 9.9 + 10.2 + 10.4 + 10.3 = 60.7 , leaving a remaining budget of 
+
+𝐶 𝑏𝑑𝑔 = 39.3 . The algorithm initializes 𝑃𝑄 by enqueuing every query 
+
+𝑞 𝑖 , its next candidate state 𝑠 (1) together with the corresponding Δ(1) 
+
+> 𝑞 𝑖
+
+.The top element in 𝑃𝑄 is highlighted in blue. With 𝐶 𝑏𝑑𝑔 > 0, the algorithm iteratively upgrades states. At Step 1, 𝑞 1 with the highest 
+
+Δ(1) 
+
+> 𝑞 𝑖
+
+is popped from the queue. Upgrading it from (𝑚 1, 4 ) to (𝑚 1, 2 )
+
+incurs an additional cost of 10.7 − 9.8 = 0.9 . Since 𝐶 𝑏𝑑𝑔 = 39.3 >
+
+0.9 , the upgrade is committed and 𝐶 𝑏𝑑𝑔 is updated to 39.3 − 0.9 =
+
+38.4 . The next candidate state of 𝑞 1, 𝑠 (2) = (𝑚 1, 1 ), along with the corresponding Δ(2) 
+
+> 𝑞 1
+
+= 0.0065 is pushed into 𝑃𝑄 as highlighted in yellow. In Step 2&3, following the same logic, the algorithm upgrades 𝑞 5 (incremental cost 3.4), and 𝑞 3 (incremental cost 9.0) based on the highest Δ(𝑡 ) 
+
+> 𝑞 𝑖
+
+in 𝑃𝑄 , reducing 𝐶 𝑏𝑑𝑔 = 38.4 to 35.0 and 26.0 step by step. By continuously upgrading the most cost-effective states, RoBatch progressively climbs the collective Pareto frontiers of all queries under the budget constraint. □
+
+With the query-state mapping S : 𝑞 𝑖 ↦ → ( 𝑚 𝑘 , 𝑏 ) determined, 
+
+RoBatch packs queries sharing the same state into batches and commits them by LLM invocations. 
+
+Theorem 5.3. Under the routing formulation that evaluates each state by the amortized per-query cost in Eq. (13) and the proxy utility 
+
+b𝑢 𝑖 ,𝑘 ,𝑏 , pruning dominated states is lossless. 
+
+Proof Sketch: Suppose there exist two states 𝑠 = (𝑚 𝑘 , 𝑏 ) and 
+
+𝑠 ′ = (𝑚 𝑘 ′ , 𝑏 ′) for a query 𝑞 𝑖 , and that 𝑠 is dominated by 𝑠 ′, i.e., 
+
+𝑠 ⪯𝑞 𝑖 𝑠 ′. Let S be any feasible assignment under the formulation that assigns 𝑞 𝑖 to state 𝑠 . We construct another assignment S′ by replacing the assignment of 𝑞 𝑖 from 𝑠 to 𝑠 ′, while keeping all other query assignments unchanged. By Definition 5.1, the dominance relation 𝑠 ⪯𝑞 𝑖 𝑠 ′ implies both (1) 𝐶 𝑞 𝑖 (𝑠 ) ≥ 𝐶 𝑞 𝑖 (𝑠 ′) and (2) b𝑢 𝑖 ,𝑘 ,𝑏 ≤
+
+b𝑢 𝑖 ,𝑘 ′,𝑏 ′ . Consequently, replacing 𝑞 𝑖 ’s state from 𝑠 with 𝑠 ′ does not decrease the total proxy utility, and does not increase the total cost under Eq. (13). Therefore, S′ is feasible and is no worse than S. □
+
+It is worth noting that the above lossless guarantee is defined with respect to the routing formulation based on amortized per-query cost. This distinction does not affect the utility objective, but it may influence the exact cost usage in practice. The reason is that 𝐶 𝑞 𝑖 (𝑠 ) and 𝐶 𝑞 𝑖 (𝑠 ′) in Eq. (13) account for the system prompt cost by amortizing it over the batch sizes 𝑏 and 𝑏 ′, respectively. If the replacement leads to incomplete batches, the practical per-query system prompt cost may exceed 𝐶 sys /𝑏 and 𝐶 sys /𝑏 ′. In such cases, the exact total costs of S and S′ become difficult to compare, as they depend on the practical sizes of the incomplete batches. Nevertheless, as the query workload grows, the effect of incomplete batches becomes increasingly negligible in practice. 
+
+Complexity Analysis. The routing stage has an overall time com-plexity of O(|Q|( 𝐾𝑑 + eB log eB + 𝑇 log |Q|)) , where eB = Í𝐾 𝑘 =1 |B 𝑘 |
+
+denotes the total number of candidate states across all models, 
+
+𝑇 denotes the maximum number of states in the Pareto frontier 
+
+Table 1: The Pareto frontier of each query 𝑞 𝑖                  
+
+> 𝑞 𝑖 𝑠 =(𝑚 𝑘 ,𝑏 ) ( 𝐶 𝑞 𝑖 (𝑠 ),b𝑢 𝑖 ,𝑘 ,𝑏 ) → · · · as the Pareto frontier
+> 𝑞 1(𝑚 1, 4 ) ( 9.8, 0.60 ) → ( 𝑚 1, 2 ) ( 10.7, 0.65 ) → ( 𝑚 1, 1 ) ( 13.8, 0.67 )
+> 𝑞 2(𝑚 1, 4 ) ( 10.1, 0.60 ) → ( 𝑚 1, 2 ) ( 12.9, 0.63 ) → ( 𝑚 1, 1 ) ( 16.8, 0.66 )→ ( 𝑚 2, 2 ) ( 17.0, 0.67 ) → ( 𝑚 2, 1 ) ( 19.2, 0.69 )
+> 𝑞 3(𝑚 1, 4 ) ( 9.9, 0.59 ) → ( 𝑚 3, 4 ) ( 18.9, 0.69 ) → ( 𝑚 3, 1 ) ( 23.9, 0.72 )
+> 𝑞 4(𝑚 1, 4 ) ( 10.2, 0.60 ) → ( 𝑚 2, 4 ) ( 14.5, 0.63 ) → ( 𝑚 2, 2 ) ( 15.1, 0.65 )→ ( 𝑚 2, 1 ) ( 19.5, 0.68 )
+> 𝑞 5(𝑚 1, 4 ) ( 10.4, 0.61 ) → ( 𝑚 2, 4 ) ( 13.8, 0.66 ) → ( 𝑚 2, 2 ) ( 14.9, 0.67 )→ ( 𝑚 3, 1 ) ( 20.2, 0.71 )
+> 𝑞 6(𝑚 1, 4 ) ( 10.3, 0.61 ) → ( 𝑚 1, 2 ) ( 13.0, 0.64 ) → ( 𝑚 2, 2 ) ( 14.8, 0.66 )→ ( 𝑚 2, 1 ) ( 19.0, 0.69 ) → ( 𝑚 3, 1 ) ( 24.0, 0.72 )
+
+Table 2: Four snapshots of 𝑃𝑄 : each cell is (𝑞 𝑖 , 𝑠 (𝑡 ) 
+
+> 𝑖
+
+, Δ(𝑡 ) 
+
+> 𝑞 𝑖
+
+).                                                    
+
+> Step 0 Step 1 Step 2 Step 3
+> 𝐶 𝑏𝑑𝑔 =39.3 𝐶 𝑏𝑑𝑔 =38.4 𝐶 𝑏𝑑𝑔 =35 𝐶 𝑏𝑑𝑔 =26
+> (𝑞 1,(𝑚 1, 2 ), 0.0556 )(𝑞 5,(𝑚 2, 4 ), 0.0147 )(𝑞 3,(𝑚 3, 4 ), 0.0111 )(𝑞 6,(𝑚 1, 2 ), 0.0111 )(𝑞 5,(𝑚 2, 4 ), 0.0147 )(𝑞 3,(𝑚 3, 4 ), 0.0111 )(𝑞 6,(𝑚 1, 2 ), 0.0111 )(𝑞 2,(𝑚 1, 2 ), 0.0107 )(𝑞 3,(𝑚 3, 4 ), 0.0111 )(𝑞 6,(𝑚 1, 2 ), 0.0111 )(𝑞 2,(𝑚 1, 2 ), 0.0107 )(𝑞 5,(𝑚 2, 2 ), 0.0091 )(𝑞 6,(𝑚 1, 2 ), 0.0111 )(𝑞 2,(𝑚 1, 2 ), 0.0107 )(𝑞 5,(𝑚 2, 2 ), 0.0091 )(𝑞 4,(𝑚 2, 4 ), 0.0070 )(𝑞 2,(𝑚 1, 2 ), 0.0107 )(𝑞 4,(𝑚 2, 4 ), 0.0070 )(𝑞 4,(𝑚 2, 4 ), 0.0070 )(𝑞 1,(𝑚 1, 1 ), 0.0065 )(𝑞 4,(𝑚 2, 4 ), 0.0070 )(𝑞 1,(𝑚 1, 1 ), 0.0065 )(𝑞 1,(𝑚 1, 1 ), 0.0065 )(𝑞 3,(𝑚 3, 1 ), 0.0060 )
+
+across all queries, and 𝑑 is query embedding dimensionality. This complexity comprises three parts. First, the proxy utility model predicts the utilities of the eB states for the |Q| queries, requiring 
+
+O(|Q|( 𝐾𝑑 + eB)) complexity. Second, identifying the Pareto fron-tier necessitates sorting the non-dominated states for each query, which contributes O(|Q| eB log eB) at most. Third, the greedy sched-uling takes a complexity of O(|Q| 𝑇 log |Q|) , because each of the |Q| 
+
+queries can be enqueued and dequeued into the priority queue at most 𝑇 times, with each push or pop operation costing O( log |Q|) .
+
+## 6 Experimental Study 
+
+In this section, we present the experimental setup in §6.1 and eval-uate our approach in the following facets: ① Compare with the baseline LLM routing and batching approaches (§6.2); ② Conduct the ablation studies for RoBatch (§6.3); ③ Study the robustness of RoBatch to key hyper-parameters and design choices (§6.4); ④
+
+Compare the scalability and scheduling overhead of RoBatch with the baselines (§6.5). 
+
+## 6.1 Experimental Setup 
+
+6.1.1 Datasets. To evaluate the effectiveness and efficiency of Ro-Batch , we conduct experimental studies on six widely used NLP benchmarks from four task categories as follows: 
+
+• Mathematical Reasoning. GSM 8K [9] is a collection of 8,000 high-quality grade school mathematical word problems. 
+
+• General Knowledge QA. MMLU [15 ] is a comprehensive bench-mark covering 57 subjects across STEM, the humanities, and the social sciences. 
+
+• Commonsense and Semantic Reasoning. SNLI (Stanford Nat-ural Language Inference) [ 3] evaluates a model’s ability to deter-mine the logical relationship between a pair of sentences, i.e., en-tailment, neutrality, or contradiction. MRPC (Microsoft Research Paraphrase Corpus) [ 12 ] consists of sentence pairs annotated for semantic equivalence, and is used to assess fine-grained semantic understanding. Towards Cost-effective LLMs Routing with Batch Prompting 
+
+• Text Classification. AGNews [37 ] is a topic classification bench-mark in which articles are categorized into four classes: World, Sports, Business, and Science/Technology. IMDB [23 ] is a binary sentiment classification dataset consisting of movie reviews and is widely used to evaluate sentiment understanding. 
+
+6.1.2 Baselines. We compare RoBatch against two LLM routing and two batch prompting baselines as follows: 
+
+• LLM Routing. RouteLLM [24 ] is a preference-data-driven rout-ing framework that selects between a stronger and a weaker LLM. For each query, it predicts whether the stronger model is neces-sary and uses a threshold to trade off response quality against inference cost. FrugalGPT [ 7] is a budget-aware framework for routing queries across multiple LLMs. It employs a learned util-ity estimator and threshold-based decision rules to determine whether a cheaper or a stronger model should be used. 
+
+• Batch Prompting. BATCHER [13 ] is originally an LLM-based entity resolution framework, but it adopts a similarity-based (BATCHER-SIM) and a diversity-based ( BATCHER-DIV) batch-ing strategies. BATCHER-SIM groups semantically similar queries into the same batch, whereas BATCHER-DIV constructs each batch using queries drawn from different clusters to increase diversity. OBP [ 17 ] is an optimized batch-prompting framework designed to reduce LLM inference cost through adaptive query grouping. Instead of relying on fixed-size batching, it clusters related queries and dynamically refines the resulting groups to balance query affinity, context length, and accuracy. Since these baselines do not jointly support both routing and batch-ing, in the experiments, we adapt these methods to ensure a fair comparison. Specifically, for the LLM routing baselines, we first apply the router to assign each query to a target model and then group the queries assigned to the same model into batches of a fixed size. For batch prompting baselines, we use the same router for non-batch prompting of our RoBatch , built in §4, and then construct batches for each model according to the batching strategy of the baselines. 
+
+6.1.3 Evaluation metrics. We use three metrics to evaluate the ef-fectiveness and efficiency of our framework. For the utility, we report the Average (Avg.) Accuracy of the queries is the primary objective in our framework. Apart from the classification tasks, Accuracy indicates whether the LLM correctly solves the problem instance. For monetary cost, we report the total expenditure (in $) incurred by each approach across the test workload. For computa-tional cost, we report the wall-clock time (in seconds) for batching and/or routing algorithms, excluding the latency of LLM API calls. 
+
+6.1.4 Implementation details. Our framework RoBatch is imple-mented by PyTorch 2.10.0+cu128 with Python 3.10.19. We use the Qwen3-0.6B [ 38 ] as the embedding model to generate the features of 1,024 dimensions for the router models of RoBatch , and adopt two vanilla ML models, a three-layer MLP and a KNN classifier. Consistent with recent work on batch prompting [ 8 ], we adopt a budget-conscious sampling strategy to limit the high cost of exhaus-tive API evaluation. Specifically, for each benchmark, we partition the dataset into 2,048 training instances, 512 validation instances, and 1,024 test instances. The training set is used primarily for the modeling stage, while the validation set is used for hyperparameter tuning. Final results are reported on the unseen test set to assess generalization. We perform a grid search over key hyperparameters, including the number of hidden layers, learning rate, and dropout ratio of the MLP, and select the configuration that achieves the highest Accuracy. In addition, RoBatch uses a threshold 𝜖 = 1% (in Eq. (9) ) and uses the 𝑘 -center greedy algorithm to find a coreset with size 256 from the 2,048 training instances. All batch size 𝑏 𝑘 ∈ B 𝑘 
+
+used are multiples of 4. For invoking LLM instances, we use the native Qwen API for the Qwen3 family [ 30 ] (Qwen3-4B, Qwen3-14B and Qwen3-32B) and the OpenRouter API for the Gemma3 family [ 29 ] (Gemma3-4B, Gemma3-12B and Gemma3-27B), ensur-ing a standardized request-response workflow across models. In addition, we disable thinking mode and use structured input and output via JSON format to prompt the LLM to generate exactly 𝑏 
+
+outputs. All experiments are conducted on a server equipped with NVIDIA RTX 4090 GPU with 24G memory to process embedding generation and router training, and the scheduling algorithm is running on the same server with Intel(R) Xeon(R) Silver 4316 CPU and 512G memory. 
+
+## 6.2 Overall Performance 
+
+We compare the overall performance of RoBatch against the rout-ing and batching baselines. For baseline methods that require a fixed batch size, we instantiate the batch size 𝑏 ∈ { 16, 8, 4, 1 }, result-ing in four corresponding budget levels. For each budget level, the real cost usages of the baselines are different because of their dif-ferent routing strategies, and we take the maximum and minimum costs of the baselines as two budgets for RoBatch . Fig. 7 presents the overall cost-accuracy landscape across six benchmarks under both the Gemma3 and Qwen3 model families. Here, the cost on the x-axis is the actual spent cost rather than the budget. Overall, RoBatch delivers the most favorable cost–accuracy trade-off across a broad range of workloads and budget regimes. In most figures, the RoBatch curve dominates the cost-accuracy trade-off, indicating that it achieves higher accuracy at the same monetary cost, or equivalently, reaches the same accuracy with lower cost than the baselines. These results suggest that the advantage of 
+
+RoBatch comes from its ability to optimize model selection and batch prompting decisions in a unified manner rather than treating them as two independent steps. The advantage of RoBatch is particularly remarkable in reason-ing and knowledge-intensive tasks, such as GSM 8K, MMLU , and 
+
+SNLI , where RoBatch clearly achieves a better cost–performance trade-off than the baselines. The improvement is especially evi-dent on GSM 8K and MMLU , indicating that the joint optimization strategy can allocate budget more effectively on difficult workloads by selecting more cost-effective assignment for each query. On 
+
+SNLI , although the absolute gap among methods narrows relative to GSM 8K and MMLU , RoBatch still lies on, or very near, the optimal frontier overall. This suggests that the benefit of RoBatch 
+
+is not confined to a single type of tasks, but generalizes well across different types of complex workloads. We also observe that the performance gap is generally larger under the Qwen3 family, while under the Gemma3 family it becomes narrower on some workloads, although the overall trend remains consistent. Haotian Xu, Kangfei Zhao, and Jiadong Xie RoBatch FrugalGPT Batcher-Div Batcher-Sim OBP RouteLLM 7e-3 2e-2 4e-2  
+
+> Cost (log scale)
+> 0.2
+> 0.3
+> Avg. Acc.
+> (a)
+
+GSM 8K2e-3 3e-3 7e-3         
+
+> Cost (log scale)
+> 0.4
+> 0.5
+> 0.6
+> Avg. Acc. (b) MMLU 2e-3 5e-3 9e-3
+> Cost (log scale)
+> 0.5
+> 0.6
+> 0.7
+> Avg. Acc. (c) SNLI 3e-3 6e-3 1e-2
+> Cost (log scale)
+> 0.65
+> 0.70
+> 0.75
+> Avg. Acc. (d)
+
+MRPC 3e-3 7e-3 1e-2   
+
+> Cost (log scale)
+> 0.6
+> 0.8
+> Avg. Acc. (e)
+
+AGNews 4e-3 6e-3 9e-3  
+
+> Cost (log scale)
+> 0.7
+> 0.8
+> 0.9
+> Avg. Acc. (f) IMDB
+
+Gemma3 (Gemma3-4B, Gemma3-12B, Gemma3-27B) 1e-1 3e-1 8e-1  
+
+> Cost (log scale)
+> 0.25
+> 0.30
+> 0.35
+> 0.40
+> Avg. Acc.
+> (g)
+
+GSM 8K5e-2 1e-1 2e-1         
+
+> Cost (log scale)
+> 0.70
+> 0.75
+> 0.80
+> Avg. Acc. (h) MMLU 3e-2 8e-2 2e-1
+> Cost (log scale)
+> 0.5
+> 0.6
+> 0.7
+> 0.8
+> Avg. Acc. (i) SNLI 5e-2 1e-1 2e-1
+> Cost (log scale)
+> 0.700
+> 0.725
+> 0.750
+> 0.775
+> Avg. Acc. (j)
+
+MRPC 5e-2 1e-1 2e-1   
+
+> Cost (log scale)
+> 0.6
+> 0.7
+> 0.8
+> Avg. Acc. (k)
+
+AGNews 3e-2 6e-2 1e-1  
+
+> Cost (log scale)
+> 0.8
+> 0.9
+> Avg. Acc. (l) IMDB
+
+Qwen3 (Qwen3-4B, Qwen3-14B and Qwen3-32B) 
+
+Figure 7: Overall Cost–Accuracy Trade-Off on Six Benchmarks with the Gemma3 and Qwen3 Model Families Batch-Only-Cheap     
+
+> RoBatch
+> Batch-Only-Middle
+> Router-Only
+> Batch-Only-Expensive 0.0 0.2 0.4 0.6
+> cost
+> 0.2
+> 0.3
+> 0.4
+> Avg. Acc
+> (a)
+
+GSM 8K0.05 0.10 0.15   
+
+> cost
+> 0.4
+> 0.5
+> 0.6
+> 0.7
+> 0.8
+> Avg.Acc (b)
+
+AGNews 0.2 0.4   
+
+> cost
+> 0.92
+> 0.93
+> 0.94
+> 0.95
+> Avg.Acc (c)
+
+IMDB 
+
+Figure 8: Ablation Studies: Comparison of RoBatch with Router-Only and Batch-Only Counterparts 
+
+In contrast, on relatively easy classification tasks such as AGNews 
+
+and IMDB , the performance gap among methods becomes smaller. As illustrated in Fig. 7((k),(e),(l),(f)), multiple methods achieve very similar performance in the high-cost region, and their main distinc-tion lies in how effectively they improve accuracy under low-cost regimes. Despite this, RoBatch continues to perform favorably relative to the baselines and still achieves the best or competitive cost–accuracy frontier over most cost regimes. A similar pattern can also be observed on MRPC , where the gain of RoBatch is more moderate than that on the harder reasoning-oriented tasks, yet its overall curve still exhibits better economic efficiency. This indicates that when a task becomes less sensitive to model capacity and execution strategy, the benefit of joint optimization is reflected mainly in maintaining competitive accuracy at lower cost. In summary, Fig. 7 reveals a consistent trend: RoBatch more demonstrably improves the cost-accuracy frontier on hard tasks, while on easier tasks it more reliably reduces the cost needed to reach comparable Accuracy, thereby yielding a stronger overall frontier across diverse workloads. 
+
+## 6.3 Ablation Studies 
+
+To evaluate the individual contributions of the routing and batching components within our framework, we conduct a series of abla-tion experiments that decouple the joint optimization strategy into two ablated variants: a Router-Only approach and a Batch-Only approach. Router-Only fixes 𝑏 = 1 for all queries, reducing the state space to the 𝐾 candidate models in M and isolating model selection via multi-label scoring without benefiting from prompt amortization. Batch-Only assigns all queries to one fixed model. Accordingly, we instantiate three Batch-Only variants in the exper-iments, corresponding to the cheap, middle, and expensive models, respectively. Within each variant, the greedy scheduling process is restricted to transitions over the fixed model 𝑚 𝑘 with batch sizes in the model-specific valid space B𝑘 .As shown in Fig. 8, the full RoBatch consistently yields a supe-rior cost-accuracy frontier than either ablated variant across the three tasks. In particular, the improvement is most evident in the low and medium-cost regions, where RoBatch achieves clearly higher accuracy at comparable cost. This trend is particularly evident in the more challenging reasoning workloads GSM 8K, where neither Router-Only nor Batch-Only is sufficient to recover the same fron-tier. On the easier classification workloads AGNews and IMDB , the gap narrows as the cost increases, and the curves of RoBatch and Router-Only gradually converge. For example, on AGNews , both methods eventually approach a similar high accuracy (around 0.81), while on IMDB most approaches already approach the performance ceiling (around 0.94-0.95), leaving less room for additional gains. Router-Only can improve model assignment at the query level, but each LLM invocation processes only one system prompt and one query and therefore cannot fully exploit the cost savings enabled by prompt amortization. In contrast, Batch-Only is constrained by the capability and pricing of the single model it uses. Under very tight budgets, increasing the batch size may still be insufficient to meet the budget constraint if the model itself remains too costly. When budget constraints are relaxed, the best assignment for a Batch-Only method eventually reduces to 𝑏 = 1, after which accuracy can no longer improve because harder queries cannot be reassigned to stronger models. By jointly optimizing model selection and batch prompting, RoBatch avoids both limitations and achieves a better cost-accuracy frontier across a wide range of costs. Towards Cost-effective LLMs Routing with Batch Prompting 
+
+Table 3: Accuracy of different coreset selection methods, query embedding models, and fitting methods of 𝜌 𝑘 (𝑏 ) under three budget levels                                                                                                     
+
+> AGNews GSM 8KIMDB
+> Method Cheap Mid. Expen. Cheap Mid. Expen. Cheap Mid. Expen. K-center 0.5996 0.8027 0.8438 0.0615 0.2510 0.2617 0.8633 0.8633 0.9502 FL 0.5996 0.8164 0.8594 0.0508 0.2451 0.2695 0.8945 0.8936 0.9404 Herding 0.6055 0.8037 0.8428 0.0498 0.2354 0.2627 0.9082 0.9014 0.9463 BGE-base 0.4580 0.8174 0.8555 0.0498 0.1982 0.2432 0.8682 0.8672 0.9443 E5-base 0.6084 0.8037 0.8447 0.0625 0.2686 0.2705 0.9053 0.9014 0.9375 Qwen3-0.6B 0.5986 0.8037 0.8457 0.0576 0.2520 0.2588 0.8652 0.8652 0.9492 Piecewise lin. 0.6113 0.7998 0.8564 0.0596 0.2354 0.2656 0.8633 0.8828 0.9385 Power-low 0.6035 0.7939 0.8506 0.0586 0.2354 0.2627 0.8623 0.8828 0.9395 KNN lin. 0.6064 0.8115 0.8545 0.0586 0.2295 0.2627 0.8652 0.8877 0.9395 Cheap Mid. Expen.
+> 0.7
+> 0.8
+> 0.9
+> 1.0
+> Budget
+> Avg. Acc.
+> size-64 size-128 size-256 size-512 Cheap Mid. Expen.
+> 0
+> 0.1
+> 0.2
+> 0.3
+> Budget
+> Avg. Acc.
+> (a)
+
+GSM 8KCheap Mid. Expen.   
+
+> 0.5
+> 0.6
+> 0.7
+> 0.8
+> 0.9
+> Budget
+> Avg. Acc. (b)
+
+AGNews Cheap Mid. Expen.   
+
+> 0.7
+> 0.8
+> 0.9
+> 1.0
+> Budget
+> Avg. Acc. (c)
+
+IMDB 
+
+Figure 9: Accuracy of Different Coreset Sizes 
+
+## 6.4 Sensitivity & Design Choice Analysis 
+
+In this section, we present a series of sensitivity and design-choice analyses for RoBatch using the Qwen3 family. For each test con-figuration, we use three budget levels: the total cost of the cheapest model (Qwen3-4B), the total cost of the medium-cost model (Qwen3-14B), and their midpoint. The configurations are maintained as default except the test hyper-parameter or design choice. 
+
+6.4.1 Coreset selection algorithms and coreset sizes. To evaluate the robustness of RoBatch with respect to the construction of the coreset, we study the sensitivity of RoBatch to the coreset selection methods and the coreset size. Specifically, we compare three widely used coreset selection algorithms, i.e., 𝑘 -center greedy, Facility Location (FL) [ 20 ] and Herding [ 34 ], and vary the coreset size |Q ′′ | from {64, 128, 256, 512 }. Overall, the results in Table 3 and Fig. 9 suggest that RoBatch is robust to the coreset construction. Across different datasets and budget levels, changing the coreset selection algorithm introduces only limited perturbation to the final Accuracy, and no single method consistently dominates in all cases. For instance, FL is slightly stronger on AGNews at the middle and expensive budgets, while 𝑘 -center greedy and Herding remain competitive on GSM 8K and IMDB , respectively, indicating that the framework is not strongly dependent on any coreset selection algorithms. In addition, increasing the coreset size from 64 to 512 results in only marginal performance differences in most settings, suggesting that even a relatively small coreset is sufficient to capture the main utility patterns needed by RoBatch .
+
+6.4.2 Impact of embedding models. To evaluate the robustness of our framework with different query embedding models, we perform a sensitivity analysis using several alternative embedding models, including E5-base-v2 [ 31 ], Qwen3-0.6B-embedding [ 38 ], and BGE-base-en-v1.5 [ 6 ]. As shown in Table 3, the differences in the final Accuracy of RoBatch among BGE-base, E5-base, and Qwen3-0.6B remain small across the three datasets and three budget constraints, MLP=(128,64)    
+
+> MLP=(256,128,64)
+> MLP=(512,256,128)
+> KNN=1
+> KNN=2
+> KNN=4
+> KNN=8
+> KNN=10
+> KNN=16 Cheap Middle Expensive
+> budget
+> 0.1
+> 0.2
+> Avg. Acc
+> (a)
+
+GSM 8KCheap Middle Expensive   
+
+> budget
+> 0.6
+> 0.7
+> 0.8
+> Avg. Acc (b)
+
+AGNews Cheap Middle Expensive   
+
+> budget
+> 0.875
+> 0.900
+> 0.925
+> 0.950
+> Avg. Acc (c)
+
+IMDB 
+
+Figure 10: Sensitivity of MLP and KNN Hyper-Parameters 
+
+although each embedding model shows slight advantages in specific cases. In summary, RoBatch does not depend heavily on a particu-lar embedding model to maintain strong overall performance. 
+
+6.4.3 Impact of routing models and hyper-parameters. To further examine the robustness of RoBatch with respect to the routing component, we study the impact of different router models and hyper-parameter settings, including MLP classifiers with differ-ent hidden-layer configurations and KNN-based classifiers with varying numbers of nearest neighbors, 𝑘 . As shown in Fig. 10, Ro-Batch shows limited sensitivity to the specific router models or hyperparameter choices, especially on AGNews and IMDB , where most MLP and KNN variants achieve very similar accuracy across the three budget levels. The effect is more evident on the more challenging GSM 8K workload. While different MLP model archi-tectures yield largely comparable results, KNN is more sensitive to 
+
+𝑘 , and typically performs better with a moderate 𝑘 ; in contrast, the extreme setting 𝑘 = 1 leads to clearly inferior accuracy. 
+
+6.4.4 Impact of different scaling functions. We investigate three representative ways of fitting the utility scaling function 𝜌 𝑘 (𝑏 ) to evaluate their impact on overall Accuracy under different budget constraints. We compare the default piecewise linear interpola-tion, as shown in Eq. (12) with two alternative fitting methods: (1) Power-law function fitting that models the decay of utilities as 
+
+𝜌 𝑘 (𝑏 ) = 1−𝛼 (𝑏 −1)𝛽 , and fits 𝛼 , 𝛽 by nonlinear least squares method on the coreset Q′′ . (2) KNN linear interpolation retrieves the near-est neighbors from Q′′ for each test query and utilizes the average utility of these neighbors at various batch sizes as query-specific in-terpolation points. The results in Table 3 show that the three fitting methods yield highly consistent performance, demonstrating the robustness of RoBatch to decay function formulations. Although different methods exhibit relative advantages under different sce-narios, the differences in final Accuracy remain within 2%. Overall, across three different workloads and three budget constraints, the convergence of all functions confirms that default piecewise lin-ear interpolation is sufficient for robust practical deployment. The overlapping cost-accuracy curves indicate that performance gains stem primarily from the joint optimization of model selection and batching rather than a specific local design. 
+
+## 6.5 Scalability & System Overhead 
+
+6.5.1 Scalability comparison with baselines. We compare how the serving overhead of different methods varies with workload size, which is measured as the elapsed time from receiving the test queries to issuing the practical LLM requests. Fig. 11 shows this elapsed time of RoBatch and three baselines, as the number of Haotian Xu, Kangfei Zhao, and Jiadong Xie RoBatch                  
+
+> RouteLLM
+> Batcher-Sim
+> Batcher-Div
+> OBP 512 1024 2048 4096 8192
+> # Queries
+> 10 0
+> 10 2
+> Time (seconds)
+> (a) MMLU 512 1024 2048 4096 7600
+> # Queries
+> 10 0
+> 10 1
+> 10 2
+> Time (seconds) (b) AGNews 512 1024 2048 4096 8192
+> # Queries
+> 10 0
+> 10 2
+> Time (seconds) (c) IMDB
+
+Figure 11: Comparison of Latency and Scalability Router Prediction Proxy utility Computation Greedy Scheduling 512 1024 2048 4096 8192              
+
+> # Queries
+> 0
+> 20
+> 40
+> Time (seconds)
+> 0
+> 0.5
+> (a) MMLU 512 1024 2048 4096 7600
+> # Queries
+> 0
+> 10
+> 20
+> 30
+> Time (seconds)
+> 0
+> 0.5 (b) AGNews 512 1024 2048 4096 8192
+> # Queries
+> 0
+> 10
+> 20
+> 30
+> Time (seconds)
+> 0
+> 0.5 (c) IMDB
+
+Figure 12: Latency Breakdown of RoBatch 
+
+queries grows. FrugalGPT is excluded from this comparison be-cause its LLM cascading design makes LLM API latency and the scheduling time intertwined. Compared with BATCHER baselines, 
+
+RoBatch incurs higher overhead because it performs additional router prediction and budget-aware greedy scheduling. As the work-load size doubles, the serving overhead of RoBatch grows approxi-mately linearly, rising from 2.48s to 34.35s on AGNews , from 1.89s to 31.97s on IMDB , and from 2.84s to 48.95s on MMLU . RouteLLM re-quires computing similarities against the entire training dataset and then solving a weighted optimization problem for each test query, which results in higher latency. In contrast, both the BATCHER and OBP begin with a computationally router prediction; BATCHER then applies low-complexity 𝑘 -means clustering, while OBP main-tains low latency through efficient clustering and lightweight ap-proximate splitting instead of expensive global optimization. In summary, RoBatch exhibits a predictable scaling behavior as the workload size increases. 
+
+6.5.2 Latency breakdown of RoBatch . Fig. 12 further decomposes the serving overhead of RoBatch into three parts: router prediction, proxy utility computation, and greedy scheduling. The profiling results reveal a clear and stable pattern: greedy scheduling domi-nates the total overhead, proxy utility computation is the second largest component, and router prediction is negligible. Concretely, greedy scheduling accounts for 76.0%-82.8% of the total time on 
+
+AGNews , 77.9%-79.7% on IMDB , and 84.0%-86.3% on MMLU , while proxy utility computation accounts for 15.4%-16.6%, 19.1%-19.7%, and 12.9%-13.1%, respectively. This breakdown is consistent with the complexity analysis in §5, where the O(|Q| 𝐾𝑑 ) router predic-tion is lightweight, and the O(|Q| 𝑇 log |Q|) greedy scheduling term is the dominant factor in practice. 
+
+## 7 Related Work 
+
+LLM Routing and Model Selection. Routing queries across a di-verse pool of LLMs has emerged as an effective strategy to optimize the trade-off between task accuracy and monetary cost [ 5]. Existing research focuses on developing LLM performance estimators that dynamically predict the suitability of candidate models for individ-ual queries. FrugalGPT [7] introduced the concept of LLM cascades, which reduce costs by sequentially invoking models of increasing capacity based on uncertainty calibration. Hybrid LLM [ 11 ] extends the routing paradigm to edge-cloud collaborative environments, employing a router to assess query difficulty and process simple queries at the edge while directing complex tasks to cloud-based models. To improve routing reliability, AutoMix [ 1] introduces a self-verification mechanism where a smaller model evaluates the confidence of its own response to decide whether to escalate to a more capable model. Furthermore, RouteLLM [24 ] explores learning routing strategies from preference data by predicting the marginal benefit of invoking a stronger model to close the performance gap between weak and strong models. These frameworks collectively establish paradigms for cost-effective model routing grounded in difficulty prediction, confidence calibration, and preference-driven learning. 
+
+Batch Prompting. Batch prompting [ 8 , 21 ] serves as a key opti-mization for improving the inference efficiency of LLM APIs by aggregating multiple independent queries into a single request. Early studies demonstrate that such aggregation effectively amor-tizes the fixed overhead of system prompts and reduces the total number of API calls for various reasoning tasks. To further explore this technique, BATCHER [ 13 ] provides a comprehensive design space exploration specifically for In-Context Learning for tasks like Entity Resolution. This work introduces contrasting grouping principles: BATCHER-SIM clusters semantically similar queries, whereas BATCHER-DIV prioritizes query diversity to enhance per-formance. Building on these heuristics, Optimized Batch Prompting ( OBP ) [ 17 ] shifts from fixed-size batching to an adaptive query batching framework. By leveraging clustering and dynamic refine-ment, OBP balances semantic affinity, context length, and accuracy to minimize costs. Overall, the existing literature establishes a solid foundation for enhancing LLM efficiency through batch prompting, with efforts primarily focused on refining query grouping heuristics and adaptive clustering to balance the economic benefits of system prompt amortization against task-specific performance. 
+
+## 8 Conclusion 
+
+LLM routing and batch prompting are two independent techniques for LLM inference optimization. In this paper, we study cost-effective LLM routing with batch prompting that simultaneously determines which model should serve each query and how to group queries into batches. We formulate the budget-constrained route with batch-ing problem as a combinatorial optimization and prove that the problem is NP-hard. To address this hard problem, we propose 
+
+RoBatch , a unified framework that integrates batch-aware util-ity modeling with budget-aware greedy scheduling. RoBatch first builds a batch-aware proxy utility model that estimates how utility changes across models and batch sizes, and then uses this model to guide routing decisions under a given cost budget. Extensive experiments on six benchmarks show that RoBatch consistently achieves a better cost–performance frontier than routing-only and batching-only baselines, while incurring only modest scheduling overhead in practice. Towards Cost-effective LLMs Routing with Batch Prompting 
+
+## References 
+
+[1] Pranjal Aggarwal, Aman Madaan, Ankit Anand, Srividya Pranavi Potharaju, Swaroop Mishra, Pei Zhou, Aditya Gupta, Dheeraj Rajagopal, Karthik Kappa-ganthu, Yiming Yang, Shyam Upadhyay, Manaal Faruqui, and Mausam. 2024. AutoMix: Automatically Mixing Language Models. In Advances in Neural Infor-mation Processing Systems 38: Annual Conference on Neural Information Processing Systems 2024, NeurIPS 2024 .[2] Malika Aubakirova, Alex Atallah, Chris Clark, Justin Summerville, and Anjney Midha. 2026. State of AI: An Empirical 100 Trillion Token Study with OpenRouter. 
+
+CoRR abs/2601.10088 (2026). [3] Samuel R. Bowman, Gabor Angeli, Christopher Potts, and Christopher D. Man-ning. 2015. A large annotated corpus for learning natural language inference. In 
+
+Proceedings of the 2015 Conference on Empirical Methods in Natural Language Pro-cessing, EMNLP 2015 . The Association for Computational Linguistics, 632–642. [4] Edward Y. Chang and Longling Geng. 2025. SagaLLM: Context Management, Validation, and Transaction Guarantees for Multi-Agent LLM Planning. Proc. VLDB Endow. 18, 12 (2025), 4874–4886. [5] Huamin Chen, Xunzhuo Liu, Bowei He, Fuyuan Lyu, Yankai Chen, Xue Liu, Yuhan Liu, and Junchen Jiang. 2026. The Workload-Router-Pool Architecture for LLM Inference Optimization: A Vision Paper from the vLLM Semantic Router Project. arXiv preprint arXiv:2603.21354 (2026). [6] Jianlv Chen, Shitao Xiao, Peitian Zhang, Kun Luo, Defu Lian, and Zheng Liu. 2024. BGE M3-Embedding: Multi-Lingual, Multi-Functionality, Multi-Granularity Text Embeddings Through Self-Knowledge Distillation. CoRR abs/2402.03216 (2024). [7] Lingjiao Chen, Matei Zaharia, and James Zou. 2024. FrugalGPT: How to Use Large Language Models While Reducing Cost and Improving Performance. Trans. Mach. Learn. Res. 2024 (2024). [8] Zhoujun Cheng, Jungo Kasai, and Tao Yu. 2023. Batch Prompting: Efficient Inference with Large Language Model APIs. In Proceedings of the 2023 Conference on Empirical Methods in Natural Language Processing: EMNLP 2023 - Industry Track , Mingxuan Wang and Imed Zitouni (Eds.). Association for Computational Linguistics, 792–810. [9] Karl Cobbe, Vineet Kosaraju, Mohammad Bavarian, Mark Chen, Heewoo Jun, Lukasz Kaiser, Matthias Plappert, Jerry Tworek, Jacob Hilton, Reiichiro Nakano, Christopher Hesse, and John Schulman. 2021. Training Verifiers to Solve Math Word Problems. CoRR abs/2110.14168 (2021). [10] Jacob Devlin, Ming-Wei Chang, Kenton Lee, and Kristina Toutanova. 2019. BERT: Pre-training of Deep Bidirectional Transformers for Language Understanding. In 
+
+Proceedings of the 2019 Conference of the North American Chapter of the Association for Computational Linguistics: Human Language Technologies, NAACL-HLT 2019, Volume 1 (Long and Short Papers) . Association for Computational Linguistics, 4171–4186. [11] Dujian Ding, Ankur Mallick, Chi Wang, Robert Sim, Subhabrata Mukherjee, Victor Rühle, Laks V. S. Lakshmanan, and Ahmed Hassan Awadallah. 2024. Hybrid LLM: Cost-Efficient and Quality-Aware Query Routing. In The Twelfth International Conference on Learning Representations, ICLR 2024, May 7-11, 2024 .OpenReview.net. [12] William B. Dolan and Chris Brockett. 2005. Automatically Constructing a Corpus of Sentential Paraphrases. In Proceedings of the Third International Workshop on Paraphrasing, IWP@IJCNLP 2005 . Asian Federation of Natural Language Processing. [13] Meihao Fan, Xiaoyue Han, Ju Fan, Chengliang Chai, Nan Tang, Guoliang Li, and Xiaoyong Du. 2024. Cost-Effective In-Context Learning for Entity Resolu-tion: A Design Space Exploration. In 40th IEEE International Conference on Data Engineering, ICDE 2024, May 13-16, 2024 . IEEE, 3696–3709. [14] Teofilo F. Gonzalez. 1985. Clustering to Minimize the Maximum Intercluster Distance. Theor. Comput. Sci. 38 (1985), 293–306. [15] Dan Hendrycks, Collin Burns, Steven Basart, Andy Zou, Mantas Mazeika, Dawn Song, and Jacob Steinhardt. 2021. Measuring Massive Multitask Language Un-derstanding. In 9th International Conference on Learning Representations, ICLR 2021 . OpenReview.net. [16] Zhongzhan Huang, Guoming Ling, Yupei Lin, Yandong Chen, Shanshan Zhong, Hefeng Wu, and Liang Lin. 2025. RouterEval: A Comprehensive Benchmark for Routing LLMs to Explore Model-level Scaling Up in LLMs. In Findings of the Association for Computational Linguistics: EMNLP 2025 . Association for Compu-tational Linguistics, 3860–3887. [17] Zhaoxuan Ji, Xinlu Wang, Zhaojing Luo, Zhongle Xie, and Meihui Zhang. 2025. Optimized Batch Prompting for Cost-effective LLMs. Proc. VLDB Endow. 18, 7 (2025), 2172–2184. [18] Richard M. Karp. 1972. Reducibility Among Combinatorial Problems. In Pro-ceedings of a symposium on the Complexity of Computer Computations (The IBM Research Symposia Series) . Plenum Press, New York, 85–103. [19] Guoliang Li, Jiayi Wang, Chenyang Zhang, and Jiannan Wang. 2025. Data+AI: LLM4Data and Data4LLM. In Companion of the 2025 International Conference on Management of Data, SIGMOD/PODS 2025 . ACM, 837–843. [20] Hui Lin and Jeff A. Bilmes. 2009. How to select a good training-data subset for transcription: submodular active selection for sequences. In 10th Annual Conference of the International Speech Communication Association, INTERSPEECH 2009 . ISCA, 2859–2862. [21] Jianzhe Lin, Maurice Diesendruck, Liang Du, and Robin Abraham. 2024. Batch-Prompt: Accomplish more with less. In The Twelfth International Conference on Learning Representations, ICLR 2024 . OpenReview.net. [22] Yinhan Liu, Myle Ott, Naman Goyal, Jingfei Du, Mandar Joshi, Danqi Chen, Omer Levy, Mike Lewis, Luke Zettlemoyer, and Veselin Stoyanov. 2019. RoBERTa: A Robustly Optimized BERT Pretraining Approach. CoRR abs/1907.11692 (2019). [23] Andrew L. Maas, Raymond E. Daly, Peter T. Pham, Dan Huang, Andrew Y. Ng, and Christopher Potts. 2011. Learning Word Vectors for Sentiment Analysis. In The 49th Annual Meeting of the Association for Computational Linguistics: Human Language Technologies, Proceedings of the Conference . The Association for Computer Linguistics, 142–150. [24] Isaac Ong, Amjad Almahairi, Vincent Wu, Wei-Lin Chiang, Tianhao Wu, Joseph E. Gonzalez, M. Waleed Kadous, and Ion Stoica. 2025. RouteLLM: Learning to Route LLMs from Preference Data. In The Thirteenth International Conference on Learning Representations, ICLR 2025, April 24-28, 2025 . OpenReview.net. [25] Liana Patel, Siddharth Jha, Melissa Z. Pan, Harshit Gupta, Parth Asawa, Carlos Guestrin, and Matei Zaharia. 2025. Semantic Operators and Their Optimization: Towards AI-Based Data Analytics with Accuracy Guarantees. Proc. VLDB Endow. 
+
+18, 11 (2025), 4171–4184. [26] Kangkang Qi, Dongyang Xie, Wenbo Li, Hao Zhang, Yuanyuan Zhu, Jeffrey Xu Yu, and Kangfei Zhao. 2026. Sema: A High-performance System for LLM-based Semantic Query Processing. arXiv preprint arXiv:2603.11622 (2026). [27] Shreya Shankar, Tristan Chambers, Tarak Shah, Aditya G. Parameswaran, and Eugene Wu. 2025. DocETL: Agentic Query Rewriting and Evaluation for Complex Document Processing. Proc. VLDB Endow. 18, 9 (2025), 3035–3048. [28] Shreya Shankar, Sepanta Zeighami, and Aditya G. Parameswaran. 2026. Task Cascades for Efficient Unstructured Data Processing. CoRR abs/2601.05536 (2026). [29] Gemma Team. 2025. Gemma 3 Technical Report. CoRR abs/2503.19786 (2025). [30] Qwen Team. 2025. Qwen3 Technical Report. CoRR abs/2505.09388 (2025). [31] Liang Wang, Nan Yang, Xiaolong Huang, Binxing Jiao, Linjun Yang, Daxin Jiang, Rangan Majumder, and Furu Wei. 2022. Text Embeddings by Weakly-Supervised Contrastive Pre-training. CoRR abs/2212.03533 (2022). [32] Yue Wang, Weishi Wang, Shafiq R. Joty, and Steven C. H. Hoi. 2021. CodeT5: Identifier-aware Unified Pre-trained Encoder-Decoder Models for Code Under-standing and Generation. In Proceedings of the 2021 Conference on Empirical Methods in Natural Language Processing, EMNLP 2021 . Association for Computa-tional Linguistics, 8696–8708. [33] Jason Wei, Xuezhi Wang, Dale Schuurmans, Maarten Bosma, Brian Ichter, Fei Xia, Ed H. Chi, Quoc V. Le, and Denny Zhou. 2022. Chain-of-Thought Prompting Elicits Reasoning in Large Language Models. In Advances in Neural Informa-tion Processing Systems 35: Annual Conference on Neural Information Processing Systems 2022 .[34] Max Welling. 2009. Herding dynamical weights to learn. In Proceedings of the 26th Annual International Conference on Machine Learning, ICML 2009 (ACM International Conference Proceeding Series) , Andrea Pohoreckyj Danyluk, Léon Bottou, and Michael L. Littman (Eds.). ACM, 1121–1128. [35] Shunyu Yao, Jeffrey Zhao, Dian Yu, Nan Du, Izhak Shafran, Karthik R. Narasimhan, and Yuan Cao. 2023. ReAct: Synergizing Reasoning and Acting in Language Models. In The Eleventh International Conference on Learning Represen-tations, ICLR 2023 . OpenReview.net. [36] Sepanta Zeighami, Shreya Shankar, and Aditya G. Parameswaran. 2025. Cut Costs, Not Accuracy: LLM-Powered Data Processing with Guarantees. Proc. ACM Manag. Data 3, 6 (2025), 1–26. [37] Xiang Zhang, Junbo Jake Zhao, and Yann LeCun. 2015. Character-level Con-volutional Networks for Text Classification. In Advances in Neural Information Processing Systems 28: Annual Conference on Neural Information Processing Sys-tems 2015 . 649–657. [38] Yanzhao Zhang, Mingxin Li, Dingkun Long, Xin Zhang, Huan Lin, Baosong Yang, Pengjun Xie, An Yang, Dayiheng Liu, Junyang Lin, Fei Huang, and Jingren Zhou. 2025. Qwen3 Embedding: Advancing Text Embedding and Reranking Through Foundation Models. CoRR abs/2506.05176 (2025). [39] Zihuai Zhao, Wenqi Fan, Jiatong Li, Yunqing Liu, Xiaowei Mei, Yiqi Wang, Zhen Wen, Fei Wang, Xiangyu Zhao, Jiliang Tang, and Qing Li. 2024. Recommender Systems in the Era of Large Language Models (LLMs). IEEE Trans. Knowl. Data Eng. 36, 11 (2024), 6889–6907. [40] Jun-Peng Zhu, Peng Cai, Kai Xu, Li Li, Yishen Sun, Shuai Zhou, Haihuang Su, Liu Tang, and Qi Liu. 2024. AutoTQA: Towards Autonomous Tabular Question Answering through Multi-Agent Large Language Models. Proc. VLDB Endow. 17, 12 (2024), 3920–3933.

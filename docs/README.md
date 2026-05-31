@@ -6,73 +6,56 @@
 </div>
 
 ## 每次日报
-- 最新运行日期：2026-05-30
-- 运行时间：2026-05-30 20:53:04 UTC
+- 最新运行日期：2026-05-31
+- 运行时间：2026-05-31 20:32:00 UTC
 - 运行状态：成功
-- 本次总论文数：17
-- 精读区：6
-- 速读区：11
+- 本次总论文数：12
+- 精读区：3
+- 速读区：9
 
 ### 今日简报（AI）
-1) 今日聚焦边缘端LLM推理优化，精读两篇高分论文分别提出自适应分布式推理与3D NAND存算一体架构，速读关注弹性解码与深度剪枝。  
-2) 最值得看的方向是面向资源受限设备的加速：Profiling驱动的动态分配与CAM多比特CIM硬件协同，满分论文可重点精读。  
-3) 建议读者优先精读《Profiling-Driven Adaptive Distributed Transformer Inference》，掌握边缘部署中计算与内存调度的自适应策略。
-- 详情：[/202605/30/README](/202605/30/README)
+今日精读阿里高性能LLM推理引擎RTP-LLM与全局混合精度量化决策框架WINDQuant，速读覆盖KV缓存淘汰及路由优化方案。最值得关注的是RTP-LLM（10分）在工业级推理上的极致优化，以及WINDQuant通过权重感知实现混合精度量化决策。建议普通读者优先精读RTP-LLM，了解大规模部署的实战调优思路。
+- 详情：[/202605/31/README](/202605/31/README)
 
 ### 精读区论文标签
-1. [Profiling-Driven Adaptive Distributed Transformer Inference on Embedded Edge Deployment](/202605/30/2605.25682v1-profiling-driven-adaptive-distributed-transformer-inference-on-embedded-edge-deployment)  
+1. [RTP-LLM: High-Performance Alibaba LLM Inference Engine](/202605/31/2605.29639v1-rtp-llm-high-performance-alibaba-llm-inference-engine)  
    标签：评分：10.0/10、query:edge-llm
-   evidence：在嵌入式边缘设备上分布式Transformer推理，使用Jetson硬件原型
-2. [NASiC: 3D NAND-based CAM-Selected Multibit CIM Architecture for Efficient On-Device Mixture-of-Experts LLM Inference](/202605/30/2605.23294v1-nasic-3d-nand-based-cam-selected-multibit-cim-architecture-for-efficient-on-device-mixture-of-experts-llm-inference)  
-   标签：评分：9.0/10、query:edge-llm
-   evidence：面向设备上MoE的3D NAND存内计算软硬协同设计
-3. [Stateful Inference for Low-Latency Multi-Agent Tool Calling](/202605/30/2605.26289v1-stateful-inference-for-low-latency-multi-agent-tool-calling)  
-   标签：评分：9.0/10、query:edge-llm
-   evidence：提出有状态推理架构，降低LLM服务每轮开销
-4. [How Far Can Disaggregation Go? A Design-Space Exploration of Attention-FFN Disaggregation for Efficient MoE LLM Serving](/202605/30/2605.28302v1-how-far-can-disaggregation-go-a-design-space-exploration-of-attention-ffn-disaggregation-for-efficient-moe-llm-serving)  
-   标签：评分：9.0/10、query:edge-llm
-   evidence：注意力-FFN分离的设计空间探索，用于高效MoE LLM服务
-5. [Adaptive Mass-Segmented KV Compression for Long-Context Reasoning](/202605/30/2605.23200v1-adaptive-mass-segmented-kv-compression-for-long-context-reasoning)  
+   evidence：工业级LLM推理引擎，包含预填充-解码分离和分层KV缓存等集成优化
+2. [WINDQuant: Weight-Informed Neural Decision-Making for Global Mixed-Precision LLM Quantization](/202605/31/2605.26660v1-windquant-weight-informed-neural-decision-making-for-global-mixed-precision-llm-quantization)  
    标签：评分：8.0/10、query:edge-llm
-   evidence：面向长上下文的KV缓存压缩，采用区域感知配额分配
-6. [CONF-KV: Confidence-Aware KV Cache Eviction with Mixed-Precision Storage for Long-Horizon LLM](/202605/30/2605.24786v1-conf-kv-confidence-aware-kv-cache-eviction-with-mixed-precision-storage-for-long-horizon-llm)  
+   evidence：基于强化学习的混合精度量化加速LLM推理
+3. [PrunePath: Towards Highly Structured Sparse Language Models](/202605/31/2605.28283v1-prunepath-towards-highly-structured-sparse-language-models)  
    标签：评分：8.0/10、query:edge-llm
-   evidence：基于置信度的KV缓存逐出与混合精度存储
+   evidence：面向硬件的FFN层结构化稀疏化
 
 ### 速读区论文标签
-1. [Optimus: Elastic Decoding for Efficient Diffusion LLM Serving](/202605/30/2605.24832v1-optimus-elastic-decoding-for-efficient-diffusion-llm-serving)  
-   标签：评分：8.0/10、query:edge-llm
-   evidence：扩散LLM服务的弹性解码，提升硬件利用率
-2. [Bandwidth-Aware LLM Inference on Heterogeneous Many-Core Supercomputers](/202605/30/2605.25655v1-bandwidth-aware-llm-inference-on-heterogeneous-many-core-supercomputers)  
-   标签：评分：8.0/10、query:edge-llm
-   evidence：异构众核超级计算机上的带宽感知LLM推理，软硬件协同设计
-3. [Locality-Aware Redundancy Pruning for LLM Depth Compression](/202605/30/2605.27786v1-locality-aware-redundancy-pruning-for-llm-depth-compression)  
-   标签：评分：8.0/10、query:edge-llm
-   evidence：免训练深度剪枝，提升LLM推理效率
-4. [ModeSwitch-LLM: A Lightweight Phase-Aware Controller for Cross-Mode LLM Inference on a Single GPU](/202605/30/2605.23057v1-modeswitch-llm-a-lightweight-phase-aware-controller-for-cross-mode-llm-inference-on-a-single-gpu)  
+1. [IndexMem: Learned KV-Cache Eviction with Latent Memory for Long-Context LLM Inference](/202605/31/2605.25475v1-indexmem-learned-kv-cache-eviction-with-latent-memory-for-long-context-llm-inference)  
    标签：评分：7.0/10、query:edge-llm
-   evidence：基于工作负载特征选择推理模式的相位感知控制器
-5. [Interdomain Attention: Beyond Token-Level Key-Value Memory](/202605/30/2605.24330v1-interdomain-attention-beyond-token-level-key-value-memory)  
+   evidence：学习型KV缓存驱逐用于高效长上下文推理
+2. [Beyond Query Memorization: Large Language Model Routing with Query Decomposition and Historical Matching](/202605/31/2605.25558v1-beyond-query-memorization-large-language-model-routing-with-query-decomposition-and-historical-matching)  
    标签：评分：7.0/10、query:edge-llm
-   evidence：提出域间注意力机制，集成SSM实现定长KV缓存，降低内存
-6. [H$^{2}$MT: Semantic Hierarchy-Aware Hierarchical Memory Transformer](/202605/30/2605.24930v1-h2mt-semantic-hierarchy-aware-hierarchical-memory-transformer)  
+   evidence：LLM路由框架优化性能-成本权衡，查询分解与历史匹配
+3. [Towards Cost-effective LLMs Routing with Batch Prompting](/202605/31/2605.28268v1-towards-cost-effective-llms-routing-with-batch-prompting)  
    标签：评分：7.0/10、query:edge-llm
-   evidence：层次内存Transformer降低长上下文推理的预填充成本
-7. [A general tensor-structured compression scheme for efficient large language models](/202605/30/2605.25344v1-a-general-tensor-structured-compression-scheme-for-efficient-large-language-models)  
+   evidence：联合优化路由和批量提示以实现成本高效的LLM服务
+4. [Augmenting Attention with Exponentially Decaying Memory Improves Query-Aware KV Sparsity](/202605/31/2605.28640v1-augmenting-attention-with-exponentially-decaying-memory-improves-query-aware-kv-sparsity)  
    标签：评分：7.0/10、query:edge-llm
-   evidence：张量结构压缩减少LLM的内存和计算
-8. [ReMoE: Boosting Expert Reuse through Router Fine-Tuning in Memory-Constrained MoE LLM Inference](/202605/30/2605.27081v1-remoe-boosting-expert-reuse-through-router-fine-tuning-in-memory-constrained-moe-llm-inference)  
+   evidence：指数衰减记忆增强注意力，提升查询感知KV稀疏性
+5. [CosmicFish-HRM: Adaptive Reasoning via Hierarchical Recurrent Mechanisms in Compact Language Models](/202605/31/2605.28919v1-cosmicfish-hrm-adaptive-reasoning-via-hierarchical-recurrent-mechanisms-in-compact-language-models)  
    标签：评分：7.0/10、query:edge-llm
-   evidence：通过改进专家重用提升MoE资源效率
-9. [GEMQ: Global Expert-Level Mixed-Precision Quantization for MoE LLMs](/202605/30/2605.23078v1-gemq-global-expert-level-mixed-precision-quantization-for-moe-llms)  
+   evidence：具有自适应推理深度的高效推理紧凑语言模型
+6. [LFQ: Logit-aware Final-block Quantization for Boosting the Generation Quality of Low-Bit Quantized LLMs](/202605/31/2605.29756v1-lfq-logit-aware-final-block-quantization-for-boosting-the-generation-quality-of-low-bit-quantized-llms)  
+   标签：评分：7.0/10、query:edge-llm
+   evidence：低比特量化实现内存高效部署
+7. [Knowledge Offloading: Decomposing LLMs into Sparse Backbones and Memory Modules](/202605/31/2605.29075v1-knowledge-offloading-decomposing-llms-into-sparse-backbones-and-memory-modules)  
    标签：评分：6.0/10、query:edge-llm
-   evidence：混合精度量化减少MoE LLM内存占用，与硬件感知加速相关
-10. [FD-RAG: Federated Dual-System Retrieval-Augmented Generation](/202605/30/2605.27432v1-fd-rag-federated-dual-system-retrieval-augmented-generation)  
+   evidence：将LLM分解为骨干和记忆模块以实现高效存储
+8. [BlockBatch: Multi-Scale Consensus Decoding for Efficient Diffusion Language Model Inference](/202605/31/2605.29233v1-blockbatch-multi-scale-consensus-decoding-for-efficient-diffusion-language-model-inference)  
    标签：评分：6.0/10、query:edge-llm
-   evidence：边缘环境中的联邦RAG，资源高效LLM推理
-11. [SiDP: Memory-Efficient Data Parallelism for Offline LLM Inference](/202605/30/2605.28095v1-sidp-memory-efficient-data-parallelism-for-offline-llm-inference)  
+   evidence：多尺度共识解码加速扩散LLM推理
+9. [Cluster-Level Attention-Guided Parallel Decoding for Masked Diffusion Language Models](/202605/31/2605.29607v1-cluster-level-attention-guided-parallel-decoding-for-masked-diffusion-language-models)  
    标签：评分：6.0/10、query:edge-llm
-   evidence：面向LLM服务的内存高效数据并行
+   evidence：掩码扩散语言模型的聚类级并行解码
 
 
 <div class="dpr-home-promo-card">
