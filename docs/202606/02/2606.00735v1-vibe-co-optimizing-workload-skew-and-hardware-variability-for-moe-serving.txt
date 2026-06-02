@@ -1,0 +1,1301 @@
+Title: ViBE: Co-Optimizing Workload Skew and Hardware Variability for MoE Serving
+
+URL Source: https://arxiv.org/pdf/2606.00735v1
+
+Published Time: Tue, 02 Jun 2026 00:50:53 GMT
+
+Number of Pages: 14
+
+Markdown Content:
+# ViBE: Co-Optimizing Workload Skew and Hardware Variability for MoE Serving 
+
+Seokjin Go 
+
+Georgia Institute of Technology Atlanta, GA, USA 
+
+seokjin.go@gatech.edu 
+
+Marko Scrbak 
+
+Advanced Micro Devices, Inc. Austin, TX, USA 
+
+marko.scrbak@amd.com 
+
+Ephrem Wu 
+
+Advanced Micro Devices, Inc. Santa Clara, CA, USA 
+
+ephrem.wu@amd.com 
+
+Srilatha Manne 
+
+Advanced Micro Devices, Inc. Bellevue, WA, USA 
+
+srilatha.manne@amd.com 
+
+Divya Mahajan 
+
+Georgia Institute of Technology Atlanta, GA, USA 
+
+divya.mahajan@gatech.edu 
+
+Abstract 
+
+In distributed Mixture-of-Experts (MoE) inference, input-dependent token routing interacts with GPU performance variability to create persistent stragglers under synchronized execution, where the slowest GPU determines layer latency. This performance variability is inherent to modern acceler-ators: manufacturing variation, power limits, and thermal conditions introduce measurable execution-time differences across nominally identical GPUs. The core challenge is that MoE execution-time imbalance arises from the interaction of workload skew and hardware asymmetry . Token routing produces uneven and layer-varying expert loads, while GPU throughput depends on device-specific operating character-istics and workload intensity. Prior work mitigates routing skew but assumes homogeneous hardware, optimizing to-ken balance rather than execution latency. As a result, even balanced token assignments can leave hardware-induced stragglers unaddressed. Thus, we propose Variability-Informed Binning of Experts 
+
+(ViBE), a hardware-aware expert placement framework that minimizes execution-time imbalance across GPUs. ViBE com-bines per-GPU performance modeling with expert activa-tion profiling to assign high-load experts to faster devices and low-load experts to slower ones, reducing layer-level stragglers without modifying model semantics or hardware. Because both workload characteristics and effective GPU throughput can shift across serving conditions, ViBE sup-ports lightweight recalibration under workload/performance drift to refresh its routing and performance estimates when needed. This preserves placement accuracy across changes in token magnitude, batch composition, and execution phase while avoiding unnecessary reshuffling overhead. Results show that ViBE consistently reduces execution-time imbal-ance and improves SLO attainment by 14%, while lowering P90 TTFT by up to 45%. We further show that the impact of hardware variability increases at scale, making variability-aware placement important for efficient, high-utilization LLM serving. EPLB 
+
+> ViBE
+
+Figure 1. Token vs. latency imbalance across MoE layers of DeepSeek-V3. Each point is one layer; axes show max/min ratio within a layer. EPLB reduces token imbalance but la-tency imbalance persists, while the proposed work directly targets the latency-balanced regime. 
+
+Keywords: Distributed LLM Training, GPU clusters, Scale-up vs. scale-out, Training Optimizations, Power and thermal behavior 
+
+1 Introduction 
+
+Mixture-of-Experts (MoE) architectures allow large language models to scale by decoupling total model capacity from per-token computation [ 1 , 13 , 20 , 25 , 28 , 29 , 46 ]. Instead of activating all parameters for every token, MoE models route each token to a small subset of experts, allowing parameter count to grow without a proportional increase in compute. This sparsity introduces system-level challenges during distributed inference. Each expert’s parameters must reside in device memory, requiring model components to be parti-tioned across multiple GPUs or nodes. While data parallelism (DP), tensor parallelism (TP), and pipeline parallelism (PP) are general mechanisms for scaling large models, MoE sys-tems additionally rely on expert parallelism (EP) to place ex-pert weights across GPUs since the full set of experts cannot fit within a single device’s memory [ 13 , 18 , 30 , 36 , 39 , 44 , 45 ]. With EP, each MoE layer requires all-to-all communication and synchronization across GPUs and layer latency is de-termined by the GPU that finishes last. This bottleneck can arise from routing skew, hardware performance variability, 
+
+> 1
+> arXiv:2606.00735v1 [cs.DC] 30 May 2026 Seokjin Go, Marko Scrbak, Ephrem Wu, Srilatha Manne, and Divya Mahajan
+
+or their interaction. Routing skew is a challenge in MoE inference because a small subset of experts can receive a large fraction of tokens, creating hotspots that increase ex-ecution time on some GPUs while others remain underuti-lized [12, 14, 17, 50]. The key challenge in distributed MoE inference is persis-tent execution-time imbalance across GPUs caused by the interaction of routing-induced workload skew and hardware performance variability. Token routing creates uneven and layer-varying expert loads, while even nominally identical GPUs, across both AMD and NVIDIA platforms, can differ in effective throughput due to manufacturing variation, power limits, and operating conditions [ 15 , 19 , 40 ]. Prior work re-ports up to 22% variation in kernel execution time across compute-bound GPUs and shows that this variability is wide-spread across devices and nodes rather than confined to a few anomalous systems [ 40 , 41 ]. Under EP, these differences accumulate because each layer synchronizes at the pace of the slowest GPU, reducing throughput and increasing tail la-tency [ 17 , 26 , 48 ]. At scale, this tail latency translates directly into lower effective utilization and higher serving cost since operators pay for provisioned GPU capacity that cannot be converted into useful inference throughput. Past works have addressed these issues in isolation. Al-gorithmic approaches re-balance experts to equalize token counts, assuming homogeneous hardware [ 12 , 14 ]. Hardware-level techniques address variability through power-aware scheduling or throughput-oriented management [ 11 , 19 , 21 ,22 , 42 , 43 ]. However, as Figure 1 illustrates, addressing only one source of imbalance is insufficient: EPLB successfully reduces token imbalance across MoE layers (points shift left toward the 𝑦 -axis), yet latency imbalance persists because GPUs within the same node can still differ by up to 7% in MoE kernel time (Figure 6). Equalizing tokens does not equalize completion times given the underlying hardware variability. Existing dynamic rebalancing mechanisms are also lim-ited in how they adapt. Prior approaches [ 12 ] periodically recalibrate placement based on token distribution, but they consider only the relative routing ratio across experts or GPUs, not the absolute token magnitude that determines workload stress and exposes hardware variability. As a re-sult, they cannot capture changes in performance asymmetry caused by shifts in batch size or serving phase. In addition, recalibration is typically invoked at fixed intervals that is not workload-aware and can introduce reshuffling overhead even when the placement remains appropriate. 
+
+Our key insight is that routing skew and hardware variability should be co-optimized rather than treated independently. Instead of attempting to eliminate variability, we use it as a lever to balance execution time. By assigning high-load experts to faster GPUs and low-load experts to slower GPUs, we can balance execution time even when token counts are not equal. This transforms variability into an opportunity to reduce stragglers and tail latency. To realize this insight, we propose Variability-Informed Binning of Experts (ViBE), a hardware-aware expert place-ment framework that directly minimizes execution-time im-balance across GPUs. ViBE combines per-GPU performance modeling with expert activation profiling to guide placement. It assigns high-load experts to faster devices and low-load ex-perts to slower devices, balancing execution time across EP ranks without modifying model semantics or hardware. As workload characteristics and effective GPU throughput can shift during serving, ViBE also supports lightweight recali-bration under workload/performance drift. Rather than recal-ibrating at fixed intervals, ViBE monitors batch token count and observed latency imbalance, and refreshes its routing and performance estimates only when drift exceeds a con-figurable threshold. This makes recalibration stress-aware and workload-aware while reducing unnecessary reshuffling overhead. Unlike token-balanced approaches, ViBE mini-mizes predicted layer latency span rather than token count alone, producing more consistent execution across GPUs. We evaluate ViBE across two representative MoE mod-els and two GPU generations, AMD Instinct ™MI325X and AMD Instinct ™MI300X. Results show that ViBE improves kernel-level balance, reduces TTFT and TPOT tail latency, and increases sustainable request throughput compared to token-based balancing methods [ 12 ]. We also observe that token-balanced placement can assign high-load experts to slower GPUs, leading to suboptimal performance when hard-ware variability is ignored. Overall, this work makes the following contributions: 
+
+• Joint characterization of routing skew and hardware variability. We quantify how these factors interact to create persistent stragglers, observing up to 7% kernel execution time variation even under balanced token loads. 
+
+• Co-optimization of workload skew and hardware asymmetry. We show that expert placement can use rout-ing skew to offset device-level performance differences, shifting the objective from token balancing to execution-time balancing. 
+
+• Variability-Informed Binning of Experts (ViBE). We introduce a hardware-aware placement strategy that min-imizes execution-time imbalance by assigning high-load experts to faster GPUs and low-load experts to slower GPUs. 
+
+• Drift-aware recalibration. We augment placement with lightweight recalibration under workload/performance drift, using token magnitude and latency imbalance to trigger updates only when needed. 
+
+• Evaluation across models and platforms. We demon-strate consistent improvements in load balance, tail la-tency, and SLO attainment across multiple MoE models and GPU platforms. 
+
+> 2ViBE: Co-Optimizing Workload Skew and Hardware Variability for MoE Serving
+
+Table 1. We categorize pertinent prior work across four variability sources; ✓ indicates that a source is explicitly addressed.                             
+
+> System Hardware *Phase MoEs Service Key Mechanism
+> PAL [19] ✓Power-aware scheduling under heterogeneous GPU performance TAPAS [42] ✓Thermal-aware placement with power capping Perseus [11] ✓Pipeline scheduling and frequency capping for energy saving DynamoLLM [43] ✓✓DVFS tuning and dynamic parallelism for workload variability Splitwise [33] ✓Prefill/decode disaggregation across heterogeneous devices Sarathi [2] ✓Chunked prefill with continuous batching AlpaServe [27] ✓Multi-instance scheduling for request-level variability EPLB [12] ✓Routing-frequency-based expert placement
+> ViBE (Ours) ✓✓✓✓Variability-informed expert placement to minimize latency imbalance
+> *Hardware variability refers to unit-to-unit performance variation among identical products. Attention
+> Add & Norm
+> Add & Norm
+> MoE Layer
+> Router
+> FFN
+> 254
+> FFN
+> 255
+> FFN
+> 0
+> FFN
+> 1
+> +
+> …
+
+(a) Single-GPU execu-tion of an MoE model with 256 experts. Attention    
+
+> Add & Norm
+> Add & Norm
+> FFN
+> 0
+> FFN
+> 31
+> Router
+> Attention
+> Add & Norm
+> Add & Norm
+> FFN
+> 224
+> FFN
+> 255
+> Router
+> All -to -All Combine
+> All -to -All Dispatch
+> GPU_ID
+> (0 … N_GPUS –1)
+> GPU_0 GPU_7
+> ……
+
+(b) Expert-parallel execution across 8 GPUs, requiring all-to-all commu-nication and synchronization. 
+
+Figure 2. Comparison of MoE execution strategies: (a) single-GPU vs (b) expert-parallel execution. 
+
+2 Background 
+
+LLM serving exhibits variability from multiple sources. Ta-ble 1 summarizes these including hardware variability from device-level performance differences due to process, power, and thermal effects, phase variability from differences be-tween prefill and decode execution, model variability from input-dependent behavior such as MoE routing and expert activation skew, and service variability from request-level dynamics such as arrival rate, output length, and SLO het-erogeneity. These factors interact to create execution-time imbalance across GPUs, directly affecting throughput and tail latency under synchronized execution. 
+
+Mixture-of-Experts and Expert Parallelism. Mixture-of-Experts (MoE) models enable conditional computation by routing each token to a subset of experts [ 1 , 13 , 25 , 28 ,36 , 38 , 46 ]. This decouples total model capacity from per-token computation, allowing model size to scale without a proportional increase in compute. Instead of activating all parameters for every token, MoE layers activate only the selected experts, which makes sparse scaling practical for large language models. Figure 2a illustrates the conceptual single-GPU case, where all experts are placed on one device and token dispatch remains local. At the same time, routing is input-dependent, so expert activation can vary across re-quests and layers, creating uneven workloads across experts. However, as MoE models grow, experts are distributed across GPUs using expert parallelism (EP), which reduces per-device memory footprint and allows the full expert set to fit across the system [ 14 , 16 , 17 , 23 , 26 , 36 , 39 , 47 , 48 , 50 ]. As shown in Figure 2b, EP partitions experts across GPUs, requiring token exchange through all-to-all communication before and after expert computation. This changes MoE ex-ecution from the local setting in Figure 2a to a distributed execution model in which layer latency is determined by the GPU that finishes last. As a result, performance becomes sensitive to both workload imbalance and device-level per-formance differences: routing skew can assign more work to some GPUs, while hardware variability can cause identical workloads to execute at different speeds. In both cases, faster GPUs idle while waiting at synchronization points. 
+
+GPU Performance Variability. GPU performance variabil-ity can arise from several sources, including process vari-ation, power-delivery constraints, temperature variations, and less common infrastructure-level effects [ 19 , 22 , 40 ]. At the hardware level, nominally identical GPUs can exhibit dif-ferent effective throughput because device-specific leakage and dynamic power characteristics determine the achiev-able operating frequency under a fixed power budget. These differences are exposed through dynamic voltage and fre-quency scaling (DVFS) and related control mechanisms. As workloads approach the power envelope, GPUs must satisfy board-level power budgets and per-rail current constraints, which can reduce attainable frequency and create perfor-mance asymmetry across devices. Runtime conditions further amplify this. Higher tempera-tures increase leakage power, reducing the dynamic power headroom available for computation and increasing the prob-ability of reaching the GPU power budget. Cooling asymme-try, rack-level temperature variation, and workload intensity  
+
+> 3Seokjin Go, Marko Scrbak, Ephrem Wu, Srilatha Manne, and Divya Mahajan 24.5%
+> 49.2%
+> 16.4%
+> Prefill
+> 22.1%
+> 19.9%
+> 27.3%
+> 23.5%
+> Decode Other
+> Elementwise
+> Memory (DMA)
+> LayerNorm
+> Attention
+> MoE FFN
+> AllToAll
+
+Figure 3. Kernel latency breakdown for end-to-end inference run, using perfect token load balance across experts. can change how strongly variability is expressed during exe-cution. In MoE serving, the most relevant and common form of variability is performance divergence that appears when workloads push GPUs near their power or current limits. 
+
+Prior Approaches to Mitigate Workload Skew and Hard-ware Variability. As summarized in Table 1, prior work ad-dresses hardware, phase, model, and service variability in iso-lation and does not jointly optimize expert placement under both workload skew and hardware variability. MoE-specific approaches such as EPLB [ 12 ] and ExFlow [ 47 ] optimize expert placement based on routing frequency or commu-nication affinity, targeting token imbalance or communica-tion cost. In contrast, hardware-aware approaches such as PAL [ 19 ], TAPAS [ 42 ], Perseus [ 11 ], and throttLL’eM [ 21 ] ad-dress power or thermal asymmetry, typically through coarse-grained scheduling or frequency control. DynamoLLM [ 43 ]adapts to service-level variation by adjusting parallelism and operating frequency. These approaches improve individual dimensions of variability, but none jointly optimize expert placement for execution-time balance under both workload skew and heterogeneous GPU performance. 
+
+3 Key Challenges 
+
+End-to-end performance of distributed MoE serving is de-termined by the interaction between workload skew and 
+
+hardware performance variability . Existing load-balancing techniques usually address these factors separately, either by balancing token distribution or by improving device uti-lization, but not by jointly minimizing execution-time im-balance [ 2, 12 , 42 ]. In this section, we evaluate these factors running DeepSeek-V3 using 8 ×EP on an 8-GPU AMD In-stinct ™MI325X system using the Sonnet dataset configured as described in the evaluation setup, Section 5. Our first observation is that MoE layers are the dominant target for optimization. As shown in Figure 3, MoE FFN kernels account for 49% of prefill and 20% of decode time in DeepSeek-V3, while all-to-all contributes an additional 24.5% and 22.1%, respectively. Even under perfect token load balance, MoE layers dominate end-to-end latency. Second, hardware variability manifests when the system is power constrained, and MoE layers drive GPU compute resources more intensively than attention, pushing devices closer to 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 
+
+> Layer ID
+> 0
+> 1
+> 2
+> 3
+> 4
+> 5
+> 6
+> 7
+> GPU ID
+> 10
+> 20
+> Token Share (%)
+
+(a) Prefill token distribution. 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15  
+
+> Layer ID
+> 0
+> 1
+> 2
+> 3
+> 4
+> 5
+> 6
+> 7
+> GPU ID
+> 10
+> 15
+> 20
+> Token Share (%)
+
+(b) Decode token distribution. 
+
+Figure 4. Token load distribution across GPUs for Sonnet on DeepSeek-V3 MoE using contiguous expert placement. their power limits and thereby amplifying inter-GPU per-formance asymmetry. For example, for requests with 1,024-token inputs at 16 batch size, the MoE layer operates at the TDP limit for 82.8% of its execution time, compared to only 34.8% for the attention layer. This sustained power satura-tion reduces GPU frequency by 38% on average for MoE layers, versus 10% for attention, making MoE layers the dom-inant source of execution-time imbalance. As such, MoE layers provide a direct lever for mitigation: routing and ex-pert placement determine how work is distributed across GPUs. This makes it possible to offset hardware asymmetry through variability-aware placement. We therefore focus on MoE layers as both the dominant source of variability and the most effective target for execution-time balancing. 
+
+Challenge 1: Routing skew creates shifting stragglers. 
+
+MoEs route each token to a subset of experts, producing input-dependent compute and communication patterns. With expert parallelism, each GPU hosts the same number of ex-perts, but the token load to those experts can vary substan-tially across layers. Figure 4 shows the resulting per-GPU token distribution for DeepSeek-V3 with 256 experts under 8×EP using vLLM contiguous expert placement. Although each GPU hosts 32 experts, token load is uneven; in layer 11 during prefill, the busiest GPU processes over 24% of the tokens, while the least-loaded GPU handles less than 10%. Moreover, the degree of skew and the GPU with the most load change across layers. As a result, the bottleneck shifts during a single execution, with different GPUs becoming the straggler at different layers. Because all GPUs must syn-chronize at every MoE layer, this routing skew causes lightly loaded GPUs to idle while waiting for the heavily loaded GPUs to finish, reducing throughput and increasing tail la-tency. 
+
+Challenge: Token imbalance creates persistent strag-glers. Expert routing produces input-dependent load im-balance, leading to uneven work distribution across GPUs. Under expert parallelism, all GPUs must synchronize at each layer, so execution time is determined by the slowest device. 
+
+Insight: Expert placement provides a lever to reduce imbalance. Expert placement can be used to redistribute workload and reduce per-layer imbalance without modify-ing model semantics.         
+
+> 4ViBE: Co-Optimizing Workload Skew and Hardware Variability for MoE Serving 01234567
+> GPU ID
+> 25.0%
+> 50.0%
+> 75.0%
+> 100.0%
+> Normalized Power  Prefill Decode
+
+(a) Power distribution. 0 1 2 3 4 5 6 7  
+
+> GPU ID
+> 70.0%
+> 80.0%
+> 90.0%
+> 100.0%
+> Norm. Frequency  Prefill Decode
+
+(b) Frequency distribution 
+
+Figure 5. GPU power and clock frequency distribution dur-ing DeepSeek-V3 prefill and decode. Power is normalized by TDP, and frequency is normalized by peak clock frequency. 
+
+Challenge 2: Hardware variability creates execution-time imbalance even with balanced token load. Even when token counts are balanced, nominally identical GPUs do not always execute the same workload at the same speed. As discussed in Section 2, this divergence arises from pro-cess variation across dies, which eventually manifests as frequency variations across GPUs [35]. Process variations matter when GPUs operate near their power limits. Under such conditions, DVFS enforces a fixed power budget, and device-specific power characteristics de-termine the achievable operating frequency. As a result, the same MoE kernel can execute at different speeds across GPUs. Figure 5 illustrates this mechanism. During prefill, MoE kernels have high compute requirements, power draw approaches TDP, and clock frequencies diverge across de-vices. During decode, power remains well below TDP, DVFS does not significantly constrain frequency, and clocks are correspondingly more uniform. This shows that hardware variability is a fixed property, but its performance impact is activated by workload intensity. To isolate the consequence of this effect, Figure 6 com-pares two controlled token assignments for a single MoE layer, with data normalized to the average across 8 GPUs. In the first chart, tokens are distributed uniformly across GPUs. In the second, knowing the measured per-GPU perfor-mance characteristics, we assign proportionally more tokens to faster GPUs and fewer tokens to slower GPUs. Even in this straightforward variability-informed assignment we observe better balance across per-GPU completion times. 
+
+Challenge: GPU performance diverges under power-limited execution. Nominally identical GPUs do not sus-tain the same operating frequency when constrained by a similar power budget, leading to execution-time differ-ences across devices even under balanced token load. 
+
+Insight: Measured per-GPU performance must guide placement. Device-specific performance characteristics can be profiled and incorporated into placement decisions to better match workload to effective compute capability. 
+
+Challenge 3: Placement becomes stale under workload-/performance drift. The interaction between routing skew and hardware variability is not fixed over time. In practice, 0 1 2 3 4 5 6 7 0 1 2 3 4 5 6 7  
+
+> GPU ID
+> 0.96
+> 0.98
+> 1.00
+> 1.02
+> 1.04
+> Token Count and Latency
+> Normalized by Average
+> Uniform Variability-Informed
+> Tokens Latency
+
+Figure 6. Token load and MoE kernel latency per GPU un-der uniform and variability-informed token assignment. All values are normalized by the cross-GPU average. both workload intensity and effective GPU performance can drift across serving conditions. Changes in batch token count, input mix, or execution phase alter the stress level of the MoE kernels, which in turn changes the degree of hardware-induced performance asymmetry. As a result, a placement that is well-matched to one serving scenario can become suboptimal as serving conditions evolve. Prior work such as EPLB provides basic dynamic recal-ibration, but it remains limited in both how and when it adapts. First, recalibration is driven by token distribution ratios across experts or GPUs without considering the abso-lute token magnitude. This is insufficient because hardware variability is stress-dependent: two batches may exhibit the same routing ratio while exposing different levels of power-constrained latency variability. Second, recalibration is typ-ically performed at fixed intervals, such as every several hundred or thousand iterations, regardless of whether the workload has actually changed. This incurs reshuffling over-head even when the existing placement remains appropriate while failing to respond promptly when drift is significant. Our observation is that recalibration should be both stress-aware and workload-aware . To determine how to recalibrate, the system must account for token magnitude since it directly affects the level of workload-induced hardware variability and therefore the performance asymmetry across GPUs. To determine when to recalibrate, the system should monitor drift in batch token count and observed latency imbalance, and refresh the placement only when that drift exceeds a configurable threshold. This avoids unnecessary reshuffling while preserving alignment between workload distribution and effective device performance. 
+
+Challenge: Static or periodic placement updates be-come stale under workload/performance drift. Token routing ratios alone do not capture the workload stress that triggers hardware variability, and fixed-interval re-calibration can incur reshuffle overhead while missing meaningful drift. 
+
+Insight: Recalibration should be drift-triggered. Place-ment should be refreshed using both token numbers and latency imbalance when workload/performance drift ex-ceeds a configurable threshold. 
+
+> 5Seokjin Go, Marko Scrbak, Ephrem Wu, Srilatha Manne, and Divya Mahajan
+
+4 ViBE Framework 
+
+We present ViBE, a variability-aware expert placement frame-work that minimizes execution-time imbalance in MoE infer-ence by jointly reasoning about workload skew and hardware performance. The core challenge is that execution time depends on two factors that evolve differently over time: input-dependent expert load and device-specific performance. The system assigns experts to GPUs, but latency emerges from a complex interaction between token load, device-specific performance, and synchronization, requiring accurate prediction rather than direct optimization. Moreover, the underlying workload and effective GPU throughput can drift, making a one-time placement suboptimal. ViBE addresses this challenge through four components as shown in Figure 7. First, it builds device-specific execu-tion models that map token load to latency. Second, it pro-files expert activation patterns to estimate workload skew for each layer. Third, it computes an execution-time-aware placement that aligns predicted per-layer completion times across GPUs. Fourth, it supports drift-aware incremental up-dates, modifying placement only when workload or perfor-mance characteristics have changed enough to affect balance. By integrating these components, ViBE shifts the objective from token balancing to execution-time balancing, improv-ing predictability and enabling higher system utilization. The end-to-end flow of ViBE is formalized in Algorithm 1; the remainder of this section details each component. 
+
+4.1 Design Principles Balance execution time, not nominal load. Hardware variability can arise from multiple sources, including pro-cess variation, power-delivery constraints, and temperature. Regardless of the source, its system-level consequence is the same: GPUs assigned similar work can still complete at dif-ferent times, creating latency imbalance under synchronized expert-parallel execution. In this work, we focus on the pri-mary and more common case in MoE serving, where GPUs are pushed toward their power limits and performance asym-metry is exposed through DVFS. While this power-limited regime is the main source of variability we study, the need to balance execution time rather than nominal load applies broadly to other forms of hardware-induced variability. 
+
+Design Principle 1: Optimize for aligned completion time. Because hardware variability causes some GPUs to finish later than others, expert placement should not optimize for equal token counts alone, but for aligned execution time across GPUs. 
+
+Reduce execution-time outliers. With expert parallelism, each MoE layer executes in a synchronized manner across GPUs, thus performance is governed by the tail of the exe-cution time distribution rather than by average load. As a result, small differences in workload or device performance create stragglers that dominate layer latency and accumu-late across execution. Figure 6 illustrates that uniform token assignment still produces a spread in kernel execution times, whereas variability-aware assignment reduces this spread by aligning per-GPU completion time. 
+
+Design Principle 2: Minimize the slowest-GPU penalty. We reveal a mismatch in token-balanced-only objectives: equal-izing token counts does not eliminate stragglers, hence, the placement objective should therefore minimize execution-time outliers, not just token-count imbalance. 
+
+4.2 Framework Design 4.2.1 Device-Specific Performance Models. Nominally identical GPUs exhibit differences in effective kernel through-put due to process variation and power-limited operation. Under expert parallelism (EP), these differences directly trans-late into execution-time imbalance, as each layer is gated by the slowest device. To enable latency-aware placement, we construct per-GPU performance models that capture the relationship between compute load and latency. Each GPU is warmed to steady-state operating conditions and profiled independently using the fused MoE kernel across a range of token counts. This produces a function 𝑓 𝑔 (𝑛 ) that maps token load 𝑛 to expected kernel latency. The relationship between token load and expected latency per GPU does not vary over time [ 19 ]; hence profiling can be done once per GPU and retained during normal operation. 
+
+4.2.2 Token Load Profiling. MoE routing produces input-dependent and layer-specific workload distributions, making it difficult to determine expert load a priori. However, empir-ical observations show that activation patterns are relatively stable for a given benchmark. We leverage this property by profiling expert activation over a representative input set. This produces an activation matrix W ∈ R𝐿 ×𝐸 , where each entry 𝑤 (𝑙 ) 
+
+> 𝑒
+
+captures the relative load of expert 𝑒 at layer 𝑙 .
+
+4.2.3 Variability-Informed Expert Placement. We for-malize expert placement as an execution-time minimiza-tion problem. The central idea is to assign experts so that projected execution times—not token counts—are equalized across GPUs within each EP group. 
+
+Problem Formulation. Each MoE layer assigns 𝐸 logical experts to 𝐺 GPUs. Given a placement {𝑆 𝑔 }, the token load on GPU 𝑔 is 𝑛 𝑔 = Í𝑒 ∈𝑆 𝑔 𝑤 𝑒 , and the layer latency is determined by the slowest device: 
+
+𝑇 = max  
+
+> 𝑔
+
+𝑓 𝑔 (𝑛 𝑔 ),
+
+and the objective minimizes Í𝑙 𝑇 (𝑙 ) across all 𝐿 MoE layers. 
+
+Latency-aware solver. Because the optimal partition prob-lem is NP-hard in general (unrelated-machines makespan minimization [ 24 ]), ViBE applies a per-layer greedy heuristic. For each GPU, we derive a speed estimate 𝑠 𝑔 = 1/𝑓 𝑔 (𝑛 ref )
+
+> 6
+
+ViBE: Co-Optimizing Workload Skew and Hardware Variability for MoE Serving Online Inference           
+
+> MoE Kernel
+> Microbenchmark
+> -ffn_dim
+> -intermediate_dim
+> -num_experts
+> -num_tokens
+> -model_dtype
+> Inference Token
+> Samples
+> MoE Layers
+> L1
+> L2
+> L3
+> …
+> Performance
+> GPU ID
+> (b) Token Load Profiling
+> (a) Learning Device -Specific Performance Models
+> (c) Variability -Informed
+> Expert Placement
+> Expert Activation
+> Statistics
+> MoE Layers
+> L1
+> L2
+> L3
+> …
+> GPU 0
+> GPU 1
+> GPU 2
+> GPU 7
+> …
+> Per -GPU
+> Performance Models
+> Token Routing Profiling
+> Performance
+> GPU ID
+> Expert Activation
+> Statistics
+> Sort Greedy Bin Packing
+> GPU 0 GPU 1
+> GPU 2 GPU 3
+> Expert Load
+> Variability -aware
+> Expert Mapping
+> Incremental
+> Placement
+> Update
+> Update
+> Activation Statistics
+> MoE Layers
+> L1
+> L2
+> L3
+> …
+> Update
+> Perf. Models
+> Update
+> Mapping
+> (d) Dynamic Recalibration Performance
+> GPU ID
+> Drift Detected
+
+Figure 7. ViBE framework: (a) learning device-specific performance models, (b) characterization of expert activation patterns, (c) variability-informed expert placement that minimizes per-layer execution-time imbalance, and (d) dynamic recalibration of expert mapping when workload drift is detected. from the performance model, where 𝑛 ref is the mean per-expert token load, then define a token target 
+
+𝜏 𝑔 = 𝑁 · 𝑠 𝑔 
+
+Íℎ 𝑠 ℎ
+
+,
+
+where 𝑁 = Í𝑒 𝑤 𝑒 is the layer’s total token load, encoding how much load each GPU should receive so that all devices finish at the same predicted latency. Experts are assigned in descending order of 𝑤 𝑒 to the GPU farthest below its target 𝜏 𝑔 .This enables faster GPUs to absorb high-load experts, directly equalizing predicted execution time rather than token count. In contrast, EPLB implicitly assumes 𝑓 𝑔 (𝑛 ) = 𝑛 , so it cannot compensate for hardware throughput differences. 
+
+4.2.4 Dynamic Recalibration. Effective throughput can shift over time due to changes in workload characteristics such as batch size, token distribution, and execution phase (e.g., prefill versus decode). To enable the system to adapt to changing operating conditions, ViBE supports lightweight recalibration of the observed per-expert token load 𝑛 fed into the performance model 𝑓 𝑔 .Prior work rearranges experts every 𝑘 steps by re-running a full greedy solver [ 12 ], which has two limitations. First, it balances token ratios but ignores magnitude : a request-rate spike shifts GPUs into steeper regions of 𝑓 𝑔 (𝑛 ), changing the optimal placement even when token ratios are unchanged. Second, fixed-cadence rearrangement wastes resources dur-ing steady state, reacts late during transients, and shuffles most experts even when a small adjustment suffices. ViBE addresses both gaps. 
+
+Drift-triggered recalibration. Because ViBE tailors ex-pert placement to the observed routing pattern — assigning high-load experts to faster GPUs — the placement becomes suboptimal when the input distribution shifts and different experts become highly loaded. To detect such shifts, ViBE tracks the cosine similarity between the current and refer-ence per-layer expert load vectors. After each rearrangement, it records the mean load vector ˆw, averaged over a window of 100 samples at every MoE layer. Every 𝐻 forward passes (default 𝐻 =10 ), ViBE computes the cosine distance between the current 100-sample window average w and the reference: 
+
+𝑑 = 1 − w · ˆw
+
+∥w∥ ∥ ˆw∥ .
+
+When any layer’s 𝑑 exceeds a threshold 𝛿 cos (default 0.05 ), the routing pattern has diverged enough to warrant readjust-ment, and ViBE triggers the incremental solver (Algorithm 2) with minimal expert movement. 
+
+Incremental placement update. Rather than re-solving from scratch, ViBE starts from the current placement and applies the minimum number of cross-GPU expert swaps to restore balance (Algorithm 2). At each iteration, the solver identifies the GPU pair with the largest latency gap and evaluates all valid swaps between them, scoring each by its marginal latency gain using the device-specific 𝑓 𝑔 . The process terminates once all GPUs fall within tolerance 𝜖 
+
+(default 0.03) of the target latency: 
+
+max  
+
+> 𝑔
+
+𝑓 𝑔 
+
+ 𝑛 𝑔 
+
+ ≤ (1 + 𝜖 ) · 1
+
+|𝐺 |∑︁ 𝑔 
+
+𝑓 𝑔 
+
+ 𝑛 𝑔 
+
+ .
+
+In practice, full rebalancing by EPLB or ViBE’s initial solver reassigns over 200 of the 256 physical expert slots per layer, incurring substantial weight-transfer overhead. The incre-mental solver typically converges in 5–30 swaps per layer, reducing transfer volume by over an order of magnitude. 
+
+5 Evaluation 
+
+5.1 Experimental Setup Hardware and Software Platform. We evaluate ViBE us-ing vLLM v0.14.2 [ 23 ], PyTorch v2.9.0 [ 32 ] on ROCm v7.0 [ 8 ]. We use AITER [ 5 ] as the attention and MoE kernel back-end. Experiments are conducted on a single-node platform with 8 × AMD Instinct ™MI325X GPUs, each featuring up to 
+
+7Seokjin Go, Marko Scrbak, Ephrem Wu, Srilatha Manne, and Divya Mahajan 
+
+Table 2. Evaluation Setup. 
+
+(a) Models and Configurations.             
+
+> Model dtype # Experts EP Degree Routed Experts
+> DeepSeek-V3 [28] FP8 256 88Qwen-3 235B [46] FP8 128 88
+
+(b) SLO Thresholds by Benchmark and Model.                       
+
+> Dataset Input Len. Output Len. # Req. Model TTFT SLO TPOT SLO
+> ShareGPT 219.2 (Avg.) 200.8 (Avg.) 5K DeepSeek-V3 250ms 125ms Qwen-3 235B 250ms 100ms Sonnet 1024 (Fixed) 128 (Fixed) 1K DeepSeek-V3 350ms 125ms Qwen-3 235B 350ms 100ms
+
+(c) Expert Placement Policies.         
+
+> Policy Objective Hardware Aware?
+> vLLM [23, 36] Contiguous expert partitioning No EPLB [12, 28] Equalize token load across GPUs No ViBE Minimize execution time imbalance Yes
+
+2100 MHz clock frequency, 256 GB HBM3e memory, and a 1000 W TDP [ 4 ]. All measurements are collected on single-node deployments to isolate intra-node variability effects. We use rocprofv3 [ 10 ] and PyTorch Profiler [ 34 ] to profile kernel traces, and ROCm SMI [ 9 ] to measure hardware telemetry. 
+
+Models and Parallelism Configuration. All experiments use hybrid Tensor Parallelism (TP) and Expert Parallelism (EP) across 8 GPUs. For dense layers, we use TP degree 8 and for each MoE layer we use EP degree 8, shown in Table 2a. Thus, for MoE layers, all GPUs participate in lockstep to process experts, whereas non-MoE layers use standard tensor parallelism. Although ViBE is compatible with alternative parallelism choices, including DP for non-MoE layers, we use EP+TP to isolate variability from expert load imbalance. ViBE remains applicable to EP+DP as well. 
+
+Workloads and Metrics. We evaluate two representative benchmarks [ 37 , 49 ], listed in Table 2b. Requests are replayed at fixed target rates with a Poisson arrival process using the vLLM client. Modern LLM serving systems often use prefill– decode disaggregation [ 33 , 49 ]. To emulate this scenario, we evaluate prefill and decode separately using our experimental node. Prefill is isolated with long-input, single-output-token requests (e.g., 1024-in / 1-out for Sonnet), while decode is iso-lated by warming the prefix cache so that measurement skips prefill computation. During decode measurements, prefix-cache hit rate remained at 100% except for the final 16-token block, which vLLM recomputes to produce logits for the first decode step. 1 For each model and hardware platform, we sweep target request rates (QPS) and report TTFT and TPOT percentiles, capturing both interactive latency and sustained generation performance under load. 
+
+Service-Level Objective (SLO). We define per-model and per-platform SLO thresholds reflecting realistic interactive-serving requirements (Table 2b), accounting for differences in model size and datasets while being consistent with prior 
+
+> 1
+
+Under disaggregation, KV cache transfer is orthogonal to expert placement and identical across all evaluated strategies. 0.5 1.0 1.5 2.0   
+
+> QPS per GPU
+> 0
+> 50
+> 100
+> SLO Attainment (%)  vLLM EPLB ViBE
+
+(a) DeepSeek-V3 - Sonnet. 2.0 2.5 3.0 3.5 4.0    
+
+> QPS per GPU
+> 0
+> 50
+> 100
+> SLO Attainment (%)  vLLM EPLB ViBE
+
+(b) Qwen-3 - Sonnet. 5.0 6.0 7.0 8.0 9.0   
+
+> QPS per GPU
+> 0
+> 50
+> 100
+> SLO Attainment (%)  vLLM EPLB ViBE
+
+(c) DeepSeek-V3 - ShareGPT. 8.0 10.0 12.0 14.0    
+
+> QPS per GPU
+> 0
+> 50
+> 100
+> SLO Attainment (%)  vLLM EPLB ViBE
+
+(d) Qwen-3 - ShareGPT. 
+
+Figure 8. SLO attainment across request rates. serving systems [ 37 , 43 ]. We report goodput —the rate of SLO-compliant requests [ 49 ]—as the primary quality-of-service metric. We target 90% goodput and report the maximum sustainable QPS that maintains this compliance level. 
+
+Expert Placement Policies. We compare three expert place-ment strategies that differ in their optimization objective and hardware awareness (Table 2c). All placements are computed offline from profiling data and held static during serving to isolate the impact of the placement policy itself. In all three configurations, we assign the same number of experts per GPU to ensure uniform memory usage. Note, however, that this is not strictly required by either EPLB or ViBE. We leave non-uniform expert allocation to future work. 
+
+5.2 Overall Results SLO Attainment. Figure 8 shows SLO attainment as a func-tion of request rate across both models and datasets. On Sonnet, which uses fixed input lengths, goodput fol-lows a consistent ordering—vLLM < EPLB < ViBE—across all QPS (Figures 8a, 8b). Fixed-length inputs produce stable routing patterns that closely match the time-averaged sta-tistics used for placement, allowing each successive policy to deliver its expected benefit. ShareGPT’s variable-length inputs introduce more routing variance (Figures 8c, 8d): de-pending on batch scheduling and timing, hot experts can exhibit sudden load spikes that deviate from the profiled average. EPLB, which balances only token ratios without hardware awareness, may assign these spike-prone experts to slow GPUs, narrowing or erasing its advantage over vLLM at certain QPS ranges. ViBE remains consistently ahead be-cause it steers hot experts toward the fastest GPUs, absorbing routing variance through hardware headroom rather than relying solely on token balance. This translates directly to reduced synchronization overhead: ViBE lowers per-layer barrier idle time by 41% over EPLB, yielding a 35% reduction in total synchronized MoE execution latency. Comparing 
+
+8ViBE: Co-Optimizing Workload Skew and Hardware Variability for MoE Serving 0.5 1.0 1.5 2.0 
+
+> QPS per GPU
+> 1.0
+> 3.0
+> 5.0
+> Norm. Latency
+
+Median TTFT    
+
+> 0.5 1.0 1.5 2.0
+> QPS per GPU
+> 1.0
+> 3.0
+> 5.0
+> Norm. Latency
+
+P90 TTFT    
+
+> 0.5 1.0 1.5 2.0
+> QPS per GPU
+> 1.0
+> 3.0
+> 5.0
+> Norm. Latency
+
+P99 TTFT    
+
+> 0.5 1.0 1.5 2.0
+> QPS per GPU
+> 0.0
+> 0.2
+> 0.4
+> 0.6
+> 0.8
+> 1.0
+> Norm. Latency
+
+Median TPOT    
+
+> 0.5 1.0 1.5 2.0
+> QPS per GPU
+> 0.0
+> 0.2
+> 0.4
+> 0.6
+> 0.8
+> 1.0
+> Norm. Latency
+
+P90 TPOT    
+
+> 0.5 1.0 1.5 2.0
+> QPS per GPU
+> 0.0
+> 0.2
+> 0.4
+> 0.6
+> 0.8
+> 1.0
+> Norm. Latency
+
+P99 TPOT      
+
+> vLLM EPLB ViBE 0.5 1.0 1.5 2.0
+> QPS per GPU
+> 1.0
+> 1.1
+> 1.1
+> 1.1
+> 1.2
+> Norm. Latency
+
+Median TTFT    
+
+> 0.5 1.0 1.5 2.0
+> QPS per GPU
+> 1.0
+> 1.1
+> 1.1
+> 1.1
+> Norm. Latency
+
+P90 TTFT    
+
+> 0.5 1.0 1.5 2.0
+> QPS per GPU
+> 1.0
+> 1.1
+> 1.1
+> 1.1
+> Norm. Latency
+
+P99 TTFT    
+
+> 0.5 1.0 1.5 2.0
+> QPS per GPU
+> 1.0
+> 1.1
+> 1.2
+> Norm. Latency
+
+Median TPOT    
+
+> 0.5 1.0 1.5 2.0
+> QPS per GPU
+> 1.0
+> 1.1
+> 1.2
+> Norm. Latency
+
+P90 TPOT    
+
+> 0.5 1.0 1.5 2.0
+> QPS per GPU
+> 1.0
+> 1.1
+> 1.2
+> Norm. Latency
+
+P99 TPOT   
+
+> vLLM EPLB ViBE
+
+(a) Key performance results of DeepSeek-V3 for Sonnet dataset. 2.0 2.5 3.0 3.5 4.0 
+
+> QPS per GPU
+> 1.0
+> 1.5
+> 2.0
+> Norm. Latency
+
+Median TTFT     
+
+> 2.0 2.5 3.0 3.5 4.0
+> QPS per GPU
+> 1.0
+> 1.5
+> 2.0
+> Norm. Latency
+
+P90 TTFT     
+
+> 2.0 2.5 3.0 3.5 4.0
+> QPS per GPU
+> 1.0
+> 1.5
+> 2.0
+> Norm. Latency
+
+P99 TTFT 
+
+> 2.0 2.5 3.0 3.5 4.0
+> QPS per GPU
+> 1.0
+> 1.5
+> 2.0
+> Norm. Latency
+
+Median TPOT 
+
+> 2.0 2.5 3.0 3.5 4.0
+> QPS per GPU
+> 1.0
+> 1.5
+> 2.0
+> Norm. Latency
+
+P90 TPOT 
+
+> 2.0 2.5 3.0 3.5 4.0
+> QPS per GPU
+> 1.0
+> 1.5
+> 2.0
+> Norm. Latency
+
+P99 TPOT       
+
+> vLLM EPLB ViBE 2.0 2.5 3.0 3.5 4.0
+> QPS per GPU
+> 1.0
+> 1.1
+> Norm. Latency
+
+Median TTFT     
+
+> 2.0 2.5 3.0 3.5 4.0
+> QPS per GPU
+> 1.0
+> 1.1
+> Norm. Latency
+
+P90 TTFT     
+
+> 2.0 2.5 3.0 3.5 4.0
+> QPS per GPU
+> 1.0
+> 1.1
+> Norm. Latency
+
+P99 TTFT     
+
+> 2.0 2.5 3.0 3.5 4.0
+> QPS per GPU
+> 1.0
+> 1.1
+> Norm. Latency
+
+Median TPOT     
+
+> 2.0 2.5 3.0 3.5 4.0
+> QPS per GPU
+> 1.0
+> 1.1
+> Norm. Latency
+
+P90 TPOT     
+
+> 2.0 2.5 3.0 3.5 4.0
+> QPS per GPU
+> 1.0
+> 1.1
+> Norm. Latency
+
+P99 TPOT    
+
+> vLLM EPLB ViBE
+
+(b) Key performance results of Qwen-3 for Sonnet dataset. 5.0 6.0 7.0 8.0 9.0 
+
+> QPS per GPU
+> 1.0
+> 1.5
+> Norm. Latency
+
+Median TTFT     
+
+> 5.0 6.0 7.0 8.0 9.0
+> QPS per GPU
+> 1.0
+> 1.5
+> 2.0
+> Norm. Latency
+
+P90 TTFT     
+
+> 5.0 6.0 7.0 8.0 9.0
+> QPS per GPU
+> 1.0
+> 1.5
+> Norm. Latency
+
+P99 TTFT 
+
+> 5.0 6.0 7.0 8.0 9.0
+> QPS per GPU
+> 0.0
+> 0.5
+> 1.0
+> Norm. Latency
+
+Median TPOT 
+
+> 5.0 6.0 7.0 8.0 9.0
+> QPS per GPU
+> 0.0
+> 0.5
+> 1.0
+> Norm. Latency
+
+P90 TPOT 
+
+> 5.0 6.0 7.0 8.0 9.0
+> QPS per GPU
+> 0.0
+> 0.5
+> 1.0
+> Norm. Latency
+
+P99 TPOT       
+
+> vLLM EPLB ViBE 11.0 12.0 13.0 14.0 15.0
+> QPS per GPU
+> 1.0
+> 1.1
+> Norm. Latency
+
+Median TTFT     
+
+> 11.0 12.0 13.0 14.0 15.0
+> QPS per GPU
+> 1.0
+> 1.1
+> Norm. Latency
+
+P90 TTFT     
+
+> 11.0 12.0 13.0 14.0 15.0
+> QPS per GPU
+> 1.0
+> 1.1
+> Norm. Latency
+
+P99 TTFT     
+
+> 11.0 12.0 13.0 14.0 15.0
+> QPS per GPU
+> 1.0
+> 1.1
+> Norm. Latency
+
+Median TPOT     
+
+> 11.0 12.0 13.0 14.0 15.0
+> QPS per GPU
+> 1.0
+> 1.1
+> Norm. Latency
+
+P90 TPOT     
+
+> 11.0 12.0 13.0 14.0 15.0
+> QPS per GPU
+> 1.0
+> 1.1
+> Norm. Latency
+
+P99 TPOT   
+
+> vLLM EPLB ViBE
+
+(c) Key performance results of DeepSeek-V3 for ShareGPT dataset. 8.0 10.0 12.0 14.0 
+
+> QPS per GPU
+> 1.0
+> 1.5
+> 2.0
+> Norm. Latency
+
+Median TTFT    
+
+> 8.0 10.0 12.0 14.0
+> QPS per GPU
+> 1.0
+> 1.5
+> 2.0
+> Norm. Latency
+
+P90 TTFT    
+
+> 8.0 10.0 12.0 14.0
+> QPS per GPU
+> 1.0
+> 1.5
+> 2.0
+> Norm. Latency
+
+P99 TTFT 
+
+> 8.0 10.0 12.0 14.0
+> QPS per GPU
+> 0.0
+> 0.5
+> 1.0
+> Norm. Latency
+
+Median TPOT 
+
+> 8.0 10.0 12.0 14.0
+> QPS per GPU
+> 0.0
+> 0.5
+> 1.0
+> Norm. Latency
+
+P90 TPOT 
+
+> 8.0 10.0 12.0 14.0
+> QPS per GPU
+> 0.0
+> 0.5
+> 1.0
+> Norm. Latency
+
+P99 TPOT     
+
+> vLLM EPLB ViBE 8.0 10.0 12.0
+> QPS per GPU
+> 1.0
+> 1.1
+> Norm. Latency
+
+Median TTFT   
+
+> 8.0 10.0 12.0
+> QPS per GPU
+> 1.0
+> 1.1
+> Norm. Latency
+
+P90 TTFT   
+
+> 8.0 10.0 12.0
+> QPS per GPU
+> 1.0
+> 1.1
+> Norm. Latency
+
+P99 TTFT   
+
+> 8.0 10.0 12.0
+> QPS per GPU
+> 1.0
+> 1.1
+> Norm. Latency
+
+Median TPOT   
+
+> 8.0 10.0 12.0
+> QPS per GPU
+> 1.0
+> 1.1
+> Norm. Latency
+
+P90 TPOT   
+
+> 8.0 10.0 12.0
+> QPS per GPU
+> 1.0
+> 1.1
+> Norm. Latency
+
+P99 TPOT    
+
+> vLLM EPLB ViBE
+
+(d) Key performance results of Qwen-3 for ShareGPT dataset. 
+
+Figure 9. End-to-end performance of vLLM, EPLB, and ViBE. All values are normalized by baseline vLLM at the lowest QPS. across models, Qwen-3 is lighter than DeepSeek-V3 and sus-tains higher request rates before reaching the SLO limit. This pushes the workload deeper into the compute-bound regime at high QPS, where per-GPU throughput differences are most pronounced—consistent with the variability characterization in Section 3. As a result, the gap between placement policies is larger for Qwen-3: ViBE extends the SLO frontier by 15% relative to EPLB, compared to 12% for DeepSeek-V3. 
+
+Impact of Hardware Stress on Placement Effectiveness. 
+
+Figure 9 shows the median, P90 and P99 TTFT and TPOT latency for the models and datasets. All results are normal-ized to the left-most QPS per GPU rate shown for vLLM. The impact of variability-aware placement scales with the operating regime of the system, whether that be because of model size, model phase (TTFT versus TPOT), or QPS rate. DeepSeek-V3, with larger expert dimensions, saturates GPU compute earlier, limiting the range of request rates feasi-ble within the given SLO. Sweeping across QPS rates shows that when GPUs are underutilized, hardware variability is minimal and EPLB can match or slightly outperform ViBE (e.g., Figure 9b at QPS 2.0). This is especially true for TPOT, where a combination of the lower intensity decode (Figure 5) combined with a light QPS load can result in higher TPOT for ViBE. In this scenario, other types of resource contention between hot experts assigned to the same GPU (e.g., memory BW, communication BW) outweigh the benefits of ViBE. As QPS increases and GPUs saturate, execution-time variability emerges, and ViBE consistently outperforms both vLLM and EPLB. This range is the most relevant in practice, as it de-termines the sustainable throughput that meets SLOs. ViBE mitigates stragglers, allowing the system to sustain higher request rates without violating latency targets. 
+
+Tail Latency and User Interactivity. The gains are most visible in the P90–P99 range: for DeepSeek-V3 on Sonnet dataset, ViBE reduces P90 and P99 TTFT by up to 45% and 30% respectively; for Qwen-3, by up to 10% and 30%. The larger gains on DeepSeek-V3 reflect its higher per-token compute, which amplifies straggler effects as QPS increases. These tail-latency reductions come without sacrificing through-put, showing that variability-aware placement addresses a bottleneck beyond token-count balancing. 
+
+5.3 Kernel Time and Hardware Telemetry 
+
+To understand the mechanisms behind ViBE’s improvements in SLO and tail latency, we examine per-GPU execution char-acteristics at the MoE layer level, combining kernel timing breakdowns with hardware telemetry. 
+
+Kernel time variability. We measure the latency gap be-tween the fastest and slowest GPU across each invocation of the MoE kernel when running DeepSeek-V3 prefill for Sonnet dataset at QPS 2.0. In the ideal case with no token or hardware variability, the latency gap should be zero mean-ing all GPUs complete at the same time. Figure 10a shows the box plot of the latency gap for the three configurations: 
+
+9Seokjin Go, Marko Scrbak, Ephrem Wu, Srilatha Manne, and Divya Mahajan vLLM 
+
+> EPLB
+> ViBE
+> 0.0
+> 1.0
+> 2.0
+> 3.0
+> 4.0
+> Latency Gap
+> Normalized by
+> vLLM Median
+
+(a) Latency gap. 0 1 2 3 4 5 6 7   
+
+> GPU ID
+> 70
+> 80
+> Norm. Frequency (%)
+> vLLM EPLB ViBE
+
+(b) Normalized GPU clock frequency. 
+
+Figure 10. Performance variability during DeepSeek-V3 pre-fill: (a) distribution of per-layer MoE kernel latency gap and (b) clock frequency per GPU, normalized by peak. vLLM, EPLB, and ViBE. Token redistribution reduces the median latency gap by 63.9% for EPLB and an additional 19.6% reduction is achieved with ViBE. Balancing the work across GPUs and reducing the latency gap results in a 49.3% and 27.9% improvement in average MoE latency for ViBE when compared to vLLM and EPLB, respectively. 
+
+Hardware telemetry confirms even utilization. Figure 10b shows per-GPU clock frequency distribution during the same prefill workload. Under vLLM and EPLB, GPUs exhibit a wide inter-device spread in mean frequency, reflecting un-even load across GPUs that does not take GPU hardware variability into consideration. ViBE narrows this inter-GPU frequency gap, and also compresses the intra-GPU distribu-tion: both the upper and lower tails of the per-GPU frequency box tighten, indicating that each device operates more con-sistently over time rather than alternating between bursts and idle periods. This is consistent with the reduced latency gap – more uniform frequency across GPUs reflects more uniform utilization across time. Together, these two figures show that ViBE’s placement decisions reduce kernel time variance, suppress straggler idle time, and produce more sta-ble per-GPU hardware utilization – all of which compound into the end-to-end TTFT and TPOT improvements. 
+
+5.4 Dynamic Workload Adaptation 
+
+In production, traffic patterns change over time, creating drift in token distribution and workload intensity, both leading to shifts in hardware variability behavior. We evaluate how different recalibration strategies handle such drift using a workload transition benchmark. 
+
+Setup. To evaluate such workload shift, we derive expert placement from one dataset and deploy it on another. We con-sider ShareGPT →Sonnet (SG →SN) and Sonnet →ShareGPT (SN →SG), and compare them with the matched-workload cases SG →SG and SN →SN from Section 5.2. Static approach of EPLB and ViBE retain the placement from original pro-filing, while adaptive updates the expert-to-GPU mapping online using measurements from the serving workload. 
+
+Serving quality. Figure 11 shows TTFT SLO attainment under cross-workload drift. Both static strategies see mean-ingful drops compared to the matched-workload baselines 0.5 1.0 1.5 2.0 
+
+> QPS / GPU
+> 0
+> 50
+> 100
+> SLO Attainment (%)
+> Static EPLB
+> Static ViBE
+> Adaptive EPLB
+> Adaptive ViBE
+
+(a) SG →SN 5.0 6.0 7.0 8.0 9.0  
+
+> QPS / GPU
+> 0
+> 50
+> 100
+> SLO Attainment (%)
+> Static EPLB
+> Static ViBE
+> Adaptive EPLB
+> Adaptive ViBE
+
+(b) SN →SG 
+
+Figure 11. SLO attainment across target QPS under cross-workload scenarios. Static placements degrade relative to matched-workload baselines because expert costs profiled on one workload do not transfer to another. 0 20 40 60 80 100 120 140  
+
+> Time (s)
+> 0
+> 2
+> 4
+> TTFT Normalized by
+> Static ViBE Median
+> Moved 19.4
+> experts/layer
+> Moved 0.5
+> experts/layer
+> Static ViBE Adaptive ViBE
+
+Figure 12. Per-request TTFT timeseries during the SG →SN serving phase under adaptive recalibration. The lines repre-sent rolling average with a window of 100 requests. Vertical dashed lines represent expert rearrangement events. (SN →SN, SG →SG), which is expected: the expert execution profile captured during the profiling phase no longer reflects the actual serving workload, so the placement is suboptimal. The adaptive variants substantially recover this gap. In the SG →SN scenario, Static ViBE meets the 90% SLO target up to 1.68 QPS/GPU, while Adaptive ViBE extends this to 1.80 QPS/GPU; a similar pattern holds for EPLB (1.51 → 1.63 QP-S/GPU). The effect is even more pronounced in the SN →SG direction: ShareGPT’s variable input lengths and more di-verse expert routing patterns create a larger distribution shift from the Sonnet profile, making recalibration more effective. Adaptive ViBE pushes the 90% crossover from 6.7 to 7.4 QP-S/GPU, and Adaptive EPLB from 6.5 to 7.0 QPS/GPU. Across both transition directions, the adaptive strategies bring SLO attainment closer to the levels achieved when the profiling and serving workloads match, demonstrating that periodic recalibration effectively tracks workload drift. 
+
+Recalibration overhead. Adaptive recalibration is not free. Figure 12 shows the per-request TTFT timeseries during adaptive serving. Each recalibration event triggers an ex-pert rearrangement phase in which a subset of experts is migrated between GPUs to match the updated placement. During this migration window, requests that overlap with the rearrangement observe elevated TTFTs, visible as tran-sient spikes in the timeseries. These spikes are short-lived – serving quality recovers within seconds once the new place-ment is installed – but they do contribute to the remaining 
+
+> 10
+
+ViBE: Co-Optimizing Workload Skew and Hardware Variability for MoE Serving 0 1 2 3 4 5 6 7
+
+> GPU ID
+> 0.96
+> 1.00
+> 1.04
+> 1.08
+> Normalized Latency
+
+(a) AMD Instinct ™MI300X sys-tem. 0 1 2 3 4 5 6 7
+
+> GPU ID
+> 0.95
+> 1.00
+> 1.05
+> 1.10
+> 1.15
+> Normalized Latency
+
+(b) Skewed AMD In-stinct ™MI325X system. 
+
+Figure 13. Kernel execution time variability for an MoE layer of DeepSeek-V3 under perfect token load balance. Latency is normalized by average across 8 GPUs for a single layer. SLO attainment gap between adaptive cross-workload and matched-workload baselines. The net effect is a trade-off: adaptive recalibration recovers the bulk of the performance lost to workload drift, at the cost of brief latency disruptions during each rearrangement event. Reducing this migration overhead – e.g., through incremental or speculative place-ment updates – is an avenue for future work. 
+
+5.5 Discussion Sensitivity to Variability Distribution. Since process vari-ation differs across every system, ViBE measures each GPU individually and adapts to whatever distribution is present. We validate across two regimes: (a) an AMD Instinct ™MI300X node [ 3 ] with lower variability, and (b) a skewed scenario where we modify the voltage-frequency curve of GPU 0 in the AMD Instinct ™MI325X system to induce up to 13% per-formance deviation (Figure 13). We assign 4K tokens per expert, and report latency distribution across 1000 consecu-tive MoE layer executions. Under mild variability (a), ViBE provides consistent TTFT improvement over vLLM and EPLB across all QPS (Figure 14a), confirming benefits even when the spread is modest. Under skewed variability (b), ViBE as-signs fewer tokens to the degraded GPU, producing a more asymmetric distribution than EPLB. At high QPS, where throttling activates, this directly reduces straggler latency and widens the gap over EPLB (Figure 14). 
+
+Extending to Rack-Scale Systems. Emerging rack-scale systems integrate over 70 GPUs in a single scale-up do-main [ 6 , 31 ]. We project placement behavior at larger EP group sizes using measured per-GPU profiles from 10 8×AMD Instinct ™MI300X nodes [ 7], preserving the empirical vari-ability distribution while scaling group size. For larger GPU counts, we emulate the distribution by duplicating a sub-set of GPUs. For each configuration, we run all three poli-cies on ShareGPT token counts and project per-layer tail latency. Figure 15 shows that ViBE’s advantage depends on two competing factors. Larger EP groups accumulate more performance spread, increasing straggler probability and the benefit of routing around slow devices. However, each GPU holds fewer experts as the group grows, reducing place-ment flexibility. These factors create a sweet spot at 16–32 0.5 1.0 1.5 2.0                  
+
+> QPS per GPU
+> 1.0
+> 2.0
+> 3.0
+> 4.0
+> Norm. Latency  Median TTFT
+> 0.5 1.0 1.5 2.0
+> QPS per GPU
+> 1.0
+> 2.0
+> 3.0
+> 4.0
+> Norm. Latency  P90 TTFT
+> 0.5 1.0 1.5 2.0
+> QPS per GPU
+> 1.0
+> 3.0
+> 5.0
+> 7.0
+> Norm. Latency  P99 TTFT
+> 0.5 1.0 1.5 2.0
+> QPS per GPU
+> 0.0
+> 0.2
+> 0.4
+> 0.6
+> 0.8
+> 1.0
+> Norm. Latency  Median TPOT
+> 0.5 1.0 1.5 2.0
+> QPS per GPU
+> 0.0
+> 0.2
+> 0.4
+> 0.6
+> 0.8
+> 1.0
+> Norm. Latency  P90 TPOT
+> 0.5 1.0 1.5 2.0
+> QPS per GPU
+> 0.0
+> 0.2
+> 0.4
+> 0.6
+> 0.8
+> 1.0
+> Norm. Latency  P99 TPOT
+> vLLM EPLB ViBE
+
+(a) AMD Instinct ™MI300X system. 1.0 1.5 2.0 2.5                  
+
+> QPS per GPU
+> 1.0
+> 3.0
+> 5.0
+> 7.0
+> 9.0
+> Norm. Latency  Median TTFT
+> 1.0 1.5 2.0 2.5
+> QPS per GPU
+> 1.0
+> 3.0
+> 5.0
+> 7.0
+> 9.0
+> Norm. Latency  P90 TTFT
+> 1.0 1.5 2.0 2.5
+> QPS per GPU
+> 1.0
+> 3.0
+> 5.0
+> 7.0
+> Norm. Latency  P99 TTFT
+> 1.0 1.5 2.0 2.5
+> QPS per GPU
+> 0.0
+> 0.2
+> 0.4
+> 0.6
+> 0.8
+> 1.0
+> Norm. Latency  Median TPOT
+> 1.0 1.5 2.0 2.5
+> QPS per GPU
+> 0.0
+> 0.2
+> 0.4
+> 0.6
+> 0.8
+> 1.0
+> Norm. Latency  P90 TPOT
+> 1.0 1.5 2.0 2.5
+> QPS per GPU
+> 0.0
+> 0.2
+> 0.4
+> 0.6
+> 0.8
+> 1.0
+> Norm. Latency  P99 TPOT
+> vLLM EPLB ViBE
+
+(b) Skewed AMD Instinct ™MI325X system. 
+
+Figure 14. Key performance results of DeepSeek-V3 Sonnet prefill on different systems. 8 16 32 64 128   
+
+> Number of GPUs
+> 1
+> 2
+> Per-layer Tail Latency
+> Normalized by vLLM Median
+> vLLM EPLB ViBE
+
+Figure 15. Projected per-MoE-layer tail latency versus EP group size, using measured 80 × AMD Instinct ™MI300X per-formance profiles. GPUs; beyond 64 GPUs, all algorithms converge to nearly identical assignments as the per-GPU expert count collapses. This motivates co-design strategies at extreme EP degrees— such as variability-aware TP grouping or selective expert duplication—which we leave to future work. 
+
+6 Conclusion 
+
+This work revisits a basic assumption in distributed MoE serving: that balancing token counts is sufficient to balance performance. We show that this assumption breaks down in practice because execution time is shaped not only by routing-induced workload skew, but also by GPU-to-GPU performance variability. Under expert parallelism, where each MoE layer completes at the pace of the slowest de-vice, these effects combine to create persistent stragglers that inflate tail latency, reduce utilization, and limit sus-tainable throughput. To address this, we propose ViBE, a variability-informed expert placement framework that shifts the optimization target from token balance to execution-time balance. ViBE combines per-GPU performance modeling, ex-pert activation profiling, execution-time-aware placement, and drift-aware recalibration to align per-layer completion times across GPUs. By assigning highly-loaded experts to 
+
+11 Seokjin Go, Marko Scrbak, Ephrem Wu, Srilatha Manne, and Divya Mahajan 
+
+faster devices and less-loaded experts to slower ones, ViBE uses variability as a lever to reduce stragglers rather than treating it as a source of inefficiency. Across multiple MoE models, ViBE consistently reduces execution-time imbalance, lowers tail latency, and expands the SLO frontier without sacrificing peak throughput. These results show that hard-ware variability is not a secondary artifact of deployment, but a first-order constraint in large-scale LLM serving. 
+
+7 Acknowledgements 
+
+Claude Code was utilized to generate portions of this work, specifically for the creation of tables and figures, LaTeX for-matting assistance, and assistance with ViBE code develop-ment. 
+
+References 
+
+[1] Sandhini Agarwal, Lama Ahmad, Jason Ai, Sam Altman, Andy Apple-baum, Edwin Arbus, Rahul K Arora, Yu Bai, Bowen Baker, Haiming Bao, et al . 2025. gpt-oss-120b & gpt-oss-20b model card. arXiv preprint arXiv:2508.10925 (2025). [2] Amey Agrawal, Nitin Kedia, Ashish Panwar, Jayashree Mohan, Nipun Kwatra, Bhargav S. Gulavani, Alexey Tumanov, and Ramachandran Ramjee. 2024. Taming Throughput-Latency Tradeoff in LLM Inference with Sarathi-Serve. arXiv:2403.02310 [cs.LG] https://arxiv.org/abs/ 2403.02310 
+
+[3] AMD. 2023. AMD Instinct ™ MI300X Accelerators. https://www.amd. com/en/products/accelerators/instinct/mi300/mi300x.html .[4] AMD. 2024. AMD Instinct ™ MI325X Accelerators. https://www.amd. com/en/products/accelerators/instinct/mi300/mi325x.html .[5] AMD. 2025. AITER: AI Tensor Engine For ROCm. https: //rocm.blogs.amd.com/software-tools-optimization/aiter-ai-tensor-engine/README.html .[6] AMD. 2025. AMD “Helios”: Advancing Openness in AI In-frastructure Built on Meta’s 2025 OCP Open Rack for AI De-sign. https://www.amd.com/en/blogs/2025/amd-helios-ai-rack-built-on-metas-2025-ocp-design.html .[7] AMD. 2026. AMD University Program AI & HPC Cluster. https://www. amd.com/en/corporate/university-program/ai-hpc-cluster.html .[8] AMD. 2026. ROCm Software. https://www.amd.com/en/products/ software/rocm .[9] AMD. 2026. ROCm System Management Interface (ROCm SMI) library. 
+
+https://rocm.docs.amd.com/projects/rocm_smi_lib/en/latest/ .[10] AMD. 2026. ROCprofiler-SDK documentation. https://rocm.docs.amd. com/projects/rocprofiler-sdk/en/latest/index.html .[11] Jae-Won Chung, Yile Gu, Insu Jang, Luoxi Meng, Nikhil Bansal, and Mosharaf Chowdhury. 2024. Reducing energy bloat in large model training. In Proceedings of the ACM SIGOPS 30th Symposium on Oper-ating Systems Principles . 144–159. [12] DeepSeek. 2025. EPLB: Expert Paralllelism Load Balancer. https: //github.com/deepseek-ai/EPLB .[13] William Fedus, Barret Zoph, and Noam Shazeer. 2022. Switch trans-formers: scaling to trillion parameter models with simple and efficient sparsity. J. Mach. Learn. Res. 23, 1, Article 120 (Jan. 2022), 39 pages. [14] Seokjin Go and Divya Mahajan. 2025. Moetuner: Optimized mixture of expert serving with balanced expert placement and token routing. 
+
+arXiv preprint arXiv:2502.06643 (2025). [15] Seokjin Go, Joongun Park, Spandan More, Hanjiang Wu, Irene Wang, Aaron Jezghani, Tushar Krishna, and Divya Mahajan. 2025. Charac-terizing the Efficiency of Distributed Training: A Power, Performance, and Thermal Perspective. In Proceedings of the 58th IEEE/ACM Inter-national Symposium on Microarchitecture . 626–642. [16] Jiaao He, Jiezhong Qiu, Aohan Zeng, Zhilin Yang, Jidong Zhai, and Jie Tang. 2021. Fastmoe: A fast mixture-of-expert training system. arXiv preprint arXiv:2103.13262 (2021). [17] Jiaao He, Jidong Zhai, Tiago Antunes, Haojie Wang, Fuwen Luo, Shangfeng Shi, and Qin Li. 2022. Fastermoe: modeling and optimizing training of large-scale dynamic pre-trained models. In Proceedings of the 27th ACM SIGPLAN Symposium on Principles and Practice of Parallel Programming . 120–134. [18] Yanping Huang, Youlong Cheng, Ankur Bapna, Orhan Firat, Dehao Chen, Mia Chen, HyoukJoong Lee, Jiquan Ngiam, Quoc V Le, Yonghui Wu, et al . 2019. Gpipe: Efficient training of giant neural networks using pipeline parallelism. Advances in neural information processing systems 32 (2019). [19] Rutwik Jain, Brandon Tran, Keting Chen, Matthew D Sinclair, and Shiv-aram Venkataraman. 2024. PAL: A variability-aware policy for sched-uling ML workloads in GPU clusters. In SC24: International Conference for High Performance Computing, Networking, Storage and Analysis .IEEE, 1–18. [20] Albert Q. Jiang, Alexandre Sablayrolles, Antoine Roux, Arthur Men-sch, Blanche Savary, Chris Bamford, Devendra Singh Chaplot, Diego de las Casas, Emma Bou Hanna, Florian Bressand, Gianna Lengyel, Guillaume Bour, Guillaume Lample, Lélio Renard Lavaud, Lucile Saulnier, Marie-Anne Lachaux, Pierre Stock, Sandeep Subramanian, Sophia Yang, Szymon Antoniak, Teven Le Scao, Théophile Gervet, Thibaut Lavril, Thomas Wang, Timothée Lacroix, and William El Sayed. 2024. Mixtral of Experts. arXiv:2401.04088 [cs.LG] https: //arxiv.org/abs/2401.04088 .[21] Andreas Kosmas Kakolyris, Dimosthenis Masouros, Petros Vavarout-sos, Sotirios Xydis, and Dimitrios Soudris. 2025. throttll’em: Predictive gpu throttling for energy efficient llm inference serving. In 2025 IEEE International Symposium on High Performance Computer Architecture (HPCA) . IEEE, 1363–1378. [22] Marco Kurzynski, Shaizeen Aga, and Di Wu. 2025. Lit Silicon: A Case Where Thermal Imbalance Couples Concurrent Execution in Multiple GPUs. arXiv:2511.09861 [cs.DC] https://arxiv.org/abs/2511.09861 
+
+[23] Woosuk Kwon, Zhuohan Li, Siyuan Zhuang, Ying Sheng, Lianmin Zheng, Cody Hao Yu, Joseph E. Gonzalez, Hao Zhang, and Ion Stoica. 2023. Efficient Memory Management for Large Language Model Serving with PagedAttention. In Proceedings of the ACM SIGOPS 29th Symposium on Operating Systems Principles .[24] Jan Karel Lenstra, David B Shmoys, and Éva Tardos. 1990. Approxi-mation algorithms for scheduling unrelated parallel machines. Math-ematical programming 46, 1 (1990), 259–271. [25] Dmitry Lepikhin, HyoukJoong Lee, Yuanzhong Xu, Dehao Chen, Orhan Firat, Yanping Huang, Maxim Krikun, Noam Shazeer, and Zhifeng Chen. 2020. Gshard: Scaling giant models with conditional computation and automatic sharding. arXiv preprint arXiv:2006.16668 
+
+(2020). [26] Jiamin Li, Yimin Jiang, Yibo Zhu, Cong Wang, and Hong Xu. 2023. Accelerating distributed {MoE } training and inference with lina. In 
+
+2023 USENIX Annual Technical Conference (USENIX ATC 23) . 945–959. [27] Zhuohan Li, Lianmin Zheng, Yinmin Zhong, Vincent Liu, Ying Sheng, Xin Jin, Yanping Huang, Zhifeng Chen, Hao Zhang, Joseph E. Gonzalez, and Ion Stoica. 2023. AlpaServe: Statistical Multiplexing with Model Parallelism for Deep Learning Serving. arXiv:2302.11665 [cs.LG] 
+
+https://arxiv.org/abs/2302.11665 
+
+[28] Aixin Liu, Bei Feng, Bing Xue, Bingxuan Wang, Bochao Wu, Chengda Lu, Chenggang Zhao, Chengqi Deng, Chenyu Zhang, Chong Ruan, et al . 2024. Deepseek-v3 technical report. arXiv preprint arXiv:2412.19437 (2024). [29] Meta, Inc. 2025. The Llama 4 herd: The beginning of a new era of natively multimodal AI innovation. https://ai.meta.com/blog/llama-4-multimodal-intelligence/ .12 ViBE: Co-Optimizing Workload Skew and Hardware Variability for MoE Serving 
+
+[30] Deepak Narayanan, Aaron Harlap, Amar Phanishayee, Vivek Seshadri, Nikhil R Devanur, Gregory R Ganger, Phillip B Gibbons, and Matei Zaharia. 2019. PipeDream: Generalized pipeline parallelism for DNN training. In Proceedings of the 27th ACM symposium on operating sys-tems principles . 1–15. [31] NVIDIA. 2025. NVIDIA GB200 NVL72. https://www.nvidia.com/en-us/data-center/gb200-nvl72/ .[32] Adam Paszke, Sam Gross, Francisco Massa, Adam Lerer, James Bradbury, Gregory Chanan, Trevor Killeen, Zeming Lin, Natalia Gimelshein, Luca Antiga, et al . 2019. Pytorch: An imperative style, high-performance deep learning library. Advances in neural informa-tion processing systems 32 (2019). [33] Pratyush Patel, Esha Choukse, Chaojie Zhang, Aashaka Shah, Íñigo Goiri, Saeed Maleki, and Ricardo Bianchini. 2024. Split-wise: Efficient generative LLM inference using phase splitting. arXiv:2311.18677 [cs.AR] https://arxiv.org/abs/2311.18677 
+
+[34] PyTorch. 2023. PyTorch Profiler. https://pytorch.org/tutorials/recipes/ recipes/profiler_recipe.html .[35] Tawfik Rahal-Arabi, Paul Van der Arend, Ashish Jain, Mehdi Saidi, Rashad Oreifej, Sriram Sundaram, Srilatha Manne, Indrani Paul, Rajit Seahra, Frank Helms, Esha Choukse, Nithish Mahalingam, Brijesh Warrier, and Ricardo Bianchini. 2024. Optimizing GPU Data Center Power. In 2024 IEEE Asia Pacific Conference on Circuits and Systems (APCCAS) . IEEE, 358–362. doi: 10.1109/APCCAS63486.2024.10808935 
+
+[36] Samyam Rajbhandari, Conglong Li, Zhewei Yao, Minjia Zhang, Reza Yazdani Aminabadi, Ammar Ahmad Awan, Jeff Rasley, and Yux-iong He. 2022. Deepspeed-moe: Advancing mixture-of-experts infer-ence and training to power next-generation ai scale. In International conference on machine learning . PMLR, 18332–18346. [37] Chaoyi Ruan, Yinhe Chen, Dongqi Tian, Yandong Shi, Yongji Wu, Jialin Li, and Cheng Li. 2025. DynaServe: Unified and Elastic Execution for Dynamic Disaggregated LLM Serving. arXiv:2504.09285 [cs.DC] 
+
+https://arxiv.org/abs/2504.09285 
+
+[38] Noam Shazeer, Azalia Mirhoseini, Krzysztof Maziarz, Andy Davis, Quoc Le, Geoffrey Hinton, and Jeff Dean. 2017. Outrageously large neural networks: The sparsely-gated mixture-of-experts layer. arXiv preprint arXiv:1701.06538 (2017). [39] Mohammad Shoeybi, Mostofa Patwary, Raul Puri, Patrick LeGresley, Jared Casper, and Bryan Catanzaro. 2019. Megatron-lm: Training multi-billion parameter language models using model parallelism. 
+
+arXiv preprint arXiv:1909.08053 (2019). [40] Prasoon Sinha, Akhil Guliani, Rutwik Jain, Brandon Tran, Matthew D Sinclair, and Shivaram Venkataraman. 2022. Not all GPUs are cre-ated equal: characterizing variability in large-scale, accelerator-rich systems. In SC22: International Conference for High Performance Com-puting, Networking, Storage and Analysis . IEEE, 01–15. [41] Platon Slynko, Jay Lu, Jason Cornick, Laksh Sharma, Shou-Kai Cheng, Benjamin Cornick, Arthur O Dias dos Santos, Caique Sobral, Carmen Li, Daoxuan Xu, et al . [n. d.]. Did You Win the GPU Cloud Lottery? Benchmarking from TFLOPS to Tokens. ([n. d.]). [42] Jovan Stojkovic, Chaojie Zhang, Íñigo Goiri, Esha Choukse, Haoran Qiu, Rodrigo Fonseca, Josep Torrellas, and Ricardo Bianchini. 2025. Tapas: Thermal-and power-aware scheduling for LLM inference in cloud platforms. In Proceedings of the 30th ACM International Confer-ence on Architectural Support for Programming Languages and Operat-ing Systems, Volume 2 . 1266–1281. [43] Jovan Stojkovic, Chaojie Zhang, Íñigo Goiri, Josep Torrellas, and Esha Choukse. 2025. Dynamollm: Designing llm inference clusters for per-formance and energy efficiency. In 2025 IEEE International Symposium on High Performance Computer Architecture (HPCA) . IEEE, 1348–1362. [44] Irene Wang, Jakub Tarnawski, Amar Phanishayee, and Divya Mahajan. 2024. Integrated Hardware Architecture and Device Placement Search. In 2024 International Conference on Machine Learning . https://www.microsoft.com/en-us/research/publication/ integrated-hardware-architecture-and-device-placement-search/ 
+
+[45] Irene Wang, Vishnu Varma Venkata, Arvind Krishnamurthy, and Di-vya Mahajan. 2026. NEST: Network- and Memory-Aware Device Placement For Distributed Deep Learning. arXiv:2603.06798 [cs.LG] 
+
+https://arxiv.org/abs/2603.06798 
+
+[46] An Yang, Anfeng Li, Baosong Yang, Beichen Zhang, Binyuan Hui, Bo Zheng, Bowen Yu, Chang Gao, Chengen Huang, Chenxu Lv, et al . 2025. Qwen3 technical report. arXiv preprint arXiv:2505.09388 (2025). [47] Jinghan Yao, Quentin Anthony, Aamir Shafi, Hari Subramoni, and Dhabaleswar K DK Panda. 2024. Exploiting inter-layer expert affinity for accelerating mixture-of-experts model inference. In 2024 IEEE International Parallel and Distributed Processing Symposium (IPDPS) .IEEE, 915–925. [48] Shulai Zhang, Ningxin Zheng, Haibin Lin, Ziheng Jiang, Wen-lei Bao, Chengquan Jiang, Qi Hou, Weihao Cui, Size Zheng, Li-Wen Chang, Quan Chen, and Xin Liu. 2025. Comet: Fine-grained Computation-communication Overlapping for Mixture-of-Experts. arXiv:2502.19811 [cs.DC] https://arxiv.org/abs/2502.19811 
+
+[49] Yinmin Zhong, Shengyu Liu, Junda Chen, Jianbo Hu, Yibo Zhu, Xu-anzhe Liu, Xin Jin, and Hao Zhang. 2024. DistServe: Disaggregating Prefill and Decoding for Goodput-optimized Large Language Model Serving. arXiv:2401.09670 [cs.DC] https://arxiv.org/abs/2401.09670 
+
+[50] Ruidong Zhu, Ziheng Jiang, Chao Jin, Peng Wu, Cesar A. Stuardo, Dongyang Wang, Xinlei Zhang, Huaping Zhou, Haoran Wei, Yang Cheng, Jianzhe Xiao, Xinyi Zhang, Lingjun Liu, Haibin Lin, Li-Wen Chang, Jianxi Ye, Xiao Yu, Xuanzhe Liu, Xin Jin, and Xin Liu. 2025. MegaScale-Infer: Serving Mixture-of-Experts at Scale with Disaggre-gated Expert Parallelism. arXiv:2504.02263 [cs.DC] https://arxiv.org/ abs/2504.02263 
+
+13 Seokjin Go, Marko Scrbak, Ephrem Wu, Srilatha Manne, and Divya Mahajan 
+
+A Appendix 
+
+A.1 ViBE End-to-End Flow 
+
+Algorithm 1 summarizes the complete ViBE pipeline across its three phases. 
+
+Phase 1: Offline profiling. Each GPU is profiled indepen-dently using the fused MoE kernel across a range of token counts, producing a device-specific latency model 𝑓 𝑔 (𝑛 ). This profiling is performed once per GPU and model configu-ration, as the relationship between token load and kernel latency is stable over time. In parallel, a representative work-load D is run through the model to collect the per-layer per-expert activation matrix W, capturing the routing skew that the placement solver must account for. 
+
+Phase 2: Initial placement. For each MoE layer, ViBE com-putes speed-proportional token targets 𝜏 𝑔 from the profiled latency models and assigns experts greedily in descending load order to the GPU with the most remaining capacity relative to its target. This produces an initial placement that equalizes predicted execution time across GPUs, accounting for both workload skew and hardware variability. 
+
+Phase 3: Online recalibration. During serving, ViBE peri-odically compares the current expert load distribution against the reference snapshot recorded at the last rearrangement. When the cosine distance exceeds 𝛿 cos at any layer, indicating that the routing pattern has shifted, the system collects fresh routing statistics under the new distribution and triggers the incremental solver (Algorithm 2) to adjust the place-ment with minimal expert movement. After rearrangement, the reference snapshot is updated and a cooldown period suppresses spurious re-triggers from transient load bursts caused by the rearrangement itself. 
+
+A.2 Incremental Placement Update 
+
+Rather than recomputing placement from scratch upon work-load drift, Algorithm 2 iteratively swaps experts between the slowest and fastest GPUs, scoring each swap by its marginal latency reduction via 𝑓 𝑔 . For each layer, the solver identifies the GPU pair with the largest latency gap, evaluates all valid swaps between them, and applies the one with the greatest gain. The process stops once tail latency is within (1+𝜖 ) of the mean or no beneficial swap exists, typically converging in 5–30 swaps per layer versus over 200 reassignments for a full re-solve. 
+
+Algorithm 1: ViBE End-to-End Flow 
+
+Input: Model with 𝐿 MoE layers, 𝐸 experts, GPU set 𝐺 ,workload D, drift threshold 𝛿 cos , tolerance 𝜖 ,monitoring interval 𝐻 
+
+Output: Expert placement S = {𝑆 (𝑙 ) 
+
+> 𝑔
+
+}
+
+/* Phase 1: Offline profiling */ 
+
+foreach GPU 𝑔 ∈ 𝐺 do 
+
+Profile MoE kernel → 𝑓 𝑔 (𝑛 );Run D through Model → W ∈ R𝐿 ×𝐸 ;
+
+/* Phase 2: Initial placement (per layer) */ 
+
+foreach layer 𝑙 = 1 . . . 𝐿 do 
+
+𝑁 ← Í𝑒 𝑤 (𝑙 ) 
+
+> 𝑒
+
+;
+
+𝑠 𝑔 ← 1/𝑓 𝑔 (𝑁 /𝐸 ) for each 𝑔 ;
+
+𝜏 𝑔 ← 𝑁 · 𝑠 𝑔 /Íℎ 𝑠 ℎ ;Sort experts by 𝑤 (𝑙 ) 
+
+> 𝑒
+
+descending; 
+
+foreach expert 𝑒 in sorted order do 
+
+Assign 𝑒 to arg max 𝑔 (𝜏 𝑔 − 𝑛 𝑔 );
+
+𝑛 𝑔 ← 𝑛 𝑔 + 𝑤 (𝑙 ) 
+
+> 𝑒
+
+;
+
+/* Phase 3: Online serving with recalibration */ 
+
+Snapshot ˆw(𝑙 ) ← current load vectors; 
+
+while serving do every 𝐻 forward passes do foreach layer 𝑙 do 
+
+𝑑 ← 1 − w(𝑙 ) · ˆw(𝑙 )      
+
+> ∥w(𝑙 )∥ ∥ ˆw(𝑙 )∥
+
+;
+
+if max 𝑙 𝑑 > 𝛿 cos then 
+
+Update W from recent routing; IncrementalUpdate( S, W, {𝑓 𝑔 }, 𝜖 ); 
+
+ˆw(𝑙 ) ← w(𝑙 ) for all 𝑙 ;Cooldown for 𝐻 forward passes; 
+
+Algorithm 2: Incremental Placement Update 
+
+Input: Placement S, expert token load {𝑤 𝑒 }, latency models {𝑓 𝑔 }, tolerance 𝜖 
+
+Output: Updated placement S′ with minimal expert moves 
+
+foreach layer 𝑙 do 
+
+Compute per-GPU token load 𝑛 𝑔 ← Í𝑒 ∈𝑆 𝑔 𝑤 𝑒 ;Compute target latency ¯𝑓 ← 1 
+
+> |𝐺 |
+
+Í𝑔 𝑓 𝑔 (𝑛 𝑔 );
+
+repeat 
+
+𝑔 + ← GPU with highest 𝑓 𝑔 (𝑛 𝑔 ) ; // slowest GPU 
+
+𝑔 − ← GPU with lowest 𝑓 𝑔 (𝑛 𝑔 ) ; // fastest GPU 
+
+Find best swap (𝑒 𝑖 , 𝑒 𝑗 ) between 𝑔 + and 𝑔 −
+
+maximizing latency reduction; Swap 𝑒 𝑖 ↔ 𝑒 𝑗 ;Update 𝑛 𝑔 + , 𝑛 𝑔 − , ¯𝑓 ;
+
+until max 𝑔 𝑓 𝑔 (𝑛 𝑔 ) ≤ ( 1+𝜖 ) ¯𝑓 or no latency reduction ;

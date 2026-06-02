@@ -6,48 +6,40 @@
 </div>
 
 ## 每次日报
-- 最新运行日期：2026-06-01
-- 运行时间：2026-06-01 22:28:01 UTC
+- 最新运行日期：2026-06-02
+- 运行时间：2026-06-02 22:51:28 UTC
 - 运行状态：成功
-- 本次总论文数：8
+- 本次总论文数：6
 - 精读区：2
-- 速读区：6
+- 速读区：4
 
 ### 今日简报（AI）
-今日关注LLM物理推理瓶颈与联邦学习协同优化，速读涵盖蒸馏、缩放与缓存压缩。
-
-最值得看精读论文：《Memory-Bound but Not Bandwidth-Limited》揭示批次1解码的物理AI瓶颈；《Joint Optimization》提出联邦边缘学习训练推理联合优化。
-
-建议普通读者优先关注如何通过测试时缩放（如UniScale）和无训练KV缓存压缩（GRKV）提升长上下文效率与推理速度。
-- 详情：[/202606/01/README](/202606/01/README)
+今日聚焦LLM推理优化，精读量化与路由调度两篇高分论文。  
+SPARQLe提出子精度激活表示实现高效量化推理，Lodestar则利用在线学习动态路由LLM请求。  
+建议普通读者优先关注SPARQLe的量化方案及Threshold-Based Exclusive Batching的批处理改进。
+- 详情：[/202606/02/README](/202606/02/README)
 
 ### 精读区论文标签
-1. [Memory-Bound but Not Bandwidth-Limited: The Physical AI Inference Gap in Batch-1 LLM Decode](/202606/01/2605.30571v1-memory-bound-but-not-bandwidth-limited-the-physical-ai-inference-gap-in-batch-1-llm-decode)  
+1. [SPARQLe: Sub-Precision Activation Representation for Quantized LLM Inference](/202606/02/2606.00365v1-sparqle-sub-precision-activation-representation-for-quantized-llm-inference)  
    标签：评分：9.0/10、query:edge-llm
-   evidence：分析了边缘典型批量-1解码场景中的内存瓶颈
-2. [Joint Optimization of Training and Inference in Federated Edge Learning via Constrained Multi-Objective Deep Reinforcement Learning](/202606/01/2605.25916v1-joint-optimization-of-training-and-inference-in-federated-edge-learning-via-constrained-multi-objective-deep-reinforcement-learning)  
+   evidence：利用激活稀疏性的软硬协同设计框架用于量化LLM推理
+2. [Lodestar: An Online-Learning LLM Inference Router](/202606/02/2606.00946v1-lodestar-an-online-learning-llm-inference-router)  
    标签：评分：8.0/10、query:edge-llm
-   evidence：资源受限边缘设备上训练与推理的联合优化
+   evidence：面向异构加速器的在线学习LLM推理路由器
 
 ### 速读区论文标签
-1. [Reasoning-preserved Efficient Distillation of Large Language Models via Activation-aware Initialization](/202606/01/2605.29327v1-reasoning-preserved-efficient-distillation-of-large-language-models-via-activation-aware-initialization)  
+1. [Threshold-Based Exclusive Batching for LLM Inference](/202606/02/2606.00516v1-threshold-based-exclusive-batching-for-llm-inference)  
    标签：评分：7.0/10、query:edge-llm
-   evidence：基于激活感知初始化的高效蒸馏，减小模型大小
-2. [UniScale: Adaptive Unified Inference Scaling via Online Joint Optimization of Model Routing and Test-Time Scaling](/202606/01/2605.30898v1-uniscale-adaptive-unified-inference-scaling-via-online-joint-optimization-of-model-routing-and-test-time-scaling)  
-   标签：评分：7.0/10、query:edge-llm
-   evidence：通过模型路由和测试时缩放实现自适应推理缩放
-3. [GRKV: Global Regression for Training-Free KV Cache Compression in Long-Context LLMs](/202606/01/2605.31105v1-grkv-global-regression-for-training-free-kv-cache-compression-in-long-context-llms)  
-   标签：评分：7.0/10、query:edge-llm
-   evidence：无训练KV缓存压缩，用于内存高效的LLM推理
-4. [CIVIC: End-to-End Sequence Compactness for Efficient Vision-Language Models](/202606/01/2605.28115v1-civic-end-to-end-sequence-compactness-for-efficient-vision-language-models)  
+   evidence：基于阈值的独占比特策略 考虑GPU内存带宽
+2. [ViBE: Co-Optimizing Workload Skew and Hardware Variability for MoE Serving](/202606/02/2606.00735v1-vibe-co-optimizing-workload-skew-and-hardware-variability-for-moe-serving)  
    标签：评分：6.0/10、query:edge-llm
-   evidence：路径一致的紧凑视觉推理，避免非连续内存访问
-5. [AsymVLM: Asymmetric Token Pruning for Efficient Vision-Language Model Inference](/202606/01/2605.29535v1-asymvlm-asymmetric-token-pruning-for-efficient-vision-language-model-inference)  
+   evidence：协同优化MoE服务中的负载倾斜和硬件变异，与异构计算相关
+3. [TwinQuant: Learnable Subspace Decomposition for 4-Bit LLM Quantization](/202606/02/2606.01556v1-twinquant-learnable-subspace-decomposition-for-4-bit-llm-quantization)  
    标签：评分：6.0/10、query:edge-llm
-   evidence：非对称令牌剪枝实现高效VLM推理
-6. [Efficient Diffusion LLMs via Temporal-Spatial Parallel Decoding and Confidence Extrapolation](/202606/01/2605.30753v1-efficient-diffusion-llms-via-temporal-spatial-parallel-decoding-and-confidence-extrapolation)  
+   evidence：4比特量化减少LLM推理内存和延迟，适用于边缘设备
+4. [MomentKV: Closing the Directional Gap in KV Cache Eviction for Long-Context Inference](/202606/02/2606.01563v1-momentkv-closing-the-directional-gap-in-kv-cache-eviction-for-long-context-inference)  
    标签：评分：6.0/10、query:edge-llm
-   evidence：时空并行解码加速扩散LLM
+   evidence：面向高效推理的KV缓存优化
 
 
 <div class="dpr-home-promo-card">
