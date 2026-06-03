@@ -6,40 +6,37 @@
 </div>
 
 ## 每次日报
-- 最新运行日期：2026-06-02
-- 运行时间：2026-06-02 22:51:28 UTC
+- 最新运行日期：2026-06-03
+- 运行时间：2026-06-03 22:12:15 UTC
 - 运行状态：成功
-- 本次总论文数：6
-- 精读区：2
+- 本次总论文数：5
+- 精读区：1
 - 速读区：4
 
 ### 今日简报（AI）
-今日聚焦LLM推理优化，精读量化与路由调度两篇高分论文。  
-SPARQLe提出子精度激活表示实现高效量化推理，Lodestar则利用在线学习动态路由LLM请求。  
-建议普通读者优先关注SPARQLe的量化方案及Threshold-Based Exclusive Batching的批处理改进。
-- 详情：[/202606/02/README](/202606/02/README)
+今日聚焦异构边缘/雾环境中高效LLM服务方案，并解析推理超越Amdahl极限的非可扩展开销消除方法。  
+最值得精读《E2LLM》(9.0分)提出的异构环境LLM部署优化，以及速读中《Scaling LLM Inference...》(7.0分)对推理扩展瓶颈的突破。  
+建议优先精读E2LLM获取实用架构启示，再速读后两篇补全计算密度与视觉token压缩视角。
+- 详情：[/202606/03/README](/202606/03/README)
 
 ### 精读区论文标签
-1. [SPARQLe: Sub-Precision Activation Representation for Quantized LLM Inference](/202606/02/2606.00365v1-sparqle-sub-precision-activation-representation-for-quantized-llm-inference)  
+1. [E2LLM: Towards Efficient LLM Serving in Heterogeneous Edge/Fog Environments](/202606/03/2606.03770v1-e2llm-towards-efficient-llm-serving-in-heterogeneous-edgefog-environments)  
    标签：评分：9.0/10、query:edge-llm
-   evidence：利用激活稀疏性的软硬协同设计框架用于量化LLM推理
-2. [Lodestar: An Online-Learning LLM Inference Router](/202606/02/2606.00946v1-lodestar-an-online-learning-llm-inference-router)  
-   标签：评分：8.0/10、query:edge-llm
-   evidence：面向异构加速器的在线学习LLM推理路由器
+   evidence：面向异构边缘/雾环境的LLM服务框架
 
 ### 速读区论文标签
-1. [Threshold-Based Exclusive Batching for LLM Inference](/202606/02/2606.00516v1-threshold-based-exclusive-batching-for-llm-inference)  
+1. [Scaling LLM Inference Beyond Amdahl`s Limits via Eliminating Non-Scalable Overheads](/202606/03/2606.01927v1-scaling-llm-inference-beyond-amdahls-limits-via-eliminating-non-scalable-overheads)  
    标签：评分：7.0/10、query:edge-llm
-   evidence：基于阈值的独占比特策略 考虑GPU内存带宽
-2. [ViBE: Co-Optimizing Workload Skew and Hardware Variability for MoE Serving](/202606/02/2606.00735v1-vibe-co-optimizing-workload-skew-and-hardware-variability-for-moe-serving)  
+   evidence：通过张量并行和开销重叠优化LLM推理系统
+2. [Tracing Computation Density in LLMs](/202606/03/2605.27033v1-tracing-computation-density-in-llms)  
    标签：评分：6.0/10、query:edge-llm
-   evidence：协同优化MoE服务中的负载倾斜和硬件变异，与异构计算相关
-3. [TwinQuant: Learnable Subspace Decomposition for 4-Bit LLM Quantization](/202606/02/2606.01556v1-twinquant-learnable-subspace-decomposition-for-4-bit-llm-quantization)  
+   evidence：提出s-Trace方法估计子图以高效计算，与资源高效推理相关
+3. [ETC: Extreme Token Compression via Task-aware Visual Information Distillation in VLMs](/202606/03/2606.00543v1-etc-extreme-token-compression-via-task-aware-visual-information-distillation-in-vlms)  
    标签：评分：6.0/10、query:edge-llm
-   evidence：4比特量化减少LLM推理内存和延迟，适用于边缘设备
-4. [MomentKV: Closing the Directional Gap in KV Cache Eviction for Long-Context Inference](/202606/02/2606.01563v1-momentkv-closing-the-directional-gap-in-kv-cache-eviction-for-long-context-inference)  
+   evidence：令牌压缩降低计算和缓存开销，适用于资源受限场景
+4. [LASER: Loss-Aware Singular-value Decomposition and Rank Allocation for Efficient Low-Precision Vision-Language Models](/202606/03/2606.00573v1-laser-loss-aware-singular-value-decomposition-and-rank-allocation-for-efficient-low-precision-vision-language-models)  
    标签：评分：6.0/10、query:edge-llm
-   evidence：面向高效推理的KV缓存优化
+   evidence：面向资源受限设备的VLM低秩分解压缩
 
 
 <div class="dpr-home-promo-card">
