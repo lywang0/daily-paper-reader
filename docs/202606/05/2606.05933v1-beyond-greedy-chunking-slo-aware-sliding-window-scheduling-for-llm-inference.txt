@@ -1,0 +1,780 @@
+Title: Beyond Greedy Chunking: SLO-Aware Sliding-Window Scheduling for LLM Inference
+
+URL Source: https://arxiv.org/pdf/2606.05933v1
+
+Published Time: Fri, 05 Jun 2026 00:57:02 GMT
+
+Number of Pages: 11
+
+Markdown Content:
+# Beyond Greedy Chunking: SLO-Aware Sliding-Window Scheduling for LLM Inference 
+
+# Yuansheng Chen 
+
+Sun Yat-sen University Guangdong, China chenysh253@mail2.sysu.edu.cn 
+
+# Yue Zhang 
+
+Sun Yat-sen University Guangdong, China zhangy2259@mail2.sysu.edu.cn 
+
+# Xuan Mo 
+
+Sun Yat-sen University Guangdong, China moxuan@mail2.sysu.edu.cn 
+
+# Weigang Wu 
+
+Sun Yat-sen University Guangdong, China wuweig@mail.sysu.edu.cn 
+
+# Jialun Li 
+
+Guangdong Polytechnic Normal University Guangdong, China jialun.li@gpnu.edu.cn 
+
+## Abstract 
+
+With the rapid growth of interactive applications in large language model (LLM) online services, maintaining high system throughput while ensuring user-perceived latency has become a key issue in inference scheduling. Existing LLM service systems rely on coarse-grained output constraints, making it difficult to effectively handle resource contention among multiple requests, resulting in low resource utilization efficiency and limited support for fine-grained quality of service (QoS) differentiation. We present SlidingServe, a sliding-window-driven SLO-Aware scheduling system for online LLM inference. SlidingServe designed a lightweight batch latency predictor to estimate the execution time of a batch. Based on this, SlidingServe uses SlidingChunker to com-bine information from the current iteration and the next iteration to achieve dynamic chunking and improve the overall system through-put while maintaining strict QoS guarantees. SlidingServe intro-duces Multi-Level Priority Sorter to sort candidate requests in or-der to balance fairness and efficiency. Additionally, when multi-ple requests within the same batch are at risk of SLO violating, SlidingServe introduces BatchConstructor, which uses dynamic programming to select the set of requests to execute in the cur-rent round, mitigating the SLO violation risk of critical requests. Our evaluation demonstrates that SlidingServe can improve service capacity by up to 30% compared to advanced scheduling systems under various load conditions, and further reduces the rate of SLO violation by 16%-53% under heavy-load inference mode. 
+
+## Keywords 
+
+LLM Serving, SLO-Aware Scheduling, Quality of Service 
+
+## 1 Introduction 
+
+With the widespread deployment of Large Language Models (LLMs) in scenarios such as intelligent question answering [ 1, 20 , 21 ], code generation [ 14 , 18 , 25 ], and interactive agents [ 17 ], inference sys-tems for online services are facing increasingly stringent perfor-mance and quality-of-service (QoS) requirements. Unlike offline batch processing tasks, online LLM serving systems not only need to maintain high throughput but also must simultaneously meet user-perceptible latency constraints. For interactive generation tasks, users typically focus on the return speed of the first output token, i.e., the Time to First Token (TTFT); after generation begins, they further focus on whether the output of subsequent tokens is stable, i.e., the Time Between Tokens (TBT). Therefore, how to simultane-ously achieve high throughput, meet TTFT and TBT constraints has become a critical challenge in the design of online LLM inference systems [2]. To balance throughput and latency, commonly used techniques include continuous batching [ 24 ] and chunked prefill [ 2 , 3]. Con-tinuous batching [ 24 ] allows the system to dynamically add new requests and advance existing requests in each iteration, thereby improving GPU utilization. Chunked prefill [ 2 , 3] decomposes long prompts into multiple smaller chunks, allowing prefill to be inter-leaved with decode requests, avoiding long periods of blocking streaming generation by a single long prompt [ 16 ]. These mecha-nisms significantly improve the throughput of inference systems, but also introduce new scheduling problems: chunk size directly determines the execution time of the current batch. Larger chunks can improve throughput and speed up prefill progress, but they will increase iteration latency and the risk of decode requests miss-ing the TBT deadline; smaller chunks can protect against decode latency, but may lead to underutilization of the GPU and worsen the TTFT of waiting requests [ 27 ]. Therefore, scheduling in the chunked prefill scenario is essentially a resource allocation problem that addresses multiple types of requests and spans multiple time scales. Besides chunk size selection, the scheduling order of candidate requests also impacts SLO performance. If the scheduler simply uses FCFS (first-come-first-served), long-prompt requests may con-sume prefill budget for an extended period, blocking more urgent requests. Using only earliest-deadline-first (EDF) might ignore the actual workload required for a request to complete prefill. Favoring only shortest-job-first (SJF) might allow low-risk, short requests to preempt requests nearing their deadlines. Specifically, request ordering must consider not only fairness but also SLO risk, deadline urgency, and remaining computational cost. Without this hybrid priority mechanism, even if the system can dynamic chunking, it may allocate limited budget to low-return requests, thus reducing the overall SLO attainment rate. Furthermore, in LLM scheduling, a batch is often not an execu-tion unit of a single request, but rather multiple requests sharing a single model execution. A request being placed in a batch does not 
+
+> arXiv:2606.05933v1 [cs.DC] 4 Jun 2026 Yuansheng Chen, Yue Zhang, Xuan Mo, Weigang Wu, and Jialun Li
+
+guarantee that it will satisfy its SLO, because it must wait for the entire batch to complete before updating its state or generating a token. Current inference systems ignore the mutual influence of re-quests within a batch, leading to SLO even when these requests are included in the batch, because the batch’s execution time exceeds the request’s TTFT slack. In response to the above issues, we present SlidingServe, a sliding-window-driven SLO-Aware scheduling method for chunked pre-fill scenarios. This method is built upon the vLLM [ 15 ] inference framework, employing unified request modeling and leveraging runtime features to construct a batch-level iterative latency pre-diction model, thereby rapidly estimating execution time across different batch compositions. Building on this, SlidingServe further expands the scheduling perspective from single-step decision to sliding window decision in two consecutive iterations: the sched-uler not only evaluates whether the current iteration meets the strictest latency constraints but also jointly considers the allocation relationship with next iteration By searching for the near-optimal budget split, it reduces the cumulative error caused by local greedy decisions. Simultaneously, regarding service competition between requests, SlidingServe designed a sorter and allocation mechanism that combines request urgency with remaining workload, thereby improving the response capability to urgent requests while pro-tecting the stability of decode request generation. Furthermore, when multiple requests within the same batch face violation risks, SlidingServe effectively reduces the SLO violation risk of critical requests by dynamically programming the set of requests to be executed in the current iteration within the batch. Our work makes the following key contributions: 
+
+• We present a sliding-window-driven dynamic chunking strategy, SlidingChunker. SlidingChunker utilizes a batch-level latency predictor to estimate the execution time under different batch compositions, extending from single-step scheduling to joint decision-making across iterations, thus alleviating the shortsightedness problem of traditional local greedy strategies under dynamic loads. 
+
+• We designed a Multi-Level Priority Sorter for mixed work-loads. The sorter comprehensively considers the SLO ur-gency of requests, the remaining prefill workload, and the request protection status, and uniformly sorts candidate requests, thereby improving the response capability to ur-gent requests while ensuring the stability of the decoding stage. 
+
+• We present BatchConstruct, a strategy for request selec-tion using dynamic programming within a batch. Batch-Constructor performs request-level selection and token allocation within a batch, adaptively determining which requests participate in the current round of execution and their respective computational budgets, thereby improving scheduling granularity and resource utilization efficiency. 
+
+• We integrated the above modules to form the SlidingServe system and conducted a systematic evaluation. Experimen-tal results show that SlidingServe’s service capabilities are up to 32% higher than the state-of-the-art scheduling sys-tem, while still meeting service quality guarantees. 
+
+## 2 Background and Motivation 2.1 LLM Inference Service 
+
+Iterative execution mechanism. Online inference for large lan-guage models typically employs an iterative execution mechanism. In such systems, requests are not processed in a "one-time execu-tion" manner, but rather incorporated into a continuously operating batch processing loop: in each iteration, the system selects a set of requests from the running queue and the waiting queue, allocates a certain amount of token computation budget to them, and organizes a batch forward execution. The lifecycle of a single request typically includes two phases : first, a prefill phase for the input prompt, and second, a token-by-token decoding phase for the generated output. The former usually has higher computational density and longer continuous execution overhead, while the latter, although having a smaller single-step computational cost, is more sensitive to the execution cycle of each iteration. 
+
+Trade-off between throughput and latency. Chunked prefill further alters the latency-throughput relationship in online infer-ence systems. It divides the prefilling of long prompts into smaller chunks, allowing them to be interleaved with decode requests within a unified scheduling framework. This mechanism improves system concurrency and provides the scheduler with greater flexi-bility; however, it also introduces a more acute latency-throughput trade-off. If the scheduler uses a larger chunk size in a single round, while accelerating the progress of long requests, it also significantly lengthens the execution time of that round’s batch, thus worsen-ing the response latency of decoding requests. Conversely, using a smaller chunk size, while protecting the online generated inter-active experience, may reduce overall throughput. In other words, throughput optimization and latency optimization are no longer simple static trade-offs, but rather a scheduling problem that needs to be dynamically balanced in each iteration [4]. 
+
+Latency metrics We adopt and expand two types of metrics related to user experience to provide a unified model for the interaction quality of requests. 
+
+• Time to First Token (TTFT). TTFT refers to the time from request arrival to the generation of the first output token, used to characterize the speed at which the system begins responding to a request. An excessively long TTFT can significantly impact the user’s perception of the real-time nature of the interaction. 
+
+• Time Between Tokens (TBT). TBT describes the stream-ing generation experience after the first token. Traditional definitions usually require that the time interval between any two adjacent output tokens does not exceed a certain threshold. In this paper, we treat TBT as a set of token-by-token deadlines. Let the arrival time of request 𝑖 be 𝑎 𝑖 , the TTFT SLO be 𝐿 ttft  
+
+> 𝑖
+
+, and the TBT SLO be 𝐿 tbt  
+
+> 𝑖
+
+. If the request has generated 𝑘 output tokens, then the deadline for the (𝑘 +
+
+1) − 𝑡ℎ token is: 
+
+𝑑 𝑖,𝑘 +1 = 𝑎 𝑖 + 𝐿 ttft  
+
+> 𝑖
+
++ 𝑘 · 𝐿 tbt  
+
+> 𝑖
+
+. (1) We consider this step’s output to be smooth as long as the 
+
+(𝑘 + 1) − 𝑡ℎ token is generated before its deadline. Beyond Greedy Chunking: SLO-Aware Sliding-Window Scheduling for LLM Inference 
+
+## 2.2 Limitations of Single-step Scheduling decode chunk prefill chunk   
+
+> current iteration next iteration
+> current ddl = 100 ms next ddl = 150 ms
+> Single-step greedy Sliding Chunker
+> chunk = 900
+> T = 100 ms
+> chunk = 260
+> T = 50 ms
+> chunk = 700
+> T = 75 ms
+> chunk = 700
+> T = 75 ms
+> total chunk = 1160 total chunk = 1400
+> Greedy
+> maximize current chunk
+> SlidingServe
+> balancing current and next chunks
+
+Figure 1: Comparison of different scheduling strategies 
+
+A straightforward SLO-Aware scheduling approach focuses on the current scheduling round: based on the remaining slack of the current decoding request, calculate the maximum allowed iteration time for this round and select a chunk size that will not exceed this latency constraint. This strategy seems reasonable because it schedules as many tokens as possible without violating the cur-rent decoding deadline. However, LLM online inference is not a single-step decision problem, but a multi-stage process consisting of consecutive iterations. The "maximum available budget" for the current round does not necessarily correspond to the maximum throughput or the lowest execution cost over multiple consecutive iterations [7]. The fundamental reason is that the relationship between batch execution time and chunk size is not a simple linear one [ 9]. Differ-ent batch compositions result in varying GPU utilization, attention computation, and key-value cache access times. Therefore, while fully utilizing the slack in the current iteration can improve the exe-cution efficiency of the current step, it severely limits the available slack in the next iteration, leading to a very small budget and po-tentially frequent degeneration into decode-heavy batches. Overall, this strategy may result in higher total execution time and lower prefill efficiency. Conversely, if the budget is slightly reduced in the current iteration, reserving some for the next iteration, both iterations’ batches may operate within a more efficient execution range, resulting in better overall throughput. Specifically, the maxi-mum legal budget for the current step is only a feasible solution, not necessarily the optimal solution across multiple iterations. The core motivation of SlidingChunker is to extend single-step maximization to budget allocation across iterations. SlidingChunker optimizes the overall system efficiency by jointly optimizing the budget supported by the current iteration and the next iteration through an optimization strategy using a sliding window of size 2 and step size 1. Consider the scenario in Figure 1, where the timeline starts from 0, with the current iteration’s deadline being 100 ms and the next iteration’s deadline being 50ms. Single-step employs a greedy strat-egy, maximizing the chunk size in the current iteration, resulting in a chunk size of only 260 for the next iteration. SlidingChunker chooses a slightly smaller chunk size in the current iteration, thus allowing for a wider slack in the next iteration, enabling larger batch computations. Ultimately, it processes 100 more tokens compared to Single-step before the next iteration’s deadline. 
+
+## 2.3 In-batch Request Scheduling decode tokens skipped requests     
+
+> Original large batch Batch Constructor
+> r1: slack 60 ms r2: slack 80 ms r3: slack 60 ms r4: slack 150 ms
+> batch latency = 95 ms
+> r1 selected r2 skipped r3 selected r4 skipped
+> rebuilt batch latency = 60 ms
+> Problem
+> r1, r2 and r3 will violate SLO
+> DP choice
+> only r2 will violate SLO
+> current iteration, r1, r2 and r3 face the risk of SLO violation.
+
+Figure 2: Comparison of In-batch request scheduling within different strategies 
+
+Cross-iteration scheduling addresses the question of "how large a chunk size should be used for the current iteration," but in actual batch building, another equally critical issue is: which requests should these budgets be allocated to? In LLM serving, a batch often contains multiple requests in the prefill phase simultaneously. Even if the global budget meets window-level constraints, some requests may still violate the SLO due to the long execution time of the batch. This issue arises from the atomic nature of batch execution in GPUs. A request being placed in a batch doesn’t mean it can imme-diately generate its first token; it must wait for the entire batch to complete before proceeding to the next state. If a batch contains too many requests or has an excessively large batch size, the execution time for that round will increase. For requests nearing their TTFT deadline, even if they are scheduled in this round, they may still violate because the batch latency exceeds their remaining slack. Therefore, request selection within a batch cannot simply adopt the "fill the budget as much as possible" approach or directly dis-card all requests that might lead to TTFT violations. SlidingServe designed the BatchConstructor module to address this. When the predicted execution time of the original batch might cause some requests to violate the TTFT, the BatchConstructor no longer di-rectly executes the complete batch. Instead, it transforms batch construction into a capacity-constrained request selection problem: given a latency constraint, it selects a set of requests that can be prefilled in this round, thereby reducing the risk of SLO violation while maximizing the scheduling benefits of this round. Consider the scenario in Figure 2, where the same batch contains four prefill requests. Using the original batch strategy, request r1, r2, and r3 would result in a SLO violation. BatchConstructor uses dynamic programming to skip r2 and r4 in this round, thus ensuring the SLO of r1 and r3, while ensuring r4 satisfies its SLO in the subsequent iteration. 
+
+## 3 SlidingServe: Design and Implementation 
+
+To address the aforementioned research objectives, this paper de-signs and implements a SlidingServe inference serving system for Yuansheng Chen, Yue Zhang, Xuan Mo, Weigang Wu, and Jialun Li 
+
+multi-request SLO categories. The system takes the running state of each iteration as input and the request allocation scheme of the current iteration as output, forming a closed-loop decision-making process encompassing "state abstraction, risk assessment, budget control, and combinatorial optimization." Waiting Queue Prefilling Queue Decoding Queue Priority Sorter Violation Checker BatchConstructor SlidingChunker     
+
+> GPU Execution Batch
+> 2346587910 True False 1maximal batch Batch Latency Predictor
+
+Figure 3: SlidingServe architecture 
+
+## 3.1 Overview 
+
+The architecture of SlidingServe can be summarized as shown in Figure 3. The system first maintains three basic queues: Waiting Queue, Prefilling Queue, and Decoding Queue. These three queues together describe the complete service state of the system at the current moment and are also the input basis for subsequent sched-uling decisions. 1 When a user sends a request to the system, it first enters the Waiting Queue; 2 At the start of each schedul-ing round, the system first reorders candidate requests using the Priority Sorter; 3 Based on the chunk size of the current round and the sorted request sequence, a maximum candidate batch is constructed. "Maximal" here does not mean it will definitely be ex-ecuted directly, but rather that this batch absorbs as many requests as possible within the current budget constraint; it serves as a ref-erence batch for assessing the current system load; 4 The system submits the maximum candidate batch to the Violation Checker for risk analysis. This module combines the batch latency estimate provided by the Batch Latency Predictor with the latency window constraint implicit in the current decoding request to determine whether directly executing this largest candidate batch would in-crease the TTFT or generation latency risk of some requests; 5 If the Violation Checker determines that the current candidate batch does not have a significant violation risk, the system enters the Slid-ingChunker branch. 6 If the Violation Checker determines that the current largest candidate batch may cause a latency violation, the system no longer uses the original sequential filling strategy but switches to the BatchConstructor branch; 7 8 Regardless of whether it goes through the SlidingChunker or the BatchConstruc-tor, the system will eventually form an executable batch. This batch not only determines which requests are included in this round, but also the token allocation method for each request; 9 The system sends the final generated batch to the GPU Execution module to perform forward computation of the model; 10 After the GPU completes this round of execution, the request status will change, and the updated three types of queues will again constitute the input for the next round of scheduling, thus forming a closed-loop iteration of the entire system. 
+
+## 3.2 Batch Latency Predictor 
+
+To support subsequent sliding window budget search and batch request selection, SlidingServe built a lightweight Batch Latency Predictor to estimate the execution latency of a single iteration under a given scheduling decision. 
+
+Predictor input. Assume there are 𝑛 scheduled requests in the cur-rent candidate batch, and the batch is denoted as B( 𝐵 ) = {( 𝑐 𝑖 , 𝑢 𝑖 )} 𝑛 𝑖 =1.Here, 𝑐 𝑖 represents the size of the tokens allocated to request 𝑖 , and 
+
+𝑢 𝑖 represents the number of tokens cached by request 𝑖 . Then, the total number of scheduled tokens in this round is defined as 𝑆 = Í𝑛 𝑖 =1 𝑐 𝑖 .To distinguish between the decoding and prefilling execution states, the predictor further divides the requests into two sets, D
+
+and P, based on the size of the allocated tokens. D represents the set of requests in the decoding stage, and P represents the set of requests in the prefilling stage. 
+
+D = {𝑖 | 𝑐 𝑖 ≤ 1} , P = {𝑖 | 𝑐 𝑖 > 1} . (2) Based on this, batch scenarios are divided into three categories: 
+
+𝑠 (B) =
+
+
+
+pure decode , |P | = 0,
+
+pure prefill , |D| = 0,
+
+mixed , otherwise .
+
+(3) This scenario partitioning allows the predictor to model pure de-code, pure prefill, and mixed batches separately, thereby improving its generalization ability under heterogeneous workloads. 
+
+Feature construction. The predictor in this paper employs explicit feature engineering. Its core idea is to decompose the main factors affecting batch latency into decode overhead, prefill overhead, cache state, global load, and interaction terms, and then construct a theory-driven low-dimensional feature vector based on this. Ultimately, a single batch is represented as a 7-dimensional feature vector, the meaning of which is defined in Table 1. Let the feature vector extracted from the current candidate batch be: 
+
+𝒙 = [𝑥 1, 𝑥 2, . . . , 𝑥 7]𝑇 . (4) The predictor takes the following form: 
+
+ˆ𝑇 = ¯𝑏 (𝑚 ) +
+
+> 7
+
+∑︁ 
+
+> 𝑗 =0
+
+¯𝑤 (𝑚 ) 
+
+> 𝑗
+
+𝑥 𝑗 . (5) where ¯𝑏 (𝑚 ) is the intercept term of scene m, and ¯𝑤 (𝑚 ) 
+
+> 𝑗
+
+is the linear coefficient of the 𝑗 -th feature in scene 𝑚 .
+
+Model training. The predictor employs a training method combin-ing offline initialization with online incremental updates. First, an initial prediction model is trained based on offline-collected batch runtime data, giving it basic latency estimation capabilities. After system deployment, real-world runtime samples are continuously collected, and the model is updated and hot-switched online at set intervals. This allows the predictor to gradually adapt to changes in actual load distribution and operating environment, improving long-term prediction accuracy and scheduling stability. Considering the significant differences in execution modes among the pure-decode, pure-prefill, and mixed scenarios, the predictor Beyond Greedy Chunking: SLO-Aware Sliding-Window Scheduling for LLM Inference 
+
+Table 1: Batch Latency Predictor Feature Symbols 
+
+Mathematical definition Meaning 
+
+𝑥 1 = Í 
+
+> 𝑖 ∈𝑃
+
+𝑐 𝑖 (𝑢 𝑖 + 𝑐 𝑖 ) The complexity of attention in the prefill stage 
+
+𝑥 2 = Í 
+
+> 𝑖 ∈𝑃
+
+𝑐 2 
+
+> 𝑖
+
+Self-attention intensity inside the prefill chunk 
+
+𝑥 3 = 𝑛 Í
+
+> 𝑖 =1
+
+𝑢 𝑖 Total calculated tokens 
+
+𝑥 4 = 𝑙𝑒𝑛 (𝐷 ) Number of decoding requests 
+
+𝑥 5 = Í 
+
+> 𝑖 ∈𝐷
+
+𝑢 𝑖 The total cumulative context length of the decode request. 
+
+𝑥 6 = Í 
+
+> 𝑖 ∈𝑃
+
+𝑐 𝑖 Total amount of prefill tokens 
+
+𝑥 7 = max    
+
+> {𝑖 ∈𝑃 }
+
+(𝑐 𝑖 ) The maximum tokens that can be allocated to a single prefill request introduces scene expert models in addition to the global model. Specifically, a global model is first trained using all samples; then, if the sample size for a particular scenario is no less than a speci-fied threshold, a dedicated model is trained on the corresponding subset for that scenario. During online inference, the system first determines the scene label based on the current batch structure. If a pre-trained expert model exists for that scenario, it is used pref-erentially; otherwise, the global model is reverted to the previous model. 
+
+## 3.3 Multi-Level Priority Sorter 
+
+In mixed load scenarios, one of the core challenges faced by the scheduler is determining the service order of requests. If only FCFS is used, long prompt requests may consume prefill budget for an extended period, blocking subsequent, more urgent requests. Con-versely, if only earlier-deadline-first EDF is used, the scheduler may ignore the computational cost required for different requests to complete prefill. Therefore, we designed a Multi-Level Prior-ity Sorter to uniformly sort prefilling and waiting requests before batch construction. Since decoding requests typically only need to generate one token per round and are highly sensitive to iteration latency, we reserve a basic budget for decoding requests in each round. Let D𝑡 be the set of decoding requests, P𝑟𝑢𝑛 𝑡 be the set of prefill-ing requests, and P𝑤𝑎𝑖𝑡 𝑡 be the set of waiting requests in the 𝑡 -th round of scheduling. Merge the prefilling and waiting requests into a unified candidate set: 
+
+P𝑡 = P𝑝𝑟𝑒 𝑓 𝑖𝑙𝑙 𝑡 ∪ P 𝑤𝑎𝑖𝑡 𝑡 . (6) After allocating decoding requests, the remaining budget is used to schedule requests P𝑡 . For any request 𝑖 in P𝑡 , let its arrival time be 𝑎 𝑖 , TTFT SLO be 𝐿 ttft  
+
+> 𝑖
+
+, prompt length be 𝑝 𝑖 , and the number of calculated tokens be 𝑐 𝑖 (𝑡 ). Then the remaining number of prefill tokens is: 
+
+𝑟 𝑖 (𝑡 ) = 𝑝 𝑖 − 𝑐 𝑖 (𝑡 ). (7) The remaining time until the TTFT deadline, i.e., the TTFT slack, is defined as: 
+
+𝑠 𝑖 (𝑡 ) = 𝑎 𝑖 + 𝐿 ttft  
+
+> 𝑖
+
+− 𝑡 . (8) Using only the TTFT slack for sorting is insufficient, as two requests with the same slack may have entirely different remaining workloads. To characterize the actual urgency of a request in the current system state, we estimate the time required to complete the remaining prefill for that request using recently observed system throughput 𝜌 𝑡 :
+
+ˆ𝑇 pre  
+
+> 𝑖
+
+(𝑡 ) = 𝑟 𝑖 (𝑡 )
+
+𝜌 𝑡 
+
+. (9) Further define the normalized urgency of the request: 
+
+𝑢 𝑖 (𝑡 ) =
+
+ˆ𝑇 pre  
+
+> 𝑖
+
+(𝑡 )
+
+max (𝑠 𝑖 (𝑡 ), 𝜖 ) = 𝑟 𝑖 (𝑡 )
+
+𝜌 𝑡 · max (𝑠 𝑖 (𝑡 ), 𝜖 ) . (10) where 𝜖 is a small positive constant added for numerical stability. This metric represents the ratio of "time required to complete the request" to "time remaining until the TTFT deadline". The larger 
+
+𝑢 𝑖 (𝑡 ) is, the closer the request is to a TTFT violation. We use a threshold 𝛼 to classify requests into normal requests and urgent requests: 
+
+𝑒 𝑖 (𝑡 ) = 1 [𝑢 𝑖 (𝑡 ) > 𝛼 ] . (11) In addition, the scheduler maintains a safeguard flag 𝑔 𝑖 ∈ { 0, 1}
+
+for each request. When 𝑔 𝑖 = 1, it indicates that the request is in a state requiring additional protection, such as a decoding request or a request from a higher-priority user. The scheduler should prioritize preventing further accumulation of latency risk for such requests. Based on the above definition, we construct a lexicographical priority key for each prefill request: 
+
+𝐾 𝑖 (𝑡 ) = (1 − 𝑔 𝑖 , 1 − 𝑒 𝑖 (𝑡 ), 𝑟 𝑖 (𝑡 )) . (12) The scheduler sorts the candidate set in ascending order of 𝐾 𝑖 (𝑡 ):
+
+𝑄 𝑡 = LexSort 𝑖 ∈ P 𝑡 (1 − 𝑔 𝑖 , 1 − 1 [𝑢 𝑖 (𝑡 ) > 𝛼 ] , 𝑟 𝑖 (𝑡 )) . (13) This priority consists of three levels. The first level is SLO safe-guard priority, which prioritizes scheduling requests that have already been marked as needing protection. The second level is ur-gency priority, which prioritizes scheduling requests with a larger remaining prefill workload relative to slack. The third level is short remaining priority, which prioritizes scheduling requests with fewer remaining prefill tokens when the risk level is the same, to increase the probability of completing prefill within a limited budget. 
+
+## 3.4 SlidingChunker 
+
+The multi-level priority sorter determines the service order of re-quests, but it doesn’t answer a more crucial question: what chunk size should the current iteration use? In chunked prefill scenarios, a larger budget allows the system to advance waiting and prefill requests more effectively, but it also increases the latency of the current iteration, blocking the next token from being decoded. A smaller budget can protect against decoding latency, but it sac-rifices TTFT and throughput. Unlike fixed chunk or single-step SLO checks, SlidingChunker jointly optimizes the request alloca-tion between the current and next iterations, mitigating the short-sightedness problem of traditional local greedy strategies under dynamic loads. The overall algorithm flow is shown in Algorithm 1. The input of the algorithm includes the decoding request set D, the sorted re-quest set D, the maximum chunk size 𝐵 supported by the server, the Yuansheng Chen, Yue Zhang, Xuan Mo, Weigang Wu, and Jialun Li 
+
+current scheduling time 𝑡 , the maximum running time allowed for the current window and the next window, and the BatchForwarder 
+
+𝐹 used to form batches and predict execution time. SlidingChunker treats the TBT SLO slack of decoding requests as a sliding window over time, where the maximum available ex-ecution time for the current iteration of the current window is determined by the most urgent of all the decode requests that need protection: 
+
+𝑇 cur = min  
+
+> 𝑖 ∈ D safe
+
+𝑠 𝑖 (𝑡 ). (14) Meanwhile, SlidingChunker further estimates the latency constraint for the next iteration of the current window: 
+
+𝑇 next = min  
+
+> 𝑖 ∈ D safe
+
+
+
+𝑠 𝑖 (𝑡 ) − 𝑇 cur + 𝐿 tbt 
+
+> 𝑖
+
+
+
+. (15) After obtaining the latency bounds for two consecutive itera-tions, SlidingChunker calls TimeToBudget to inversely solve for the optimal chunk size. This inverse solution process is approximated using binary search in the implementation. Then, SlidingChunker selects a budget 𝑏 for the current window and considers 𝐵 sum −𝑏 as the approximate budget for the next window, aiming to minimize the total prediction execution time for two consecutive windows. 
+
+𝐵 ∗ = arg min 
+
+> 𝑏
+
+ ˆ𝑇 (𝑏 ) + ˆ𝑇 (𝐵 Σ − 𝑏 ) . (16) This process is achieved through a discrete ternary search, which embodies the core idea of the sliding-window: the current iteration should not only pursue safety in the current round, nor should it excessively sacrifice prefill, but should strike a balance between the current iteration and the next iteration. Finally, the scheduler returns 𝐵 ∗ and its corresponding request-level allocation 𝐴 ∗.
+
+## 3.5 BatchConstructor 
+
+SlidingChunker determines the chunk size available for the current iteration at the window level, but controlling only the total budget is insufficient. A batch in LLM serving often contains multiple prefill requests simultaneously. The execution time of the batch will be determined jointly by all the requests. For some requests that are close to the TTFT deadline, even if they are included in the batch in this round, a TTFT violation may occur before the first token is generated due to the batch being too large and the execution time being too long. Therefore, the goal of BatchConstructor is not simply to "fill the budget," but to dynamically select the set of requests that should actually be executed in this round when there is a risk of TTFT violation. Specifically, the scheduler needs to actively filter a subset from the candidate prefill requests so that the predicted execution time of this batch falls within the TTFT slack of critical requests, while completing the prefill of as many high-value requests as possible. For specific implementation, refer to Algorithm 2. The algorithm first performs a prediction on the original batch to obtain the prediction latency ˆ𝑇 full . If the TTFT slack of all prefill re-quests is sufficient to cover ˆ𝑇 full , then there is no need to reconstruct the batch, and the algorithm returns an empty result. Otherwise, the BatchConstructor is triggered when at least one request has a TTFT violation. The core idea of DP is to use risky requests as anchors. For a given risky request 𝑎 , its TTFT slack 𝑠 𝑎 is considered the maximum 
+
+Algorithm 1 Sliding-window-driven dynamic chunking 
+
+Require: Decoding set D, sorted set P, maximum budget 𝐵 , cur-rent time 𝑡 ,𝑇 cur , 𝑇 next , BatchForwarder F
+
+Ensure: Final decision (𝐵 ★, 𝐴 ★) 
+
+> 1:
+
+𝐵 cur ← F .TimeToBudget (D , P,𝑇 cur ) 
+
+> 2:
+
+𝐵 next ← F .TimeToBudget (D , P,𝑇 next ) 
+
+> 3:
+
+𝐵 Σ ← 𝐵 cur + 𝐵 next  
+
+> 4:
+
+𝑙 ← |D| , 𝑟 ← 𝐵  
+
+> 5:
+
+𝑙 0 ← 𝑙 , 𝑟 0 ← 𝑟  
+
+> 6:
+
+while 𝑟 − 𝑙 > 30 do  
+
+> 7:
+
+𝑚 1 ← 𝑙 + ⌊( 𝑟 − 𝑙 )/ 3⌋ 
+
+> 8:
+
+𝑚 2 ← 𝑟 − ⌊( 𝑟 − 𝑙 )/ 3⌋ 
+
+> 9:
+
+𝑇 1 ← F .Pred (𝑚 1, D, P) + F .Pred (𝐵 Σ − 𝑚 1, D, P)  
+
+> 10:
+
+𝑇 2 ← F .Pred (𝑚 2, D, P) + F .Pred (𝐵 Σ − 𝑚 2, D, P)  
+
+> 11:
+
+if 𝑇 1 ≤ 𝑇 2 then  
+
+> 12:
+
+𝑟 ← 𝑚 2 − 1 
+
+> 13:
+
+else  
+
+> 14:
+
+𝑙 ← 𝑚 1 + 1 
+
+> 15:
+
+end if  
+
+> 16:
+
+end while  
+
+> 17:
+
+𝑚 ← ⌊( 𝑙 + 𝑟 )/ 2⌋ 
+
+> 18:
+
+𝐶 ← { 𝑙 0, 𝑟 0, 𝑚 } 
+
+> 19:
+
+𝐵 ★ ← 𝑙 0, 𝑇 ★ ← +∞ , 𝐴 ★ ← ∅  
+
+> 20:
+
+for all 𝑏 ∈ 𝐶 do  
+
+> 21:
+
+(𝑇 𝑏 , 𝐴 𝑏 ) ← F .Forward (D , P, 𝑏 ) 
+
+> 22:
+
+𝑇 𝑏 ← 𝑇 𝑏 + F .Pred (𝐵 Σ − 𝑏, D, P)  
+
+> 23:
+
+if 𝑇 𝑏 < 𝑇 ★ or (𝑇 𝑏 = 𝑇 ★ and 𝑏 > 𝐵 ★) then  
+
+> 24:
+
+(𝑇 ★, 𝐵 ★, 𝐴 ★) ← ( 𝑇 𝑏 , 𝑏, 𝐴 𝑏 ) 
+
+> 25:
+
+end if  
+
+> 26:
+
+end for  
+
+> 27:
+
+return (𝐵 ★, 𝐴 ★)
+
+acceptable execution time for this batch, i.e., 𝑇 𝑎 = 𝑠 𝑎 . The scheduler converts this time constraint into a usable token capacity 𝐵 𝑎 using TimeToBudget . After deducting the fixed usage of decode requests, the available prefill capacity is: 
+
+𝐶 𝑎 = 𝐵 𝑎 − |D| . (17) Since the anchor request is the one that needs protection right now, the BatchConstructor forcibly includes it in this batch. If 
+
+𝑟 𝑎 > 𝐶 𝑎 , it means that even considering only this anchor, prefill-ing cannot be completed within its TTFT slack, and the solution corresponding to this anchor is not feasible. When the anchor is fea-sible, the BatchConstructor selects additional requests from those in the slack that are no earlier than the anchor. Thus, after fixing the anchor, each selection is transformed into a capacity selection problem under a clear deadline. For a candidate request 𝑗 , its weight is defined as the number of remaining prefill tokens 𝑟 𝑗 , and its value is defined as its scheduling benefit. We adopt a value function that considers both slack and remaining workload: 
+
+𝑣 𝑗 = 1   
+
+> 𝑠 𝑗 Í𝑘 ∈𝑆𝑎 𝑠 𝑘
+
++ 𝑟 𝑗 Í𝑘 ∈𝑆𝑎 𝑟 𝑘 
+
+. (18) This function prioritizes requests with smaller Slack values and fewer remaining tokens. The algorithm then solves the 0/1 knapsack Beyond Greedy Chunking: SLO-Aware Sliding-Window Scheduling for LLM Inference 
+
+problem within the remaining capacity 𝐶 𝑎 − 𝑟 𝑎 .
+
+max  
+
+> Y ⊆ 𝑆 𝑎 \{ 𝑎 }
+
+∑︁ 𝑗 ∈ Y 
+
+𝑣 𝑗 , s.t. ∑︁  
+
+> 𝑗 ∈ Y
+
+𝑟 𝑗 ≤ 𝐶 𝑎 − 𝑟 𝑎 . (19) The final selection set is 
+
+Y𝑎 = Y ∪ { 𝑎 }. (20) The algorithm selects the optimal anchor solution from all op-tions, represented by the 𝐶𝑂𝑀𝑃𝐴𝑅𝐸𝑅 function. The 𝐶𝑂𝑀𝑃𝐴𝑅𝐸𝑅 
+
+comparison rule prioritizes maximizing the number of requests that complete prefilling in the current round, then maximizing the total value, and finally maximizing the utilized budget. 
+
+Y1 ≻ Y 2 if ©«
+
+|Y 1 |,∑︁  
+
+> 𝑗 ∈ Y 1
+
+𝑣 𝑗 ,∑︁  
+
+> 𝑗 ∈ Y 1
+
+𝑟 𝑗 ª®¬
+
+> ©«
+
+|Y 2 |,∑︁  
+
+> 𝑗 ∈ Y 2
+
+𝑣 𝑗 ,∑︁  
+
+> 𝑗 ∈ Y 2
+
+𝑟 𝑗 ª®¬
+
+.
+
+(21) BatchConstructor ultimately returns an explicit batch decision: 
+
+𝐴 ∗ = {( 𝑖, 1) | 𝑖 ∈ D} ∪ {( 𝑗, 𝑟 𝑗 ) | 𝑗 ∈ Y ∗ }. (22) Each decoding request is still assigned a token, while the se-lected prefill request is assigned its full remaining prefill token to ensure that these requests can complete prefilling in this round and generate the first token as soon as possible. BatchConstructor uses dynamic programming to build batches. By selecting a suitable and more efficient subset of requests, it reduces batch execution time and prioritizes limited budgets for requests most likely to experience TTFT violations, thereby im-proving SLO achievement rate. 
+
+## 4 Implementation 
+
+We implemented SlidingServe based on the vLLM [ 15 ]. We ex-tended the request metadata, enabling each request to carry SLO constraints such as TTFT and TBT upon submission on the sched-uler layer. Before each iteration, SlidingServe reads the system state and outputs the chunk size for that iteration, along with optional request-level token allocation methods.This modular design ensures broad compatibility with mainstream service ecosystems such as SGLang [26] and TensorRT-LLM [23]. We’ve incorporated a lightweight profiling mechanism to record relevant data for each real batch execution. This data is used for offline training and validation of the predictor, and also supports optional online calibration. Online predictor calibration is asyn-chronously updated in a background thread and replaces the model via hot-swapping, without blocking the main inference path. To support runtime decision-making, we implemented a light-weight batch forward simulator. Given the current set of decoding, prefilling, and waiting requests, and the candidate chunk size, the simulator constructs batches according to the vLLM token alloca-tion rules and calls the predictor to estimate the execution time of each batch. 
+
+## 5 Evaluation 
+
+Our evaluation aims to answer the following questions. 
+
+• What is the improvement due to SlidingServe in the serving capacity while meeting specified QoS SLOs across different datasets? 
+
+Algorithm 2 BatchConstructor 
+
+Require: Decode requests D, sorted requests P, maximum budget 
+
+𝐵 , current time 𝑡 , BatchForwarder F , function 𝐾𝑁 𝐴𝑃𝑆𝐴𝐶𝐾 ,function 𝐶𝑂𝑀𝑃𝐴𝑅𝐸𝑅 ,
+
+Ensure: Batch decision (𝐵 ★, 𝐴 ★) or ∅ 
+
+> 1:
+
+( ˆ𝑇 full , 𝐴 full ) ← F .Forward (D , P, 𝐵 ) 
+
+> 2:
+
+for all 𝑗 ∈ P do  
+
+> 3:
+
+𝑟 𝑗 ← remaining prefill tokens of request 𝑗  
+
+> 4:
+
+𝑠 𝑗 ← TTFT slack of request 𝑗 at time 𝑡  
+
+> 5:
+
+end for  
+
+> 6:
+
+R𝑟𝑖𝑠𝑘 ← { 𝑗 ∈ P | 𝑠 𝑗 < ˆ𝑇 full } 
+
+> 7:
+
+if R𝑟𝑖𝑠𝑘 = ∅ then  
+
+> 8:
+
+return ∅ 
+
+> 9:
+
+end if  
+
+> 10:
+
+Sort C by increasing (𝑠 𝑗 , 𝑟 𝑗 ) 
+
+> 11:
+
+𝐴 dec ← {( 𝑖, 1) | 𝑖 ∈ D}  
+
+> 12:
+
+𝐵 dec ← |D|  
+
+> 13:
+
+𝐵 ★ ← 𝐵 dec , 𝐴 ★ ← ∅  
+
+> 14:
+
+for all anchor request 𝑎 ∈ R 𝑟𝑖𝑠𝑘 do  
+
+> 15:
+
+𝑇 𝑎 ← 𝑠 𝑎  
+
+> 16:
+
+𝐵 𝑎 ← F .TimeToBudget (D , P,𝑇 𝑎 ) 
+
+> 17:
+
+𝐶 𝑎 ← min (𝐵, 𝐵 𝑎 ) − 𝐵 dec  
+
+> 18:
+
+if 𝐶 𝑎 ≤ 0 or 𝑟 𝑎 > 𝐶 𝑎 then  
+
+> 19:
+
+continue  
+
+> 20:
+
+end if  
+
+> 21:
+
+S𝑎 ← { 𝑗 ∈ C | 𝑠 𝑗 ≥ 𝑠 𝑎 } 
+
+> 22:
+
+Compute value 𝑣 𝑗 for each 𝑗 ∈ S 𝑎  
+
+> 23:
+
+Y ← Knapsack (S 𝑎 \ { 𝑎 }, 𝐶 𝑎 − 𝑟 𝑎 , 𝑟 𝑗 , 𝑣 𝑗 ) 
+
+> 24:
+
+Y ← Y ∪ { 𝑎 } 
+
+> 25:
+
+𝐵 Y ← 𝐵 dec + Í𝑗 ∈ Y 𝑟 𝑗  
+
+> 26:
+
+𝐴 Y ← 𝐴 dec ∪ {( 𝑗, 𝑟 𝑗 ) | 𝑗 ∈ Y}  
+
+> 27:
+
+if Comparer (Y , 𝐵 Y, 𝐴 Y, 𝐵 ★, 𝐴 ★) then  
+
+> 28:
+
+(𝐵 ★, 𝐴 ★) ← ( 𝐵 Y, 𝐴 Y ) 
+
+> 29:
+
+end if  
+
+> 30:
+
+end for  
+
+> 31:
+
+return (𝐵 ★, 𝐴 ★)• What is the impact of SlidingServe on request latencies and deadline violations under high load conditions? 
+
+• How does SlidingServe perform in response to sudden in-creases in transient loads? 
+
+• How do SlidingServe’s individual optimizations in isolation contribute to its performance? 
+
+Table 2: Statistics of Workloads. Prompt Tokens Output Tokens 
+
+Mean P90 Mean P90 ShareGPT 357 1724 89 184 Arxiv-v1 3253 4382 356 542 Arxiv-v2 6267 7567 423 623 
+
+Models and Hardware. We evaluated two representative models widely used in industry and academia: Llama3-8B and Qwen2.5-7B ,both deployed on RTX 3090 using TP2. We used two widely accepted Yuansheng Chen, Yue Zhang, Xuan Mo, Weigang Wu, and Jialun Li ShareGPT           
+
+> Arxiv-v1
+> Arxiv-v2
+> Mixed-v1
+> Mixed-v2
+> 0
+> 2
+> 4
+> Goodput (QPS)
+> 2.80
+> 0.60 0.35
+> 1.50 1.30
+> 3.20
+> 0.85
+> 0.50
+> 1.70 1.50
+> 3.50
+> 1.00
+> 0.65
+> 1.95 1.70
+> (a) Qwen2.5-7B (TP2-3090)
+> ShareGPT
+> Arxiv-v1
+> Arxiv-v2
+> Mixed-v1
+> Mixed-v2
+> 0
+> 2
+> 4
+> 2.30
+> 0.45 0.25
+> 1.25 1.10
+> 3.00
+> 0.80
+> 0.40
+> 1.55 1.35
+> 3.30
+> 0.95
+> 0.50
+> 1.85 1.55
+> (b) Llama3-8B (TP2-3090)
+> Sarathi-EDF QoServe SlidingServe
+
+Figure 4: Maximum goodput across models, hardware, and datasets 
+
+public workloads: ShareGPT (dialogue) [ 12 ] and arXiv-Summarization (long text summarization) [ 11 ], as shown in Table 2, where arXiv used two different subsets. To simulate mixed workloads, we also mixed ShareGPT with Arxiv-v1 and Arxiv-v2 at ratios of 3:1 and 5:1, respectively, generating new datasets mixed-v1 and mixed-v2. 
+
+SLOs. We perform SLOs according to the specifications in Table 3. Specifically, we focus on the maximum TTFT Slowdown during the pre-filling phase and the TBT during the decoding phase. Maximum TTFT Slowdown represents the time deceleration of the request relative to exclusive service. 
+
+Table 3: SLOs for different model configurations. 
+
+Max TTFT Slowdown TBT dialogue 5x 40ms summarization 10x 80ms 
+
+Baseline. Our evaluation includes two baselines: (1) Sarathi-EDF ,which implements the EDF strategy on Sarathi by prioritizing re-quests based on deadlines. (2) QoServe (SOTA) [ 8], the State-of-the-art SLO-Aware scheduling system, which improves system throughput while ensuring request QoS through fine-grained QoS classification, combined with dynamic chunking, hybrid prioritiza-tion, and proactive relegation strategies. 
+
+## 5.1 Goodput Evaluation 
+
+We measure the system’s goodput, defined as the number of re-quests served per second while meeting the latency targets (p99), allowing a maximum of 1% of total requests to violate their SLO. we compare against the Sarathi-EDF and QoServe baselines. Figure 4 shows the goodput of the three different datasets listed in table 2 and two synthetic datasets under two model configurations. As shown As shown in Figure 4, SlidingServe achieves 25%-111% high-ter goodput compared to Sarathi-EDF and 9.7%-30% higher goodput than QoServe. SlidingServe significantly outperforms its performance on the Arxiv dataset compared to the ShareGPT dataset, while its per-formance on the mixed dataset falls in between. We believe this difference primarily stems from the distribution of prompt lengths across different datasets: in ShareGPT, request prompts tend to be shorter, thus limiting the benefits of Multi-Level priority sorter and resulting in behavior more akin to EDF; whereas in long prompt scenarios, EDF might continue to allocate computational resources to requests that have already violated their SLOs, thereby blocking newly arriving requests and reducing system goodput. Furthermore, the prefill process for long prompt requests typically requires multi-ple iterations, and the mutual interference between these iterations and decoding requests further increases scheduling complexity, which is a key reason for proposing SlidingChunker. 
+
+## 5.2 Latency and SLO violations under Overload 
+
+We evaluate system behavior under overload by comparing Slid-ingServe against baselines. We measure two key parameters: (1) p50, p95 and p99 latency across all requests, (2) percentage of SLO violations across all requests. 
+
+Latency. Figure 5 shows the p50,p90 and p95 latency across all requests for Qwen2.5-7B on five datasets. As load increases, Sarathi-EDF’s TTFT grows much more rapidly, suggesting that it is more vulnerable to queue buildup and request interference under heavy load, which consequently degrades the overall latency distribution. By contrast, SlidingServe adopts Multi-Level Priority Sorter that takes both request prompt length and arrival time into account, thereby achieving a median TTFT comparable to QoServe while remaining substantially lower than Sarathi-EDF. Additionally, Slid-ingServe may exhibit higher tail latency in some scenarios. This behavior stems primarily from its strategy of lowering the schedul-ing priority of requests that have already violated their SLOs, so as to reserve resources for requests that still have a chance of meet-ing their deadlines. Although this strategy increases the latency of a small subset of overdue requests, it leads to a higher overall SLO satisfaction rate and thus represents a reasonable trade-off for service-quality optimization. 
+
+SLO violations. Figure 5 shows that SlidingServe achieved a lower SLO violation rate across all datasets under various high-load sce-narios. Compared to QoServe, its violation rate can be reduced by up to 53%, indicating that SlidingServe’s overall design can more effectively guarantee SLOs. 
+
+## 5.3 Transient Overload Scenario 
+
+We evaluated SlidingServe’s performance under transient overload by performing an end-to-end evaluation of a polarized load pattern. Using the mixed-v1 dataset, we dynamically varied the system load every 2 minutes over a total of 20 minutes, with varying low (QPS: 1.0) and high (QPS: 2.5) points, obtaining cumulative violations over Beyond Greedy Chunking: SLO-Aware Sliding-Window Scheduling for LLM Inference 
+
+Figure 5: Latency and SLO violations of five databases under overload 
+
+a relative timeline, as shown in Figure 6. This workload pattern simulates the request variations within a real production cycle, incorporating a 1.5 × peak-to-trough ratio, consistent with request rate variations recorded in LLM production traces. [13] Figure 6 shows that SlidingServe’s cumulative violations increase more gradually, adapting quickly to load abrupt changes, and ex-hibiting significantly fewer instances of surging violations com-pared to Sarathi-EDF and QoServe. Over the entire system simula-tion time dimension, SlidingServe’s SLO violation rate was 30.22% lower than Sarathi-EDF and 23.74% lower than QoServe. This im-provement come from the ability to adapt request urgency to load changes, allowing SlindingServe to schedule requests that require greater urgency. Furthermore, the increased throughput from dy-namic chunking helps SlindingServe handle higher loads. 0 500 1000 1500 
+
+> Time (s)
+> 0
+> 250
+> 500
+> 750
+> 1000
+> Cumulative violations
+> Sarathi-EDF
+> QoServe
+> SlidingServe
+
+Scheme Violations (%) Sarathi-EDF 57.78 QoServe 51.30 SlidingServe 27.56 
+
+Figure 6: Cumulative violations over time and overall SLO violations across different schemes 
+
+## 5.4 Ablation Studies 
+
+We now examine how each component of SlidingServe affects sys-tem throughput and SLO violation. For this analysis, we evaluate three design elements—SlidingChunker, Multi-Level Priority Sorter, and BatchConstructor. We compared the mixed-v1 dataset and the Qwen2.5-7B model with the Sarathi-EDF baseline. Table 4 shows the comparison results. SlidingChunk provides a 16.7% boost in throughput, while Multi-Level Priority Sorter adds 5.7% and BatchConstructor adds 5.4%. Under high load, MLPS yields greater benefits because high load amplifies the costs of faulty sched-uling. If the system prioritizes requests with high execution costs that are close to or have already violated their SLOs, it may occupy computing resources for an extended period, blocking subsequent new requests that are more likely to complete on time, resulting in a higher violation rate and lower goodput. Because under high load, it is more likely that a batch will contain multiple at-risk requests, thus increasing the benefits of BC. 
+
+Table 4: Impact of SlidingServe’s optimizations. (SC: SlidingChunker , MLPS: Multi-Level Priority Sorter, BC: BatchConstructor) 
+
+Scheme Optimal Load High load (QPS=3) QPS % gain % viola. % impr. Sarathi-EDF 1.5 - 100 -SlidingServe (SC) 1.75 16.7% 81.5 18.5% SlidingServe (SC+MLPS) 1.85 5.7% 58.6 22.9% SlidingServe (SC+MLPS+BC) 1.95 5.4% 50.5 8.1% Yuansheng Chen, Yue Zhang, Xuan Mo, Weigang Wu, and Jialun Li 
+
+## 5.5 Fidelity of the predictor model 
+
+To validate the predictor model, we evaluated it on various con-figurations using Qwen2.5-7B. Table 5 shows that the predictor achieved extremely low mean absolute error (MAE) (2.52–2.72 ms) and root mean square error (RMSE) (4.12–4.33 ms), with all R 2
+
+scores above 0.99. This indicates that it accurately capture the la-tency characteristics of LLM inference on different GPUs, providing reliable support for SL0-aware scheduling. 
+
+Table 5: Evaluation of Batch Latency Predictor performance 
+
+Config MAE (ms) RMSE (ms) 𝑅 2
+
+RTX3090 (tp2) 2.64 4.33 0.9956 A6000 (tp2) 2.52 4.12 0.9923 A100 2.72 4.254 0.9929 
+
+## 6 Related work 
+
+In recent years, LLM inference service systems have primarily focused on improving throughput, reducing memory overhead. Orca [ 24 ] proposed iteration-level scheduling, enabling the system to dynamically add and remove requests, thereby improving batch processing efficiency. vLLM [ 15 ] further proposed PagedAttention, which significantly reduces memory fragmentation through paged KV cache management. Sarathi-Serve [ 2 , 3] et al. proposed chun-ked prefill, which splits long prompts into multiple smaller chunks and interleaves them with decode requests, thereby alleviating the blocking effect of long prefills on decode latency. QoS-aware scheduling for LLM online services has been exten-sively studied [ 5 , 6, 10 , 22 ]. PolyServe [ 28 ] achieves the SLO compli-ance rate while maximizing throughput by using load gradient rout-ing and fine-grained scalability and de-scalability. Conserve [ 19 ]integrates online requests with offline batch tasks, while balanc-ing low latency and high utilization. QoServe [ 8 ] incorporates the requested SLO constraints into the scheduling decisions and bal-ances the urgency of the deadline and the estimated processing time through hybrid prioritization. The focus of SlidingServe is dif-ferent: we use a sliding window to avoid local optima in single-step scheduling; furthermore, we support dynamic request selection within batches to address the issue of individual requests violation on TTFT. 
+
+## 7 Conclusion 
+
+In this work, we present SlidingServe, a sliding-window-driven SLO-Aware scheduling system for online LLM serving. To address the myopic nature of single-step scheduling and the coarse-grained request selection within a batch, SlidingServe integrates a batch latency predictor, a Multi-Level Priority Sorter, SlidingChunker, and BatchConstructor to jointly optimize chunk sizing and request assignment. Evaluation show that SlidingServe improves service capacity by up to 30% over SOTA schedulers under various load conditions and reduces SLO violation rates by 16% - 53% under high-load workloads. 
+
+## References 
+
+[1] Daniel Adiwardana, Minh-Thang Luong, David R So, Jamie Hall, Noah Fiedel, Romal Thoppilan, Zi Yang, Apoorv Kulshreshtha, Gaurav Nemade, Yifeng Lu, et al. 2020. Towards a human-like open-domain chatbot . arXiv:2001.09977 [2] Amey Agrawal, Nitin Kedia, Ashish Panwar, Jayashree Mohan, Nipun Kwatra, Bhargav Gulavani, Alexey Tumanov, and Ramachandran Ramjee. 2024. Taming 
+
+{Throughput-Latency } tradeoff in {LLM } inference with {Sarathi-Serve }. In 
+
+18th USENIX Symposium on Operating Systems Design and Implementation (OSDI 24) . pages 117–134,2024. [3] Amey Agrawal, Ashish Panwar, Jayashree Mohan, Nipun Kwatra, Bhargav S Gulavani, and Ramachandran Ramjee. 2023. Sarathi: Efficient llm inference by piggybacking decodes with chunked prefills . arXiv:2308.16369 [4] Yu Ding, Jingxuan Zhao, Zhengong Cai, Kai Shi, Fansong Zeng, and Boweiy Yang. 2025. Adaptoserve: An Efficient System for Supporting Adaptive Chunked-Prefills in LLM Inference. In 2025 IEEE International Conference on High Perfor-mance Computing and Communications (HPCC) . 1–9. [5] Jiangsu Du, Hongbin Zhang, Taosheng Wei, Zhenyi Zheng, Kaiyi Wu, Zhiguang Chen, and Yutong Lu. 2025. Ecoserve: Enabling cost-effective llm serving with proactive intra-and inter-instance orchestration . arXiv:2504.18154 [6] Jingqi Feng, Yukai Huang, Rui Zhang, Sicheng Liang, Ming Yan, and Jie Wu. 2025. Windserve: Efficient phase-disaggregated llm serving with stream-based dynamic scheduling. In Proceedings of the 52nd Annual International Symposium on Computer Architecture . 1283–1295. [7] Shihong Gao, Xin Zhang, Yanyan Shen, and Lei Chen. 2025. Apt-serve: Adaptive request scheduling on hybrid cache for scalable llm inference serving. Proceedings of the ACM on Management of Data 3, 3 (2025), 1–28. [8] Kanishk Goel, Jayashree Mohan, Nipun Kwatra, Ravi Shreyas Anupindi, and Ramachandran Ramjee. 2026. QoServe: Breaking the Silos of LLM Inference Serving. In Proceedings of the 31st ACM International Conference on Architectural Support for Programming Languages and Operating Systems, Volume 2 . 1492–1507. [9] Connor Holmes, Masahiro Tanaka, Michael Wyatt, Ammar Ahmad Awan, Jeff Rasley, Samyam Rajbhandari, Reza Yazdani Aminabadi, Heyang Qin, Arash Bakhtiari, Lev Kurilenko, et al . 2024. Deepspeed-fastgen: High-throughput text generation for llms via mii and deepspeed-inference . arXiv:2401.08671 [10] Ke Hong, Xiuhong Li, Lufang Chen, Qiuli Mao, Guohao Dai, Xuefei Ning, Shengen Yan, Yun Liang, and Yu Wang. 2025. Sola: Optimizing slo attainment for large language model serving with state-aware scheduling. Proceedings of Machine Learning and Systems 7 (2025). [11] HuggingFace. 2025. arxiv_summarization_postprocess. https://huggingface.co/ datasets/whu9/arxiv_summarization_postprocess. [12] HuggingFace. 2025. ShareGPT_Vicuna_unfiltered. https://huggingface.co/ datasets/anon8231489123/ShareGPT_Vicuna_unfiltered. [13] Shashwat Jaiswal, Kunal Jain, Yogesh Simmhan, Anjaly Parayil, Ankur Mallick, Rujia Wang, Renee St Amant, Chetan Bansal, Victor Ruhle, Anoop Kulkarni, et al .2025. SageServe: Optimizing LLM Serving on Cloud Data Centers with Forecast Aware Auto-Scaling. Proceedings of the ACM on Measurement and Analysis of Computing Systems 9, 3 (2025), 1–24. [14] Juyong Jiang, Fan Wang, Jiasi Shen, Sungju Kim, and Sunghun Kim. 2026. A survey on large language models for code generation. ACM Transactions on Software Engineering and Methodology 35, 2 (2026), 1–72. [15] Woosuk Kwon, Zhuohan Li, Siyuan Zhuang, Ying Sheng, Lianmin Zheng, Cody Hao Yu, Joseph Gonzalez, Hao Zhang, and Ion Stoica. 2023. Efficient Memory Management for Large Language Model Serving with PagedAttention. In Proceedings of the ACM Symposium on Operating Systems Principles(SOSP) .pages 611–626,2023. [16] Pratyush Patel, Esha Choukse, Chaojie Zhang, Aashaka Shah, Íñigo Goiri, Saeed Maleki, and Ricardo Bianchini. 2024. Splitwise: Efficient generative llm inference using phase splitting. In 2024 ACM/IEEE 51st Annual International Symposium on Computer Architecture (ISCA) . 118–132. [17] Uwe Peters and Benjamin Chin-Yee. 2025. Generalization bias in large language model summarization of scientific research. Royal Society Open Science 12, 4 (2025), pages 241776. [18] Saurabh Pujar, Luca Buratti, Xiaojie Guo, Nicolas Dupuis, Burn Lewis, Sahil Suneja, Atin Sood, Ganesh Nalawade, Matt Jones, Alessandro Morari, et al . 2023. Automated code generation for information technology tasks in yaml through large language models. In Proceedings of the 60th ACM/IEEE Design Automation Conference (DAC) . pages 1–4,2023. [19] Yifan Qiao, Shu Anzai, Shan Yu, Haoran Ma, Shuo Yang, Yang Wang, Miryung Kim, Yongji Wu, Yang Zhou, Jiarong Xing, et al . 2024. ConServe: Fine-Grained GPU Harvesting for LLM Online and Offline Co-Serving . arXiv:2410.01228 [20] Partha Pratim Ray. 2023. ChatGPT: A comprehensive review on background, applications, key challenges, bias, ethics, limitations and future scope. Internet of Things and Cyber-Physical Systems 3 (2023), pages 121–154. [21] Stephen Roller, Emily Dinan, Naman Goyal, Da Ju, Mary Williamson, Yinhan Liu, Jing Xu, Myle Ott, Kurt Shuster, Eric M Smith, et al . 2020. Recipes for building an open-domain chatbot . arXiv:2004.13637 Beyond Greedy Chunking: SLO-Aware Sliding-Window Scheduling for LLM Inference 
+
+[22] Ting Sun, Penghan Wang, and Fan Lai. 2025. Hygen: Efficient llm serving via elastic online-offline request co-location . arXiv:2501.14808 [23] N. Vaidya, F. Oh, and N. Comly. 2023. Optimizing inference on large language models with NVIDIA TensorRT-LLM, now publicly available. https://github. com/NVIDIA/TensorRT-LLM. [24] Gyeong-In Yu, Joo Seong Jeong, Geon-Woo Kim, Soojeong Kim, and Byung-Gon Chun. 2022. Orca: A distributed serving system for transformer-based generative models. In Proceedings of the USENIX Symposium on Operating Systems Design and Implementation (OSDI) . pages 521–538,2022. [25] Shun Zhang, Zhenfang Chen, Yikang Shen, Mingyu Ding, Joshua B Tenenbaum, and Chuang Gan. 2024. Planning with large language models for code generation .arXiv:2303.05510 [26] Lianmin Zheng, Liangsheng Yin, Zhiqiang Xie, Chuyue Sun, Jeff Huang, Cody H Yu, Shiyi Cao, Christos Kozyrakis, Ion Stoica, Joseph E Gonzalez, et al . 2024. Sglang: Efficient execution of structured language model programs. Advances in neural information processing systems 37 (2024), 62557–62583. [27] Yinmin Zhong, Shengyu Liu, Junda Chen, Jianbo Hu, Yibo Zhu, Xuanzhe Liu, Xin Jin, and Hao Zhang. 2024. {DistServe }: Disaggregating prefill and decoding for goodput-optimized large language model serving. In 18th USENIX Symposium on Operating Systems Design and Implementation (OSDI 24) . 193–210. [28] Kan Zhu, Haiyang Shi, Le Xu, Jiaxin Shan, Arvind Krishnamurthy, Baris Kasikci, and Liguang Xie. 2025. PolyServe: Efficient Multi-SLO Serving at Scale .arXiv:2507.17769

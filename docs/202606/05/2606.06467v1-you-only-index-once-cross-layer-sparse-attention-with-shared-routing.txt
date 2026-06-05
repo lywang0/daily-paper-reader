@@ -1,0 +1,458 @@
+Title: You Only Index Once: Cross-Layer Sparse Attention with Shared Routing
+
+URL Source: https://arxiv.org/pdf/2606.06467v1
+
+Published Time: Fri, 05 Jun 2026 01:36:16 GMT
+
+Number of Pages: 15
+
+Markdown Content:
+# You Only Index Once: Cross-Layer Sparse Attention with Shared Routing 
+
+Yutao Sun ∗ 12 Yanqi Zhang ∗ 1 Li Dong ∗ 1
+
+Jianyong Wang 2 Furu Wei 11 Microsoft Research 2 Tsinghua University https://aka.ms/GeneralAI Long-context inference in modern LLMs is increasingly constrained by decoding effi-ciency, especially in reasoning-heavy settings where models generate long intermediate chains of thought. Existing sparse attention methods often face a practical efficiency-quality trade-off. Structured block sparse methods typically provide stronger acceleration but incur noticeable quality loss, while token sparse methods are usually more accurate yet deliver limited end-to-end speedup because top-k routing over the full cache remains expensive. In this work, we propose cross-layer sparse attention (CLSA), which is built on top of KV-sharing architectures such as YOCO. The core idea is to share not only the KV cache across cross-decoder layers, but also the routing index. A single indexer computes token-level top-k selection once and reuses the resulting index across layers, thereby preserving the fine-grained selectivity of token sparse attention while amortizing the routing overhead. The resulting architecture improves all major inference bottlenecks jointly, including pre-filling, KV-cache storage, and long-context decoding. Experiments across short-context and long-context benchmarks show that CLSA is both accurate and efficient, achieving up to 7.6× decoding speedup and 17 .1× overall throughput improve-ment at 128K context. These results suggest a more complete architectural solution for long-context LLMs that jointly advances model quality and inference efficiency. 
+
+## 1 Introduction 
+
+Long-context inference has become a common operating regime for modern LLMs, especially in reasoning-heavy settings such as chain-of-thought generation and test-time scaling [17, 13]. In these scenarios, models often need to decode long intermediate reasoning traces while repeatedly attend-ing to a large context, making inference increasingly decoding-bound as the sequence grows. At the same time, pre-filling becomes more expensive and the KV cache grows with context length. De-signing an architecture that remains efficient under long contexts is therefore now a core requirement rather than a niche optimization. Sparse attention is a natural direction for reducing the cost of long-context inference, but existing methods often face a difficult efficiency-quality trade-off. In practice, block-sparse attention [37, 23, 30, 9] usually delivers larger wall-clock speedups because its structured sparsity maps better to GPU execution, but it also tends to introduce a coarser approximation and more noticeable quality loss. Token-sparse attention [22] is often more accurate because it can preserve finer-grained salient tokens, yet its end-to-end acceleration is usually limited. A key reason is that token sparse methods still require a routing stage based on top-k selection over the full cache, and this step is irregular and expensive on modern GPUs, especially when it is recomputed independently across many layers during decoding. In this work, we propose cross-layer sparse attention (CLSA), which is built on top of the KV sharing design of cross-attention architectures such as YOCO [27]. The central idea is to extend sharing from  
+
+> ∗
+
+Equal contribution.     
+
+> arXiv:2606.06467v1 [cs.CL] 4 Jun 2026 Output
+> Cross -Attention
+> Feed Forward
+> Sparse KV
+> 𝑄
+> Efficient Self -Attention
+> Feed Forward
+> 𝐾
+> 𝑉
+> 𝑄
+> 𝐿
+> 2-Layer
+> 𝐿
+> 2-Layer
+> <s> Routing Once, Cache
+> Embedding
+> Routing Once, Cache Once
+> Full 𝐾 V
+> Top -k
+> Indexer
+> Qidx Figure 1: Overview of cross-layer sparse attention. The self-decoder first produces a shared KV cache, which is computed only once and then reused by all subsequent cross-decoder layers. During this stage, a shared query-aware indexer jointly generates the routing queries and keys and computes a token-level sparse top-k
+> index for each query token. This sparse index is also produced only once and is shared across the following cross-decoder layers, allowing them to reuse the same selected KV positions instead of recomputing layer-specific sparse routing.
+
+memory to routing. When multiple cross-decoder layers read from the same KV cache, they also share the same routing index. Concretely, a single indexer computes token-level top-k routing once and the resulting index is reused across layers. In this way, the model preserves the main advantage of token-sparse attention, namely selecting a compact active subset of informative tokens without sacrificing quality, while substantially reducing the practical cost of sparse decoding by amortizing the routing overhead. The resulting architecture provides a unified treatment of the major inference bottlenecks in long-context LLMs. Through KV sharing, it retains YOCO’s advantages in pre-filling and KV-cache stor-age, while shared-index sparse retrieval improves decoding efficiency by avoiding repeated dense global attention and repeatedly recomputed routing. Consequently, the overall system approaches a favorable efficiency frontier across pre-filling, KV-cache footprint, and long-context decoding, rather than improving only one aspect at the expense of the others. Our experiments show that CLSA preserves model quality across both short and long context bench-marks spanning multiple domains, while maintaining nearly lossless behavior relative to dense base-lines. Attention-pattern analysis further shows that sharing one routing index across layers has only a minor effect on the resulting attention behavior, supporting the central assumption behind our design. At the same time, CLSA delivers substantial acceleration. At 128K context, it improves decoding throughput by up to 7.6× over the Transformer baseline and improves overall end-to-end throughput by up to 17 .1×. Taken together, these results suggest that CLSA provides a potentially promising LLM architecture that better reconciles model quality and inference efficiency. 
+
+## 2 Method 
+
+Figure 1 gives an overview of our method. We build on the cross-attention architecture of YOCO [27], which naturally decomposes the model into a self-decoder and a cross-decoder. The self-decoder first encodes the input sequence into shared hidden states and constructs a single KV cache. On top of these shared states, we add a lightweight query-aware indexer that computes a token-level top-k routing index once. The cross-decoder layers then reuse both the shared KV cache 2and the shared routing index, so each layer keeps its own query states and FFN transformation while attending only to the selected KV positions. This overview highlights the main design principle of cross-layer sparse attention: when several decoder layers read from the same memory, the expensive routing decision should also be tied to that memory and shared across layers. As a result, CLSA preserves the fine-grained selectivity of token-sparse attention, but avoids recomputing layer-specific top-k indices during decoding. The following subsections detail the sparse attention formulation, the multi-layer distillation objective used to train the shared indexer, and the resulting inference advantages. 
+
+Efficient Self-decoder. The self-decoder is kept unchanged from YOCO. It performs an efficient attention mechanism and constructs the shared KV cache exactly once. This stage encodes the his-tory into reusable memory while avoiding dense full-context attention throughout the whole stack. As a result, the model preserves YOCO’s efficiency advantages in both pre-filling and KV-cache storage. 
+
+Sparse Cross-decoder. Each cross-decoder layer consists of a cross-attention module followed by an FFN block. Its role is to retrieve relevant information from the shared KV cache and refine the representation through the feed-forward transformation. In dense YOCO, the cross-attention module performs dense full attention over the shared cache. Our modification is to replace this dense retrieval with CLSA driven by the shared indexer, while keeping the FFN and the rest of the cross-decoder unchanged. 
+
+2.1 Cross-Layer Sparse Attention 
+
+As shown in Figure 1, we consider a stack of decoder layers that all query the same external memory through a cross-attention module. Let H ∈ Rn×d denote the shared hidden states written into the memory, let K, V ∈ Rn×d denote the corresponding shared KV cache, and let Q(l) be the query states of decoder layer l. A dense cross-attention module computes 
+
+O(l) = Attn( Q(l), K, V ), (1) which means every decoder layer scans the full cache. Our goal is to keep the shared-memory struc-ture, but replace dense retrieval with a routed sparse variant. To do so, we introduce an additional single-head indexing branch on top of the shared hidden states. Specifically, the index queries and keys are computed as: 
+
+Qidx = HW Q
+
+> idx
+
+, Kidx = HW K
+
+> idx
+
+, (2) where Qidx , K idx ∈ Rn×didx . Unlike the multi-head attention projections used by the main attention module, this indexing branch uses only one head. We then form indexing scores and routing indices 
+
+I = Qidx K⊤
+
+> idx
+
+, St = TopK( It, k ) (3) and restrict attention to the selected tokens: 
+
+O(l) 
+
+> t
+
+= Attn( Q(l) 
+
+> t
+
+, K St , V St ) (4) Here the index query and index key are both derived from the same shared hidden states and have shape [n, d idx ], while the layer-wise query Q(l) still varies across decoder layers. The activated set size k is much smaller than n, so each layer only attends to a compact subset of the global memory. The central idea is to bind the routing index to the shared KV cache, rather than treating them as separate objects. Once multiple decoder layers attend to the same KV cache, they should also reuse the same routing index, so inference only needs to compute top-k once. 
+
+2.2 Multi-Layer Distillation 
+
+Sharing one routing index across multiple decoder layers is efficient, but the selected tokens must be useful to several layers simultaneously rather than matching the preference of one layer in isola-tion. Follow prior sparse attention methods with distillation [9, 1], we use a multi-layer distillation objective to train the shared indexer. 3Table 1: Comparison of inference complexity. N , L, and D denote sequence length, number of layers, and hidden dimension. W1 denotes the local window size, and W2 denotes the number of selected tokens in sparse attention. γ denotes the fraction of global-attention layers in a hybrid model, and η denotes the per query-key routing cost of the indexer.                                                        
+
+> Model KV Cache Memory Prefilling Time Decoding Time
+> Transformer O(LN D )O(LN 2D)O(LN D )
+> Hybrid TRM O(L(γN + (1 −γ)W1)D)O(L(γN 2+ (1 −γ)W1N)D)O(L(γN + (1 −γ)W1)D)
+> YOCO (Dense) O(( N+W1L)D)O(L
+> 2W1N D )O(L
+> 2(N+W1)D)
+> DSA O(LN D )O(LW 2N D +ηLN 2)O(LW 2D+ηLN )
+> YOCO (CLSA) O(( N+W1L)D)O(L
+> 2W1N D )O(L
+> 2(W1+W2)D+ηN )
+
+For an input sequence, the dense cross-attention modules provide attention distributions from all decoder layers and all heads. We first aggregate them into a common target 
+
+¯A = 1
+
+LH 
+
+> L
+
+X
+
+> l=1
+> H
+
+X
+
+> h=1
+
+softmax 
+
+
+
+Q(l,h )K(h)⊤
+
+, (5) and then match that target with the indexer distribution using 
+
+LKD = 1
+
+n
+
+> n
+
+X
+
+> t=1
+
+KL  sg  ¯At
+
+ softmax( It) , (6) where L is the number of decoder layers, H is the number of attention heads in each layer, and sg[ ·]
+
+denotes stop-gradient. Intuitively, the shared indexer learns to preserve the consensus salient tokens that remain important across the full decoder stack. 
+
+Stage 1: indexer warmup with frozen backbone. We first warm up the shared indexer using only the distillation objective while freezing the backbone parameters. In this stage, the indexer learn a stable routing pattern before it is coupled with language modeling. 
+
+Lstage1 = LKD . (7) 
+
+Stage 2: joint sparse adaptation. After the indexer warmup, we optimize the model with both language modeling and distillation losses. The main purpose of this stage is to let the backbone adapt to the sparse attention distribution induced by the shared indexer: 
+
+Lstage2 = LLM + λLKD . (8) where λ is a fixed weighting coefficient for the KD loss, and we set λ = 0 .1 in all experiments. 
+
+2.3 Inference Advantages 
+
+Decoding efficiency, pre-filling efficiency, and KV-cache footprint cover most of the practical bot-tlenecks in LLM inference. Our design improves these three aspects in a complementary way. 
+
+Decoding efficiency from shared top-k routing. In a standard sparse design, each decoder layer still needs to run its own routing procedure to identify the top-k tokens, and that routing must still be computed over the full-length cache. More importantly, the top-k operator is not well matched to modern GPU execution. Unlike dense matrix multiplications, it cannot effectively leverage Tensor Core acceleration, so its wall-clock cost can account for a large fraction of decoding time. Our shared-indexer design removes this redundancy by computing the top-k result once and reusing it across the decoder stack. As a result, sparse retrieval becomes practically useful for decoding. While the model still attends to only a small active set, but inference no longer wastes time recomputing the same expensive top-k step in every layer. 
+
+Pre-filling and KV-cache efficiency inherited from YOCO. YOCO [27] already makes pre-filling efficient by avoiding dense full-context attention, and it reduces KV-cache memory by letting the cross-decoder layers reuse a single shared cache. Our method preserves these benefits com-pletely, because it only changes how the shared cache is read by the cross-attention modules in the 4Table 2: Main downstream benchmark results for the 4B Transformer baseline, dense YOCO, and YOCO with cross-sparse attention. YOCO (CLSA) maintains the overall capability profile of the dense baselines while improving ARC-Challenge (ARC-C), GSM8K, and DROP, and matching the best HumanEval score.                                 
+
+> Model ARC-C BBH GSM8K HellaSwag HumanEval MMLU DROP WinoGrande
+> Transformer 0.453 0.420 0.434 0.667 0.384 0.527 0.366 0.638
+> YOCO (Dense) 0.461 0.411 0.430 0.676 0.396 0.519 0.387 0.630 YOCO (CLSA) 0.465 0.418 0.470 0.674 0.396 0.513 0.391 0.616
+
+cross-decoder. The two components are complementary: YOCO addresses pre-filling and KV-cache storage, while cross-sparse attention addresses decoding. Together they cover nearly all major bot-tlenecks in LLM inference, yielding a unified design that is efficient in pre-filling, memory footprint, and long-context generation. 
+
+Complexity comparison with other architectures. Table 1 highlights why improving only one component is insufficient for long-context inference. Pure dynamic sparse attention [22] reduces the number of tokens read by each attention layer, but it still maintains a layer-wise KV cache of size O(LN D ) and therefore does not address the memory bottleneck. Its decoding cost can also be dominated by the indexer term ηLN , because token selection must be performed over the full cache and repeated across layers. Hybrid architectures [33, 32, 11] reduce part of the attention cost by mixing efficient-attention layers with global retrieval layers, but their gains are constrained by the hybrid ratio γ. In contrast, CLSA combines KV sharing with a shared routing index, reducing cache storage through YOCO-style memory sharing while paying the expensive indexer cost only once across the cross-decoder stack. 
+
+## 3 Experiments 
+
+3.1 Setup Model configuration We compare a Transformer baseline, a dense YOCO model, and YOCO with cross-sparse attention, all at the 4B scale. The baseline uses RoPE with base =500 ,000 , and both YOCO variants use RNoPE [34], where RoPE [25] is activated in SWA with base =10 ,000 and NoPE in global attention. Both YOCO variants use sliding window attention in the self-decoder with window size 512 . QK normalization is enabled in the Transformer and the self-decoder of YOCO. The maximal activated tokens in CLSA is 2048 . Across models we keep width and depth aligned with hidden size 2560 , 7680 FFN width, 32 layers, 20 heads and 4 KV heads, no weight tying. For the YOCO variants, the 32 layers are split into 16 self-decoder layers and 16 cross-decoder layers. The full field-by-field layout is in Section C. 
+
+Training hyper-parameters Dense pretraining runs in two stages. In dense stage 1 we use batches of 8M tokens per step, maximum sequence length 8192 , peak learning rate 3×10 −4 with minimum 
+
+3×10 −5, 2000 warmup iterations, and 125 ,000 optimizer updates. Dense stage 2 increases the context cap to 32 ,768 tokens, fixes the learning rate at 3×10 −5, and runs for 10 ,000 optimizer steps. Sparse adaptation also uses two stages on 32 ,768 -token sequences: sparse stage 1 likewise uses 8 M tokens per step, learning rate 3×10 −4 with the same minimum 3×10 −4, for 2500 steps, and sparse stage 2 continues for another 2500 steps at 3×10 −5. Further settings and stage-wise details are given in Section B. 
+
+Evaluation benchmarks We evaluate models with BBH [29] and MMLU [15] for heterogeneous knowledge and reasoning, DROP [7] and ARC-Challenge [4] for reading-style reasoning, Hel-laSwag [38] and WinoGrande [19] for commonsense multiple-choice completion, GSM8K [5] for grade-school math word problems, HumanEval [3] for Python function synthesis, and RULER [16] for long-context synthetic retrieval. 
+
+3.2 General Benchmark 
+
+Table 2 summarizes the main downstream results for the Transformer baseline, YOCO (Dense), and YOCO (CLSA). Overall, CLSA preserves the broad capability profile of the dense models while 5Table 3: RULER results at 16K and 32K context lengths. TRM denotes the standard Transformer. CLSA maintains strong single-needle retrieval performance and achieves the best average score at 32K, with gains mainly from the harder multi-needle settings. 
+
+Ctx Model Single Needle Multi Needle RULER Tasks Avg 
+
+S1 S2 S3 MK1 MK2 MK3 MQ MV QH QS CWE FWE 16K TRM 100.0 99.8 98.4 88.2 71.4 14.4 85.7 85.6 28.8 33.2 15.6 52.1 64.4 
+
+YOCO (Dense) 100.0 99.8 96.4 69.4 91.6 61.2 45.8 49.3 30.8 31.4 9.4 67.0 62.7 YOCO (CLSA) 100.0 100.0 98.4 70.4 92.4 58.4 53.0 47.2 31.2 32.7 9.8 61.6 62.9 32K TRM 100.0 98.8 83.4 57.0 38.8 0.8 45.6 42.6 21.2 20.2 1.8 43.8 46.2 YOCO (Dense) 100.0 90.2 74.8 53.2 84.0 43.6 27.0 29.0 30.6 30.6 4.6 60.3 52.3 YOCO (CLSA) 100.0 93.6 83.2 58.4 88.8 38.0 31.6 29.8 29.2 29.2 5.1 50.2 53.1 8192 16384 24576 32768        
+
+> Length
+> 1.8
+> 1.9
+> 2.0
+> Loss
+> Book
+> 8192 16384 24576 32768
+> Length
+> 1.08
+> 1.10
+> 1.12
+> 1.14
+> Loss
+> ArXiv
+> 8192 16384 24576 32768
+> Length
+> 0.570
+> 0.575
+> 0.580
+> 0.585
+> 0.590
+> Loss
+> StarCoder
+> YOCO (Dense) YOCO (CLSA)
+
+Figure 2: Long-context validation loss for dense and cross-sparse attention on Books, ArXiv, and StarCoder. The two curves track each other closely from 8K to 32K tokens. 
+
+improving performance on several tasks that require selective evidence aggregation. In particular, YOCO (CLSA) obtains the best scores on ARC-Challenge, GSM8K, and DROP, and matches the best HumanEval result. On BBH, MMLU, HellaSwag, and WinoGrande, its performance remains close to the dense baselines, indicating that sparsifying the global attention path does not introduce a systematic degradation of general reasoning or knowledge. More broadly, hybrid architectures may also yield quality gains by combining complementary modeling capabilities and by leveraging multiple positional-encoding configurations. 
+
+3.3 Long Context 
+
+Table 3 reports long-context results on RULER at 16K and 32K tokens. At 16K, the Transformer baseline achieves the best overall average, while CLSA remains competitive with dense attention and preserves near-perfect performance on the single-needle retrieval tasks. At 32K, where long-range interference becomes more pronounced, CLSA achieves the best average score among all models. The improvement is mainly driven by stronger robustness on the more difficult multi-needle settings, especially MK1 and MK2, while maintaining comparable performance on the single-needle tasks. As shown in Figure 2, beyond these synthetic retrieval benchmarks, we also measure language modeling quality on long validation slices from Books, ArXiv, and StarCoder at context lengths from 8K to 32K tokens. YOCO (Dense) and YOCO (CLSA) exhibit nearly overlapping cross-entropy loss across domains and lengths, indicating that CLSA is effectively lossless for long-context modeling. As context grows from 8K to 32K, CLSA follows the same loss trend as dense attention across all three domains. This indicates that CLSA preserves the same context-scaling behavior. 
+
+3.4 Inference Efficiency 
+
+We integrate CLSA into the open-source vLLM [18] inference stack by merging our implementation into its codebase, and we report end-to-end serving measurements from the resulting build. All numbers in this subsection are obtained on NVIDIA B200 GPUs. Figure 3 compares prefill and decode throughput across context lengths. The raw throughput values for the plotted prefill and decode panels, along with the overall end-to-end generation measure-68K 16K 32K 64K 128K 
+
+Context Length 
+
+1x 
+
+5x 
+
+20x 
+
+> Relative Speedup (x)
+> 2.04x
+> 2.78x
+> 6.29x
+> 11.68x
+> 20.35x
+
+Prefill 
+
+8K 16K 32K 64K 128K 
+
+Context Length 
+
+1x 
+
+5x 
+
+20x 
+
+> Relative Speedup (x)
+> 1.42x
+> 2.05x
+> 3.10x
+> 4.36x
+> 7.60x
+
+Decode 
+
+Transformer YOCO (Dense) YOCO (CLSA) Figure 3: Inference throughput relative to the Transformer for prefill and decode across different context lengths. Both YOCO variants substantially accelerate prefill, while CLSA provides the largest decoding gains and widens its advantage as the context grows. MLP 
+
+> Sparse Attn
+> Dense Attn
+> Amortized Top-k
+> Top-k
+> 10 −1
+> 10 0
+> Latency (ms)
+
+Figure 4: 128K latency analysis for different com-ponents. After amortizing routing, the amortized top-k becomes efficient. Without amortization, the unamortized top-k stage can be comparable to or even larger than dense attention. Transformer 
+
+> DSA
+> IndexCache
+> HySparse
+> CLSA
+> 0.0
+> 0.5
+> 1.0
+> 1.5
+> 2.0
+> 2.5
+> 3.0
+> Per-layer Latency (ms)
+> MLP
+> Attn
+> Top-k
+
+Figure 5: Per-layer latency comparison across representative sparse attention methods and dense baselines at 128K context. CLSA achieves the lowest latency by amortizing routing across cross-decoder layers. 
+
+ments, are listed in Section E. During prefill, both YOCO variants are substantially faster than the Transformer because the decoder architecture avoids quadratic full-context attention, and YOCO (CLSA) remains close to YOCO (Dense). The main benefit of cross-sparse attention appears during decoding, where CLSA is consistently faster than both baselines, and the margin grows with context length. At 128K context, CLSA achieves roughly 7.6× Transformer decode throughput and about 
+
+17 .1× overall throughput, showing that sparsifying the global path translates directly into practical generation speed. Figure 4 demonstrates that top-k routing is irregular and poorly matched to the wide, data-parallel execution that dense matrix multiplies exploit, so a standalone top-k pass at 128K context can take time comparable to substantial dense attention work despite involving far fewer arithmetic opera-tions. Sparse attention therefore only becomes practically faster when routing is amortized as in CLSA, where the same routing decision is reused across multiple layers so the one-off top-k cost is shared over the attention computations it replaces. Figure 5 further compares per-layer decode latency against representative sparse attention methods, including DSA [22], which performs independent token-level top-k every layer, IndexCache [1], which reuses the routing index across four layers, and HySparse [11], which mixes block-sparse layers with a fraction of dense layers. At 128K context, DSA is slower than the dense Transformer because the unamortized token top-k dominates per-layer cost. IndexCache and HySparse reduce this overhead but still pay substantial attention or routing costs. CLSA achieves the lowest per-layer latency by combining lightweight sparse attention with fully amortized routing across all cross-decoder layers. 70.0 0.1 0.2          
+
+> Latency (ms)
+> Transformer
+> YOCO (Dense)
+> YOCO (CLSA)
+> Sequence Length: 8K
+> 0.0 0.2 0.4 0.6
+> Latency (ms)
+> Sequence Length: 32K
+> 0.0 0.5 1.0 1.5 2.0
+> Latency (ms)
+> Sequence Length: 128K
+> MLP Attention Top-k
+
+Figure 6: Per-layer latency breakdown at 8K, 32K, and 128K context. For YOCO (Dense), the attention cost is averaged over SWA and dense attention layers. For YOCO (CLSA), the attention cost is averaged over SWA and CLSA layers, and the top-k cost is amortized across cross-decoder layers. At 128K context, the amortized top-k stage takes about 0.08 ms per layer. 
+
+Table 4: Attention coverage and cross-entropy loss under sparse selection across selected-token budgets. Larger budgets recover more dense attention mass. Importantly, sparse selection introduces negligible cross-entropy loss degradation. 2048 selected tokens provide a favorable trade-off across domains. 
+
+Attn. Coverage (% ↑) Cross-Entropy Loss ( ↓)Domain 512 1024 2048 4096 512 1024 2048 4096 Dense ∆2048 
+
+StarCoder 62.34 76.28 84.12 90.73 0.5789 0.5717 0.5699 0.5703 0.5703 −0.0004 Books 51.37 65.11 76.29 84.10 1.7720 1.7560 1.7500 1.7480 1.7446 +0.0054 ArXiv 55.77 67.73 80.67 89.55 1.1070 1.0900 1.0844 1.0837 1.0818 +0.0026 
+
+Figure 6 decomposes per-layer latency, and the corresponding numeric values are listed in Section D. For YOCO (Dense), the reported attention term averages the cost of SWA in the 16 self-decoder layers and dense full attention in the 16 cross-decoder layers. For YOCO (CLSA), it averages the same 16 SWA layers and the 16 CLSA layers. The top-k routing is executed once for the shared KV cache and its output is reused by the 16 cross-decoder layers. To make the stacked bars comparable across Transformer, YOCO (Dense), and YOCO (CLSA), Figure 6 reports all components after normalization by the full 32-layer model depth. Therefore, the plotted top-k term is the one-off routing cost divided by 32, while the architectural sharing occurs across the 16 cross-decoder layers. In a dense Transformer stack, attention grows into the dominant term as sequences lengthen, whereas in CLSA the sparse attention kernel itself stays comparatively light. Yet lower theoretical FLOPs do not automatically translate into wall-clock speedups on modern GPUs. 
+
+3.5 Attention Sparsity Analysis 
+
+Table 4 summarizes attention behavior on books, ArXiv, and StarCoder data. As we increase the number of activated tokens, sparse attention recovers a growing fraction of the dense attention mass. At a 1:16 activation ratio, which corresponds to 2048 selected tokens, the routed set already captures roughly 80% of the dense attention score, showing that a small active subset can approximate most of the global allocation. Second, matching full dense attention is not the same as matching language-modeling quality. Across Books, ArXiv, and StarCoder, sparse attention reaches dense-level quality, with loss dif-ferences around 0.006 or smaller. On StarCoder, the sparse curve even slightly improves over dense YOCO. This shows that selected-token sparse attention can preserve dense quality without recover-ing 100% of the attention mass. This analysis also clarifies the relationship among block sparse attention, token sparse attention, and shared routing. Block sparse attention gains efficiency from structured memory access, but it relies on a block-level inductive bias that is not well aligned with long-context retrieval. Nearby tokens may serve very different semantic roles and exhibit very different attention patterns, so a block can contain both irrelevant tokens and a few crucial ones. This makes it difficult for block sparsity to reach the same long-context quality as fine-grained selection. Token sparse attention avoids this 8bias by estimating saliency at token granularity, but recomputing token-level top-k independently in every layer is expensive. CLSA keeps the token-level routing index and shares it across layers. The validity of this sharing comes from the empirical similarity of cross-layer attention scores induced by the data distribution and shared KV memory, rather than from an imposed block structure, which helps preserve quality while amortizing routing cost. 
+
+## 4 Related Work 
+
+4.1 Sparse Attention 
+
+Training-aware approaches including NSA [37] and MoBA [23] integrate dynamic sparse at-tention directly into model training. A parallel line of post-training or training-free meth-ods [10, 28, 9, 30, 22] exploits similar sparsity patterns at inference time. These works generally reduce the quadratic cost of dense attention by adaptively selecting a subset of relevant tokens or blocks, thereby improving efficiency while retaining strong model quality. In contrast to these meth-ods, a central challenge in prior dynamic sparse attention methods is the efficiency-quality trade-off. Methods with stronger accuracy typically yield limited end-to-end speedup, while methods that achieve more aggressive acceleration often incur noticeable quality degradation. A second line of work exploits the observation that salient tokens tend to remain relatively stable across nearby transformer layers. Some methods use this property in a training-free manner, relying on heuristic cross-layer propagation of token importance patterns during inference [6, 14, 35, 8]. More recently, training-aware approaches such as HySparse [11] and IndexCache [1] explicitly learn cross-layer salient-token reuse, through post-training distillation or end-to-end training. These works provide evidence that cross-layer saliency reuse is often well aligned with the ground-truth attention patterns. However, this observation is largely established in conventional attention archi-tectures, where the resulting speedup is often limited in practice. In contrast, we incorporate this idea into YOCO architecture for improving decode efficiency, while the pre-filling and KV cache storage remain efficient. 
+
+4.2 Hybrid Architecture 
+
+A closely related line of work studies hybrid architectures that combine attention with more efficient sequence operators, such as Mamba [12], RetNet [26], and Gated DeltaNet [36]. In practice, hybrid models integrate these operators with softmax attention using carefully designed schedules [21, 20, 33, 32]. Overall, these works suggest that hybrid scheduling can improve efficiency without substantially harming model quality. A related line of work combines hybrid architectures with cross-layer KV cache sharing to further reduce memory cost. YOCO [27] introduces this design into the architectural level, allowing later layers to reuse KV states from earlier layers rather than maintaining fully independent caches. Sub-sequent works adopt closely related ideas in a range of model families, including CLA [2], Gemma 3n [31], and Phi-4-mini-Flash [24]. Collectively, these studies suggest that cross-layer KV reuse can substantially reduce cache memory with limited impact on model quality. However, these works primarily target prefill efficiency and KV cache memory reduction through cross-layer KV reuse, whereas our focus is on improving decoding efficiency in which dense layers identify informative context and subsequent sparse layers reuse that information in a structured manner. 
+
+## 5 Conclusion 
+
+We presented cross-layer sparse attention for KV-sharing architectures that extends sharing from memory to routing. By reusing one shared routing index across cross-decoder layers, CLSA pre-serves the fine-grained selectivity of token sparse attention while amortizing the practical cost of top-k routing. This yields an architecture that jointly improves the three major inference bottlenecks in long-context LLMs, namely pre-filling, KV-cache storage, and decoding. Empirically, CLSA re-mains nearly lossless across short-context and long-context evaluations while delivering substantial end-to-end acceleration, including up to 7.6× decode speedup and 17 .1× overall throughput im-provement at 128K context. We hope this result provides a more complete architectural direction for long-context LLMs that better reconciles model quality and inference efficiency. 9References 
+
+[1] Y. Bai, Q. Dong, T. Jiang, X. Lv, Z. Du, A. Zeng, J. Tang, and J. Li. Indexcache: Accelerating sparse attention via cross-layer index reuse. arXiv preprint arXiv:2603.12201 , 2026. [2] W. Brandon, M. Mishra, A. Nrusimha, R. Panda, and J. Ragan-Kelley. Reducing transformer key-value cache size with cross-layer attention. Advances in Neural Information Processing Systems , 37:86927–86957, 2024. [3] M. Chen, J. Tworek, H. Jun, Q. Yuan, H. P. D. O. Pinto, J. Kaplan, H. Edwards, Y. Burda, N. Joseph, G. Brockman, et al. Evaluating large language models trained on code. arXiv preprint arXiv:2107.03374 , 2021. [4] P. Clark, I. Cowhey, O. Etzioni, T. Khot, A. Sabharwal, C. Schoenick, and O. Tafjord. Think you have solved question answering? try arc, the ai2 reasoning challenge. arXiv preprint arXiv:1803.05457 , 2018. [5] K. Cobbe, V. Kosaraju, M. Bavarian, M. Chen, H. Jun, L. Kaiser, M. Plappert, J. Tworek, J. Hilton, R. Nakano, et al. Training verifiers to solve math word problems. arXiv preprint arXiv:2110.14168 , 2021. [6] D. Deshmukh, S. Goyal, N. Kwatra, and R. Ramjee. Kascade: A practical sparse attention method for long-context llm inference. arXiv preprint arXiv:2512.16391 , 2025. [7] D. Dua, Y. Wang, P. Dasigi, G. Stanovsky, S. Singh, and M. Gardner. Drop: A reading compre-hension benchmark requiring discrete reasoning over paragraphs. In Proceedings of the 2019 Conference of the North American Chapter of the Association for Computational Linguistics: Human Language Technologies, Volume 1 (Long and Short Papers) , pages 2368–2378, 2019. [8] H. Entezari Zarch, L. Gao, C. Jiang, and M. Annavaram. Delta: Dynamic layer-aware token attention for efficient long-context reasoning. arXiv preprint arXiv:2510.09883 , 2025. [9] Y. Gao, Z. Zeng, D. Du, S. Cao, P. Zhou, J. Qi, J. Lai, H. K.-H. So, T. Cao, F. Yang, et al. Seer-attention: Learning intrinsic sparse attention in your llms. arXiv preprint arXiv:2410.13276 ,2024. [10] Y. Gao, S. Guo, S. Cao, Y. Xia, Y. Cheng, L. Wang, L. Ma, Y. Sun, T. Ye, L. Dong, H. K.-H. So, Y. Hua, T. Cao, F. Yang, and M. Yang. Seerattention-r: Sparse attention adaptation for long reasoning, 2025. URL https://arxiv.org/abs/2506.08889 .[11] Y. Gao, J. Wei, Q. Zhang, Y. Cheng, S. Chen, Z. Tang, Z. Jiang, Y. Song, H. Zhang, L. Zhao, et al. Hysparse: A hybrid sparse attention architecture with oracle token selection and kv cache sharing. arXiv preprint arXiv:2602.03560 , 2026. [12] A. Gu and T. Dao. Mamba: Linear-time sequence modeling with selective state spaces. arXiv preprint arXiv:2312.00752 , 2023. [13] D. Guo, D. Yang, H. Zhang, J. Song, R. Zhang, R. Xu, Q. Zhu, S. Ma, P. Wang, X. Bi, et al. Deepseek-r1: Incentivizing reasoning capability in llms via reinforcement learning. arXiv preprint arXiv:2501.12948 , 2025. [14] J. Hao, Y. Zhu, T. Wang, J. Yu, X. Xin, B. Zheng, Z. Ren, and S. Guo. Omnikv: Dynamic context selection for efficient long-context llms. In The Thirteenth International Conference on Learning Representations , 2025. [15] D. Hendrycks, C. Burns, S. Basart, A. Zou, M. Mazeika, D. Song, and J. Steinhardt. Measuring massive multitask language understanding. arXiv preprint arXiv:2009.03300 , 2020. [16] C.-P. Hsieh, S. Sun, S. Kriman, S. Acharya, D. Rekesh, F. Jia, Y. Zhang, and B. Ginsburg. Ruler: What’s the real context size of your long-context language models? arXiv preprint arXiv:2404.06654 , 2024. [17] A. Jaech, A. Kalai, A. Lerer, A. Richardson, A. El-Kishky, A. Low, A. Helyar, A. Madry, A. Beutel, A. Carney, et al. Openai o1 system card. arXiv preprint arXiv:2412.16720 , 2024. 10 [18] W. Kwon, Z. Li, S. Zhuang, Y. Sheng, L. Zheng, C. H. Yu, J. Gonzalez, H. Zhang, and I. Sto-ica. Efficient memory management for large language model serving with pagedattention. In 
+
+Proceedings of the 29th symposium on operating systems principles , pages 611–626, 2023. [19] H. Levesque, E. Davis, and L. Morgenstern. The winograd schema challenge. In Proceedings of KR , 2012. URL https://dl.acm.org/doi/10.5555/3031843.3031909 .[20] A. Li, B. Gong, B. Yang, B. Shan, C. Liu, C. Zhu, C. Zhang, C. Guo, D. Chen, D. Li, et al. Minimax-01: Scaling foundation models with lightning attention. arXiv preprint arXiv:2501.08313 , 2025. [21] O. Lieber, B. Lenz, H. Bata, G. Cohen, J. Osin, I. Dalmedigos, E. Safahi, S. Meirom, Y. Belinkov, S. Shalev-Shwartz, O. Abend, R. Alon, T. Asida, A. Bergman, R. Glozman, M. Gokhman, A. Manevich, N. Ratner, N. Rozen, E. Shwartz, M. Zusman, and Y. Shoham. Jamba: A hybrid Transformer-Mamba language model. CoRR , abs/2403.19887, 2024. [22] A. Liu, A. Mei, B. Lin, B. Xue, B. Wang, B. Xu, B. Wu, B. Zhang, C. Lin, C. Dong, et al. Deepseek-v3. 2: Pushing the frontier of open large language models. arXiv preprint arXiv:2512.02556 , 2025. [23] E. Lu, Z. Jiang, J. Liu, Y. Du, T. Jiang, C. Hong, S. Liu, W. He, E. Yuan, Y. Wang, Z. Huang, H. Yuan, S. Xu, X. Xu, G. Lai, Y. Chen, H. Zheng, J. Yan, J. Su, Y. Wu, N. Y. Zhang, Z. Yang, X. Zhou, M. Zhang, and J. Qiu. Moba: Mixture of block attention for long-context llms, 2025. URL https://arxiv.org/abs/2502.13189 .[24] L. Ren, C. Chen, H. Xu, Y. J. Kim, A. Atkinson, Z. Zhan, J. Sun, B. Peng, L. Liu, S. Wang, et al. Decoder-hybrid-decoder architecture for efficient reasoning with long generation. arXiv preprint arXiv:2507.06607 , 2025. [25] J. Su, M. Ahmed, Y. Lu, S. Pan, W. Bo, and Y. Liu. Roformer: Enhanced transformer with rotary position embedding. Neurocomputing , 568:127063, 2024. [26] Y. Sun, L. Dong, S. Huang, S. Ma, Y. Xia, J. Xue, J. Wang, and F. Wei. Retentive network: A successor to transformer for large language models. arXiv preprint arXiv:2307.08621 , 2023. [27] Y. Sun, L. Dong, Y. Zhu, S. Huang, W. Wang, S. Ma, Q. Zhang, J. Wang, and F. Wei. You only cache once: Decoder-decoder architectures for language models, 2024. URL https: //arxiv.org/abs/2405.05254 .[28] Y. Sun, T. Ye, L. Dong, Y. Xia, J. Chen, Y. Gao, S. Cao, J. Wang, and F. Wei. Rectified sparse attention. arXiv preprint arXiv:2506.04108 , 2025. [29] M. Suzgun, N. Scales, N. Schärli, S. Gehrmann, Y. Tay, H. W. Chung, A. Chowdhery, Q. Le, E. Chi, D. Zhou, et al. Challenging big-bench tasks and whether chain-of-thought can solve them. In Findings of the Association for Computational Linguistics: ACL 2023 , pages 13003– 13051, 2023. [30] J. Tang, Y. Zhao, K. Zhu, G. Xiao, B. Kasikci, and S. Han. Quest: Query-aware sparsity for efficient long-context llm inference, 2024. URL https://arxiv.org/abs/2406.10774 .[31] G. Team, A. Kamath, J. Ferret, S. Pathak, N. Vieillard, R. Merhej, S. Perrin, T. Matejovi-cova, A. Ramé, M. Rivière, L. Rouillard, T. Mesnard, G. Cideron, J. bastien Grill, S. Ramos, E. Yvinec, M. Casbon, E. Pot, I. Penchev, G. Liu, F. Visin, K. Kenealy, L. Beyer, X. Zhai, A. Tsitsulin, R. Busa-Fekete, A. Feng, N. Sachdeva, B. Coleman, Y. Gao, B. Mustafa, I. Barr, E. Parisotto, D. Tian, M. Eyal, C. Cherry, J.-T. Peter, D. Sinopalnikov, S. Bhupatiraju, R. Agar-wal, M. Kazemi, D. Malkin, R. Kumar, D. Vilar, I. Brusilovsky, J. Luo, A. Steiner, A. Friesen, A. Sharma, A. Sharma, A. M. Gilady, A. Goedeckemeyer, A. Saade, A. Feng, A. Kolesnikov, A. Bendebury, A. Abdagic, A. Vadi, A. György, A. S. Pinto, A. Das, A. Bapna, A. Miech, A. Yang, A. Paterson, A. Shenoy, A. Chakrabarti, B. Piot, B. Wu, B. Shahriari, B. Petrini, C. Chen, C. L. Lan, C. A. Choquette-Choo, C. Carey, C. Brick, D. Deutsch, D. Eisen-bud, D. Cattle, D. Cheng, D. Paparas, D. S. Sreepathihalli, D. Reid, D. Tran, D. Zelle, E. Noland, E. Huizenga, E. Kharitonov, F. Liu, G. Amirkhanyan, G. Cameron, H. Hashemi, 11 H. Klimczak-Pluci´ nska, H. Singh, H. Mehta, H. T. Lehri, H. Hazimeh, I. Ballantyne, I. Szpek-tor, I. Nardini, J. Pouget-Abadie, J. Chan, J. Stanton, J. Wieting, J. Lai, J. Orbay, J. Fernandez, J. Newlan, J. yeong Ji, J. Singh, K. Black, K. Yu, K. Hui, K. Vodrahalli, K. Greff, L. Qiu, M. Valentine, M. Coelho, M. Ritter, M. Hoffman, M. Watson, M. Chaturvedi, M. Moyni-han, M. Ma, N. Babar, N. Noy, N. Byrd, N. Roy, N. Momchev, N. Chauhan, N. Sachdeva, O. Bunyan, P. Botarda, P. Caron, P. K. Rubenstein, P. Culliton, P. Schmid, P. G. Sessa, P. Xu, P. Stanczyk, P. Tafti, R. Shivanna, R. Wu, R. Pan, R. Rokni, R. Willoughby, R. Vallu, R. Mullins, S. Jerome, S. Smoot, S. Girgin, S. Iqbal, S. Reddy, S. Sheth, S. Põder, S. Bhat-nagar, S. R. Panyam, S. Eiger, S. Zhang, T. Liu, T. Yacovone, T. Liechty, U. Kalra, U. Evci, V. Misra, V. Roseberry, V. Feinberg, V. Kolesnikov, W. Han, W. Kwon, X. Chen, Y. Chow, Y. Zhu, Z. Wei, Z. Egyed, V. Cotruta, M. Giang, P. Kirk, A. Rao, K. Black, N. Babar, J. Lo, E. Moreira, L. G. Martins, O. Sanseviero, L. Gonzalez, Z. Gleicher, T. Warkentin, V. Mir-rokni, E. Senter, E. Collins, J. Barral, Z. Ghahramani, R. Hadsell, Y. Matias, D. Sculley, S. Petrov, N. Fiedel, N. Shazeer, O. Vinyals, J. Dean, D. Hassabis, K. Kavukcuoglu, C. Farabet, E. Buchatskaya, J.-B. Alayrac, R. Anil, Dmitry, Lepikhin, S. Borgeaud, O. Bachem, A. Joulin, A. Andreev, C. Hardin, R. Dadashi, and L. Hussenot. Gemma 3 technical report, 2025. URL 
+
+https://arxiv.org/abs/2503.19786 .[32] K. Team, Y. Zhang, Z. Lin, X. Yao, J. Hu, F. Meng, C. Liu, X. Men, S. Yang, Z. Li, et al. Kimi linear: An expressive, efficient attention architecture. arXiv preprint arXiv:2510.26692 , 2025. [33] A. Yang, A. Li, B. Yang, B. Zhang, B. Hui, B. Zheng, B. Yu, C. Gao, C. Huang, C. Lv, et al. Qwen3 technical report. arXiv preprint arXiv:2505.09388 , 2025. [34] B. Yang, B. Venkitesh, D. Talupuru, H. Lin, D. Cairuz, P. Blunsom, and A. Locatelli. Rope to nope and back again: A new hybrid attention strategy. arXiv preprint arXiv:2501.18795 , 2025. [35] L. Yang, Z. Zhang, Z. Chen, Z. Li, and Z. Jia. Tidaldecode: Fast and accurate llm decoding with position persistent sparse attention. arXiv preprint arXiv:2410.05076 , 2024. [36] S. Yang, J. Kautz, and A. Hatamizadeh. Gated delta networks: Improving mamba2 with delta rule. arXiv preprint arXiv:2412.06464 , 2024. [37] J. Yuan, H. Gao, D. Dai, J. Luo, L. Zhao, Z. Zhang, Z. Xie, Y. X. Wei, L. Wang, Z. Xiao, Y. Wang, C. Ruan, M. Zhang, W. Liang, and W. Zeng. Native sparse attention: Hardware-aligned and natively trainable sparse attention, 2025. URL https://arxiv.org/abs/2502. 11089 .[38] R. Zellers, A. Holtzman, Y. Bisk, A. Farhadi, and Y. Choi. Hellaswag: Can a machine really finish your sentence? In Proceedings of ACL , 2019. URL https://aclanthology.org/ P19-1472/ .12 A Dense-Stage Training Curves 
+
+Figure 7 shows the dense-stage training curves on representative benchmarks. YOCO remains com-petitive with the Transformer throughout training. Since CLSA is coupled with the YOCO backbone, these curves also serve as a sanity check that YOCO provides a strong dense attention starting point, including on retrieval-style tasks such as DROP. This makes it possible to start from a good dense model and obtain our final model through a near-lossless sparse-attention adaptation, rather than relying on a substantially different pretraining recipe. 200 400 600 800 1000          
+
+> Training Tokens (B)
+> 0.20
+> 0.25
+> 0.30
+> 0.35
+> 0.40
+> Accuracy
+> Humaneval
+> 200 400 600 800 1000
+> Training Tokens (B)
+> 0.20
+> 0.25
+> 0.30
+> 0.35
+> DROP
+> 200 400 600 800 1000
+> Training Tokens (B)
+> 0.55
+> 0.60
+> 0.65
+> Hellaswag
+> Transformer YOCO
+
+Figure 7: Dense-stage training curves on HumanEval, DROP, and HellaSwag as a function of training tokens. YOCO remains competitive with the Transformer throughout training, supporting its use as a stable dense backbone before sparse adaptation. 
+
+## B Training Hyper-parameters 
+
+This appendix provides the exact optimization settings used for dense pretraining and sparse adap-tation. Dense pretraining follows a two-stage schedule: stage 1 trains with a peak learning rate of 
+
+3×10 −4 using 2000 warmup iterations on 8K contexts, and stage 2 increases the context cap to 32,768 while switching to a fixed learning rate of 3×10 −5 for the remaining 10,000 updates. Sparse adaptation then reuses the same training recipe on 32,768-token sequences: stage 1 keeps the batch size and peak learning rate from dense stage 1, and uses the warmup iterations listed below; stage 2 continues for another 2,500 updates at the smaller fixed learning rate. For completeness, we also include the shared optimizer settings (Adam betas, epsilon, and weight decay), which are applied across all stages unless explicitly overridden. 
+
+Table 5: Stage-wise training hyperparameters for dense pretraining and sparse adaptation. 
+
+Dense Stage 1 Dense Stage 2 Sparse Stage 1 Sparse Stage 2 
+
+Learning rate 3×10 −4 3×10 −5 3×10 −4 3×10 −5
+
+Minimum LR 3×10 −5 3×10 −5 3×10 −4 3×10 −5
+
+Max sequence length 8192 32768 32768 32768 
+
+Warmup iterations 2000 0 500 0Training steps 125000 10000 2500 2500 
+
+Table 6: Shared optimization settings across all training stages. 
+
+Hyper-parameter Value 
+
+Batch size 8M Adam β (0.9, 0.95 )Adam ε 10 −8
+
+Weight decay 0.1
+
+## C Model Configuration 
+
+Tables 7 and 8 list the architectural hyperparameters for all evaluated variants. Across models we keep the same overall width and depth, and (for the YOCO-based models) split the 32 layers into 16 13 self-decoder layers and 16 cross-decoder layers. The key practical difference lies in how positional information is handled: the Transformer applies RoPE throughout, while YOCO (CLSA) uses an RNoPE setting that restricts RoPE to the sliding-window self-decoder and removes positional en-coding from the global cross-decoder attention path. We additionally enable QK normalization and use GQA in all models, as summarized in the table. 
+
+Table 7: Shared architectural hyperparameters across all evaluated models. 
+
+Hyperparameter Value 
+
+Hidden size 2560 
+
+FFN width 7680 
+
+Layers 32 
+
+Heads 20 
+
+KV heads 4
+
+Head dimension 128 
+
+QK Norm enabled Weight tying disabled 
+
+Table 8: Key architectural differences among the Transformer baseline, YOCO (Dense), and YOCO (CLSA), including positional encoding and attention type. 
+
+Transformer YOCO (Dense) YOCO (CLSA) 
+
+Positional encoding RoPE RNoPE RNoPE RoPE base 5 × 10 5 1 × 10 4 1 × 10 4
+
+Attention type GQA GQA GQA+CLSA 
+
+## D Experimental Details of Latency Breakdown 
+
+This section lists the per-layer latency values used in Figure 6. The table reports the plotted values in milliseconds after the script’s scaling and per-layer averaging. For YOCO (Dense), the reported attention term averages SWA in the 16 self-decoder layers and dense full attention in the 16 cross-decoder layers. For YOCO (CLSA), it averages the same 16 SWA layers and 16 CLSA layers. The top-k term is the amortized per-layer routing cost, obtained by dividing the one-off routing latency by the full 32-layer model depth to match the normalization used in the plot. The routing decision itself is shared by the 16 cross-decoder layers, and the unamortized one-off 128K top-k cost is shown separately in Figure 4. 
+
+Table 9: Per-layer latency breakdown (ms) used in Figure 6. For the YOCO variants, attention terms are averaged across layer types, and the top-k column reports the amortized per-layer routing cost for YOCO (CLSA). 
+
+Context Model MLP Dense Attn. Sparse Attn. Top-k Total 
+
+8K Transformer 0.11 0.14 – – 0.25 8K YOCO (Dense) 0.11 0.07 – – 0.18 8K YOCO (CLSA) 0.11 – 0.03 0.01 0.15 32K Transformer 0.13 0.50 – – 0.63 32K YOCO (Dense) 0.13 0.24 – – 0.37 32K YOCO (CLSA) 0.13 – 0.03 0.02 0.18 128K Transformer 0.17 2.11 – – 2.28 128K YOCO (Dense) 0.17 0.87 – – 1.04 128K YOCO (CLSA) 0.17 – 0.05 0.08 0.31 
+
+## E Experimental Details of Inference Throughput 
+
+This section lists the raw throughput measurements used to produce the plotted panels of Figure 3, and also reports overall end-to-end generation throughput for the same setup. In the main paper 14 we plot throughput ratios relative to the Transformer; the absolute tokens/s values reported here correspond to the same measurements for prefill, decode, and overall end-to-end generation (all evaluated on NVIDIA B200 GPUs). 
+
+Table 10: Raw prefill throughput (tokens/s) used in the left panel of Figure 3. 
+
+Context Length Transformer YOCO (Dense) YOCO (CLSA) 
+
+8K 4721.71 10884.35 9623.48 16K 4160.92 13033.56 11572.40 32K 2889.39 18450.18 18163.24 64K 1741.56 20343.94 20349.11 128K 1019.06 20864.85 20741.51 
+
+Table 11: Raw decode throughput (tokens/s) used in the right panel of Figure 3. 
+
+Context Length Transformer YOCO (Dense) YOCO (CLSA) 
+
+8K 4762.79 5516.50 6742.39 16K 3091.32 4147.85 6350.39 32K 1761.72 2677.12 5461.33 64K 948.15 1600.00 4137.37 128K 431.16 960.94 3276.80 
+
+Table 12: Raw overall throughput (tokens/s) measured under the same setup as Figure 3. 
+
+Context Length Transformer YOCO (Dense) YOCO (CLSA) 
+
+8K 2989.78 4311.58 4920.12 16K 1449.91 2904.96 3715.19 32K 570.27 1832.66 2805.48 64K 191.36 1042.90 1735.59 128K 62.53 599.05 1068.06 
+
+15
