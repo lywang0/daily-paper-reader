@@ -6,45 +6,31 @@
 </div>
 
 ## 每次日报
-- 最新运行日期：2026-06-05
-- 运行时间：2026-06-05 21:48:48 UTC
+- 最新运行日期：2026-06-06
+- 运行时间：2026-06-06 20:26:51 UTC
 - 运行状态：成功
-- 本次总论文数：7
-- 精读区：3
-- 速读区：4
+- 本次总论文数：3
+- 精读区：1
+- 速读区：2
 
 ### 今日简报（AI）
-今日日报精选7篇论文，聚焦LLM推理效率与边缘部署创新，涵盖异构算子映射、SLO感知调度及网络感知选择三大方向。
-
-最值得关注的是《BIDENT》和《Beyond Greedy Chunking》，前者提出异构算子级映射提升边缘推理效率，后者以滑动窗口调度突破LLM推理的贪心分块瓶颈，均获8.0高分。
-
-建议读者优先精读这两篇，并结合速读中的《NetKV》和《RH+》，深入理解多维度优化如何协同提升大模型部署性能。
-- 详情：[/202606/05/README](/202606/05/README)
+今日精读1篇可微分混合精度分配论文，并速读2篇RAG缓存优化与KV缓存淘汰相关研究。  
+重点关注低精度浮点格式的自动混合精度分配方法（dMX），以及查询感知的RAG缓存融合技术（QCFuse）。  
+建议读者关注低精度训练与推理的自动化工具，并在RAG系统中尝试结合查询特性优化缓存策略。
+- 详情：[/202606/06/README](/202606/06/README)
 
 ### 精读区论文标签
-1. [BIDENT: Heterogeneous Operator-level Mapping for Efficient Edge Inference](/202606/05/2606.05271v1-bident-heterogeneous-operator-level-mapping-for-efficient-edge-inference)  
+1. [dMX: Differentiable Mixed-Precision Assignment for Low-Precision Floating-Point Formats](/202606/06/2606.04115v1-dmx-differentiable-mixed-precision-assignment-for-low-precision-floating-point-formats)  
    标签：评分：8.0/10、query:edge-llm
-   evidence：异构算子映射用于边缘推理
-2. [Beyond Greedy Chunking: SLO-Aware Sliding-Window Scheduling for LLM Inference](/202606/05/2606.05933v1-beyond-greedy-chunking-slo-aware-sliding-window-scheduling-for-llm-inference)  
-   标签：评分：8.0/10、query:edge-llm
-   evidence：基于SLO感知的LLM推理服务调度
-3. [RedKnot: Efficient Long-Context LLM Serving with Head-Aware KV Reuse and SegPagedAttention](/202606/05/2606.06256v1-redknot-efficient-long-context-llm-serving-with-head-aware-kv-reuse-and-segpagedattention)  
-   标签：评分：8.0/10、query:edge-llm
-   evidence：高效的长上下文LLM服务系统
+   evidence：面向LLM的可微混合精度量化框架，支持可学习的比特宽度分配，契合软硬协同设计
 
 ### 速读区论文标签
-1. [NetKV: Network-Aware Decode Instance Selection for Disaggregated LLM Inference](/202606/05/2606.03910v1-netkv-network-aware-decode-instance-selection-for-disaggregated-llm-inference)  
+1. [QCFuse: Query-Aware Cache Fusion via Compressed View for Efficient RAG Serving](/202606/06/2606.05875v1-qcfuse-query-aware-cache-fusion-via-compressed-view-for-efficient-rag-serving)  
    标签：评分：7.0/10、query:edge-llm
-   evidence：面向解耦LLM推理服务的网络感知调度
-2. [RH+: Row-Hit-Optimized Scheduling for PIM-based LLM Inference](/202606/05/2606.05511v1-rh-row-hit-optimized-scheduling-for-pim-based-llm-inference)  
-   标签：评分：7.0/10、query:edge-llm
-   evidence：针对PIM架构LLM推理的行命中优化调度
-3. [You Only Index Once: Cross-Layer Sparse Attention with Shared Routing](/202606/05/2606.06467v1-you-only-index-once-cross-layer-sparse-attention-with-shared-routing)  
-   标签：评分：7.0/10、query:edge-llm
-   evidence：跨层稀疏注意力提升LLM推理效率
-4. [Minimizing the Hidden Cost of Scales: Graph-Guided Ultra-Low-Bit Quantization for Large Language Models](/202606/05/2606.05429v1-minimizing-the-hidden-cost-of-scales-graph-guided-ultra-low-bit-quantization-for-large-language-models)  
+   evidence：查询感知的缓存融合方法，降低RAG服务中的预填充开销
+2. [Value-Aware Stochastic KV Cache Eviction for Reasoning Models](/202606/06/2606.03928v1-value-aware-stochastic-kv-cache-eviction-for-reasoning-models)  
    标签：评分：6.0/10、query:edge-llm
-   evidence：超低位量化降低边缘计算开销
+   evidence：面向内存高效LLM推理的KV缓存驱逐方法
 
 
 <div class="dpr-home-promo-card">
