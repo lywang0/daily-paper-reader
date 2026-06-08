@@ -6,29 +6,46 @@
 </div>
 
 ## 每次日报
-- 最新运行日期：2026-06-07
-- 运行时间：2026-06-07 20:56:41 UTC
+- 最新运行日期：2026-06-08
+- 运行时间：2026-06-08 21:47:14 UTC
 - 运行状态：成功
-- 本次总论文数：3
-- 精读区：1
-- 速读区：2
+- 本次总论文数：8
+- 精读区：2
+- 速读区：6
 
 ### 今日简报（AI）
-今日精读1篇FlexNPU实现透明NPU虚拟化以动态共置LLM的预填充与解码，速读2篇涉及LLM压缩粒度及硬件感知稀疏训练。最值得关注FlexNPU（9.0分）对推理效率优化的突破性思路。建议普通读者优先精读FlexNPU，理解NPU虚拟化如何提升LLM部署灵活性。
-- 详情：[/202606/07/README](/202606/07/README)
+今日聚焦LLM内部几何保持蒸馏与预测调度缓解阻塞，两篇高分精读揭示核心突破。  
+最值得看《Beyond Output Matching》证明保留中间层几何结构优于纯输出匹配，《Clairvoyant》提出预测式SJF调度有效克服串行LLM后端头阻塞问题。  
+建议普通读者优先关注速读中的OffQ和SigmaScale——结构化异常值偏移与SVD低秩分解，在量化压缩场景最具实操价值。
+- 详情：[/202606/08/README](/202606/08/README)
 
 ### 精读区论文标签
-1. [FlexNPU: Transparent NPU Virtualization for Dynamic LLM Prefill-Decode Co-location](/202606/07/2606.04415v1-flexnpu-transparent-npu-virtualization-for-dynamic-llm-prefill-decode-co-location)  
-   标签：评分：9.0/10、query:edge-llm
-   evidence：NPU虚拟化，硬件感知的LLM推理优化
+1. [Beyond Output Matching: Preserving Internal Geometry in NVFP4 LLM Distillation](/202606/08/2606.05682v2-beyond-output-matching-preserving-internal-geometry-in-nvfp4-llm-distillation)  
+   标签：评分：8.0/10、query:edge-llm
+   evidence：基于NVFP4的低精度推理，硬件感知蒸馏
+2. [Clairvoyant: Predictive SJF Scheduling to Mitigate Head-of-Line Blocking in Serial LLM Backends](/202606/08/2606.07248v1-clairvoyant-predictive-sjf-scheduling-to-mitigate-head-of-line-blocking-in-serial-llm-backends)  
+   标签：评分：8.0/10、query:edge-llm
+   evidence：为边缘设备上的串行LLM后端提供预测调度
 
 ### 速读区论文标签
-1. [From Layers to Submodules: Rethinking Granularity in Replacement-Based LLM Compression](/202606/07/2606.02559v1-from-layers-to-submodules-rethinking-granularity-in-replacement-based-llm-compression)  
+1. [Skip a Layer or Loop It? Learning Program-of-Layers in LLMs](/202606/08/2606.06574v1-skip-a-layer-or-loop-it-learning-program-of-layers-in-llms)  
    标签：评分：7.0/10、query:edge-llm
-   evidence：LLM压缩减少资源占用，可用于边缘
-2. [HASTE: Hardware-Aware Dynamic Sparse Training for Large Output Spaces](/202606/07/2606.01117v1-haste-hardware-aware-dynamic-sparse-training-for-large-output-spaces)  
+   evidence：动态层跳过实现高效LLM推理
+2. [SigmaScale: LLM Compression with SVD-based Low-Rank Decomposition and Learned Scaling Matrices](/202606/08/2606.07098v1-sigmascale-llm-compression-with-svd-based-low-rank-decomposition-and-learned-scaling-matrices)  
+   标签：评分：7.0/10、query:edge-llm
+   evidence：基于SVD的LLM压缩用于资源高效推理
+3. [OffQ: Taming Structured Outliers in LLM Quantization by Offsetting](/202606/08/2606.07116v1-offq-taming-structured-outliers-in-llm-quantization-by-offsetting)  
+   标签：评分：7.0/10、query:edge-llm
+   evidence：低比特量化加速LLM推理
+4. [Toward Multi-Domain and Long-Tailed Quantization via Feature Alignment and Scaling](/202606/08/2606.04920v1-toward-multi-domain-and-long-tailed-quantization-via-feature-alignment-and-scaling)  
    标签：评分：6.0/10、query:edge-llm
-   evidence：硬件感知的稀疏训练，可提升推理效率
+   evidence：面向资源受限设备的多域量化方法，可迁移至LLM模型
+5. [Depth-Attention: Cross-Layer Value Mixing for Language Models](/202606/08/2606.05014v1-depth-attention-cross-layer-value-mixing-for-language-models)  
+   标签：评分：6.0/10、query:edge-llm
+   evidence：跨层值混合提升语言模型推理效率
+6. [Tangram: Unlocking Non-Uniform KV Cache for Efficient Multi-turn LLM Serving](/202606/08/2606.06302v1-tangram-unlocking-non-uniform-kv-cache-for-efficient-multi-turn-llm-serving)  
+   标签：评分：6.0/10、query:edge-llm
+   evidence：针对非均匀KV缓存的服务系统，提升多轮LLM效率
 
 
 <div class="dpr-home-promo-card">
