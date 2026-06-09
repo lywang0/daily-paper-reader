@@ -6,46 +6,49 @@
 </div>
 
 ## 每次日报
-- 最新运行日期：2026-06-08
-- 运行时间：2026-06-08 21:47:14 UTC
+- 最新运行日期：2026-06-09
+- 运行时间：2026-06-09 22:02:57 UTC
 - 运行状态：成功
-- 本次总论文数：8
-- 精读区：2
-- 速读区：6
+- 本次总论文数：9
+- 精读区：4
+- 速读区：5
 
 ### 今日简报（AI）
-今日聚焦LLM内部几何保持蒸馏与预测调度缓解阻塞，两篇高分精读揭示核心突破。  
-最值得看《Beyond Output Matching》证明保留中间层几何结构优于纯输出匹配，《Clairvoyant》提出预测式SJF调度有效克服串行LLM后端头阻塞问题。  
-建议普通读者优先关注速读中的OffQ和SigmaScale——结构化异常值偏移与SVD低秩分解，在量化压缩场景最具实操价值。
-- 详情：[/202606/08/README](/202606/08/README)
+1) 今日精选2篇精读与3篇速读，聚焦边缘LLM推理加速与安全蒸馏，以及长上下文优化新思路。  
+2) 最值得关注的是PALUTE通过查找表实现存内计算加速边缘LLM，以及Distilling Safe LLM Systems用软提示在设备端实现安全蒸馏。  
+3) 建议优先阅读精读论文，了解边缘部署中性能与安全的平衡；速读中的语义缓存和稀疏注意力可辅助优化长文本任务。
+- 详情：[/202606/09/README](/202606/09/README)
 
 ### 精读区论文标签
-1. [Beyond Output Matching: Preserving Internal Geometry in NVFP4 LLM Distillation](/202606/08/2606.05682v2-beyond-output-matching-preserving-internal-geometry-in-nvfp4-llm-distillation)  
+1. [PALUTE: Processing-In-Memory Acceleration via Lookup Table for Edge LLM Inference](/202606/09/2606.08891v1-palute-processing-in-memory-acceleration-via-lookup-table-for-edge-llm-inference)  
+   标签：评分：9.0/10、query:edge-llm
+   evidence：基于存内计算的查找表加速器，用于边缘LLM推理
+2. [Distilling Safe LLM Systems via Soft Prompts for On Device Settings](/202606/09/2606.09388v1-distilling-safe-llm-systems-via-soft-prompts-for-on-device-settings)  
+   标签：评分：9.0/10、query:edge-llm
+   evidence：通过蒸馏和软提示实现资源高效的设备端LLM安全
+3. [AgentCompile: An LLM-Guided Compiler for Direct CUDA Inference](/202606/09/2606.07665v1-agentcompile-an-llm-guided-compiler-for-direct-cuda-inference)  
    标签：评分：8.0/10、query:edge-llm
-   evidence：基于NVFP4的低精度推理，硬件感知蒸馏
-2. [Clairvoyant: Predictive SJF Scheduling to Mitigate Head-of-Line Blocking in Serial LLM Backends](/202606/08/2606.07248v1-clairvoyant-predictive-sjf-scheduling-to-mitigate-head-of-line-blocking-in-serial-llm-backends)  
+   evidence：面向硬件感知加速的LLM引导CUDA推理编译器
+4. [Beyond FLOPs: Benchmarking Real Inference Acceleration of LLM Pruning under a GEMM-Centric Taxonomy](/202606/09/2606.09080v1-beyond-flops-benchmarking-real-inference-acceleration-of-llm-pruning-under-a-gemm-centric-taxonomy)  
    标签：评分：8.0/10、query:edge-llm
-   evidence：为边缘设备上的串行LLM后端提供预测调度
+   evidence：硬件感知的LLM剪枝加速基准测试
 
 ### 速读区论文标签
-1. [Skip a Layer or Loop It? Learning Program-of-Layers in LLMs](/202606/08/2606.06574v1-skip-a-layer-or-loop-it-learning-program-of-layers-in-llms)  
+1. [Semantic Cache Distillation: Efficient State Transfer via Reuse and Selective Patching](/202606/09/2606.07684v1-semantic-cache-distillation-efficient-state-transfer-via-reuse-and-selective-patching)  
    标签：评分：7.0/10、query:edge-llm
-   evidence：动态层跳过实现高效LLM推理
-2. [SigmaScale: LLM Compression with SVD-based Low-Rank Decomposition and Learned Scaling Matrices](/202606/08/2606.07098v1-sigmascale-llm-compression-with-svd-based-low-rank-decomposition-and-learned-scaling-matrices)  
+   evidence：面向解耦服务的语义缓存蒸馏实现高效KV缓存传输
+2. [FlashMemory-DeepSeek-V4: Lightning Index Ultra-Long Context via Lookahead Sparse Attention](/202606/09/2606.09079v1-flashmemory-deepseek-v4-lightning-index-ultra-long-context-via-lookahead-sparse-attention)  
    标签：评分：7.0/10、query:edge-llm
-   evidence：基于SVD的LLM压缩用于资源高效推理
-3. [OffQ: Taming Structured Outliers in LLM Quantization by Offsetting](/202606/08/2606.07116v1-offq-taming-structured-outliers-in-llm-quantization-by-offsetting)  
+   evidence：通过KV缓存优化的新型LLM服务推理范式
+3. [From Rigid to Dynamic: Entropy-Guided Adaptive Inference for Long-Context LLMs](/202606/09/2606.09508v1-from-rigid-to-dynamic-entropy-guided-adaptive-inference-for-long-context-llms)  
    标签：评分：7.0/10、query:edge-llm
-   evidence：低比特量化加速LLM推理
-4. [Toward Multi-Domain and Long-Tailed Quantization via Feature Alignment and Scaling](/202606/08/2606.04920v1-toward-multi-domain-and-long-tailed-quantization-via-feature-alignment-and-scaling)  
+   evidence：基于注意力熵的自适应计算分配
+4. [BUDDY: BUdget-Driven DYnamic Depth Routing for Adaptive Large Language Model Inference](/202606/09/2606.09514v1-buddy-budget-driven-dynamic-depth-routing-for-adaptive-large-language-model-inference)  
+   标签：评分：7.0/10、query:edge-llm
+   evidence：预算驱动的动态深度路由，提高LLM推理效率
+5. [CANS: Accelerating Multiuser Collaborative Edge Inference via Cooperative Autodidactic NeuroSurgeon](/202606/09/2606.09175v1-cans-accelerating-multiuser-collaborative-edge-inference-via-cooperative-autodidactic-neurosurgeon)  
    标签：评分：6.0/10、query:edge-llm
-   evidence：面向资源受限设备的多域量化方法，可迁移至LLM模型
-5. [Depth-Attention: Cross-Layer Value Mixing for Language Models](/202606/08/2606.05014v1-depth-attention-cross-layer-value-mixing-for-language-models)  
-   标签：评分：6.0/10、query:edge-llm
-   evidence：跨层值混合提升语言模型推理效率
-6. [Tangram: Unlocking Non-Uniform KV Cache for Efficient Multi-turn LLM Serving](/202606/08/2606.06302v1-tangram-unlocking-non-uniform-kv-cache-for-efficient-multi-turn-llm-serving)  
-   标签：评分：6.0/10、query:edge-llm
-   evidence：针对非均匀KV缓存的服务系统，提升多轮LLM效率
+   evidence：多用户协同边缘DNN推理优化
 
 
 <div class="dpr-home-promo-card">
