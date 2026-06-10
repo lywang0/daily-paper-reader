@@ -1,0 +1,670 @@
+Title: CLP: Collocation-Length Prediction for Zero-Loss Adaptive Multi-Token Inference
+
+URL Source: https://arxiv.org/pdf/2606.10935v1
+
+Published Time: Wed, 10 Jun 2026 01:09:15 GMT
+
+Number of Pages: 9
+
+Markdown Content:
+# CLP: Collocation-Length Prediction for Zero-Loss Adaptive Multi-Token Inference 
+
+Xuezhen Xie ∗ Zhiqiang Zhou †
+
+Abstract —Large language model inference is bottlenecked by autoregressive decoding, where each token requires a full forward pass. Multi-token prediction (MTP) offers a promis-ing acceleration path, but existing approaches suffer from a fundamental architectural flaw: the MTP head for the first token competes with the backbone’s own language model (LM) head, leading to severe quality degradation when predictions are accepted. We identify this head-backbone competition as the root cause of repetitive and incoherent outputs in prior MTP-based acceleration methods. To address this, we propose Backbone-as-Architect, a design principle where the backbone LM head always generates the first token, and MTP heads are responsible only for subsequent tokens. Building on this principle, we introduce CLP (Collocation-Length Predictor), a lightweight span-level decision layer that predicts how many additional tokens can be safely accepted at each decoding step. CLP uses only a single linear layer (4.6K–7.7K parameters), replacing the over-engineered 1M-parameter gate networks used in prior work. Experiments on Qwen2.5 models (0.5B, 1.5B, 7B) show that CLP achieves 1.20x–1.29x speedup on 1.5B and 1.14x–1.20x on 7B, with zero quality degradation (repetition ratio < 0.02 ), while gate-based approaches fail to accelerate (1.07x) or produce severely degraded outputs (repetition ratio > 0.5). We further demonstrate that shorter prediction horizons ( k = 2 ) recover 24% higher MTP head accuracy on large models, establishing a scaling-aware design principle. We identify MTP head prediction accuracy as the binding constraint on acceleration and establish a clear roadmap for future improvements. 
+
+Index Terms —multi-token prediction, inference acceleration, autoregressive decoding, language models, speculative decoding 
+
+I. I NTRODUCTION 
+
+Large language models (LLMs) have demonstrated remark-able capabilities across diverse tasks, but their autoregressive decoding process remains a significant deployment bottleneck. Each token generation requires a full forward pass through the model, making inference latency proportional to output length. This has motivated extensive research into accelerating autoregressive decoding [4], [5]. The key challenge is to reduce the number of sequential backbone forward passes without compromising the quality of generated text. Several families of acceleration methods have been pro-posed. Speculative decoding [4], [5] uses a smaller “draft” model to generate candidate tokens that are then verified by the target model. While effective (achieving 2–3x speedup), this approach requires maintaining two models and additional memory. Multi-token prediction [1], [2], [12] trains the model itself to predict multiple future tokens, eliminating the need for a separate draft model. However, the quality-speed tradeoff in MTP-based methods remains poorly understood. Multi-token prediction (MTP) offers a promising direction by training models to predict multiple future tokens simultane-Backbone  
+
+> (1.5B params)
+> Head 0
+> (MLP, ~0.5M)
+> LM Head
+> (built-in)
+
+X
+
+> COMPETE
+> Both predict token t+1
+> (a) Standard MTP Architecture
+> Backbone
+> (1.5B params)
+> LM Head
+> Step 1 (t+1)
+> MTP Head
+> Step 2+ (t+2)
+> HANDOFF
+> Clean separation of concerns
+> (b) Backbone-as-Architect (Ours)
+
+Fig. 1: Architecture comparison. (a) Standard MTP: Head 0 and the backbone LM head both predict token t + 1 , creating competition that degrades output quality. (b) Backbone-as-Architect (ours): the backbone LM head always generates the first token; MTP heads handle subsequent tokens only, eliminating competition. ously [1], [2]. During inference, if the MTP head’s predictions are correct, multiple tokens can be accepted per forward pass, effectively reducing the number of backbone calls. However, a critical challenge remains: how to decide whether to accept or reject MTP predictions without compromising output quality .Prior approaches have addressed this decision problem in two ways: (1) fixed-step methods that always accept a fixed number of tokens [3], which sacrifice quality for speed; and (2) gate-based methods that train a neural network to predict acceptance [2], which add complexity without resolving the fundamental quality issue. In this paper, we identify a deeper architectural flaw in existing MTP approaches: the MTP head for the first token competes with the backbone’s own LM head . As illustrated in Figure 1, both Head 0 and the backbone LM head predict the token at position t + 1 . This redundancy, when exploited for acceleration, leads to quality degradation because the MTP head’s predictions are less accurate than the backbone’s own outputs. Based on this diagnosis, we make three contributions: 1) Backbone-as-Architect Design . We propose that the back-bone LM head should always generate the first token, with MTP heads responsible only for subsequent tokens (t + 2 , t + 3 , . . . ). This eliminates head-backbone competi-tion and establishes a zero-quality-loss baseline. 2) Collocation-Length Predictor (CLP) . We introduce a lightweight span-level decision layer that predicts how many additional tokens can be safely accepted. CLP uses a single linear layer (4.6K–7.7K parameters) operating on 
+
+> arXiv:2606.10935v1 [cs.LG] 9 Jun 2026
+
+the backbone’s hidden state, replacing the over-engineered gate networks used in prior work. 3) Pareto Frontier Analysis . We provide the first systematic analysis of the quality-speed tradeoff in adaptive MTP inference, identifying MTP head prediction accuracy as the binding constraint on acceleration. II. R ELATED WORK 
+
+A. Multi-Token Prediction 
+
+Multi-token prediction trains language models to predict multiple future tokens simultaneously. Gloeckle et al. [1] showed that MTP training improves code generation quality. Cai et al. [2] proposed Medusa, which adds multiple MTP heads to a frozen backbone for inference acceleration. Medusa uses a tree attention mechanism that complicates the decoding process and requires careful calibration. Hydra [18] extends MTP with sequentially-consistent drafting. DeepSeek-V3 [12] integrates MTP into production-scale training, demonstrating its viability at scale. However, DeepSeek-V3’s MTP differs fundamentally from ours in both objective and mechanism. DeepSeek-V3 uses MTP as an auxiliary training objective to improve the backbone’s internal representations; at inference time, it employs a draft-and-verify paradigm where MTP heads generate candidate tokens that are then verified by the backbone—essentially a form of self-speculative decoding. This means DeepSeek-V3 still suffers from head-backbone competition for the first token and incurs verification overhead proportional to the draft length. In contrast, CLP uses MTP heads solely for inference acceleration on a frozen backbone, eliminates head-backbone competition through the Backbone-as-Architect design, and replaces token-level verification with a single span-level decision. The two approaches are comple-mentary: DeepSeek-V3’s training-time MTP could potentially improve MTP head accuracy, which would directly benefit CLP’s acceptance rate. 
+
+B. Speculative Decoding 
+
+Speculative decoding [4], [5] uses a smaller “draft” model to generate candidate tokens, which are then verified by the target model. While effective (achieving 2–3x speedup in production systems [16]), this approach requires maintaining two models and does not leverage the target model’s own predictions. EAGLE [7] and its successor EAGLE-2 [13] use feature-level draft prediction with dynamic draft trees. Sequoia [15] unifies speculative decoding strategies under a hardware-aware framework. Self-speculative decoding [14] eliminates the draft model by using the target model’s own early exit layers. Our work differs from all these approaches: we use dedicated MTP heads (not early exit) with a span-level decision layer (not token-level verification). 
+
+C. Adaptive Decoding 
+
+Adaptive decoding methods dynamically adjust the number of tokens generated per step. Sun et al. [6] proposed early exit-ing, where simpler tokens are generated faster. LayerSkip [17] combines early exit with self-speculative decoding. Lookahead decoding [8] parallelizes generation through Jacobi iteration. Our work focuses on the decision layer itself, showing that a single linear layer can outperform complex gate networks. Table I provides a detailed comparison of our approach with existing MTP and speculative decoding methods across key design dimensions. CLP occupies a unique position in the design space: it requires no draft model (unlike speculative decoding), uses an ultra-lightweight decision layer (200 × smaller than Medusa’s gate), and makes span-level decisions (unlike all existing approaches that operate token-by-token). While the absolute speedup is lower than speculative decoding methods (which use a separate draft model), CLP achieves zero quality loss without the overhead of maintaining and running a second model. 
+
+D. Token Dependencies and Span-Level Prediction 
+
+Linguistic research has long recognized that tokens exhibit strong sequential dependencies [9]: the probability of a token being correct is not independent of its neighbors. When a language model generates token t with high confidence, nearby tokens ( t+1 , t +2 , . . . ) within the same local context can often be predicted with comparable accuracy by lightweight heads. This sequential correlation—which we term prediction span continuity —motivates our span-level CLP design: rather than making per-token binary acceptance decisions, CLP predicts the length of a contiguous span of reliable predictions. III. B ACKGROUND AND MOTIVATION 
+
+A. Standard MTP Architecture 
+
+In standard MTP architectures, a frozen backbone model is augmented with k additional prediction heads. Each head Hi
+
+is trained to predict the token at position t + i + 1 from the hidden state at position t:
+
+ˆyt+i+1 = Hi(ht), i = 0 , 1, . . . , k − 1 (1) where ht is the backbone’s hidden state at position t. The heads are typically small MLPs or linear layers trained with cross-entropy loss on frozen backbone hidden states. 
+
+B. The Head-Backbone Competition Problem 
+
+A critical design flaw exists in standard MTP architectures: 
+
+Head 0 and the backbone LM head both predict the token at position t + 1 . This creates a competitive redundancy:  
+
+> •
+
+The backbone LM head is the model’s native prediction mechanism, trained with full causal attention and optimized through the primary training objective.  
+
+> •
+
+Head 0 is a separate network (typically a small MLP) that predicts the same token from the same hidden state, but with a different parameterization. When Head 0’s predictions are accepted for acceleration, they replace the backbone’s own predictions. Since Head 0 is less accurate than the backbone LM head (by construction— it has fewer parameters and a simpler architecture), this substitution introduces quality degradation. TABLE I: Comparison of MTP and Speculative Decoding Methods 
+
+Method Draft Model Decision Layer Decision Level Params (Decision) Max Speedup Quality Loss 
+
+Speculative Decoding [4] Required (separate) Verification (exact) Token-level 0 2–3x None Speculative Sampling [5] Required (separate) Verification (approx.) Token-level 0 2–3x Bounded Medusa [2] Not required Gate network (MLP) Token-level ∼1M 2.2x Possible EAGLE [7] Required (feature-level) Verification (exact) Token-level 0 2.5–3x None Lookahead [8] Not required Jacobi iteration Token-level 0 1.5–2x None Fixed-step Not required None (always accept N ) Step-level 0 Configurable Severe 
+
+CLP (Ours) Not required CLP (linear) Span-level 4.6K–7.7K 1.14–1.55x None 
+
+TABLE II: Head-Backbone Competition: Quality Impact 
+
+Method Speedup Rep. Ratio Quality 
+
+Greedy (backbone only) 1.000x 0.019 ✓
+
+Fixed-step k = 2 (Head 0) 1.060x 0.579 ×
+
+Fixed-step k = 3 (Heads 0–1) 1.060x 0.579 ×
+
+Ours: Backbone-as-Architect 1.294x 0.018 ✓
+
+Table II quantifies this effect. Fixed-step acceptance with 
+
+k = 2 produces outputs with repetition ratio > 0.57, compared to 0.019 for greedy decoding. The backbone’s own predictions are substantially more reliable than any MTP head’s predic-tions for the same position. 
+
+C. Gate Network Limitations 
+
+Prior work has addressed the acceptance decision by train-ing gate networks—small neural networks that predict whether MTP head predictions are correct. However, our experiments reveal three fundamental limitations: 1) Information asymmetry : A 1M-parameter gate network attempts to judge the reliability of predictions from a 1.5B-parameter backbone, using only a few statistical features (top-1 probability, margin, entropy). 2) Over-conservatism : Gate networks learn to reject most predictions to minimize error, resulting in near-zero ac-celeration (avg accept len ≈ 0.4–0.6). 3) Training distribution mismatch : Gate labels are gener-ated offline, but inference-time distributions differ, leading to calibration errors. These limitations motivate our approach: rather than training a complex gate to judge predictions, we design the architecture so that the backbone’s own predictions are never replaced, and use a lightweight CLP to decide how many additional tokens to accept. IV. M ETHOD 
+
+A. Backbone-as-Architect Design 
+
+We propose Backbone-as-Architect , a design principle that eliminates head-backbone competition: 
+
+The backbone LM head always generates the first token at each decoding step. MTP heads are respon-sible only for subsequent tokens ( t + 2 , t + 3 , . . . ). 
+
+Formally, at each decoding step, the backbone generates: 
+
+yt+1 = arg max LM Head (ht) (2) Backbone              
+
+> Forward ht
+> LM Head
+> yt+ 1 (ok)
+> CLP Head
+> Linear( d,k)
+> P(L= 0. . k)
+> H0
+> H1
+> H2
+> yt+ 1
+> yt+ 2
+> yt+ 3
+> yt+ 4
+> Step 1:
+> Always accepted
+> Step 2:
+> Predict L
+> Step 3:
+> Accept Ltokens
+> CLP-Guided Decoding Pipeline
+> L
+
+Fig. 2: CLP-guided decoding pipeline. At each step: (1) the backbone generates token yt+1 via its LM head (always accepted); (2) the CLP head predicts acceptance length L from 
+
+ht; (3) MTP heads generate L additional tokens. The pipeline ensures zero quality loss at minimum (greedy-equivalent), with acceleration from successful multi-token acceptance. This token is always accepted —it is identical to greedy decoding and carries zero quality risk. The MTP heads then predict subsequent tokens: 
+
+ˆyt+i+1 = Hi−1(ht), i = 1 , 2, . . . , k − 1 (3) The decision layer determines how many of these additional tokens to accept. If L tokens are accepted, the total tokens generated per step is 1 + L, where L ∈ { 0, 1, . . . , k − 1}.This design has several advantages:  
+
+> •
+
+Zero quality loss baseline : At minimum, one token is generated per step, identical to greedy decoding.  
+
+> •
+
+Clean separation of concerns : The backbone handles the “anchor” prediction; MTP heads handle “bonus” predic-tions.  
+
+> •
+
+Reduced head count : Only k − 1 MTP heads are needed (vs. k in standard architectures). 
+
+B. Collocation-Length Predictor (CLP) 
+
+We introduce the Collocation-Length Predictor (CLP) , a lightweight span-level decision layer. Unlike gate networks that make per-token binary decisions, CLP predicts the maxi-mum number of additional tokens that can be safely accepted at each position. 
+
+1) Architecture: CLP is a single linear layer: CLP (ht) = softmax (W · ht + b) (4) 0 200 400 600 800 1000 1200 
+
+Parameters (thousands)    
+
+> Gate
+> (prior work)
+> CLP k=2
+> CLP k=3
+> CLP k=4
+> 1000.0K
+> 4.6K
+> 6.1K
+> 7.7K
+> ~200x smaller
+
+Decision Layer Parameters Fig. 3: Parameter comparison between CLP and the gate-based approach from Medusa [2]. CLP uses 200 × fewer parameters while achieving superior speedup and quality. where W ∈ Rk×d, b ∈ Rk, and d is the hidden dimension. The output is a probability distribution over L ∈ { 0, 1, . . . , k −
+
+1}. The parameter count is: 
+
+|θCLP | = k × (d + 1) (5) For k = 2 , d = 1536 : 4,611 parameters. For k = 4 , d =1536 : 7,685 parameters. This is ∼200 × smaller than typical gate networks ( ∼1M parameters), as shown in Figure 3. 
+
+2) Training: CLP is trained on frozen backbone hidden states with supervised labels. For each position t in the training data, the label L∗ is the maximum number of consecutive MTP heads that predict correctly: 
+
+L∗ = max {L : H0(ht) = yt+2 ∧ · · · ∧ HL−1(ht) = yt+L+1 }
+
+(6) with the constraint that predictions must be consecutive—if head i is wrong, heads i + 1 , i + 2 , . . . are not counted. This consecutiveness constraint reflects the empirical observation that reliable MTP predictions form contiguous spans, consis-tent with the sequential dependencies in natural language [9]. The loss function is standard cross-entropy: 
+
+L = − X
+
+> t
+
+log P (L∗ 
+
+> t
+
+| ht; W , b) (7) CLP trains in 20 epochs with AdamW (lr= 10 −3), taking only a few minutes on a single GPU. 
+
+3) Inference: Algorithm 1 describes the CLP-guided de-coding process. The threshold τ controls the quality-speed tradeoff: higher τ is more conservative (better quality, less speedup), while lower τ is more aggressive. 
+
+C. Comparison with Gate Networks 
+
+Table III compares CLP with gate-based approaches across multiple dimensions. CLP achieves the best balance of param-eter efficiency, decision quality, and inference overhead. 
+
+Algorithm 1 CLP-Guided Decoding 
+
+Require: Backbone M, MTP heads {Hi}k−1 
+
+> i=1
+
+, CLP head C,threshold τ 
+
+> 1:
+
+y ← ∅  
+
+> 2:
+
+while not EOS do  
+
+> 3:
+
+ht ← M .forward (y) 
+
+> 4:
+
+yt+1 ← arg max LM Head (ht) {Always accepted } 
+
+> 5:
+
+p ← softmax (C(ht)) {Distribution over L} 
+
+> 6:
+
+L ← arg max l pl 
+
+> 7:
+
+if max l pl < τ then  
+
+> 8:
+
+L ← 0 {Confidence too low } 
+
+> 9:
+
+end if  
+
+> 10:
+
+Append yt+1 to y {Backbone token first } 
+
+> 11:
+
+for i = 1 to min( L, k − 1) do  
+
+> 12:
+
+ˆyt+i+1 ← Hi(ht) 
+
+> 13:
+
+Append ˆyt+i+1 to y 
+
+> 14:
+
+end for  
+
+> 15:
+
+end while 
+
+TABLE III: Decision Layer Comparison                   
+
+> Aspect Gate [2] Single-Threshold CLP (Ours)
+> Parameters ∼1M 04.6K–7.7K Decision level Token-level Token-level Span-level Training Offline labels N/A Offline labels Inference cost 1 forward + 1 MLP 1 comparison 1 forward + 1 linear Redundancy Judges backbone N/A No redundancy
+
+V. E XPERIMENTS 
+
+A. Setup 1) Model: We use Qwen2.5-1.5B-Instruct [10] as the back-bone model (1.5B parameters, hidden dimension d = 1536 ,vocabulary size 151,936). The model uses grouped-query attention with 16 attention heads and a context length of 32,768 tokens. 
+
+2) Dataset: Training uses WikiText-2 [11] with 20,000 samples (max length 128 tokens). Evaluation uses the vali-dation split (1,000 samples). All experiments use the same data splits for reproducibility. 
+
+3) MTP Heads: Each MTP head is an MLP: Linear(1536, 768) → GELU → Linear(768, vocab size). Training: 15 epochs, AdamW optimizer, lr= 2 × 10 −4, batch size 8, weight decay 0.01. The backbone remains frozen throughout. We train all MTP heads jointly with equal loss weights. For k = 3 (the best configuration), this results in 2 MTP heads with 118M parameters each (236M total trainable). 
+
+4) CLP: Single linear layer: Linear(1536, k). Training: 20 epochs, AdamW optimizer, lr= 10 −3, weight decay 10 −4, co-sine annealing schedule. CLP is trained on the validation split of WikiText-2 (1,000 samples) using pre-computed backbone hidden states. The training process involves three steps: (1) extract hidden states from the frozen backbone, (2) generate labels L∗ using the trained MTP heads, (3) train CLP to predict 
+
+L∗ from hidden states. k=2 k=3 k=4   
+
+> 0.9
+> 1.0
+> 1.1
+> 1.2
+> 1.3
+> 1.4
+> Speedup (relative to greedy)
+> 1.24x
+> 1.29x
+> 1.17x
+> (a) Speedup Comparison
+> Greedy
+> Gate/Threshold
+> CLP (Ours)
+> k=2 k=3 k=4
+> 0.00
+> 0.02
+> 0.04
+> 0.06
+> 0.08
+> 0.10
+> 0.12
+> 0.14
+> Repetition Ratio (lower is better)
+> Quality threshold
+> (b) Output Quality
+> Greedy
+> Gate/Threshold
+> CLP (Ours)
+
+Fig. 4: Main results across k = 2, 3, 4. (a) Speedup: CLP achieves 1.20x–1.29x, consistently outperforming gate/threshold baselines. (b) Quality: CLP maintains repetition ratio < 0.02 (comparable to greedy), while fixed-step methods exceed 0.5. 
+
+5) Baselines:  
+
+> •
+
+Greedy : Standard autoregressive decoding (baseline, quality reference).  
+
+> •
+
+Gate-based : 1M-parameter gate network with per-token acceptance, following Medusa [2].  
+
+> •
+
+Single-threshold : Accept if MTP head’s top-1 probability 
+
+> threshold (tuned per k). 
+
+6) Metrics:  
+
+> •
+
+Tokens Per Second (TPS) : Throughput metric measured on 15 generation prompts.  
+
+> •
+
+Speedup : TPS relative to greedy baseline.  
+
+> •
+
+Repetition Ratio : Fraction of repeated 3-grams (lower is better; < 0.02 indicates quality comparable to greedy).  
+
+> •
+
+Average Accept Length : Mean number of tokens accepted per decoding step. 
+
+B. Main Results 
+
+Figure 4 and Table IV present the main results across k =2, 3, 4.
+
+Key findings: 
+
+1) CLP achieves 1.20x–1.29x speedup with zero quality degradation across all k values on 1.5B. 2) CLP outperforms the 1M-parameter gate network (1.24x vs 1.07x for k = 2 ) while using 200 × fewer parameters. The gate’s underperformance stems from its conservative behavior: trained with imbalanced labels (most positions have L∗ = 0 ), the gate learns to reject nearly all MTP predictions (avg accept len = 1 .000 ), effectively degener-ating to greedy decoding. 3) The best speedup occurs at k = 3 (1.29x), not k = 4 , sug-gesting diminishing returns from additional MTP heads due to decreased head accuracy at longer prediction horizons. 4) At k = 4 , CLP converges with single-threshold (1.166x vs 1.168x) because both methods become limited by the same bottleneck: MTP head accuracy drops to 0.58, leaving little room for any decision layer to differentiate. CLP’s advantage is most pronounced at k = 2 –3, where head accuracy supports meaningful span-level decisions. 0.3 0.4 0.5 0.6 0.7 0.8 0.9   
+
+> CLP Threshold ( )
+> 40
+> 45
+> 50
+> 55
+> 60
+> 65
+> 70
+> 75
+> Tokens per Second (TPS)
+> Greedy
+> Best: =0.3
+> 1.29x speedup
+> Threshold Sensitivity ( k=3)
+> TPS (speed)
+> Repetition ratio
+> 0.00
+> 0.02
+> 0.04
+> 0.06
+> 0.08
+> 0.10
+> 0.12
+> Repetition Ratio
+> Quality threshold
+
+Fig. 5: Threshold sensitivity for CLP at k = 3 . Blue (left axis): TPS throughput. Red (right axis): repetition ratio. The optimal threshold τ = 0 .3 achieves the highest speedup (1.29x) while maintaining quality (repetition ratio 0.018). Higher thresholds (τ ≥ 0.6) become overly conservative. 
+
+C. Cross-Model Scaling 
+
+To validate CLP’s effectiveness across model scales, we evaluate on Qwen2.5-0.5B-Instruct (int8) and Qwen2.5-7B-Instruct (int8) with the same training protocol. Table Vpresents the results. Table V reveals a clear scaling trend: 1) Head accuracy scales inversely with model size :MTP head accuracy drops from 60% (0.5B) to 14–18% (1.5B/7B). This is the primary reason larger models achieve lower speedup. 2) Shorter prediction horizons recover accuracy : k = 2 
+
+consistently achieves higher head accuracy than k = 3 
+
+(18% vs 14% on 1.5B and 7B), because predicting one token ahead is fundamentally easier than predicting two. 3) CLP maintains zero quality loss at all scales : repetition ratio remains < 0.02 across all configurations, confirming that the Backbone-as-Architect design generalizes. 4) The 0.5B upper bound : At 60% head accuracy, CLP achieves 1.55x speedup—validating that head accuracy, not the decision layer, is the binding constraint. 5) EAGLE underperforms on small models : The EAGLE-style draft head achieves only 4.6% accuracy with 2.4M parameters (vs 60% for 137.7M MLP heads), demonstrat-ing that feature-level prediction requires significantly more capacity. 
+
+D. Threshold Sensitivity Analysis 
+
+Figure 5 shows the effect of CLP threshold τ on speedup and quality for k = 3 . The optimal threshold is τ = 0 .3, which achieves the highest speedup (1.29x) while maintaining quality (repetition ratio 0.018, comparable to greedy’s 0.019). Higher thresholds (τ ≥ 0.6) are overly conservative, sometimes underperforming greedy. This demonstrates that CLP’s confi-dence calibration is well-behaved: a single threshold parameter provides fine-grained control over the quality-speed tradeoff. TABLE IV: Main Results: CLP vs. Baselines on Qwen2.5-1.5B-Instruct 
+
+k Method TPS Speedup Rep. Ratio Avg Accept CLP Params Quality 
+
+2Greedy 50.86 1.000x 0.019 1.000 — ✓
+
+Gate (1M params) 54.64 1.074x 0.019 1.000 1,049,601 ✓
+
+CLP (4.6K params) 63.26 1.244x 0.009 1.076 4,611 ✓
+
+3Greedy 52.13 1.000x 0.019 1.000 — ✓
+
+Single-threshold 57.52 1.103x 0.000 1.094 0 ✓
+
+CLP (6.1K params) 67.47 1.294x 0.018 1.243 6,147 ✓
+
+4Greedy 55.25 1.000x 0.019 1.000 — ✓
+
+Single-threshold 64.50 1.168x 0.000 1.123 0 ✓
+
+CLP (7.7K params) 64.42 1.166x 0.000 1.123 7,685 ✓
+
+TABLE V: CLP Scaling Across Model Sizes ( k=2 and k=3, best threshold per config) 
+
+Model k MTP Acc Speedup Rep. Quality 
+
+0.5B (int8) 3 0.60 1.546x 0.000 ✓
+
+3† 0.046 1.088x 0.012 ✓
+
+1.5B (int8) 2 0.181 1.244x 0.009 ✓
+
+3 0.145 1.294x 0.018 ✓
+
+7B (int8) 2 0.180 1.143x 0.000 ✓
+
+3 0.144 1.199x 0.000 ✓
+
+> †
+
+EAGLE-style feature-level draft head (2.4M params vs 137.7M for MLP head). 1     
+
+> (backbone)
+> 2
+> (+1 MTP)
+> 3
+> (+2 MTP)
+> 0
+> 20
+> 40
+> 60
+> 80
+> 100
+> 120
+> Count (out of 127 steps)
+> 108
+> 17
+> 2
+> (a) CLP k=3, =0.3
+> 1
+> (backbone)
+> 2
+> (+1)
+> 3
+> (+2)
+> 4
+> (+3)
+> 0
+> 20
+> 40
+> 60
+> 80
+> 100
+> 120
+> Count (out of 127 steps)
+> 108
+> 42
+> (b) CLP k=4, =0.8
+
+Fig. 6: Accept length distribution for CLP. (a) k = 3 , τ =0.3: CLP accepts 2 tokens in 13.3% of steps and 3 tokens in 1.6%. (b) k = 4 , τ = 0 .8: CLP rarely accepts beyond the backbone token, reflecting decreased MTP head accuracy at longer horizons. 
+
+E. Accept Length Distribution 
+
+Figure 6 shows the distribution of accepted token counts. For k = 3 (the best configuration), CLP accepts 2 tokens in 13.3% of steps and 3 tokens in 1.6%. While the additional acceptance rate is modest, it provides meaningful speedup because each accepted token saves one full backbone forward pass. For k = 4 , CLP becomes more conservative due to decreased MTP head accuracy at longer prediction horizons. 
+
+F. Quality Analysis 
+
+We analyze output quality through repetition ratio and manual inspection. Table VI shows that CLP maintains qual-ity indistinguishable from greedy decoding, while fixed-step methods produce severely degraded outputs with repetition ratio > 0.5. TABLE VI: Quality Comparison: CLP vs. Fixed-Step ( k = 3 )
+
+Method Rep. Ratio Output Quality 
+
+Greedy 0.019 Reference quality CLP ( τ = 0 .3) 0.018 Near-identical to greedy CLP ( τ = 0 .8) 0.000 Perfect (no repetition) Fixed-step (accept 2) 0.579 Severe repetition Fixed-step (accept 3) 0.579 Severe repetition 0.95 1.00 1.05 1.10 1.15 1.20 1.25 1.30 1.35 
+
+Speedup (relative to greedy)        
+
+> 0.0
+> 0.1
+> 0.2
+> 0.3
+> 0.4
+> 0.5
+> 0.6
+> Repetition Ratio (lower is better)
+> Greedy Gate ( k=2) CLP k=2 CLP k=3
+> CLP k=4
+> Fixed-step k=3
+> Zero-loss region
+> Dominated
+> (worse speed + worse quality)
+
+Quality-Speed Pareto Frontier     
+
+> Greedy
+> Gate ( k=2)
+> CLP k=2
+> CLP k=3
+> CLP k=4
+> Fixed-step k=3
+> Pareto frontier
+
+Fig. 7: Quality-speed Pareto frontier. CLP dominates all al-ternatives: for any given quality level, CLP achieves higher speedup. Fixed-step methods are Pareto-dominated—they of-fer less speedup with worse quality. The shaded region indi-cates the zero-loss zone (repetition ratio < 0.02 ). VI. A NALYSIS 
+
+A. Why CLP Outperforms Gate Networks 
+
+CLP’s superiority over gate networks stems from three factors: 1) Appropriate granularity : Gate networks make per-token binary decisions, which is too fine-grained for the colloca-tion structure of natural language. CLP makes span-level decisions that align with linguistic structure. 2) Simplicity : A single linear layer has fewer failure modes than a multi-layer gate network. With only 4.6K parame-ters, CLP cannot overfit to training artifacts. 2 3 4    
+
+> Max prediction length ( k)
+> 1.10
+> 1.15
+> 1.20
+> 1.25
+> 1.30
+> 1.35
+> Best Speedup (quality-ok)
+> 1.244x
+> (4.6K params)
+> 1.294x
+> (6.1K params)
+> 1.166x
+> (7.7K params)
+> (a) Speedup vs k
+> 234
+> Max prediction length ( k)
+> 0.40
+> 0.45
+> 0.50
+> 0.55
+> 0.60
+> 0.65
+> 0.70
+> 0.75
+> MTP Head Accuracy  0.67
+> 0.64
+> 0.58
+> Accuracy drops
+> with longer horizons
+> (b) Head Accuracy vs k
+
+Fig. 8: Scaling behavior across k values. (a) Speedup peaks at k = 3 (1.29x) then decreases at k = 4 (1.17x). (b) MTP head accuracy drops with longer prediction horizons and larger models, from 0.60 (0.5B, k = 3 ) to 0.14 (7B, k = 3 ). Head accuracy is the binding constraint. 3) No redundancy : Gate networks attempt to judge the backbone’s reliability using limited statistical features. CLP directly predicts the quantity of interest (acceptance length) from the backbone’s full hidden state. Figure 7 shows the Pareto frontier: CLP dominates all alternatives, offering the best speedup at every quality level. 
+
+B. Scaling Behavior 
+
+Figure 8 shows CLP’s behavior across different k values on 1.5B. The optimal k is 3, where MTP head accuracy (14.5%) is sufficient to support span-level acceptance. At k = 4 , head accuracy drops further and CLP becomes more conservative, reducing the effective speedup. This reveals the fundamental tension in adaptive MTP :increasing k provides more acceleration potential, but MTP head accuracy decreases with longer prediction horizons. Cross-model scaling (Table V) shows this effect is even more pronounced across model sizes: the 0.5B model achieves 60% head accuracy and 1.55x speedup, while 1.5B/7B models drop to 14–18% accuracy with correspondingly lower speedups. 
+
+C. Binding Constraint Analysis 
+
+Our experiments identify MTP head prediction accuracy 
+
+as the binding constraint on acceleration:  
+
+> •
+
+At 0.5B scale: MTP head accuracy ≈ 0.60, CLP achieves 1.55x speedup.  
+
+> •
+
+At 1.5B scale: MTP head accuracy ≈ 0.14–0.18, CLP achieves 1.20x–1.29x speedup.  
+
+> •
+
+At 7B scale: MTP head accuracy ≈ 0.14–0.18, CLP achieves 1.14x–1.20x speedup. This relationship holds across scales: the sharp drop in head accuracy from 0.5B (60%) to 1.5B/7B (14–18%) directly explains the reduced speedup at larger scales. The decision layer cannot compensate for inaccurate predictions—it can only avoid accepting them. The k = 2 vs k = 3 comparison provides further evidence. Across both 1.5B and 7B, k = 2 achieves higher head accuracy than k = 3 (18% vs 14%), because predicting one token ahead is fundamentally easier than predicting two. This 24% accuracy improvement at k = 2 is consistent across model scales, suggesting it reflects a structural property of MTP heads rather than a training artifact. The decision layer’s role is to correctly identify when MTP heads are accurate, not to compensate for their inaccuracy. This is why CLP’s simplicity is an advantage: a complex gate network cannot extract information that isn’t present in the hidden state. 
+
+D. Case Study: Acceptance Patterns 
+
+We examine CLP’s acceptance patterns to understand when span-level acceptance occurs. CLP assigns higher acceptance lengths to positions where the backbone’s hidden state encodes high local predictability—typically short, high-frequency to-ken sequences (e.g., function word sequences, common col-locations). Lower acceptance lengths occur at semantically uncertain positions (e.g., content word transitions, sentence boundaries). This pattern supports our design choice: span-level decisions align with the local predictability structure of natural language, which is richer than what per-token thresholds can capture. 
+
+E. Limitations 
+
+1) Absolute speedup : CLP’s 1.29x speedup is lower than speculative decoding methods (2–3x). However, CLP op-erates at zero additional model cost and guarantees zero quality loss, targeting a different region of the design space. We view CLP as complementary to speculative decoding rather than competitive. 2) Model scale : Experiments span 0.5B–7B parameters. The 72B+ regime remains untested; however, our memory overhead analysis (Table IX) shows that MTP head over-head becomes negligible ( <2%) at large scales, suggesting favorable deployment characteristics. 3) English-centric evaluation : All experiments use En-glish text (WikiText-2). Cross-lingual evaluation would strengthen the generalizability claims. 4) MTP head architecture : We use MLP heads; alterna-tive architectures (e.g., linear, attention-based) may yield different results. A systematic head architecture study is warranted. 5) Threshold sensitivity : CLP requires threshold tuning per configuration. Automatic threshold selection (e.g., via val-idation set calibration) remains an open problem. 6) Acceptance rate : The current acceptance rate for addi-tional tokens (13–15%) is modest. This is a direct conse-quence of MTP head accuracy ( ∼0.64 at k = 3 ), not a limi-tation of CLP itself. Improving MTP head accuracy through better training strategies (e.g., knowledge distillation from the backbone [19], curriculum learning) would directly translate to higher speedup under the CLP framework. 
+
+F. Ablation Study 
+
+Table VII presents ablation experiments examining the contribution of each design choice. TABLE VII: Ablation Study ( k = 2 , τ = 0 .5)                        
+
+> Variant TPS Speedup Rep. Accept
+> CLP (MLP heads) 61.03 1.200x 0.009 1.085 CLP (Linear heads) 58.50 1.151x 0.018 1.068 Single-threshold 57.52 1.103x 0.000 1.058 Gate (1M params) 54.64 1.074x 0.019 1.000 Fixed-step (accept 2) 53.89 1.060x 0.579 2.000
+
+TABLE VIII: Training Time ( k = 3 , single RTX 3090)              
+
+> Component Epochs Time Trainable Params
+> MTP Heads 15 ∼75 min 236M CLP Labels —∼5 min —CLP Head 20 ∼3 min 6,147
+> Total ∼83 min
+
+The ablation reveals several insights:  
+
+> •
+
+MLP vs. Linear heads : MLP heads outperform linear heads by 0.8% accuracy, translating to 4% higher speedup. The nonlinearity helps capture token dependencies beyond simple linear projection.  
+
+> •
+
+CLP vs. Single-threshold : CLP outperforms single-threshold by 10% in speedup (1.20x vs. 1.10x). The span-level decision captures joint confidence signals that per-token thresholds miss.  
+
+> •
+
+CLP vs. Gate : CLP achieves 17% higher speedup than the 1M-parameter gate (1.20x vs. 1.07x) with 200 × fewer parameters. The gate’s information asymmetry and over-conservatism are fundamental limitations.  
+
+> •
+
+Fixed-step baseline : Always accepting 2 tokens produces severe quality degradation (rep. ratio 0.579) with only marginal speedup (1.06x), confirming the necessity of an adaptive decision layer. 
+
+G. Training Efficiency 
+
+Table VIII reports training time for each component. The CLP head trains in just 3 minutes—25 × faster than the MTP heads. This is because CLP operates on pre-computed hidden states and has only 6K parameters. The total training pipeline (MTP heads + CLP) completes in under 1.5 hours on a single GPU. 
+
+H. Discussion 1) Why Simple Works: CLP’s effectiveness with a single linear layer challenges the assumption that complex decision mechanisms are necessary for adaptive inference. We attribute this to two factors: 1) The hidden state is information-rich : The backbone’s hidden state already encodes prediction confidence im-plicitly. CLP merely extracts this signal through a linear projection. 2) Span-level acceptability is linearly decodable : The de-cision “how many tokens can be predicted reliably” cor-relates strongly with local token statistics (frequency, pre-dictability, entropy) that are already encoded in the back-bone’s hidden states, making a linear projection sufficient. 
+
+2) Implications for Future MTP Systems: Our findings suggest that the MTP research community should focus on two directions: 1) Improve head accuracy, not decision complexity : Since head accuracy is the binding constraint, investing in better head architectures (e.g., attention-based heads, knowledge distillation from the backbone) will yield greater returns than more complex gate networks. 2) Align head and backbone predictions : Training MTP heads with a distillation objective (matching the backbone’s output distribution rather than hard labels) may improve head-backbone alignment and increase acceptance rates. 
+
+3) Positioning in the Acceleration Design Space: CLP is not a replacement for speculative decoding; it occupies a different region of the design space. Speculative decoding methods (EAGLE [7], Sequoia [15]) achieve 2–3x speedup but require a separate draft model or complex tree verification. CLP targets the opposite extreme: zero additional model overhead, minimal decision-layer complexity, and guaranteed zero quality loss. This makes CLP suitable for deployment scenarios where memory is constrained, latency budgets are tight, and quality degradation is unacceptable—conditions that are increasingly common in edge and on-device inference. The 1.14x–1.29x speedup may appear modest compared to speculative decoding, but it comes at essentially zero cost: no extra model, no extra memory, no quality risk. Crucially, CLP’s speedup is consistent across model scales (0.5B–7B) and persists even at 7B int8 quantization, where 1.14x–1.20x speedup is achieved with zero quality degradation. In produc-tion systems where speculative decoding is already deployed, CLP can serve as a complementary layer on the backbone itself, providing baseline acceleration that persists even when the draft model is unavailable or underperforms. 
+
+4) Deployment Considerations: For practical deployment, CLP offers several advantages over gate-based approaches:  
+
+> •
+
+No additional forward pass : CLP is a single matrix mul-tiplication, adding negligible latency ( < 0.01ms per step).  
+
+> •
+
+Simple implementation : CLP requires only a Linear layer and softmax—no custom CUDA kernels or attention modi-fications.  
+
+> •
+
+Easy tuning : Only one hyperparameter ( τ ) controls the quality-speed tradeoff, vs. multiple hyperparameters for gate networks. A practical concern is the memory overhead of MTP heads. Table IX analyzes this overhead across model scales. The MTP head parameters are dominated by the vocabulary projection layer Linear (H/ 2, V ), where V ≈ 152 K is the fixed vocab-ulary size. This gives MTP head params ≈ H × V / 2, while the backbone scales as L × c × H2 (where L is the number of layers and c ≈ 12 captures attention and FFN parameters per layer). The overhead ratio is therefore: Overhead ≈ H × V / 2
+
+L × c × H2 = V
+
+2c · L · H (8) This scales as 1/(L × H)—both depth and width contribute to diluting the overhead. At the 1.5B scale, the 236M MTP pa-TABLE IX: MTP Head Memory Overhead Across Model Scales ( k = 3 , 2 heads, fp16) 
+
+Model H Head Params Backbone Overhead 
+
+0.5B 896 136M 500M 27% 1.5B 1536 236M 1.5B 16% 7B 3584 558M 7B 8% 72B 8192 1.26B 72B 1.8% 
+
+rameters add 16% memory (the worst case in our experiments). At 7B, this drops to 8%, and at 72B it becomes negligible at 1.8%. For the 1.5B model used in our experiments, this overhead is acceptable; for larger models, CLP’s acceleration comes at essentially no additional memory cost. VII. C ONCLUSION 
+
+We have identified a fundamental architectural flaw in existing multi-token prediction approaches: the MTP head for the first token competes with the backbone’s own LM head, leading to quality degradation. Our Backbone-as-Architect design eliminates this competition by assigning the first token to the backbone and subsequent tokens to MTP heads. Building on this principle, we introduced CLP (Collocation-Length Predictor), a 4.6K–7.7K parameter decision layer that predicts span-level acceptance lengths. Experiments across three model scales (0.5B, 1.5B, 7B) demonstrate that CLP achieves 1.20x–1.29x speedup on 1.5B and 1.14x–1.20x on 7B with zero quality degradation, outperforming 1M-parameter gate networks while using 200 × fewer parameters. Our cross-model analysis reveals two key insights. First, MTP head prediction accuracy is the binding constraint on acceleration: it drops from 60% on 0.5B to 14–18% on larger models, directly limiting speedup. Second, shorter prediction horizons ( k = 2 ) consistently recover higher head accuracy than k = 3 (18% vs 14% on 1.5B and 7B), establishing a scaling-aware design principle. These findings establish a clear roadmap: improving MTP head accuracy through better training strategies, knowledge distillation, or alternative head architectures will directly translate to higher speedup under the CLP framework. ETHICS STATEMENT 
+
+This research does not involve human subjects, sensitive data, or animal experiments. All experiments were conducted on publicly available datasets (WikiText-2) and open-source models (Qwen2.5). AI D ISCLOSURE 
+
+AI tools (LLM-based coding assistants) were used during the implementation of experimental scripts. All experimental results, analysis, and paper writing were performed by the authors. REFERENCES [1] F. Gloeckle, B. Y. Idrissi, R. Rozi` eres, D. Raposo, D. Masson, and A. Joulin, “Better & faster large language models via multi-token prediction,” in Proc. NeurIPS , 2024. [2] T. Cai, Y. Li, Z. Geng, H. Peng, and T. Dao, “Medusa: Simple LLM inference acceleration framework with multiple decoding heads,” in 
+
+Proc. ICML , 2024. [3] B. Spector and C. Re, “Accelerating LLM inference with staged specu-lative decoding,” arXiv preprint arXiv:2308.04623 , 2023. [4] Y. Leviathan, M. Kalman, and Y. Matias, “Fast inference from trans-formers via speculative decoding,” in Proc. ICML , 2023. [5] C. Chen, S. Borgeaud, S. Shannon, J. Lesort, and L. Denoyer, “Acceler-ating large language model decoding with speculative sampling,” arXiv preprint arXiv:2302.01318 , 2023. [6] M. Sun, Y. Liu, and J. Zhou, “You only look at one sequence: Rethinking transformers for autoregressive generation,” arXiv preprint , 2024. [7] Y. Li, T. Cai, Y. Zhang, D. Chen, and T. Dao, “EAGLE: Speculative sampling requires rethinking feature uncertainty,” in Proc. ICML , 2024. [8] Y. Fu, “Break the sequential dependency of LLM inference using lookahead decoding,” arXiv preprint arXiv:2402.02057 , 2024. [9] M. Benson, E. Benson, and R. Ilson, The BBI Combinatory Dictionary of English . John Benjamins, 1986. [10] Qwen Team, “Qwen2.5 technical report,” arXiv preprint arXiv:2412.15115 , 2025. [11] S. Merity, C. Xiong, J. Bradbury, and R. Socher, “Pointer sentinel mixture models,” in Proc. ICLR , 2017. [12] DeepSeek-AI, “DeepSeek-V3 technical report,” arXiv preprint arXiv:2412.19437 , 2024. [13] Y. Li, T. Cai, Y. Zhang, D. Chen, and T. Dao, “EAGLE-2: Faster inference of language models with dynamic draft trees,” arXiv preprint arXiv:2406.16858 , 2024. [14] J. Zhang, S. Singh, and G. Durrett, “Draft & verify: Lossless large language model acceleration via self-speculative decoding,” in Proc. ACL , 2024. [15] C. Chen, S. Borgeaud, S. Shannon, J. Lesort, and L. Denoyer, “Se-quoia: Scalable, robust, and hardware-aware speculative decoding,” 
+
+arXiv preprint arXiv:2402.12739 , 2024. [16] Meta AI, “The Llama 3 herd of models,” arXiv preprint arXiv:2407.21783 , 2024. [17] M. Elhoushi, A. Shrivastava, D. Liskovich, and M. Carbin, “LayerSkip: Enabling early exit inference and self-speculative decoding,” arXiv preprint arXiv:2404.16710 , 2024. [18] Z. Ankner, T. Cai, and T. Dao, “Hydra: Sequentially-consistent drafting for speculative decoding,” arXiv preprint arXiv:2405.13427 , 2024. [19] C. Zhou, J. Li, R. Shi, and Z. Liu, “DistillSpec: Improving speculative decoding with knowledge distillation,” in Proc. ICLR , 2024.
