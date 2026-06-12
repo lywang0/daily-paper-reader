@@ -6,43 +6,29 @@
 </div>
 
 ## 每次日报
-- 最新运行日期：2026-06-11
-- 运行时间：2026-06-11 22:21:56 UTC
+- 最新运行日期：2026-06-12
+- 运行时间：2026-06-12 21:42:56 UTC
 - 运行状态：成功
-- 本次总论文数：7
+- 本次总论文数：3
 - 精读区：1
-- 速读区：6
+- 速读区：2
 
 ### 今日简报（AI）
-今日聚焦7篇前沿论文，精读满分《TileFuse》解锁AMD NPU量化推理，速读涵盖KV缓存压缩与多芯片GPU模拟。  
-重点推荐混合精度核库与上下文压缩两大方向，为端侧大模型部署提供关键加速。  
-建议读者优先精读TileFuse方法，并持续关注缓存压缩技术对推理效率的实战影响。
-- 详情：[/202606/11/README](/202606/11/README)
+今日推荐3篇论文，其中1篇精读、2篇速读。最值得关注的是精读论文《UniSVQ》提出的2-bit统一标量-向量量化方法（9.0分），以及速读中的动态推理网络重构工作。建议优先深入理解UniSVQ的低比特量化技术，后续可关注稀疏化LLM的持续训练方案。
+- 详情：[/202606/12/README](/202606/12/README)
 
 ### 精读区论文标签
-1. [TileFuse: A Fused Mixed-Precision Kernel Library for Efficient Quantized LLM Inference on AMD NPUs](/202606/11/2606.11357v1-tilefuse-a-fused-mixed-precision-kernel-library-for-efficient-quantized-llm-inference-on-amd-npus)  
-   标签：评分：10.0/10、query:edge-llm
-   evidence：面向NPU的混合精度内核库，LLM推理的异构计算运行时
+1. [UniSVQ: 2-bit Unified Scalar-Vector Quantization](/202606/12/2606.10520v1-unisvq-2-bit-unified-scalar-vector-quantization)  
+   标签：评分：9.0/10、query:edge-llm
+   evidence：2位量化实现LLM推理加速并兼容高效整数内核
 
 ### 速读区论文标签
-1. [Still: Amortized KV Cache Compaction in a Single Forward Pass](/202606/11/2606.07878v1-still-amortized-kv-cache-compaction-in-a-single-forward-pass)  
+1. [Sigma-Branch: Hierarchical Single-Path Network Reconstruction for Dynamic Inference with Reduced Active Parameters](/202606/12/2606.09924v1-sigma-branch-hierarchical-single-path-network-reconstruction-for-dynamic-inference-with-reduced-active-parameters)  
    标签：评分：7.0/10、query:edge-llm
-   evidence：KV缓存压缩提高内存效率
-2. [End-to-End Context Compression at Scale](/202606/11/2606.09659v1-end-to-end-context-compression-at-scale)  
-   标签：评分：7.0/10、query:edge-llm
-   evidence：端到端上下文压缩以减少LLM推理内存
-3. [A Fast Locality Simulator for GEMM Design-Space Exploration on Multi-Chiplet GPUs](/202606/11/2606.11716v1-a-fast-locality-simulator-for-gemm-design-space-exploration-on-multi-chiplet-gpus)  
-   标签：评分：7.0/10、query:edge-llm
-   evidence：针对多芯粒GPU上GEMM的快速局部性模拟器
-4. [Making Locality-aware GEMM Compatible with Page-Granularity Placement on Chiplet GPUs](/202606/11/2606.11718v1-making-locality-aware-gemm-compatible-with-page-granularity-placement-on-chiplet-gpus)  
-   标签：评分：7.0/10、query:edge-llm
-   evidence：面向芯片GPU的硬件感知调度
-5. [Domain-Adapted Small Language Models with Hybrid Post-Processing: Achieving Cost-Efficient, Low-Latency Multi-Label Structured Prediction via LoRA Fine-Tuning on Scarce Data](/202606/11/2606.05781v2-domain-adapted-small-language-models-with-hybrid-post-processing-achieving-cost-efficient-low-latency-multi-label-structured-prediction-via-lora-fine-tuning-on-scarce-data)  
+   evidence：在内存受限的边缘加速器上部署DNN，减少权重传输
+2. [Continual LLM Upcycling: A Predictor-Gated Bank-Wise Sparsity Training Recipe for Dense-to-Sparse LLMs](/202606/12/2606.10722v1-continual-llm-upcycling-a-predictor-gated-bank-wise-sparsity-training-recipe-for-dense-to-sparse-llms)  
    标签：评分：6.0/10、query:edge-llm
-   evidence：小模型微调加规则后处理实现低延迟边缘推理
-6. [Task-Aware Structured Memory for Dynamic Multi-modal In-Context Learning](/202606/11/2606.11853v1-task-aware-structured-memory-for-dynamic-multi-modal-in-context-learning)  
-   标签：评分：6.0/10、query:edge-llm
-   evidence：面向多模态LLM的任务感知KV缓存压缩
+   evidence：面向硬件的稀疏LLM的预测器门控稀疏FFN训练
 
 
 <div class="dpr-home-promo-card">

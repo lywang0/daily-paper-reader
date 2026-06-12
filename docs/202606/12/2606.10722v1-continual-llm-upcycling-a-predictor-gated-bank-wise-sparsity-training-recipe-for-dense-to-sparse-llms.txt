@@ -1,0 +1,520 @@
+Title: Continual LLM Upcycling: A Predictor-Gated Bank-Wise Sparsity Training Recipe for Dense-to-Sparse LLMs
+
+URL Source: https://arxiv.org/pdf/2606.10722v1
+
+Published Time: Wed, 10 Jun 2026 00:54:49 GMT
+
+Number of Pages: 15
+
+Markdown Content:
+# Continual LLM Upcycling: A Predictor-Gated Bank-Wise Sparsity Training Recipe for Dense-to-Sparse LLMs 
+
+Ruixuan Huang 1 Jinyuan Shi 2 Hantao Huang 3,* Yifan Huang 3
+
+Ziyi Guan 3 Hao Zeng 2 Ian En-Hsu Yen 2,* Minghui Yu 3,* 
+
+## Abstract 
+
+We study dense-to-sparse continual training as a way to construct channel-sparse large language models from dense checkpoints. Starting from a Qwen2.5-8B dense backbone, we continue training at 32K context and introduce a predictor-gated sparse SwiGLU FFN in the 32K stage. For each token and layer, we use a low-rank predictor to produce FFN-channel routing logits. We then apply a bank-wise top-k rule to retain 16 channels in every 64-channel bank, yielding 4x sparsity in the FFN intermediate activation. Unlike post-hoc sparse inference methods, the routing module is placed on the main language modeling path and optimized during continual training, enabling the dense model to be upcycled into a hardware-oriented sparse model. We report the architecture, training recipe, benchmark performance, and training lessons. We also identify a layer-local long-context failure mode on RULER-CWE and propose a single-layer repair algorithm that substantially improves the affected length range. 
+
+## 1 Introduction 
+
+The cost of large language models (LLMs) is increasingly dominated by the parameter size and the amount of computation for every token. This is especially apparent in decoder-only Transformers [1 ], where each token passes through a dense feed-forward network (FFN) in every layer. In modern SwiGLU-based models [ 2], the FFN expands the hidden state to a much larger intermediate dimension, applies element-wise gating, and projects the result back to the model dimension. During long-context training and long-prompt prefill, this computation is applied over large token blocks, even though only a subset of intermediate channels are important for any particular token [ 3]. Reducing this token-wise FFN cost is therefore a central requirement for making long-context LLMs more efficient. Conditional computation offers a natural route to this goal. Mixture-of-Experts (MoE) models reduce computation by routing each token to a small number of expert FFNs, but they introduce separate expert parameter pools, expert-level routing, load-balancing concerns, and often all-to-all communication [ 4, 5 ]. A finer-grained alternative is to view the intermediate channels of a dense FFN as neuron-level computational units and activate only a subset of them for each token. It preserves the original dense FFN parameterization while exposing conditional computation inside each layer and can turn a dense FFN into a sparse sub-FFN whose active components change with the token. However, not all channel sparsity leads to usable acceleration. Contextual sparsity methods demon-strate that LLM computation is strongly input-dependent [ 3, 6, 7]. Channel-level methods [ 8] show that many FFN channels can be suppressed on a per-token basis. However, if the sparse mask is derived from native FFN activations, the routing signal may arrive too late to skip the dominant gate and up projections. For channel sparsity to become a hardware-facing computation path, the sparse mask must be available before the main FFN channel computation is materialized.    
+
+> 1HKUST. 2Moffett AI. 3Independent Contributor. *Corresponding authors. Preprint.
+> arXiv:2606.10722v1 [cs.CL] 9 Jun 2026
+
+This paper studies the dense-to-sparse continual-training process, seeking to convert a dense LLM into a channel-wise sparse model. We introduce a lightweight low-rank predictor that maps each token hidden state to logits over FFN intermediate channels. The predictor produces the routing signal before the FFN computations. We then impose a fixed bank-wise top-k rule, which keeps 16 active channels in every 64-channel bank, giving a 4 × reduction in active FFN intermediate width. The resulting sparse path is trained with hard sparse execution in the forward pass and a soft surrogate gradient through the top-k boundary. We instantiate this idea in a Qwen2.5-8B model backbone [9]. The model is first trained from scratch at 8K context length and then continued at 32K context length. Sparsity is introduced late in the 32K stage, reflecting a practical upcycling scenario [10]. Our experiments compare the resulting sparse model with (1) a dense companion run and (2) a naive 4× sparse baseline based on dense activation magnitude (Dense-4x). Our sparse model is consistently closer to the dense baseline than the naive Dense-4x baseline across a broad set of evaluation benchmarks, indicating that channel sparsity can be trained as part of the language-modeling path rather than applied only as a post-training compression heuristic. This paper reveals that sparse upcycling is not lossless. We highlight two instructive failure modes during our training process. First, channel-level routing does not inherit MoE-style balancing in a straightforward way. Second, long-context evaluation exposes failures that are nearly invisible in broad short-context benchmarks. On RULER-CWE [ 11 ], the sparse model remains healthy at shorter lengths but develops a sharp 12K–16K cliff. We propose a dense fallback intervention that localizes much of this failure to a single layer and the final question-answer suffix. 
+
+Contributions. In summary, this paper makes the following contributions: • Predictor-gated channel sparsity pattern. We introduce a predictor-gated sparse pattern in which a low-rank token-wise predictor produces channel routing logits before FFN channel computation, and a hard bank-wise top-k rule retains 16 channels in every 64-channel bank. It can skip inactive gate, up, and down channels when supported by specialized kernels or sparse hardware. • Dense-to-sparse continual training recipe. We present a dense-to-sparse continual training recipe that converts a Qwen2.5-8B dense model trained at 8K and continued at 32K into a predictor-gated 4× sparse FFN model, with limited performance degradation. • Training lessons. We report two training lessons. First, MoE-style balance bias does not transfer cleanly to bank-wise channel routing. Second, RULER-CWE reveals a layer-local long-context failure that can be partially repaired through a single-layer intervention. 
+
+## 2 Related work 
+
+Contextual sparsity. Prior work shows that LLM computation is input-dependent and can often be sparsified. Dejavu predicts token-dependent sparse sets of attention heads and MLP neurons for efficient inference [ 3], while ShadowLLM improves predictor-based contextual sparsity with stronger importance criteria and deployment-oriented predictors [ 6]. Sirius highlights that training-free contextual sparsity can be fragile on complex generation tasks and introduces correction mechanisms to recover quality [ 7]. This paper is more training-centric, where the sparse gate is inserted into the main SwiGLU FFN computation and optimized during continual training. 
+
+Channel-sparse FFNs. Mixture-of-Channels (MoC) introduces persistent channel sparsity inside SwiGLU FFNs by selecting the top-k channels from the native gate projection for each token [ 8]. However, the sparse decision is still derived from the native gate output, so the gate projection must be evaluated before the active set is known. SparkTransformer proposes a new sparse architecture for both FFN and attention, using top-k activation masks and low-cost predictors formed by real-locating existing dimensions [ 12 ]. This predictor is an internal consequence of Spark’s redesigned parameterization. The resulting sparse design is not directly compatible with an existing SwiGLU architecture. 
+
+MoE and dense-to-sparse conversion. Expert-level conditional computation routes tokens to a small number of full FFN experts. Related dense-to-sparse approaches include MoEfication, which partitions FFN parameters into functional experts and builds expert routers [ 13 ], and Aran et al., which initializes sparse MoE models from dense checkpoints [ 10 ]. The channel-level view we use 2X
+
+> Self
+> Attention
+
+X 
+
+> Gate Up
+> Down
+
+X
+
+[B, S, d]
+
+[B, S, d]
+
+[B, S, d] × [d, di]
+
+→ [B, S, di]
+
+[B, S, di] × [di , d]
+
+→ [B, S, d]
+
+> Hadamard
+> Production
+
+[B, S, d]
+
+> Low Rank
+> Predictor
+
+X 
+
+> Gate Up
+> Down
+
+[B, S, d]
+
+[B, S, d] × [d, di]
+
+→ [B, S, di]
+
+[B, S, ds] × [ds , d]
+
+→ [B, S, d]  
+
+> Hadamard
+> Production
+> in: d
+> ou t:di
+> Low Rank
+> Predictor
+
+X
+
+> Gate
+> Up
+> Down
+
+[B, S, d]
+
+[B, S, d] × [d, ds]
+
+→ [B, S, ds]
+
+[B, S, ds] × [ds , d]
+
+→ [B, S, d]  
+
+> Hadamard
+> Production
+> in: d
+> ou t:di
+
+Original SwiGLU Architecture 
+
+Predictor Arch 1 
+
+Predictor Arch 2    
+
+> Sparse by
+> Predictor Output
+> Original shape
+> [di,d]
+> Sparse
+> Original shape
+> [d,di]
+> Sparse
+
+🔥 
+
+🔥 
+
+🔥 
+
+🔥  
+
+> Original shape
+> [di,d]
+> Sparse
+> Accelerate!
+
+Figure 1: Our proposed predictor-gated sparse SwiGLU FFN. A low-rank predictor maps the token hidden state to FFN-channel routing logits. here is MoE-like in spirit because FFN intermediate channels behave as fine-grained conditional units, but it does not introduce independent expert parameter pools or expert-level all-to-all dispatch. It preserves the dense SwiGLU parameterization and performs token-wise channel selection. 
+
+## 3 Methodology 
+
+This section describes the predictor-gated sparse FFN that we use in the dense-to-sparse continual-training process. We start from the dense SwiGLU computation, then introduce the proposed low-rank predictor, the bank-wise top-k routing, and technical details that keep the sparse path trainable. 
+
+3.1 Dense SwiGLU FFN 
+
+For layer l and token position t, let the FFN input be xl,t ∈ Rd, where d is the hidden dimension. We use di for the dense FFN intermediate dimension. A standard SwiGLU FFN computes 
+
+ul,t = W gl xl,t , vl,t = W ul xl,t , (1) 
+
+mdense 
+
+l,t = SiLU( ul,t ) ⊙ vl,t = ul,t ⊙ σ(ul,t ) ⊙ vl,t , (2) 
+
+ydense 
+
+l,t = W ol mdense 
+
+l,t . (3) where ul,t , v l,t , m dense 
+
+l,t ∈ Rdi . In our 8B-scale training configuration, d = 4096 and di = 14336 .
+
+3.2 Predictor-gated Channel Sparsity 
+
+We introduce a per-layer predictor Pl that maps the token hidden state to logits over FFN intermediate channels: 
+
+pl,t = Pl(xl,t ) ∈ Rdi . (4) The sparse gate gl,t is built from these logits and replaces the dense SwiGLU gate σ(ul,t ):
+
+ml,t = ul,t ⊙ gl,t ⊙ vl,t , (5) 
+
+yl,t = W ol ml,t . (6) Thus, the predictor directly modulates the FFN intermediate activation and receives gradients from the language modeling loss. 3The predictor is a small two-layer low-rank module 
+
+Pl(x) = W p, 2 
+
+> l
+
+W p, 1 
+
+> l
+
+x, (7) with dimensions 
+
+W p, 1 
+
+> l
+
+: Rd → R448 , W p, 2 
+
+> l
+
+: R448 → Rdi . (8) The hidden size 448 is di/32 . The predictor output also includes a bank-level affine calibration with learnable scale and bias parameters shared within each 64-channel bank. 
+
+3.3 Bank-wise Hard Top-k with Soft Surrogate Gradients 
+
+The FFN intermediate dimension is partitioned into fixed banks of size Cbank = 64 . For each token, layer, and bank, we keep k = 16 channels: 
+
+pl,t = [ p(1)  
+
+> l,t
+
+, . . . , p (G) 
+
+> l,t
+
+], p(b) 
+
+> l,t
+
+∈ RCbank , (9) 
+
+S(b) 
+
+> l,t
+
+= topk( p(b) 
+
+> l,t
+
+, k = 16) . (10) The gate is 
+
+gl,t,i =
+
+(
+
+σ(pl,t,i ), i ∈ S(b) 
+
+> l,t
+
+,
+
+0, otherwise . (11) With di = 14336 , this gives G = di/C bank = 224 banks and keeps ds = Gk = 3584 channels per token per layer. Here, ds is the sparse intermediate dimension shown in Figure 1. Adding a predictor and a discrete top-k operator changes the FFN routing rule, but the end-to-end training path remains a standard language-modeling computation graph with a custom gradient for the mask. In the forward pass, each bank first normalizes predictor logits, selects the top-16 channels, and constructs a binary mask hl,t . The FFN intermediate activation is then 
+
+ml,t = ul,t ⊙ vl,t ⊙ σ(pl,t ) ⊙ hl,t , (12) so inactive channels are exactly zero in the model path seen by the loss. In the backward pass, gradients through W ol , W gl , W ul , and the selected intermediate activations follow ordinary automatic differentiation under the chosen mask. The non-differentiable top-k
+
+selection is handled by a soft top-k surrogate: around each bank’s selection threshold, the hard indicator is assigned a sigmoid-like local gradient. Thus the language-modeling loss can still update the predictor logits and predictor parameters near the routing boundary. 
+
+3.4 Hardware Implications 
+
+Our training and validation are performed on GPUs as a functional simulation of bank-wise sparse FFN semantics. The model is trained with a hard sparse gate in the forward path, but the GPU implementation still materializes the dense gate and up projections, W g x and W ux, before applying the top-k mask. As a result, the practically accelerated part on GPUs is mainly the downstream projection W om, where the zeroed intermediate activation can be gathered and multiplied against only the selected rows/columns. Our experiments therefore validate sparse semantics and model quality rather than demonstrating measured 4x end-to-end GPU wall-clock speedup. The algorithmic principle is stronger than what our GPU implementation exposes. For any inactive channel i with hl,t,i = 0 , the term 
+
+ul,t,i vl,t,i σ(pl,t,i ) hl,t,i (13) contributes exactly zero to the FFN output. Dedicated sparse hardware can therefore place the predictor-generated mask before the FFN projections and avoid computing inactive channels in all three FFN stages: the gate projection W g , the up projection W u, and the down projection W o.Under the 64:16 bank rule, the ideal sparse execution shape is reduced from the dense intermediate width di to the selected sparse width ds = di/4 for each token and layer, while preserving the same mathematical sparse FFN path. The intended efficiency target is therefore dedicated sparse hardware or specialized sparse kernels. 44 Training recipe 
+
+This section reports the training-side context needed to interpret the sparse model and its comparisons. We describe the Qwen2.5-style model backbone and the training data curriculum. 
+
+4.1 Model Backbone 
+
+The dense backbone follows the Qwen2.5 architectural family rather than a post-hoc modification of an open-source checkpoint [ 9]. The 8B-scale configuration uses 32 layers, hidden size 4096, FFN intermediate dimension 14336, 32 query heads, and 4 shared key-value heads. The tokenizer vocabulary size is 155136. We also follow the Qwen2.5-style companion recipe. We double the number of query heads in grouped-query attention to increase the parameter count. The sparse model adds a per-layer low-rank predictor that produces token-wise FFN channel routing logits before bank-wise top-k selection. The predictor adds approximately 0.26B trainable parameters. 
+
+4.2 Pretraining Data 
+
+The pretraining corpus is a multilingual, multi-domain mixture designed to transfer strong English capability while progressively increasing Chinese coverage. Table 1 summarizes the active 8K and 32K schedules used for the model. The 8K dense stage uses an 8T-token schedule. The 32K continuation uses a separate long-context mixture with 4T tokens. During the 32K continuation, the RoPE base is increased to support the longer sequence length. Table 1: Data mixture and context-length curriculum. Content columns report expected sampling shares within each stage; token counts use the reported training budget.                                             
+
+> Stage Seq. Tokens RoPE base Chinese English Wiki/ref. Code Math Domain Reasoning Parallel Stage 1 8K 0–3T 10 40.0% 67.3% 0.0% 21.0% 1.5% 6.8% 3.0% 0.4% 8K 3–5T 10 415.3% 50.0% 0.0% 20.0% 1.5% 8.8% 4.0% 0.4% 8K 5–8T 10 430.6% 32.7% 0.0% 19.0% 1.5% 10.8% 5.0% 0.4% Stage 2 32K 4T 10 67.6% 7.6% 3.8% 33.5% 10.2% 20.1% 17.2% 0.0%
+
+4.3 Sparse Continual Training 
+
+The sparse branch is introduced late in Stage 2. The dense model first runs the full 8K stage and then continues at 32K. Predictor sparsity is introduced only after roughly 3T tokens. In particular, this sparse branch uses weight decay 0.06, whereas the non-sparse reference recipe uses weight decay 0.1. In Figure 2, the x-axis is aligned to the 4T-token 32K stage budget. We summarize the whole training process as follows: 1. Dense, 8K stage : train from scratch with the same Qwen2.5-8B architecture. 2. Dense, 32K stage : resume from the dense 8K checkpoint, increase the context length to 32K, and continue dense training for around 3T tokens. 3. Predictor warm-up : add the low-rank predictor and train it as an auxiliary branch that imitates the native gate signal; this branch does not affect the main loss and lasts only a small number of tokens. 4. Predictor-gated dense FFN : route the main FFN gate through the predictor and sigmoid so that the predictor affects the language-modeling loss, but do not yet apply hard top-k channel selection. 5. Predictor-gated top-k sparse FFN : add bank-wise top-k selection to impose 4x channel sparsity. Appendix A reports a model diagnostic ablation that motivates this predictor-before-top-k ordering. This ablation runs on a 200M model and is separate from our main evaluation. 55 Evaluation 
+
+We evaluate the sparse model against two companion baselines: • Dense companion : a fully dense run with comparable data and training budget. • Dense-4x : a naive 4x sparse baseline based on activation magnitude, applied post-hoc to the dense companion’s training results. • Ours : our predictor-gated channel-wise 4x sparsity. Table 2 compares the benchmarking performance of the three models. The Dense-4x and sparse columns append their deltas relative to the dense companion; green indicates a positive delta and red indicates a negative delta. We summarize the evaluated benchmarks as six categories: • Factual QA : SimpleQA [14] and Chinese SimpleQA [15]. • Code : MBPP [16], MBPP+ [17], MultiPL-E [18], MBXP [19], and LiveCodeBench [20]. • Reasoning : KOR-Bench [ 21 ], ZebraLogic [ 22 ], ProcBench [ 23 ], ARC-AGI [ 24 ], DROP [ 25 ], and BBH [26]. • Math : AIME [27] and MATH [28]. • Composite : LiveBench [ 29 ], SuperGPQA [ 30 ], AGIEval [ 31 ], MMLU-Pro [ 32 ], C-Eval [ 33 ], and MMLU [34]. • Long-Context : RULER [11]. Table 2: Benchmark results. Higher is better. Deltas are score differences versus the dense companion. 
+
+Benchmark Dense Dense-4x Sparse 
+
+Factual QA 
+
+SimpleQA 5.0 3.9 −1.1 3.8 −1.2
+
+Chinese SimpleQA 29.7 22.4 −7.3 27.5 −2.2
+
+Code 
+
+MBPP 72.6 66.2 −6.4 72.6 +0 .0
+
+MBPP+ 67.2 62.2 −5.0 65.1 −2.1
+
+MultiPL-E 53.4 46.8 −6.6 54.1 +0 .7
+
+MBXP 67.2 62.2 −5.0 66.8 −0.4
+
+LiveCodeBench 34.4 23.9 −10 .5 26.9 −7.5
+
+Reasoning 
+
+KOR-Bench 43.8 36.7 −7.0 43.0 −0.7
+
+ZebraLogic 12.5 10.8 −1.7 13.3 +0 .8
+
+ProcBench 10.1 11.1 +1 .0 11.3 +1 .2
+
+ARC-AGI 8.9 6.1 −2.8 6.4 −2.5
+
+DROP 69.2 63.8 −5.5 67.9 −1.4
+
+BBH 71.9 70.8 −1.1 77.8 +6 .0
+
+Benchmark Dense Dense-4x Sparse 
+
+Math 
+
+AIME 2025 2.0 2.3 +0 .3 0.7 −1.3
+
+AIME 2024 6.3 3.0 −3.3 1.3 −5.0
+
+MATH 57.7 51.9 −5.7 57.1 −0.6
+
+Composite 
+
+LiveBench 30.5 26.5 −4.0 28.2 −2.3
+
+SuperGPQA 20.0 23.2 +3 .2 24.9 +4 .9
+
+AGIEval 64.6 58.9 −5.7 64.4 −0.3
+
+MMLU-Pro 50.0 42.4 −7.7 48.8 −1.3
+
+C-Eval 83.4 80.6 −2.8 80.8 −2.6
+
+MMLU 77.0 75.4 −1.7 77.1 +0 .1
+
+Long Context 
+
+RULER 4K 93.6 94.3 +0 .7 93.8 +0 .2
+
+RULER 8K 92.6 92.1 −0.5 92.5 −0.1
+
+RULER 16K 89.3 88.6 −0.6 88.6 −0.7
+
+RULER 32K 79.2 73.5 −5.8 80.4 +1 .1
+
+Across the results, our predictor-gated sparsity is usually closer to the dense companion than Dense-4x. The sparse model matches or slightly exceeds dense on MBPP, MultiPL-E and MMLU, etc. It also substantially reduces the Dense-4x degradation on Chinese SimpleQA, MBPP+, MBXP and KOR-Bench, etc. The sparse model performs better than Dense-4x at retaining dense quality. 
+
+Loss Curves. Figure 2 reports the training-loss trajectory around the sparse transition in the 32K stage. The dense model is first trained through the 8K stage and is then continued for a 4T-token 32K stage; the figure zooms into the late 32K continuation where sparse adaptation is introduced. The colored bands correspond to the sparse-transition phases in the training recipe: predictor side-branch warm-up, predictor-gated dense FFN, and predictor-gated top-k sparse FFN. 62.8T 3T 3.5T 4T   
+
+> 32K-stage training tokens (T)
+> 1.05
+> 1.10
+> 1.15
+> 1.20
+> 1.25
+> 1.30
+> 1.35
+> Training loss
+> Dense 32K companion
+> Predictor-sparse 32K
+> Predictor side-branch warm-up Predictor-gated dense FFN Predictor-gated top-k sparse FFN
+
+Figure 2: Training loss around the sparse transition in the 32K stage. Colored bands denote predictor side-branch warm-up, predictor-gated dense FFN, and predictor-gated top-k sparse FFN. 
+
+## 6 Training Lessons and Failure Modes 
+
+6.1 Channel Balancing 
+
+MoE models often use expert-balancing mechanisms to avoid routing collapse. Since our FFN channels behave like fine-grained experts, it is natural to ask whether an expert-balance bias can be applied at the channel level. We evaluate a channel-level routing bias inspired by MoE expert balancing. In our setting, this does not improve the final training outcome, so the main recipe does not adopt a channel-level balancing strategy. 
+
+Balance-bias variants. For a token t and FFN channel c, let rt,c be the predictor logit and st,c =
+
+σ(rt,c ) be the predictor score used by the hard top-k gate. Channels are partitioned into banks Bj of size 64, and 4x sparsity keeps k = 16 channels in each bank. A balance-bias vector b is not optimized by backpropagation; it is an online routing correction added only for selection: 
+
+St,j = topk c∈B j (st,c + bc, k ), (14) 
+
+gt,c = st,c 1[c ∈ S t,j ]. (15) The FFN intermediate activation is then multiplied by gt,c as in the normal predictor-sparse path. After accumulating one training step and all-reducing token counts across data-parallel ranks, we compute the selected-token count 
+
+nc = X
+
+> t
+
+1[c ∈ S t,j ], ¯n = 1
+
+C
+
+> C
+
+X
+
+> c=1
+
+nc, (16) where C is the number of local FFN channels in the tensor-parallel shard. We evaluated two update rules. Average balance updates every channel toward the mean usage, 
+
+bc ← bc + α sign(¯ n − nc). (17) The 0.05-threshold balance updates only severely under-used channels: 
+
+bc ← bc + α 1[nc < 0.05¯ n] sign(¯ n − nc). (18) 7The no-balance baseline fixes bc = 0 and applies no online update. In the ablation below, α is the same small step size across balance variants. Figure 3 shows the training-loss comparison that motivates this decision. The ablation runs in the 32K continual-training window, where the predictor-sparse model is initialized from a dense checkpoint. We compare no channel-balance bias, average balance, and 0.05-threshold balance. In this ablation window, average balance is consistently worse, and the 0.05-threshold balance does not improve over the no-balance branch. Therefore, explicitly forcing channel balance is not beneficial. This is a useful negative result. Channel-level routing differs from expert-level routing: channels are much finer-grained, grouped into fixed banks, and coupled through the same FFN matrices. A balance algorithm that works for complete experts may over-constrain or destabilize channel-level selection. We note that this observation is specific to continual training from a dense checkpoint; it does not rule out balance mechanisms during training from scratch, where the router and FFN channels can co-adapt from initialization. 3.07T 3.10T 3.14T 3.18T 
+
+> 32K-stage training tokens (T)
+> 1.17
+> 1.20
+> 1.23
+> 1.26
+> 1.29
+> Training loss per token
+> Dense companion
+> No balance
+> 0.05-threshold balance
+> Average balance
+
+Figure 3: Channel-balance ablations during 32K continual training. 
+
+6.2 Layer-local Predictor Failure on RULER-CWE 
+
+Most short-context and general benchmarks appear close to the dense companion, but RULER-CWE exposes a sharper long-context failure mode. Figure 4 presents a fine-grained length sweep with 512-token increments, averaged over 50 independent runs with different seeds. The sparse model is healthy up to 8K but develops an early cliff around 12K–16K, while the dense model remains much more stable at those lengths. This failure is not a global collapse of the sparse model. On short-context reasoning, the sparse model remains close to dense: MMLU accuracy is 0.7404 for sparse v.s. 0.7439 for dense, and ARC-Challenge is 0.9036 for sparse v.s. 0.9181 for dense. To diagnose the failure, we use a dense fallback intervention that bypasses the sparse predictor at selected FFN layers and token regions. For a target layer, let msparse be the sparse FFN intermediate activation and mdense be the dense FFN intermediate activation. We compute a norm calibration factor 
+
+rl =
+
+s
+
+E∥msparse  
+
+> l
+
+∥22
+
+E∥mdense  
+
+> l
+
+∥22
+
+, (19) and replace the selected sparse intermediate activation with rlmdense  
+
+> l
+
+.The main positive result is localized to the 7-th layer. In the sweep, layer-7 repair improves the 8704–12288 range average from 0.856 to 0.947 and the 12800–16384 range average from 0.583 to 0.802. This result shows that the RULER-CWE cliff can be traced to a narrow layer-local routing failure instead of a whole-model collapse. Appendix B gives the detailed phase and token-region localization, as well as the observed trade-offs with short-context reasoning benchmarks. 82K 4K 8K 12K 16K 20K 24K 28K 32K  
+
+> Context length
+> 0.2
+> 0.4
+> 0.6
+> 0.8
+> 1.0
+> Mean recall@10
+> main repair window tail noisy window
+> Dense
+> Dense-4x
+> Ours
+> Ours + L7 repair
+
+Figure 4: RULER-CWE average recall@10 as context length increases. 
+
+## 7 Conclusion 
+
+We present a channel-level dense-to-sparse continual-training recipe for an 8B-scale language model. The central idea is to reinterpret FFN intermediate channels as fine-grained experts and to use a lightweight predictor as a token-wise router over those channels. The recipe imposes 4x bank-wise channel sparsity, trains the predictor on the main language-modeling path, and converts a dense 8K-to-32K training trajectory into a hardware-oriented sparse FFN model. Current benchmark results show that the predictor-gated sparse model is often much closer to the dense companion than a naive Dense-4x baseline. The training analysis also exposes two useful failure modes: channel-level balance bias does not transfer from expert-level MoE training, and RULER-CWE can reveal layer-local long-context predictor failures that broad short-context benchmarks do not expose. The single-layer repair analysis shows that part of this long-context failure is localizable and partially recoverable. 
+
+## References 
+
+[1] Ashish Vaswani, Noam Shazeer, Niki Parmar, Jakob Uszkoreit, Llion Jones, Aidan N. Gomez, Lukasz Kaiser, and Illia Polosukhin. Attention is all you need. In Isabelle Guyon, Ulrike von Luxburg, Samy Bengio, Hanna M. Wallach, Rob Fergus, S. V. N. Vishwanathan, and Roman Garnett, editors, Advances in Neural Information Processing Systems 30: Annual Conference on Neural Information Processing Systems 2017, December 4-9, 2017, Long Beach, CA, USA ,pages 5998–6008, 2017. URL https://proceedings.neurips.cc/paper/2017/hash/ 3f5ee243547dee91fbd053c1c4a845aa-Abstract.html .[2] Noam Shazeer. GLU variants improve transformer. ArXiv preprint , abs/2002.05202, 2020. URL https://arxiv.org/abs/2002.05202 .[3] Zichang Liu, Jue Wang, Tri Dao, Tianyi Zhou, Binhang Yuan, Zhao Song, Anshumali Shri-vastava, Ce Zhang, Yuandong Tian, Christopher Ré, and Beidi Chen. Deja vu: Contextual sparsity for efficient llms at inference time. In Andreas Krause, Emma Brunskill, Kyunghyun Cho, Barbara Engelhardt, Sivan Sabato, and Jonathan Scarlett, editors, International Confer-ence on Machine Learning, ICML 2023, 23-29 July 2023, Honolulu, Hawaii, USA , volume 202 of Proceedings of Machine Learning Research , pages 22137–22176. PMLR, 2023. URL 
+
+https://proceedings.mlr.press/v202/liu23am.html .[4] Dmitry Lepikhin, HyoukJoong Lee, Yuanzhong Xu, Dehao Chen, Orhan Firat, Yanping Huang, Maxim Krikun, Noam Shazeer, and Zhifeng Chen. Gshard: Scaling giant models with con-ditional computation and automatic sharding. In 9th International Conference on Learning 
+
+9Representations, ICLR 2021, Virtual Event, Austria, May 3-7, 2021 . OpenReview.net, 2021. URL https://openreview.net/forum?id=qrwe7XHTmYb .[5] William Fedus, Barret Zoph, and Noam Shazeer. Switch transformers: Scaling to trillion parameter models with simple and efficient sparsity. Journal of Machine Learning Research , 23 (120):1–39, 2022. [6] Yash Akhauri, Ahmed F. AbouElhamayed, Jordan Dotzel, Zhiru Zhang, Alexander M. Rush, Safeen Huda, and Mohamed S. Abdelfattah. Shadowllm: Predictor-based contextual sparsity for large language models. ArXiv preprint , abs/2406.16635, 2024. URL https://arxiv.org/ abs/2406.16635 .[7] Yang Zhou, Zhuoming Chen, Zhaozhuo Xu, Victoria Lin, and Beidi Chen. Sirius: Contextual sparsity with correction for efficient llms. ArXiv preprint , abs/2409.03856, 2024. URL https: //arxiv.org/abs/2409.03856 .[8] Tong Wu, Yutong He, Bin Wang, and Kun Yuan. Mixture-of-channels: Exploiting sparse ffns for efficient llms pre-training and inference. ArXiv preprint , abs/2511.09323, 2025. URL 
+
+https://arxiv.org/abs/2511.09323 .[9] An Yang, Baosong Yang, Beichen Zhang, Binyuan Hui, Bo Zheng, Bowen Yu, Chengyuan Li, Dayiheng Liu, Fei Huang, Haoran Wei, et al. Qwen2.5 technical report. ArXiv preprint ,abs/2412.15115, 2024. URL https://arxiv.org/abs/2412.15115 .[10] Aran Komatsuzaki, Joan Puigcerver, James Lee-Thorp, Carlos Riquelme Ruiz, Basil Mustafa, Joshua Ainslie, Yi Tay, Mostafa Dehghani, and Neil Houlsby. Sparse upcycling: Training mixture-of-experts from dense checkpoints. In The Eleventh International Conference on Learning Representations, ICLR 2023, Kigali, Rwanda, May 1-5, 2023 . OpenReview.net, 2023. URL https://openreview.net/pdf?id=T5nUQDrM4u .[11] Cheng-Ping Hsieh, Simeng Sun, Samuel Kriman, Shantanu Acharya, Dima Rekesh, Fei Jia, and Boris Ginsburg. Ruler: What’s the real context size of your long-context language models? In 
+
+First Conference on Language Modeling , 2024. [12] Chong You, Kan Wu, Zhipeng Jia, Lin Chen, Srinadh Bhojanapalli, Jiaxian Guo, Utku Evci, Jan Wassenberg, Praneeth Netrapalli, Jeremiah J. Willcock, Suvinay Subramanian, Felix Chern, Alek Andreev, Shreya Pathak, Felix Yu, Prateek Jain, David E. Culler, Henry M. Levy, and Sanjiv Kumar. Spark transformer: Reactivating sparsity in ffn and attention. ArXiv preprint ,abs/2506.06644, 2025. URL https://arxiv.org/abs/2506.06644 .[13] Zhengyan Zhang, Yankai Lin, Zhiyuan Liu, Peng Li, Maosong Sun, and Jie Zhou. MoEfication: Transformer feed-forward layers are mixtures of experts. In Smaranda Muresan, Preslav Nakov, and Aline Villavicencio, editors, Findings of the Association for Computational Linguistics: ACL 2022 , pages 877–890, Dublin, Ireland, 2022. Association for Computational Linguistics. doi: 10. 18653/v1/2022.findings-acl.71. URL https://aclanthology.org/2022.findings-acl. 71 .[14] Jason Wei, Nguyen Karina, Hyung Won Chung, Yunxin Joy Jiao, Spencer Papay, Amelia Glaese, John Schulman, and William Fedus. Measuring short-form factuality in large language models. 
+
+ArXiv preprint , abs/2411.04368, 2024. URL https://arxiv.org/abs/2411.04368 .[15] Yancheng He, Shilong Li, Jiaheng Liu, Yingshui Tan, Weixun Wang, Hui Huang, Xingyuan Bu, Hangyu Guo, Chengwei Hu, Boren Zheng, Zhuoran Lin, Xuepeng Liu, Dekai Sun, Shirong Lin, Zhicheng Zheng, Xiaoyong Zhu, Wenbo Su, and Bo Zheng. Chinese SimpleQA: A chinese factuality evaluation for large language models. ArXiv preprint , abs/2411.07140, 2024. URL 
+
+https://arxiv.org/abs/2411.07140 .[16] Jacob Austin, Augustus Odena, Maxwell Nye, Maarten Bosma, Henryk Michalewski, David Dohan, Ellen Jiang, Carrie Cai, Michael Terry, Quoc V. Le, and Charles Sutton. Program synthesis with large language models. ArXiv preprint , abs/2108.07732, 2021. URL https: //arxiv.org/abs/2108.07732 .10 [17] Jiawei Liu, Chunqiu Steven Xia, Yuyao Wang, and Lingming Zhang. Is your code generated by chatgpt really correct? rigorous evaluation of large language models for code generation. In Alice Oh, Tristan Naumann, Amir Globerson, Kate Saenko, Moritz Hardt, and Sergey Levine, editors, Advances in Neural Information Processing Systems 36: Annual Conference on Neural Information Processing Systems 2023, NeurIPS 2023, New Orleans, LA, USA, December 10 - 16, 2023 , 2023. URL http://papers.nips.cc/paper_files/paper/2023/hash/ 43e9d647ccd3e4b7b5baab53f0368686-Abstract-Conference.html .[18] Federico Cassano, John Gouwar, Daniel Nguyen, Sydney Nguyen, Luna Phipps-Costin, Donald Pinckney, Ming-Ho Yee, Yangtian Zi, Carolyn Jane Anderson, Molly Q. Feldman, Arjun Guha, Michael Greenberg, and Abhinav Jangda. MultiPL-E: A scalable and extensible approach to benchmarking neural code generation. IEEE Transactions on Software Engineering , 2023. [19] Ben Athiwaratkun, Sanjay Krishna Gouda, Zijian Wang, Xiaopeng Li, Yuchen Tian, Ming Tan, Wasi Uddin Ahmad, Shiqi Wang, Qing Sun, Mingyue Shang, Sujan Kumar Gonugondla, Hantian Ding, Varun Kumar, Nathan Fulton, Arash Farahani, Siddhartha Jain, Robert Gi-aquinto, Haifeng Qian, Murali Krishna Ramanathan, and Ramesh Nallapati. Multi-lingual evaluation of code generation models. In The Eleventh International Conference on Learning Representations, ICLR 2023, Kigali, Rwanda, May 1-5, 2023 . OpenReview.net, 2023. URL 
+
+https://openreview.net/pdf?id=Bo7eeXm6An8 .[20] Naman Jain, King Han, Alex Gu, Wen-Ding Li, Fanjia Yan, Tianjun Zhang, Sida Wang, Armando Solar-Lezama, Koushik Sen, and Ion Stoica. LiveCodeBench: Holistic and contami-nation free evaluation of large language models for code. ArXiv preprint , abs/2403.07974, 2024. URL https://arxiv.org/abs/2403.07974 .[21] Kaijing Ma, Xinrun Du, Yunran Wang, Haoran Zhang, Zhoufutu Wen, Xingwei Qu, Jian Yang, Jiaheng Liu, Minghao Liu, Xiang Yue, Wenhao Huang, and Ge Zhang. KOR-Bench: Benchmarking language models on knowledge-orthogonal reasoning tasks. ArXiv preprint ,abs/2410.06526, 2024. URL https://arxiv.org/abs/2410.06526 .[22] Bill Yuchen Lin, Ronan Le Bras, Kyle Richardson, Ashish Sabharwal, Radha Poovendran, Peter Clark, and Yejin Choi. ZebraLogic: On the scaling limits of LLMs for logical reasoning. ArXiv preprint , abs/2502.01100, 2025. URL https://arxiv.org/abs/2502.01100 .[23] Ippei Fujisawa, Sensho Nobe, Hiroki Seto, Rina Onda, Yoshiaki Uchida, Hiroki Ikoma, Pei-Chun Chien, and Ryota Kanai. ProcBench: Benchmark for multi-step reasoning and following procedure. ArXiv preprint , abs/2410.03117, 2024. URL https://arxiv.org/abs/2410. 03117 .[24] François Chollet. On the measure of intelligence. ArXiv preprint , abs/1911.01547, 2019. URL 
+
+https://arxiv.org/abs/1911.01547 .[25] Dheeru Dua, Yizhong Wang, Pradeep Dasigi, Gabriel Stanovsky, Sameer Singh, and Matt Gardner. DROP: A reading comprehension benchmark requiring discrete reasoning over paragraphs. In Jill Burstein, Christy Doran, and Thamar Solorio, editors, Proceedings of the 2019 Conference of the North American Chapter of the Association for Computational Linguistics: Human Language Technologies, Volume 1 (Long and Short Papers) , pages 2368– 2378, Minneapolis, Minnesota, 2019. Association for Computational Linguistics. doi: 10. 18653/v1/N19-1246. URL https://aclanthology.org/N19-1246 .[26] Mirac Suzgun, Nathan Scales, Nathanael Schärli, Sebastian Gehrmann, Yi Tay, Hyung Won Chung, Aakanksha Chowdhery, Quoc Le, Ed Chi, Denny Zhou, and Jason Wei. Chal-lenging BIG-bench tasks and whether chain-of-thought can solve them. In Anna Rogers, Jordan Boyd-Graber, and Naoaki Okazaki, editors, Findings of the Association for Com-putational Linguistics: ACL 2023 , pages 13003–13051, Toronto, Canada, 2023. Associa-tion for Computational Linguistics. doi: 10.18653/v1/2023.findings-acl.824. URL https: //aclanthology.org/2023.findings-acl.824 .[27] Mathematical Association of America. American invitational mathematics examination (AIME). 
+
+https://maa.org/student-programs/amc/ , 2025. 11 [28] Dan Hendrycks, Collin Burns, Saurav Kadavath, Akul Arora, Steven Basart, Eric Tang, Dawn Song, and Jacob Steinhardt. Measuring mathematical problem solving with the MATH dataset. In Advances in Neural Information Processing Systems , volume 34, 2021. [29] Colin White, Samuel Dooley, Manley Roberts, Arka Pal, Ben Feuer, Siddhartha Jain, Ravid Shwartz-Ziv, Neel Jain, Khalid Saifullah, Siddartha Naidu, Chinmay Hegde, Yann LeCun, Tom Goldstein, Willie Neiswanger, and Micah Goldblum. LiveBench: A challenging, contamination-free LLM benchmark. ArXiv preprint , abs/2406.19314, 2024. URL https://arxiv.org/ abs/2406.19314 .[30] M-A-P Team et al. SuperGPQA: Scaling LLM evaluation across 285 graduate disciplines. 
+
+ArXiv preprint , abs/2502.14739, 2025. URL https://arxiv.org/abs/2502.14739 .[31] Wanjun Zhong, Ruixiang Cui, Yiduo Guo, Yaobo Liang, Shuai Lu, Yanlin Wang, Amin Saied, Weizhu Chen, and Nan Duan. AGIEval: A human-centric benchmark for evaluating foundation models. In Kevin Duh, Helena Gomez, and Steven Bethard, editors, Findings of the Association for Computational Linguistics: NAACL 2024 , pages 2299–2314, Mexico City, Mexico, 2024. Association for Computational Linguistics. URL https://aclanthology. org/2024.findings-naacl.149 .[32] Yubo Wang, Xueguang Ma, Ge Zhang, Yuansheng Ni, Abhranil Chandra, Shiguang Guo, Weiming Ren, Aaran Arulraj, Xuan He, Ziyan Jiang, Tianle Li, Max Ku, Kai Wang, Alex Zhuang, Rongqi Fan, Xiang Yue, and Wenhu Chen. Mmlu-pro: A more robust and challenging multi-task language understanding benchmark. In Amir Globersons, Lester Mackey, Danielle Belgrave, Angela Fan, Ulrich Paquet, Jakub M. Tomczak, and Cheng Zhang, editors, 
+
+Advances in Neural Information Processing Systems 38: Annual Conference on Neural Information Processing Systems 2024, NeurIPS 2024, Vancouver, BC, Canada, December 10 - 15, 2024 , 2024. URL http://papers.nips.cc/paper_files/paper/2024/hash/ ad236edc564f3e3156e1b2feafb99a24-Abstract-Datasets_and_Benchmarks_Track. html .[33] Yuzhen Huang, Yuzhuo Bai, Zhihao Zhu, Junlei Zhang, Jinghan Zhang, Tangjun Su, Jun-teng Liu, Chuancheng Lv, Yikai Zhang, Jiayi Lei, Yao Fu, Maosong Sun, and Junxian He. C-eval: A multi-level multi-discipline chinese evaluation suite for foundation models. In Al-ice Oh, Tristan Naumann, Amir Globerson, Kate Saenko, Moritz Hardt, and Sergey Levine, editors, Advances in Neural Information Processing Systems 36: Annual Conference on Neu-ral Information Processing Systems 2023, NeurIPS 2023, New Orleans, LA, USA, December 10 - 16, 2023 , 2023. URL http://papers.nips.cc/paper_files/paper/2023/hash/ c6ec1844bec96d6d32ae95ae694e23d8-Abstract-Datasets_and_Benchmarks.html .[34] Dan Hendrycks, Collin Burns, Steven Basart, Andy Zou, Mantas Mazeika, Dawn Song, and Jacob Steinhardt. Measuring massive multitask language understanding. In 9th International Conference on Learning Representations, ICLR 2021, Virtual Event, Austria, May 3-7, 2021 .OpenReview.net, 2021. URL https://openreview.net/forum?id=d7KBjmI3GmQ .[35] Greg Kamradt. LLMTest_NeedleInAHaystack: Doing simple retrieval from LLM models at various context lengths to measure accuracy. https://github.com/gkamradt/LLMTest_ NeedleInAHaystack , 2023. GitHub repository. 12 Appendix A Predictor Top-k Ablation 
+
+This section records the diagnostic ablation that motivates the predictor-before-top-k sparse-routing order. This experiment is run on a 200M-parameter small diagnostic model. It is not a final quality claim for the 8B sparse model. The ablation compares several ways to impose sparse FFN routing after a common continual-training checkpoint: • Direct top-k: Selects active channels directly from native FFN channel scores. • Direct top-k with compensation : Keeps the same selected channels but rescales the post-mask activation. • Predictor-before-top-k (adopted recipe) : Places the low-rank predictor before bank-wise hard top-k selection. Figure 5 shows the corresponding training loss comparison. The result supports using a trainable predictor before the hard top-k operator. Direct top-k masking is simpler, but it gives worse loss performance. 120K 130K 140K 150K 160K 170K   
+
+> Training step
+> 3.20
+> 3.21
+> 3.22
+> 3.23
+> 3.24
+> 3.25
+> 3.26
+> 3.27
+> 3.28
+> 3.29
+> Training loss
+> Predictor-before-top-k Direct top-k Direct top-k + compensation
+
+Figure 5: Continual-training ablation comparing predictor before top-k sparse routing with direct top-k masking variants. 13 B RULER-CWE Repair Analysis 
+
+This section records the details behind the layer-7 repair result in Section 6.2. The repair replaces selected sparse FFN intermediate activations with norm-calibrated dense activations at one layer and then measures which task behavior is recovered or damaged. 
+
+Prompt Prefill Repair is Sufficient for the CWE Recovery. We first separate the layer-7 repair by execution phase. In the all-call condition, the calibrated dense fallback is applied whenever the target layer is evaluated. In the prompt-processing condition, it is applied only while consuming the input prompt. In the decoding-only condition, it is applied only after generation begins. Table 3 reports results averaged over 50 different random seeds, with context length increasing in 512-token steps. Table 3: Phase localization for layer-7 repair on RULER-CWE. We report the recall@10.                               
+
+> Context range Dense Sparse Repair All Repair Prefill Repair Decode 2048–8192 0.991 0.978 0.989 0.987 0.981 8704–12288 0.975 0.856 0.944 0.947 0.878 12800–16384 0.925 0.583 0.817 0.802 0.604 16896–24576 0.762 0.352 0.575 0.566 0.371 25088–32000 0.498 0.259 0.277 0.374 0.196
+
+The main recovery therefore comes from how the model processes the prompt, not from changing the tokens produced during autoregressive decoding. 
+
+Effective Token Region: Final Question-and-Answer Suffix. We then restrict the same layer-7 prompt-processing repair to different final prompt regions. Table 4 shows that the strongest localized repair comes from patching the suffix where the prompt asks the question and begins the answer. Repairing the final 64 tokens and repairing the question-and-answer suffix produce nearly identical CWE recovery, while excluding that suffix removes most of the gain. Table 4: Token-region localization for layer-7 prompt-processing repair.             
+
+> Repair condition CWE recall@10 MMLU No repair 0.133 0.702 Final 64 tokens 0.933 0.628 Question-and-answer suffix 0.933 0.632 Final 64 tokens excluding Q&A suffix 0.267 0.702 Answer-prefix only 0.650 0.698
+
+This points to a readout-query failure. The sparse model appears to process enough evidence that a localized suffix repair can recover the common-word answer, but the predictor routing at the final question-and-answer suffix is not reliable for this long-CWE prompt. 
+
+Repair is not a General Long-Context Fix. The same intervention does not repair Needle-In-A-Haystack (NIAH) [ 35 ], where the model must retrieve and reason over a needle embedded in long context. Table 5 shows that final-suffix repairs do not close the dense-sparse gap. Table 5: NIAH recall under the same layer-7 repair interventions.       
+
+> Condition NIAH recall Dense companion 0.8636 Sparse baseline 0.7136 Final 64-token repair 0.7111 Question-and-answer repair 0.7111 Answer-prefix only 0.7161
+
+This negative result suggests that the CWE repair restores a small amount of low-level readout functionality rather than a general long-context understanding mechanism. Tasks such as NIAH appear to require distributed retrieval and integration behavior that cannot be recovered by patching one layer and one final suffix region. 14 Repair Trades off with MMLU. The repair also trades off against short-context reasoning. Figure 6 varies the number of repaired final prompt tokens. As the repaired window grows, the average long-CWE gain increases, while MMLU accuracy decreases relative to the sparse baseline. 1 4 8 16 32 64 128 256  
+
+> Number of repaired final prompt tokens
+> 0.0
+> 0.1
+> 0.2
+> 0.3
+> Long-CWE recall gain
+> Long-CWE gain MMLU drop
+> 0.00
+> 0.02
+> 0.04
+> 0.06
+> 0.08
+> MMLU accuracy drop
+
+Figure 6: Layer-7 final-token repair shows a trade-off between long-CWE recovery and MMLU. One plausible explanation is that the same layer-7 suffix routing subspace that is fragile for long-CWE readout is also useful for ordinary semantic selection in short benchmarks. Replacing it with dense activations can recover the narrow CWE behavior while disrupting the sparse model’s learned predictor routing on MMLU. 15
