@@ -6,41 +6,46 @@
 </div>
 
 ## 每次日报
-- 最新运行日期：2026-06-13
-- 运行时间：2026-06-13 21:06:05 UTC
+- 最新运行日期：2026-06-14
+- 运行时间：2026-06-14 20:20:02 UTC
 - 运行状态：成功
-- 本次总论文数：7
-- 精读区：3
-- 速读区：4
+- 本次总论文数：8
+- 精读区：5
+- 速读区：3
 
 ### 今日简报（AI）
-今日7篇论文聚焦端侧推理与系统优化，精读重点：NPU端RAG系统设计与vLLM冷启动延迟分析。最值得关注的是移动NPU上能效型RAG方案，以及推理引擎的冷启动瓶颈。建议优先阅读这两篇精读，对理解端侧部署和推理系统低延迟有直接帮助。
-- 详情：[/202606/13/README](/202606/13/README)
+今日精选8篇论文，重点精读2篇：移动NPU端侧RAG系统设计与LLM多比特量化技术。
+最值得关注：移动端NPU上高效RAG方案（满分10分）和基于加性码本的多比特量化方法（9分）。
+建议读者优先精读上述两篇的工程实现与量化细节，关注边缘AI部署的能效与压缩路线。
+- 详情：[/202606/14/README](/202606/14/README)
 
 ### 精读区论文标签
-1. [Energy-Efficient On-Device RAG on a Mobile NPU: System Design and Benchmark on Snapdragon X Elite](/202606/13/2606.11257v1-energy-efficient-on-device-rag-on-a-mobile-npu-system-design-and-benchmark-on-snapdragon-x-elite)  
+1. [Energy-Efficient On-Device RAG on a Mobile NPU: System Design and Benchmark on Snapdragon X Elite](/202606/14/2606.11257v1-energy-efficient-on-device-rag-on-a-mobile-npu-system-design-and-benchmark-on-snapdragon-x-elite)  
    标签：评分：10.0/10、query:edge-llm
-   evidence：移动端NPU上端到端RAG，硬件软件协同设计，异构计算
-2. [Breaking the Ice: Analyzing Cold Start Latency in vLLM](/202606/13/2606.07362v2-breaking-the-ice-analyzing-cold-start-latency-in-vllm)  
+   evidence：移动NPU上的端侧RAG，能效优化
+2. [Multi-Bitwidth Quantization for LLMs Using Additive Codebooks](/202606/14/2606.12876v1-multi-bitwidth-quantization-for-llms-using-additive-codebooks)  
    标签：评分：9.0/10、query:edge-llm
-   evidence：vLLM冷启动延迟分析，主要LLM服务框架
-3. [LC-QAT: Data-Efficient 2-Bit QAT for LLMs via Linear-Constrained Vector Quantization](/202606/13/2606.10531v1-lc-qat-data-efficient-2-bit-qat-for-llms-via-linear-constrained-vector-quantization)  
-   标签：评分：9.0/10、query:edge-llm
-   evidence：面向LLM推理加速的硬件感知2位权重量化
+   evidence：面向异构硬件的多比特宽度量化
+3. [AGENTSERVESIM: A Hardware-aware Simulator for Multi-Turn LLM Agent Serving](/202606/14/2606.09613v1-agentservesim-a-hardware-aware-simulator-for-multi-turn-llm-agent-serving)  
+   标签：评分：8.0/10、query:edge-llm
+   evidence：面向LLM代理服务的硬件感知模拟器及调度策略
+4. [Towards Autonomous Accelerator Design: FPGA Accelerator Generation with SECDA](/202606/14/2606.11117v1-towards-autonomous-accelerator-design-fpga-accelerator-generation-with-secda)  
+   标签：评分：8.0/10、query:edge-llm
+   evidence：LLM引导的FPGA加速器设计，用于AI工作负载
+5. [MiniPIC: Flexible Position-Independent Caching in <100LOC](/202606/14/2606.13126v1-minipic-flexible-position-independent-caching-in-100loc)  
+   标签：评分：8.0/10、query:edge-llm
+   evidence：针对LLM服务框架的KV缓存优化
 
 ### 速读区论文标签
-1. [Joint Structural Pruning and Mixed-Precision Quantization for LLM Compression](/202606/13/2606.07819v1-joint-structural-pruning-and-mixed-precision-quantization-for-llm-compression)  
+1. [Express Language Modeling](/202606/14/2606.10944v1-express-language-modeling)  
    标签：评分：7.0/10、query:edge-llm
-   evidence：通过剪枝和量化压缩LLM以高效部署
-2. [Look Less, Reason More: Block-wise Attention Skipping for Efficient Multimodal LLMs](/202606/13/2606.08511v1-look-less-reason-more-block-wise-attention-skipping-for-efficient-multimodal-llms)  
+   evidence：使用I/O感知的Triton实现解决LLM推理中的资源瓶颈
+2. [MiniMax Sparse Attention](/202606/14/2606.13392v1-minimax-sparse-attention)  
+   标签：评分：7.0/10、query:edge-llm
+   evidence：面向长上下文LLM的块稀疏注意力提升效率
+3. [Q-Delta: Beyond Key-Value Associative State Evolution](/202606/14/2606.08804v1-q-delta-beyond-key-value-associative-state-evolution)  
    标签：评分：6.0/10、query:edge-llm
-   evidence：通过注意力跳过实现高效多模态LLM推理
-3. [ReasonAlloc: Hierarchical Decoding-Time KV Cache Budget Allocation for Reasoning Models](/202606/13/2606.11164v1-reasonalloc-hierarchical-decoding-time-kv-cache-budget-allocation-for-reasoning-models)  
-   标签：评分：6.0/10、query:edge-llm
-   evidence：解码时KV缓存预算分配加速LLM推理
-4. [Defense Against Prompt Inversion Attacks: An Information-Theoretic Approach for LLM Collaborative Inference](/202606/13/2606.11592v1-defense-against-prompt-inversion-attacks-an-information-theoretic-approach-for-llm-collaborative-inference)  
-   标签：评分：6.0/10、query:edge-llm
-   evidence：面向LLM的协作边缘-云端推理与隐私防御
+   evidence：面向线性注意力的硬件高效分块并行公式
 
 
 <div class="dpr-home-promo-card">
