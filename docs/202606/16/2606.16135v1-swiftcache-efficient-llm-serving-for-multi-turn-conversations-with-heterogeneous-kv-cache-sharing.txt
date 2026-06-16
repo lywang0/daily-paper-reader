@@ -1,0 +1,843 @@
+Title: SwiftCache: Efficient LLM Serving for Multi-turn Conversations with Heterogeneous KV Cache Sharing
+
+URL Source: https://arxiv.org/pdf/2606.16135v1
+
+Published Time: Tue, 16 Jun 2026 02:02:19 GMT
+
+Number of Pages: 15
+
+Markdown Content:
+# SwiftCache: Efficient LLM Serving for Multi-turn Conversations with Heterogeneous KV Cache Sharing 
+
+## Jianmin Hu 
+
+Southern University of Science and Technology; Shenzhen Institutes of Advanced Technology, CAS Shenzhen, Guangdong, China 
+
+## Minxian Xu ∗
+
+Shenzhen Institutes of Advanced Technology, CAS Shenzhen, Guangdong, China 
+
+## Sa Wang 
+
+Institute of Computing Technology, CAS Beijing, China 
+
+## Chong Ma 
+
+Alibaba Group Hangzhou, China 
+
+## Min Shen 
+
+Alibaba Group Hangzhou, China 
+
+## Kejiang Ye 
+
+Shenzhen Institutes of Advanced Technology, CAS Shenzhen, Guangdong, China 
+
+## Lin Qu 
+
+Alibaba Group Hangzhou, China 
+
+## Chengzhong Xu 
+
+University of Macau Macau, Macau, China 
+
+## Abstract 
+
+Multi-turn conversation is a fundamental scenario in LLM applications, widely used in chatbots and AI agents. As the conversation evolves, historical tokens accumulate continu-ously. Existing systems cache their key-value (KV) pairs to avoid redundant computation. However, limited GPU mem-ory (HBM) capacity often forces these KV caches to be of-floaded to CPU memory or SSD, making KV cache reloads increasingly costly in terms of latency as the context grows. Meanwhile, the constrained HBM capacity also limits the maximum inference length, thereby restricting the number of turns that can be supported in a conversation. To address these two challenges, we propose SwiftCache, a collaborative inference system that enables heterogeneous models to share underutilized GPU memory and NVLink bandwidth within a server. Specifically, models with low KV cache demand donate idle GPU memory to store the prefix cache of high-demand models, allowing cross-model KV cache sharing over NVLink and avoiding slow PCIe transfers. SwiftCache further reduces memory pressure by keeping only the KV cache of the currently active layer in local GPU memory, thereby enabling longer-context inference. Our experiments on real-world workloads show that SwiftCache reduces P99 time-to-first-token (TTFT) by up to 69% and extends maximum context length by up to 3.98 × compared to vLLM and SGLang, with minimal interference to co-located models. 
+
+CCS Concepts: • Computer systems organization →
+
+Real-time systems ; • Computing methodologies → Nat-ural language processing; Distributed computing methodolo-gies .
+
+> ∗Corresponding author
+
+Keywords: Large Language Models, KV Cache, Multi-Model Serving, Cross-Model Memory Sharing 
+
+## 1 Introduction 
+
+With the rapid advancement of large language models (LLMs), the maximum context window supported by modern LLMs has increased dramatically. Many state-of-the-art LLMs now support inference with context windows ranging from 128K to 1M tokens. Multi-turn conversation is a critical and highly prevalent long-context inference scenario, widely used in chatbots [ 4 , 6, 10 , 29 ], AI agents [ 30 , 39 ], and other interac-tive applications. In multi-turn conversations, the amount of historical tokens increases as the number of turns grows, be-cause the content from all previous turns, primarily consist-ing of user prompts and system responses, must be preserved and continuously incorporated into inference. In contrast, each new turn typically contributes only a relatively small amount of additional user input or response content. The KV pairs corresponding to historical tokens are usually cached in HBM. However, as the number of historical tokens increases, HBM eventually becomes insufficient to accommodate ad-ditional KV pairs. As a result, part of the KV pairs must be offloaded to CPU memory or SSD. Such a hierarchical caching strategy has already been adopted by mainstream LLM serving systems, including vLLM [ 18 , 24 ], SGLang [ 56 ], and Mooncake [ 33 ]. However, existing hierarchical caching mechanisms still face two major challenges when serving long-context multi-turn conversations. 
+
+First, KV cache reload becomes increasingly expen-sive as history grows. As conversational context continues to grow, TTFT rises substantially even though newly en-tered input remains relatively stable across turns [ 12 ]. This latency growth is mainly due to the cost of fetching histor-ical KV caches from CPU memory or SSD back into GPU    
+
+> arXiv:2606.16135v1 [cs.DC] 15 Jun 2026 5k 10k 20k 50k
+> Number of historical tokens
+> 0
+> 200
+> 400
+> 600
+> 800
+> Total Time(ms)
+> 0
+> 25
+> 50
+> 75
+> 100
+> Transfer Time Ratio (%)
+> 73.2%
+> 24.7%
+> 80.1%
+> 29.4%
+> 80.9%
+> 28.7%
+> 86.2%
+> 35.5%
+> computing time
+> NVLink loading time
+> PCIe loading time
+> PCIe transfer ratio
+> NVLink transfer ratio
+
+Figure 1. Latency breakdown for computing 256 new tokens and loading KV cache with varying numbers of historical tokens on two 96 GB H20 GPUs using the LWM-1M-Text [ 23 ]. The system uses PCIe 4.0 with a peak bandwidth of 32 GB/s and NVLink with a peak bandwidth of 400 GB/s. memory over PCIe, which becomes the dominant bottleneck. As shown in Figure 1, PCIe-based loading takes around 75ms at 5k historical tokens, while computation only takes about 27ms, and the transfer overhead rises from 73.2% to 86.2% as history grows to 50k tokens. This suggests that in multi-turn conversations, KV cache transfer for historical tokens is non-negligible and can dominate the overall latency. By contrast, NVLink can substantially reduce this transfer overhead and mitigate its impact on end-to-end inference latency. 
+
+Second, limited HBM capacity restricts the maxi-mum context length. Although many modern LLMs adver-tise very long context windows, the actual length they can handle is often much smaller due to HBM limits. For example, although LWM-1M-Text [ 23 ] supports a maximum context length of 1M tokens, it can only process sequences up to 18K tokens on a 32GB V100 GPU and up to 160K tokens even on a 96GB H20 GPU. Existing approaches such as chunked prefill [ 2 ], parallelization [ 17 , 20 , 38 ], and compression-based methods [ 15 , 19 , 54 , 55 ] can help, but they either require more hardware or may hurt accuracy. Meanwhile, we observed that some co-located models still leave idle GPU memory, cre-ating an opportunity to extend inference length by sharing memory across models. To address these two challenges, we propose SwiftCache, an efficient inference system designed for long-context multi-turn conversations. The core ideas of SwiftCache are as fol-lows: (1) it offloads KV pairs into idle blocks in the KV caches of other models via high-speed NVLink to accelerate KV cache transmission. This is motivated by the observation that heterogeneous models co-located on the same server often serve workloads with markedly differ-ent KV cache demands: some models handling long-context multi-turn conversations require large cache capacity, while others serving shorter or less cache-intensive workloads leave substantial KV cache space idle. Meanwhile, because different models usually run independently, they rarely gen-erate frequent GPU-to-GPU communication with each other at the hardware level. SwiftCache leverages this otherwise idle bandwidth and memory for fast cross-model KV cache sharing. (2) it retains only the KV pairs of the currently active layer in the local KV cache, thereby reducing GPU memory overhead and supporting longer infer-ence lengths. We observed that only the currently execut-ing layer accesses its own KV cache, while the KV caches of other layers remain temporarily idle but still occupy valu-able GPU memory. Existing systems [ 18 , 27 , 56 ] typically keep all layer KV caches resident in local GPU memory, but this design significantly increases peak memory usage and limits the maximum context length. (3) it introduces an elastic cache mechanism that can be resized in O(1)
+
+time according to workload intensity. In multi-model serving, cache capacity needs to be flexibly reallocated as workload intensity changes over time. However, existing systems often incur substantial data movement if KV cache resizing is required because of the layer-major layout. To tackle this, SwiftCache proposes a block-major layout and in-tegrates it into the elastic cache, enabling fast, low-overhead reallocation. Overall, SwiftCache is designed as a multi-model collab-orative inference system for long-context workloads. It en-ables KV cache memory space sharing across co-located models, allowing models with high KV cache demand to offload prefix KVs to idle cache blocks of other models. The core components of SwiftCache are layer stream cache and 
+
+elastic cache . Layer stream cache stores only the KV pairs of the currently active layer in local GPU memory. It streams the KV pairs of other layers from external memory on de-mand, thereby reducing memory pressure and extending the maximum inference length (§3.2). To further support flexible and efficient cache reallocation, SwiftCache introduces elas-tic cache with block-major layout, which dynamically adjusts the cache capacity assigned to each model with only 𝑂 (1)
+
+overhead according to workload demand (§3.4). Together, these designs improve GPU memory utilization and overall serving performance for long-context inference. We evaluate SwiftCache on two real-world multi-turn conversation datasets, ShareGPT [ 36 ] and L-Eval [ 5 ], using Qwen3-family [ 49 ] models and LWM-1M-Text [ 23 ]. Com-pared with state-of-the-art inference systems, SwiftCache reduces P99 TTFT by up to 69% and extends the maximum inference length by up to 3.98 × across GPUs with various HBM capacities. Our key contributions are: 
+
+• We analyze the characteristics of multi-turn conversa-tions and identify two key challenges for LLM serving in this scenario: inefficient KV cache transfer and lim-ited HBM capacity. 
+
+• We propose SwiftCache, a collaborative serving system that enables heterogeneous models to share KV cache 
+
+> 2
+
+through NVLink and dynamically reallocate memory across models, fully utilizing underused NVLink band-width and GPU memory within a server. 
+
+• We design layer stream cache and elastic cache, two mechanisms that reduce local KV footprint and sup-port efficient 𝑂 (1) resizing of cache allocations. 
+
+• We demonstrate significant gains in latency and maxi-mum context length across real-world workloads and different GPU memory capacities, with only minimal interference to co-located models. 
+
+## 2 Background and Motivations 
+
+2.1 KV Cache and Prefix Caching 
+
+Autoregressive LLMs produce tokens one after another, and each token looks back at all the tokens generated before it. In each iteration, the model recomputes the keys and values for all preceding tokens in the sequence. To reduce this redundancy, modern inference systems [ 18 , 27 , 56 ] widely adopt KV cache, which stores the key and value states of past tokens for reuse in later decoding steps. By reusing these cached states, KV cache significantly improves decoding efficiency and is a core mechanism in LLM inference. In addition to intra-sequence reuse during generation, many workloads also exhibit prefix reuse across different requests, where multiple prompts share the same system instruction, template, or other common prefix. KV cache can store the KV pairs from a processed request. When a subse-quent request shares the same prefix, these cached pairs can be reused to avoid redundant computation. We refer to this cross-request reuse of KV cache as prefix caching [ 12 , 27 , 53 ]. One typical use case of prefix caching is multi-turn con-versations. Since LLMs do not have an intrinsic memory mechanism, multi-turn interaction is implemented as a se-quence of independent requests, where the prompt of each turn is constructed by concatenating the previous content with the user’s current input. Consequently, all requests in a session share the same prefix, which makes multi-turn conversations a natural use case for prefix caching. 
+
+2.2 Multi-turn Conversations Inference in LLMs Transformer architecture. Transformer [ 44 ] is the back-bone architecture of modern LLMs. As shown in Fig. 2, a transformer layer typically consists of embedding, self-attention, feed-forward network, and normalization modules. Given an input sequence, the model first maps tokens into hidden representations through the embedding layer. These representations are then projected into query, key, and value vectors via the QKV projection. In the attention module, each token attends to all tokens that precede it to capture contextual dependencies. The resulting representations are further processed by output projection and feed-forward Embedding                                          
+
+> QKV Projection
+> Attention
+> OProjection
+> Up_Gated
+> Projection
+> Act
+> Down Projection
+> LayerNorm
+> LayerNorm
+> User:
+> What is Spring Festival ？
+> Assistant:
+> The Spring Festival, also known as the
+> Chinese Lunar New Year, is the most
+> important traditional holiday in China,
+> usually celebrated on the first day of the
+> first month in the lunar calendar, which
+> typically falls between late January and
+> mid -February in the Gregorian calendar .
+> User:
+> What do people do on this day ？
+> Assistant:
+> ……
+> Historical Tokens
+> New Tokens
+> Cached in GPU
+> /CPU/SSD
+> To be Computed
+> Load
+> Unknown Tokens
+> To be Generated
+> Multi -turn Conversations
+
+Figure 2. An illustration of multi-turn conversation infer-ence in LLMs. Historical tokens from previous turns are cached in GPU, CPU, or SSD memory, while only new tokens in the current turn need to be computed. During attention, the cached key-value pairs of historical tokens are loaded and combined with newly computed tokens to generate the next response. 0 500 1000 1500 2000  
+
+> #Tokens
+> 0
+> 1
+> 2
+> 3
+> Density
+> 1e 2
+> User (p90=132)
+> Assistant (p90=943)
+
+(a) Distributions of user prompt and assistant response length. 0 20k 40k 60k 
+
+> #Tokens
+> 0.0
+> 0.2
+> 0.4
+> 0.6
+> 0.8
+> 1.0
+> CDF
+> P90: 13k
+> P99: 56k
+
+(b) Distribution of total token lengths across sessions. 
+
+Figure 3. Token length statistics in ShareGPT. layers, which usually include gated-up projection, activa-tion, and down-projection operations. By stacking multiple Transformer layers, LLMs can model complex semantic rela-tionships over long sequences. 
+
+Multi-turn conversations. Multi-turn conversations are a common interaction pattern for LLMs, where a user and the assistant exchange multiple rounds of messages. In this setting, the tokens from previous turns form the conversa-tional history, while the newly entered user tokens constitute the current input. During inference, only the new tokens need to be computed, whereas the historical tokens can be reused through the KV cache. Compared with recomput-ing all historical tokens from scratch, using the KV cache avoids repetitive execution of embedding, feed-forward net-work, normalization, and projection operations, which are essentially large matrix multiplications, thereby reducing the overall computational cost of inference. Specifically, in the attention computation of a new turn, the model retrieves the cached KV pairs of historical tokens and combines them with the KV pairs from the new tokens. This mechanism al-lows the model to avoid recomputing previously seen tokens, 
+
+> 3
+
+Table 1. Performance of the LWM-1M-Text model across various workloads on an H20 GPU with and without prefix cache.                               
+
+> Workload Classifications Data Source Hit Rate (%) TTFT w/ Cache TTFT w/o Cache Avg. Input Length Demand
+> Summarization L-Eval [5] 6.3 0.77s 0.86s 7124 Low Code Completion HumanEval [8] 0.1 0.03s 0.03s 155 Low Multi-turn Conversations ShareGPT [36] 90.7 0.11s 0.72s 6231 High Question Answering L-Eval [5] 81.8 0.92s 7.95s 43958 High
+
+significantly reducing the TTFT of the next turn. When the historical tokens’ KV pairs can be reused in the next round, we refer to this as a prefix cache hit .
+
+Characteristics of multi-turn conversations. In multi-turn conversations, historical tokens accumulate across turns, whereas each new turn typically adds only a short user in-put. Thus, inference latency is driven not only by new-token computation but also by historical KV cache loading, which becomes expensive when cache is offloaded to CPU memory or SSD. As shown in Fig. 3a, 90% of user prompts are shorter than 132 tokens, indicating that prefill computation is rela-tively lightweight. In contrast, Fig. 3b shows that 10% and 1% of sessions exceed 13k and 56k tokens, respectively, lead-ing to severe GPU memory pressure and limiting maximum inference length. 
+
+2.3 Different Workloads Have Different Prefix Cache Demands 
+
+In LLM inference, we observe that the demand for prefix cache varies substantially across workloads. As Table 1 shows, multi-turn conversational and question answering scenarios often involve extensive reuse of prefix KV pairs, with pre-fix cache hit rates of 90.7% and 81.8%, respectively, making prefix caching a critical mechanism for reducing inference latency. Therefore, models serving such workloads require large KV cache capacity for higher prefix cache hit rates. In contrast, tasks like summarization or code completion typically present distinct contexts, resulting in low hit rates and minimal cache usage, with prefix cache hit rates of 6.3% and 0.1%, respectively. Turning off prefix cache in these tasks would not significantly impact performance. This difference in KV cache demand highlights the sharply different KV cache capacity requirements of LLM services across sce-narios, and suggests an opportunity to optimize inference through cross-model KV cache sharing. 
+
+Insight-1 : Models with high KV cache capacity demand can offload their prefix cache to the KV cache space of lower demand models, thereby improving overall GPU memory utilization. 
+
+2.4 Underutilized NVLink Bandwidth Between Heterogeneous Models 
+
+In a server, where each model may occupy one or more GPUs, we observe that GPUs belonging to different models rarely engage in direct GPU-to-GPU communication. This is because mainstream parallelization strategies, including Tensor Parallelism [ 38 ], Model Parallelism [ 21 ], and Pipeline Parallelism [ 17 ], operate exclusively within the scope of a single model, leaving high-bandwidth interconnects such as NVLink or NVSwitch between GPUs of different mod-els largely underutilized. Even in multi-model collaborative scenarios such as multi-agent systems, inter-model commu-nication is typically mediated by the CPU through network or process-level messaging rather than direct GPU-to-GPU transfer. As a result, NVLink links between heterogeneous models often remain idle or only lightly utilized. Therefore, if we co-locate a model with high KV cache demand and a model with low KV cache demand within a server, the former can offload its prefix cache to the GPUs of the latter via these high-speed interconnects. Compared to the con-ventional approach of offloading the prefix cache to host memory or SSD through PCIe, which incurs higher latency and CPU involvement, this direct GPU-to-GPU transfer is significantly faster and fully bypasses the CPU. 
+
+Insight-2 : We can co - locate models with high KV cache ca-pacity demand and models with low demand on a server, and transfer prefix cache via NVLink. 
+
+2.5 Only One Layer of KV Cache is Active During LLM Inference 
+
+In LLM inference, the attention of each layer only accesses the KV cache of that layer. KV caches from other layers re-main idle but still occupy GPU memory. This means that most of the KV cache is inactive while a given layer is run-ning. Based on this observation, all layers’ KV caches can be stored in external memory such as another GPU, CPU memory, or high-speed devices. The local GPU only keeps a buffer for the current layer. When executing the attention of a certain layer, its KV cache is loaded from the external memory into the local GPU in advance. This way, the GPU only needs memory space for one layer’s KV cache at a time, allowing that space to store more KV pairs and support a longer context length. For example, consider a model with three decoder layers on a given GPU, where each layer can store up to 10K tokens of KV cache. If the KV caches of the other two layers are stored on other GPUs, the local GPU can repurpose all KV cache memory, originally allocated for the KV pairs of all  
+
+> 4Worker -N
+> Inference Engine
+> Scheduler
+> Master
+
+⋯⋯     
+
+> Scheduler
+> Worker -1
+> Inference Engine
+> Elastic Cache
+> Block Table
+> Coordinator
+> Elastic Cache
+> Coordinator
+> Block Table
+> Coordinator
+> Block Tables
+> Layer Stream Cache Regular Cache
+
+⋯    
+
+> Inference Engine
+> Request 1
+> Requests
+> Dispatcher
+> Request 2
+> Request 3
+> User Request
+> GPU Data
+> CPU Data
+> Sync Message
+> Scheduler
+> 1
+> 2
+> 4
+> 3
+> Master  Cache  Manager
+> Worker  Cache  Manager
+> Worker  Cache  Manager
+
+Figure 4. SwiftCache system overview. three layers, to store just a single layer, theoretically increas-ing its capacity to 30K tokens. This both preserves the KV caches of other layers and increases the maximum context length during inference. Furthermore, based on Insight-1 and Insight-2 , when high KV cache capacity demand models and low demand models are co-located on the same machine, the prefix cache of the high demand model can be transferred to the GPUs of the low -demand model via high-speed NVLink interconnects. This direct GPU - to - GPU migration avoids PCIe and CPU involvement, thereby preventing high inference latency from cache transfer. 
+
+Insight-3 : Inactive KV caches from other layers in LLM infer-ence can be offloaded, enabling the active layer to store more KV and extend the maximum context length. 
+
+## 3 SwiftCache Design 
+
+3.1 Overview 
+
+To address the above challenges we propose SwiftCache, a multi-model collaborative system that is based on our three insights to improve GPU memory utilization and NVLink bandwidth efficiency within a server. As shown in Fig. 4, SwiftCache consists of one model with high KV cache de-mand, referred to as the master , and multiple models with low KV cache demand, referred to as workers . Each model has its own scheduler , cache manager , coordinator , and inference engine . User requests are dispatched to either the master or a worker based on their KV cache demand, and the scheduler adopts an iteration-level [ 51 ] scheduling policy with FCFS ordering. On the master side, the master cache manager maintains two cache structures: layer stream cache and regular cache. The layer stream cache keeps only the KV cache of the active layer in local GPU memory to reduce local memory usage, while the regular cache stores full-layer KV blocks in the master’s local memory for low-latency reuse, without incur-ring any cross-GPU data transfer (§ 3.2). On the worker side, the worker cache manager maintains an elastic cache with a block-major layout that supports 𝑂 (1) cache resizing be-tween local workloads and master borrowing (§ 3.4). When a worker is lightly loaded, it donates idle cache blocks to the master; when its own demand increases, it reclaims the borrowed capacity. This constant-time resizing is enabled by block-level remapping, allowing each worker cache manager to update its local block table and coordinate synchroniza-tion without expensive data movement (§ 3.5). The master and workers interact through their respective coordinators to ensure the elastic cache is reasonably allocated between them (§ 3.5). 
+
+3.2 Master Cache Manager Design 
+
+In this section, we describe the two key components of the master cache manager, layer stream cache and regular cache, and show how they together enable SwiftCache to extend the maximum inference length. 
+
+Layer Stream Cache. Layer stream cache (LSC, denoted by 1 in Figure 4) is a GPU buffer designed to temporar-ily hold the KV cache of only the currently executed layer during inference. In scenarios where the requested prefix cache is stored on a worker GPU, SwiftCache preloads the KV cache for a given layer into the LSC of the master GPU before the model executes the attention of that layer. Newly generated KV entries are also written into this memory and subsequently transferred back to the worker GPU after com-putation. Because LSC stores only one layer’s KV cache at any given time, it significantly reduces the amount of KV cache that needs to reside in the master’s local GPU memory, thus enabling a longer maximum inference context length. The capacity of LSC, measured in terms of the number of blocks it can hold, is determined by the total KV cache size of all worker models and the memory footprint of a single block in the master model. Specifically, let the total KV cache size across all worker models be Í𝑁 𝑖 =1 𝐶 (𝑖 )
+
+> worker
+
+, where 𝐶 (𝑖 )
+
+> worker
+
+denotes the KV cache size of the 𝑖 -th worker model and 𝑁 is the total number of worker models. In the master model, the memory footprint of a single KV block per layer is given by: 
+
+𝑀 block = 2 × 𝐵 × 𝐻 kv × 𝐷 kv × 𝑑 type , (1) where the factor of 2 reflects the storage of both key and value tensors, 𝐵 , 𝐻 kv , 𝐷 kv , and 𝑑 type denote the block size, the number of KV heads, dimension per KV head, and the number of bytes per element in the master, respectively. Let 𝐾 𝑖 denote the number of master full-layer blocks that can be stored using the KV cache space of the 𝑖 −th worker model, i.e., 
+
+> 5
+
+𝐾 𝑖 =
+
+$ 𝐶 (𝑖 )
+
+> worker
+
+𝑀 block × 𝐿 
+
+%
+
+, (2) where 𝐿 denotes the number of decoder layers of the master. Let 𝐾 master denote the number of single-layer blocks that the master’s local memory can store: 
+
+𝐾 master =
+
+𝐶 master 
+
+𝑀 block 
+
+
+
+, (3) where 𝐶 master is KV cache size of the master. Then, the number of KV blocks in LSC is given by: 
+
+𝑁 LSC = min 
+
+> 𝑁
+
+∑︁ 
+
+> 𝑖 =1
+
+𝐾 𝑖 , 𝐾 master 
+
+!
+
+. (4) This formulation ensures that LSC is sized to hold the KV cache from all worker devices, up to the master’s local mem-ory limit, and enables the master to process long sequences without exhausting its memory. 
+
+Regular Cache. Since the size of LSC is strictly determined by Eq. 4, the master’s local GPU memory may not be fully occupied. When Í𝑁 𝑖 =1 𝐾 𝑖 < 𝐾 master , LSC consumes exactly 
+
+Í𝑁 𝑖 =1 𝐾 𝑖 single-layer blocks, leaving surplus memory for regu-lar cache (RC, denoted by 2 in Figure 4). RC stores KV cache directly on the master’s local memory and retains full-layer data throughout the entire inference process, offering the lowest access latency as it requires no cross-GPU transfer. Using the notation defined above, the number of full-layer KV blocks that RC can store is given by: 
+
+𝑁 RC =
+
+$ 𝐾 master − Í𝑁 𝑖 =1 𝐾 𝑖 
+
+𝐿 
+
+%
+
+. (5) Conversely, when Í𝑁 𝑖 =1 𝐾 𝑖 ≥ 𝐾 master , LSC occupies the entire master memory, leaving no space for RC. Ultimately, the maximum inference length supported by the master is 
+
+(𝑁 LSC + 𝑁 RC ) × 𝐵 tokens. Here is a specific example. Assume the master has 𝐿 =
+
+10 layers. The master’s local memory can store a total of 
+
+𝐾 master = 100 single-layer blocks. Worker 1 can store 𝐾 1 =
+
+9 full-layer blocks, and worker 2 can store 𝐾 2 = 8 full-layer blocks. The number of blocks that LSC can store is 
+
+𝑁 LSC = 9 + 8 = 17 . Thus, LSC occupies 17 blocks, leaving 
+
+100 − 17 = 83 single-layer blocks in master memory for RC. Since RC stores full-layer blocks, the number of RC blocks is 𝑁 RC = ⌊83 /10 ⌋ = 8. Therefore, the maximum inference context length supported is 𝑁 LSC + 𝑁 RC = 25 blocks. In con-trast, a conventional system without LSC can only support 
+
+⌊100 /10 ⌋ = 10 blocks. 1 2 3 4 1 2 3 4 1 2 3 4                                                                 
+
+> 123412341234
+> 123123123
+> scale down
+> layer 1 layer 2 Layer 3
+> 123412341234
+> 123412341234
+> 123451234512
+> scale up
+> layer 1 layer 2 layer 3
+> 345
+> O(n_layers ×n_blocks)
+> free blocks free blocks data copy data copy
+
+Figure 5. Resizing operations in a layer-major KV cache layout. 
+
+3.3 Overlapping KV Cache Transfer with Computation 
+
+To minimize the latency introduced by cross-GPU KV cache transfers, both load and store operations are performed in a layer-wise manner and can be overlapped with computation. 
+
+KV Store. Newly generated KV entries are produced after the QKV operation of each layer. Once generated, they can be asynchronously transferred to the worker GPU without blocking subsequent computation. 
+
+KV Load. For the first layer, the KV cache loading can begin immediately after the scheduling phase, before the attention computation starts. For subsequent layers (i.e., layer 𝑖 where 
+
+𝑖 ≥ 2), the KV cache of layer 𝑖 must wait until both the attention of layer 𝑖 − 1 has completed and the layer-wise KV cache transfer of layer 𝑖 − 1 has finished. This ensures that no data is overwritten before being successfully transferred back to the worker GPU. Once these conditions are satisfied, the KV cache of layer 𝑖 can be loaded asynchronously while the FFN of layer 𝑖 − 1 executes, effectively hiding the transfer latency. By leveraging layer-wise pipelining, overlapping computa-tion with communication, and the high-bandwidth NVLink interconnect, the overhead of both loading from and storing to worker GPUs can be effectively hidden, thereby improving overall inference throughput. 
+
+3.4 Worker Cache Manager Design Elastic Cache. In multi-model inference scenarios, worker models must continue serving their own requests concur-rently with the master model. Consequently, it is infeasible for a worker model to permanently allocate all of its GPU memory reserved for KV cache to the master. To address this constraint, we propose the elastic cache (denoted by 3 in Figure 4) that enables the worker to dynamically reallocate portions of its KV cache memory to the master according to workload intensity. 
+
+High Cost of Elasticity in Existing Systems . Most cur-rent inference frameworks (e.g., vLLM [ 18 ], SGLang [ 56 ], LightLLM [ 7 , 13 ]) are not designed for dynamic KV cache resizing. If such resizing operations are performed within these systems, they would incur substantial overhead due to their layer-major layout. In this layout, memory is orga-nized with the layer index as the first dimension and the                                                         
+
+> 6123412341234
+> 123412341234
+> 555123412341234
+> scale up
+> free blocks
+> no data copy
+> 123412341234
+> scale down
+> 123123123
+> 123123123
+> free blocks
+> no data copy
+> O( 1)
+
+Figure 6. Resizing operations in a block-major KV cache layout. block index as the second dimension, so the shape of the KV cache tensor is ( n_layers , n_blocks , block_elems ), where 
+
+n_layers is the total number of transformer layers in the model. n_blocks is the number of KV cache blocks allocated per layer. block_elems is the number of elements in a block, computed as block_size × n_heads × head_dim . Under this layout, all KV blocks belonging to the same layer are stored contiguously in memory, while blocks from different layers reside in separate, non-adjacent regions. When resizing, such as reducing the number of blocks allocated to a worker model or increasing the allocation for a master model, the change is applied uniformly across all layers. This means that the same block index must be added or removed in every layer. Under the layer-major layout, all blocks within a single layer are stored contiguously, but blocks with the same index from different layers reside in separate regions of GPU memory. As a result, removing a block from the worker requires shifting subsequent blocks within each affected layer to close the gap and retain that layer’s internal contiguous arrangement. Similarly, inserting new blocks for the master entails moving existing blocks within each layer to make room for the additions. This per-layer rearrangement, although logically concerning only a single block index, induces extensive physical memory move-ment across multiple disjoint regions, leading to significant latency and reallocation overhead. The left part of Figure 5 shows the scaling-up process of a model with three decoder layers, each containing four blocks. In this case, each layer is extended with one additional block, which causes extensive data movement. For instance, the first block of the second layer must give up its position to the newly inserted fifth block in the first layer, and then be shifted to occupy the position of the second block in the second layer, triggering similar moves for subsequent blocks. The right part of Figure 5 shows the scaling-down process of the same model, where the fourth block of each layer is freed. Because blocks within the same layer are stored contiguously and blocks from different layers reside in separate memory regions, removing the last block requires shifting all blocks starting from the first block of the second layer forward. For example, the first block of the second layer is moved to the position originally occupied by the fourth block of the first layer. Since blocks in the first layer remain in place while blocks in the other layers must be moved, both operations result in a time complexity of 𝑂 (n_layers × n_blocks ).
+
+Block-Major Layout for Efficient Resizing. To eliminate cross-layer migration, we propose a block-major layout in which all layer data belonging to the same block are stored contiguously in device memory. The KV cache shape is ad-justed to ( n_blocks , n_layers , block_elems ). As a result, resizing operations require only appending a new block at the end for expansion or releasing the last block for contrac-tion, without relocating data from other blocks. The com-plexity is thereby reduced from 𝑂 (n_layers × n_blocks )
+
+to 𝑂 (1).In this layout, all KV cache blocks with the same index across layers are stored contiguously in memory, while blocks of different indices are stored in separate regions. The left part of Figure 6 shows the scaling-up process, where each layer is extended with one additional block (block index 5). Since the newly added blocks are placed at the end of their respective contiguous regions, no existing KV cache data needs to be moved. The right part shows the scaling-down process, where the last block of each layer (block index 4) is freed. Removing these blocks simply releases the ending memory region without shifting any other blocks. Because both operations avoid moving existing KV cache data, the time complexity is 𝑂 (1), making block-major layout highly efficient for dynamic resizing. 
+
+The Minimum Granularity of Scaling. Due to differences in the number of layers, the size of each block, the num-ber of attention heads, and the dimensionality of each head between the master and worker models, the number of ele-ments contained in each KV cache block ( block_elems ) also varies. If KV cache borrowing and returning are performed at the granularity of a block, GPU memory alignment may not be preserved, leading to memory wastage. Therefore, it is necessary to establish a shared alignment unit for memory scaling. This unit must ensure that, from both the master and worker perspectives, any expansion or shrinkage is per-formed in increments that are integer multiples of both KV cache block sizes. By doing so, memory waste can be avoided. This requirement naturally leads to the adoption of the least common multiple (LCM) [ 53 ] principle for determining the scaling unit. We define the number of elements in a single block of the master model as 
+
+𝐵𝐸 𝑚 = 𝐿 × 𝐵 × 𝐻 kv × 𝐷 kv , (6) and the number of elements in a single block of the 𝑖 -th worker model as 
+
+𝐵𝐸 𝑖 = 𝐿 𝑖 × 𝐵 𝑖 × 𝐻 (𝑖 ) 
+
+> kv
+
+× 𝐷 (𝑖 ) 
+
+> kv
+
+, (7) where 𝐿 𝑖 , 𝐵 𝑖 , 𝐻 (𝑖 ) 
+
+> kv
+
+and 𝐷 (𝑖 ) 
+
+> kv
+
+denote the number of layers, the block size, the number of KV heads and dimension per KV head, respectively. The least common multiple of these 
+
+> 7
+
+Algorithm 1 Elastic KV Cache Scale-Up and Scale-Down  
+
+> 1:
+
+Input:  
+
+> 2:
+
+𝑁 𝑖 : Current #KV blocks for 𝑖 -th worker  
+
+> 3:
+
+𝐵 𝑖 : Block size for 𝑖 -th worker  
+
+> 4:
+
+𝑀𝐸𝑈 𝑖 : Minimum elastic unit for 𝑖 -th worker  
+
+> 5:
+
+𝑀𝐸𝑈 𝑚 : Minimum elastic unit for master  
+
+> 6:
+
+𝑟𝑒𝑞𝑢𝑒𝑠𝑡 _𝑙𝑒𝑛 : Number of tokens in the current request.  
+
+> 7:
+
+𝑡 : Time window  
+
+> 8:
+
+Output: Number of blocks needed to update for master and 𝑖 -th worker  
+
+> 9: 10:
+
+function ScaleUp (𝑁 𝑖 , 𝐵 𝑖 , 𝑀𝐸𝑈 𝑖 , 𝑀𝐸𝑈 𝑚 , 𝑟𝑒𝑞𝑢𝑒𝑠𝑡 _𝑙𝑒𝑛 ) 
+
+> 11:
+
+𝑛𝑒𝑒𝑑 ← ⌈ 𝑟𝑒𝑞𝑢𝑒𝑠𝑡 _𝑙𝑒𝑛 /𝐵 𝑖 ⌉ 
+
+> 12:
+
+if 𝑛𝑒𝑒𝑑 ≤ 𝑁 𝑖 then  
+
+> 13:
+
+return (0, 0) 
+
+> 14:
+
+else  
+
+> 15:
+
+𝑑𝑖 𝑓 𝑓 ← 𝑛𝑒𝑒𝑑 − 𝑁 𝑖  
+
+> 16:
+
+𝑘 ← ⌈ 𝑑𝑖 𝑓 𝑓 /𝑀𝐸𝑈 𝑖 ⌉ 
+
+> 17:
+
+return (𝑘 × 𝑀𝐸𝑈 𝑖 , 𝑘 × 𝑀𝐸𝑈 𝑚 ) 
+
+> 18:
+
+end if  
+
+> 19:
+
+end function  
+
+> 20: 21:
+
+function ScaleDown (𝑁 𝑖 , 𝐵 𝑖 , 𝑀𝐸𝑈 𝑖 , 𝑀𝐸𝑈 𝑚 , 𝑡 ) 
+
+> 22:
+
+𝑚𝑎𝑥 _𝑙𝑒𝑛 ← max {𝑙𝑒𝑛 (𝑟 ) | 𝑟 in last 𝑡 seconds } 
+
+> 23:
+
+𝑚𝑎𝑥 _𝑛𝑒𝑒𝑑 ← ⌈ 𝑚𝑎𝑥 _𝑙𝑒𝑛 /𝐵 𝑖 ⌉ 
+
+> 24:
+
+if 𝑚𝑎𝑥 _𝑛𝑒𝑒𝑑 ≥ 𝑁 𝑖 then  
+
+> 25:
+
+return (0, 0) 
+
+> 26:
+
+else  
+
+> 27:
+
+𝑑𝑖 𝑓 𝑓 ← 𝑁 𝑖 − 𝑚𝑎𝑥 _𝑛𝑒𝑒𝑑  
+
+> 28:
+
+𝑘 ← ⌊ 𝑑𝑖 𝑓 𝑓 /𝑀𝐸𝑈 𝑖 ⌋ 
+
+> 29:
+
+return (𝑘 × 𝑀𝐸𝑈 𝑖 , 𝑘 × 𝑀𝐸𝑈 𝑚 ) 
+
+> 30:
+
+end if  
+
+> 31:
+
+end function 
+
+quantities is denoted as 
+
+𝐿𝐶𝑀 elem = lcm (𝐵𝐸 𝑚 , 𝐵𝐸 𝑖 ), (8) which serves as the shared alignment unit in terms of ele-ments. From each model’s perspective, the minimum elastic unit (MEU) is then given by 
+
+𝑀𝐸𝑈 m = 𝐿𝐶𝑀 elem 
+
+𝐵𝐸 𝑚 
+
+, 𝑀𝐸𝑈 𝑖 = 𝐿𝐶𝑀 elem 
+
+𝐵𝐸 𝑖 
+
+. (9) This implies that whenever the master model scales up or down by 𝑀𝐸𝑈 m blocks, the 𝑖 -th worker model must simul-taneously scale down or up by 𝑀𝐸𝑈 𝑖 blocks. Furthermore, any scaling operation involving both the master and the 𝑖 -th worker will necessarily touch at least 𝑀𝐸𝑈 m and 𝑀𝐸𝑈 𝑖 
+
+blocks, respectively. This strategy ensures that scaling operations are performed in units that are integer multiples of both the master and worker KV cache block sizes, thereby preserving GPU mem-ory alignment and avoiding wastage. 
+
+3.5 Master-Worker Coordination 
+
+The master and worker models collaboratively manage KV cache capacity to balance serving demand and memory uti-lization. This cooperation is mediated by the coordinator (denoted by 4 in Figure 4) in each cache manager, which handles cache borrowing, reclamation, and block-table syn-chronization. When the worker is under low load, its idle cache blocks can be borrowed by the master; when its own demand increases, it triggers a scale-up operation to reclaim capacity. This dynamic coordination enables SwiftCache to adapt cache allocation to changing workloads while preserv-ing memory alignment and block mapping consistency. 
+
+Worker KV Cache Scale-Up. The worker scale-up oper-ation is triggered when the current number of KV cache blocks allocated to a worker is insufficient to handle the incoming request. The scale-up procedure is described in the function ScaleUp in Algorithm 1. We first calculate the total number of KV cache blocks required for the incoming request (line 11). If the required number of blocks is less than or equal to the worker’s currently allocated blocks, this indicates that the worker already has sufficient capacity to serve the request, and no scaling operation is performed (lines 12-13). Otherwise, we determine the additional number of blocks needed to accommodate the request. This increment must be an integer multiple of the worker’s MEU to preserve memory alignment (lines 15-17). The worker cache manager then expands its local KV cache allocation accordingly and notifies the master cache manager through the coordinator. Upon receiving the synchronization message, the master cache manager updates its replica of the worker’s block table to reflect the new allocation. This synchronization ensures that both the worker and master maintain a consistent view of the block mapping after reallocation. 
+
+Worker KV Cache Scale-Down. The worker scale-down operation is performed periodically to determine whether the KV cache allocation for a worker can be reduced. The procedure is described in the function ScaleDown in Algo-rithm 1. At each check interval, the worker examines the longest request observed within the past time window 𝑡 (e.g., 1 minute) and uses it as an estimate for the potential length of future requests (lines 22-23). If the maximum number of KV cache blocks required by any request in this window is greater than or equal to the worker’s currently allocated blocks, we assume that similar requests may occur in the future, indicating that the current allocation is necessary. In this case, no scale down operation is performed (lines 24-25). Otherwise, when the maximum block requirement within the past time window is smaller than the worker’s current allocation, a scale-down is triggered. We calculate the dif-ference between the current number of blocks and the past maximum requirement to determine the number of blocks 
+
+> 8
+
+Table 2. Model specs and per-token KV cache size (float16)     
+
+> Model Layers Heads Head Dim Overhead/Token
+
+LWM 32 32 128 0.50 MB Qwen3-8B 36 8 128 0.141 MB Qwen3-14B 40 8 128 0.156 MB Qwen3-32B 64 8 128 0.25 MB to be released (lines 27-29). This number also must be an in-teger multiple of the worker’s MEU. Similar to scale-up, the master and worker synchronize their block tables through their respective coordinators. 
+
+## 4 Implementation 
+
+SwiftCache is an end-to-end, high-performance inference system designed to optimize KV cache storage and trans-mission during the prefill stage. It operates in single-server, multi-GPU environments to coordinate multiple heteroge-neous models, fully utilizing both GPU memory and inter-GPU bandwidth resources. We employ FastAPI [ 35 ] as the front-end interface for user requests. The inference engine components of SwiftCache are implemented in about 8.6K lines of Python and Triton [ 41 ] code. However, the scheduler and the cache manager are implemented in about 1.8K lines of C++ code, in order to accelerate request scheduling and scaling operations. For control message exchange between the master and worker models, we use the ZeroMQ [ 28 ]messaging component. Transmission of KV cache across GPUs is managed using the torch.distributed library in PyTorch [31]. In addition, SwiftCache integrates several common LLM inference optimization techniques, including continuous batching [ 51 ], FlashAttention [ 9 ], and PagedAttention [ 18 ]. The current implementation supports the Qwen3 [ 49 ] series and LLaMA2 [42] series models. 
+
+## 5 Evaluations 
+
+In this section, we present our experimental setup and eval-uate the performance of SwiftCache with state-of-the-art LLM inference systems under various real-world workloads. 
+
+Model. We use the Qwen3 [ 49 ] series models in our eval-uation, including Qwen3-8B, Qwen3-14B, and Qwen3-32B. All three models support a maximum context length of 40K tokens and adopt the GQA [ 3 ] mechanism, which optimizes the size of the KV cache. In addition, to highlight the impact of KV cache transmission on inference performance, we also use the LWM-1M-Text [ 23 ] model. This model shares the same parameter scale and architecture as Llama2-7B [ 42 , 43 ], employs the conventional MHA [ 44 ] technique, and sup-ports a maximum context length of 1 million tokens. All models use FP16 precision. The detailed specifications of these models are summarized in Table 2. 
+
+Testbed. Our experiments are conducted on a server equipped with four NVIDIA H20 GPUs (96 GB each), a 64-core CPU, and 128 GB of host memory. The GPUs are in-terconnected via NVLink with a bidirectional bandwidth of 400 GB/s. The software environment includes Python 3.10.18, PyTorch 2.7, CUDA 12.4, and OpenAI Triton 3.3.0. The connection between the host memory and the GPUs is through PCIe 4.0, providing a total bandwidth of 32 GB/s that is shared among the four GPUs. 
+
+Workloads. In our evaluation, requests are sent to the server according to a Poisson arrival process, and all requests originate from the following two datasets. 
+
+• ShareGPT [ 36 ]: It is a real-world dataset collected from user interactions with ChatGPT [ 29 ], and has been widely used in recent studies. It contains approx-imately 90K multi-turn conversations, with session length ranging from 12 to 602K tokens. 
+
+• L-Eval [ 5]: It is a comprehensive dataset with more than 500 tasks, covering long-context multi-turn con-versations, question answering, and summarization tasks. The sequence length in this dataset ranges from 2.6K to 195.0K. 
+
+Baselines. We compare SwiftCache to three state-of-the-art baseline systems: 
+
+• vLLM [ 18 ] (LMCache [ 24 , 45 ]) 1: vLLM is an open-source serving engine for LLMs. LMCache stores KV pairs of computed prefixes to reduce redundant com-putation across requests. We use LMCache as imple-mented in vLLM as a representative cache-based serv-ing baseline. 
+
+• vLLM w/ chunked prefill [ 2 ]: vLLM with chunked prefill reduces peak GPU memory usage by processing prompts in chunks, thereby lowering activation mem-ory overhead during prefill. We use it as a baseline for measuring maximum context length. 
+
+• SGLang [ 56 ] (HiCache) 2: SGLang is an LLM serv-ing framework designed for efficient multi-turn con-versations and complex task execution. HiCache ex-tends caching by maintaining hierarchical cache [ 12 ,52 ] structures to maximize prefix reuse under diverse workloads. We adopt HiCache in SGLang as another representative caching baseline. 
+
+Metrics. We use the following metrics to evaluate the performance and effectiveness of SwiftCache: 
+
+• P99 TTFT : The 99 th percentile of the time-to-first-token latency, which reflects the worst-case respon-siveness for the first output token across requests. 
+
+• Interference : It measures the interference experi-enced by the worker model, defined as the ratio of                                 
+
+> 1vLLM version is 0.14.0 and LMCache version is 0.3.15.
+> 2SGLang version is 0.5.3, and HiCache is a built-in module in SGLang and does not have its own version number.
+> 90.0 0.5 1.0 1.5 2.0 2.5
+> Request rate (req/s)
+> 0.0
+> 2.5
+> 5.0
+> 7.5
+> P99 TTFT (s)
+> LWM
+> 0.0 0.5 1.0 1.5 2.0 2.5
+> Request rate (req/s)
+> 0.0
+> 2.5
+> 5.0
+> 7.5
+> Qwen3-14B
+> 0.0 0.2 0.4 0.6 0.8 1.0
+> Request rate (req/s)
+> 0.0
+> 2.5
+> 5.0
+> 7.5
+> Qwen3-32B
+> 0.0 0.5 1.0 1.5 2.0 2.5
+> Request rate (req/s)
+> 0.0
+> 2.5
+> 5.0
+> 7.5
+> P99 TTFT (s)
+> 0.0 0.5 1.0 1.5 2.0 2.5
+> Request rate (req/s)
+> 0.0
+> 2.5
+> 5.0
+> 7.5
+> 0.0 0.2 0.4 0.6 0.8 1.0
+> Request rate (req/s)
+> 0.0
+> 2.5
+> 5.0
+> 7.5
+> ShareGPT L-Eval
+> SwiftCache SGLang (HiCache) vLLM (LMCache)
+
+Figure 7. P99 TTFT of SwiftCache vs. vLLM (LMCache) and SGLang (HiCache) on ShareGPT and L-Eval datasets. the inference latency without interference to the in-ference latency under interference. 
+
+• Maximum Context Length : The largest input se-quence length that the system can handle, indicating the capability to process long-context requests. 
+
+5.1 End-to-End Performance 
+
+In this section, we conduct experiments using LWM, Qwen3-14B, and Qwen3-32B on the ShareGPT and L-Eval datasets. For each experiment, we designate one model as the mas-ter, with the remaining two serving as workers. We mea-sure the master’s P99 TTFT, the performance degradation of each worker during the prefill and decoding stages, and the maximum request length that the master can handle. Both baselines are configured with 96 GB of CPU memory as the offloading space. Before conducting the formal experiments, we first send the initial rounds of multi-turn conversations to the server as a warm-up process, in order to eliminate the substan-tial recomputation overhead caused by the first requests and their impact on the P99 latency. To better demonstrate SwiftCache’s performance in long-context conversations, for LWM, we select requests with lengths greater than 20K, with no upper limit, from each dataset. For Qwen3-14B and Qwen3-32B, we select requests ranging from approximately 20K to 40K tokens, as the maximum context length sup-ported by the Qwen3 series is 40K. As shown in Figure 7, SwiftCache reduces P99 TTFT by approximately 67% and 69% on the ShareGPT and L-Eval datasets, respectively, com-pared to SGLang (HiCache). Compared to vLLM (LMCache), SwiftCache reduces P99 TTFT by approximately 54% and 58% on these two datasets, respectively. These improvements pri-marily stem from two optimizations: SwiftCache leverages high-speed NVLink instead of PCIe for KV cache transfers, and utilizes idle GPU memory on worker GPUs to expand the capacity of the prefix cache. 
+
+5.2 Interference on Worker Models 
+
+We evaluate the interference from the master model on the worker models during the prefill and decoding stages under varying input lengths and request rates, as shown in Figure 8. When LWM is used as the master, we test input lengths of 16K, 32K, and 64K tokens. For Qwen3-14B as the worker, the maximum increases in TTFT across these lengths reach 9.7%, while Time-Per-Output-Token (TPOT) increases by up to 6.5%. For Qwen3-32B as the worker, TTFT increases by up to 7.9% and TPOT by up to 6.4% across the same three lengths. Given that Qwen3-32B has a built-in maximum inference length of 40K tokens, we evaluate it with input lengths of 16K, 32K, and 40K tokens when serving as the master. In this setting, TTFT increases by up to 7.7% and TPOT by up to 5.6%. These results demonstrate that in SwiftCache, interference from the master to the worker is minimal. This is because KV cache loading and storing operations on worker GPUs do not occupy any compute resources, consuming only net-work resources and a negligible fraction of GPU memory bandwidth. The network resource usage between the master and worker has no impact on worker performance. Overall, SwiftCache delivers substantial performance gains for the master, but it incurs only a slight performance loss on the workers ( ≤9.7%).                                     
+
+> 10 0.0 0.5 1.0 1.5 2.0 2.5
+> Request rate (req/s)
+> 0.90
+> 0.95
+> 1.00
+> TTFT Ratio
+> LWM Qwen3-14B
+> 0.0 0.5 1.0 1.5 2.0 2.5
+> Request rate (req/s)
+> 0.90
+> 0.95
+> 1.00
+> LWM Qwen3-32B
+> 0.0 0.2 0.4 0.6 0.8 1.0
+> Request rate (req/s)
+> 0.90
+> 0.95
+> 1.00
+> Qwen 32B LWM
+> 0.0 0.5 1.0 1.5 2.0 2.5
+> Request rate (req/s)
+> 0.90
+> 0.95
+> 1.00
+> TPOT Ratio
+> 0.0 0.5 1.0 1.5 2.0 2.5
+> Request rate (req/s)
+> 0.90
+> 0.95
+> 1.00
+> 0.0 0.2 0.4 0.6 0.8 1.0
+> Request rate (req/s)
+> 0.90
+> 0.95
+> 1.00
+> 16k 32k 64k 40k
+
+Figure 8. Normalized TTFT and TPOT of different worker models under master interference in SwiftCache. 
+
+5.3 Maximum Context Length 
+
+In model inference, the achievable maximum context length is often constrained by the memory capacity of the GPU on which the model is running. In our experiments, we selected two categories of GPUs to represent typical industrial infer-ence environments: high capacity GPUs with 96GB and 80GB VRAM, corresponding to NVIDIA H20 and A100, and low ca-pacity GPUs with 32GB and 24GB VRAM, corresponding to NVIDIA V100 and L4. For the 96GB, 80GB, and 32GB settings, we chose Qwen3-14B and Qwen3-8B as worker models; for the 24GB setting, we deployed two Qwen3-8B workers, as Qwen3-14B cannot fit into 24GB memory. To more compre-hensively evaluate the effectiveness of SwiftCache, we do not consider the maximum context length specified in the model’s configuration. Figure 9 shows the maximum context length achievable by the master model under these configurations. Among the three baselines, vLLM with chunked prefill [ 2 ] using a chunk size of 8K tokens (the default configuration of vLLM) supports the longest context length, due to its smallest activa-tion footprint during the prefill stage. However, SwiftCache achieves significantly longer contexts compared to this base-line, with improvements ranging from 1.58 × to 3.98 × across the tested VRAM settings. Compared to the other two base-lines, vLLM without chunked prefill and vLLM with chunked prefill (chunk size = 32K), SwiftCache delivers memory ef-ficiency gains corresponding to maximum context length improvements in the range of 1.81 × to 6.66 ×.These results demonstrate that SwiftCache’s superiority in context length scalability stems from its layer stream cache 
+
+mechanism, described in § 3.2, which enables efficient stream-ing of layer outputs and reduces peak activation memory usage during inference. Moreover, LSC is orthogonal to chun-ked prefill, seamlessly integrating with it to further alleviate activation memory pressure in ultra-long contexts. 
+
+5.4 Latency Breakdown 
+
+To understand SwiftCache’s effectiveness in more detail, we perform a latency breakdown of the prefill stage. We divide the lifecycle of the prefill stage into four phases: prefill queu-ing , load KV , prefill execution , and store KV . The total latency of the prefill stage is obtained by summing the time spent in each phase across all requests. In this analysis, we temporar-ily ignore any overlap between computation and KV cache transmission. Figure 10 shows the latency breakdown for the Qwen3-32B model on the ShareGPT and L-Eval datasets. We chose Qwen3-32B because KV cache transmission is more demand-ing for larger models. Despite this, KV cache loading and storing account for less than 1.4% and 1.1% of the total la-tency, respectively. When considering the overlap between computation and transmission, the time spent on KV cache transmission drops to below 0.1%. By examining the CDFs of transmission delay in Figure 11, we observe that even for Qwen3-32B, 99% of requests have KV cache loading times under 11 ms, and 99% of requests have KV cache storing times under 6 ms. Such overhead is negligible for Qwen3-32B requests with more than 10K to-kens, where computation time is orders of magnitude greater, ranging from hundreds of milliseconds to several seconds. Although LWM has a larger KV cache footprint per token as shown in Table 2, its significantly smaller model weights           
+
+> 11 Qwen3-32B LWM
+> 0k
+> 100k
+> 200k
+> 300k
+> Maximum Length
+> 1.00x
+> 6.66x
+> 2.78x 3.30x
+> 1.00x
+> 2.22x
+> 1.76x 1.81x
+> 96 GB VRAM
+> Qwen3-32B LWM
+> 0k
+> 100k
+> 200k 1.00x
+> 6.38x
+> 3.62x
+> 5.44x
+> 1.00x
+> 2.45x
+> 1.58x
+> 1.87x
+> 80 GB VRAM
+> Qwen3-14B LWM
+> 0k
+> 20k
+> 40k
+> 60k
+> 1.00x
+> 4.59x 3.98x 4.43x
+> 1.00x
+> 2.12x
+> 1.66x
+> 1.90x
+> 32 GB VRAM
+> Qwen3-8B LWM
+> 0k
+> 50k
+> 100k
+> 150k 1.00x
+> 6.15x
+> 3.11x
+> 4.94x 1.00x
+> 3.18x 1.96x 2.55x
+> 24 GB VRAM
+> SwiftCache vLLM w/o chunked prefill vLLM w/ chunked prefill(8K) vLLM w/ chunked prefill(32K)
+
+Figure 9. Maximum inference length supported by SwiftCache and vLLM (without chunked prefill, and with chunked prefill using chunk sizes of 8K and 32K) across different VRAM capacities and model sizes. 0.2 0.4 0.6 0.8 1.0        
+
+> Request rate (req/s)
+> 0
+> 25
+> 50
+> 75
+> 100
+> Latency Breakdown (%)  ShareGPT
+> 0.2 0.4 0.6 0.8 1.0
+> Request rate (req/s)
+> 0
+> 25
+> 50
+> 75
+> 100
+> L-Eval
+> Prefill Queuing Load KV Prefill Execution Store KV
+
+Figure 10. Left: The latency breakdown when serving Qwen3-32B on the ShareGPT dataset with SwiftCache. Right: The latency breakdown when serving Qwen3-32B on the L-Eval dataset with SwiftCache. compared to Qwen3-32B leave more GPU memory available for regular cache allocation. Consequently, more KV pairs can be stored in the local regular cache rather than workers’ 
+
+elastic cache , thereby reducing transmission overhead. 
+
+## 6 Related Work 
+
+Efficient LLM serving : Recently, many studies [ 14 , 22 , 34 ,47 , 59 ] have focused on improving the inference efficiency of LLM serving systems. Orca [ 51 ] introduces continuous batching , which eliminates the need for padding between requests of different lengths, and leverages iteration-level scheduling to remove completed requests from the infer-ence engine promptly. vLLM [ 18 ] proposes PagedAttention 
+
+to reduce memory fragmentation and improve memory uti-lization, thereby increasing the throughput of LLM serving. SwiftCache integrates both continuous batching and Page-dAttention to enhance general inference performance for LLMs. DistServe [ 58 ] and Splitwise [ 32 ] decouple the prefill 
+
+and decoding stages to meet the SLO requirements of each stage individually. SwiftCache is also compatible with such PD separation strategies. 
+
+KV cache reusing : CachedAttention [ 12 , 16 , 52 ] extends the capacity of KV cache to host memory and SSD storage, en-abling the system to support more prefixes and reduce recom-putation overhead during the prefill stage. Mooncake [ 33 ]constructs a centralized KV cache pool shared across multi-ple model instances, thereby improving throughput in multi-turn dialogue scenarios. SwiftCache dynamically extends the KV cache of a model to the GPUs of other models, which, compared to existing PCIe-based KV cache transmission, substantially reduces transfer latency and improves overall GPU memory utilization. In addition, many works [ 19 , 25 , 37 , 50 , 57 ] exploit the sparsity in the KV cache or decoding layers to enable cache reuse. While these approaches can significantly increase system throughput, they may also cause semantic accuracy degradation due to partial cache utilization. Notably, both Mooncake and DroidSpeak [ 26 ] involve sharing KV cache across LLMs. Mooncake shares KV cache across different instances of the same model, whereas Droid-Speak supports LLMs originating from the same foundation models, since such models must have identical architectures. In contrast, SwiftCache enables direct sharing of KV cache memory buffers across heterogeneous models, even when their architectures differ. 
+
+Long context inference: PrefillOnly [ 11 ] proposes hybrid prefilling to reduce activations during inference, thereby lowering memory usage and supporting longer text genera-tion. LoongServe [ 46 ] introduces elastic sequence parallelism ,which reduces KV cache transmission overhead and effi-ciently supports long-context inference. Chunked prefill fur-ther improves inference efficiency by splitting long prompts into smaller chunks during prefill, reducing peak memory usage and enabling support for longer sequences. In addi-tion, works like [ 1, 40 , 48 ] reduce the size of the KV cache to lower memory consumption and further support longer text generation, but at the cost of some accuracy degradation, whereas SwiftCache does not incur such loss. 
+
+## 7 Conclusions and Discussions 
+
+In this paper, we presented SwiftCache, a multi-model collab-orative LLM serving system for efficient multi-turn conver-sations with heterogeneous KV cache sharing. By leveraging NVLink-based cache sharing and layer stream cache together with elastic cache, SwiftCache improves memory utilization and serving efficiency for long-context inference. Experi-mental results also show that SwiftCache reduces P99 TTFT by up to 69% and extends the maximum context length by           
+
+> 12 0510 15 20
+> Load KV Time (ms)
+> 0.00
+> 0.25
+> 0.50
+> 0.75
+> 1.00
+> CDF
+> 0510 15 20
+> Store KV Time (ms)
+> 0.00
+> 0.25
+> 0.50
+> 0.75
+> 1.00
+> LWM Qwen3-14B Qwen3-32B
+
+Figure 11. Left: The CDF of KV loading time for three models. Right: The CDF of KV storing time for three models. up to 3.98 × compared with state-of-the-art baselines, while incurring only modest interference to co-located models. These results demonstrate the effectiveness of SwiftCache for efficient long-context multi-turn LLM serving. Currently, SwiftCache is primarily designed for deployment on a single multi-GPU server, since GPUs located on different servers cannot communicate directly through NVLink. Extending SwiftCache to multi-server environments would incur signif-icant communication overhead and may require additional hardware support, which we leave for future work. 
+
+## Code Availability 
+
+The code of SwiftCache is open-source and publicly available at https://anonymous.4open.science/r/SwiftCache-97FE for research usage. 
+
+## References 
+
+[1] Muhammad Adnan, Akhil Arunkumar, Gaurav Jain, Prashant J Nair, Ilya Soloveychik, and Purushotham Kamath. 2024. Keyformer: KV Cache Reduction Through Key Tokens Selection for Efficient Genera-tive Inference. Proceedings of Machine Learning and Systems 6 (2024), 114–127. [2] Amey Agrawal, Nitin Kedia, Ashish Panwar, Jayashree Mohan, Nipun Kwatra, Bhargav Gulavani, Alexey Tumanov, and Ramachandran Ram-jee. 2024. Taming Throughput-Latency Tradeoff in LLM Inference with Sarathi-Serve. In 18th USENIX Symposium on Operating Systems Design and Implementation (OSDI 24) . 117–134. [3] Joshua Ainslie, James Lee-Thorp, Michiel De Jong, Yury Zemlyanskiy, Federico Lebrón, and Sumit Sanghai. 2023. GQA: Training Generalized Multi-Query Transformer Models from Multi-Head Checkpoints. In 
+
+Proceedings of the 2023 Conference on Empirical Methods in Natural Language Processing . 4895–4901. [4] Alibaba Cloud. 2024. Qwen Large Language Models. https://github. com/QwenLM . Accessed: 2026-05-13. [5] Chenxin An, Shansan Gong, Ming Zhong, Xingjian Zhao, Mukai Li, Jun Zhang, Lingpeng Kong, and Xipeng Qiu. 2024. L-Eval: Institut-ing Standardized Evaluation for Long Context Language Models. In 
+
+Proceedings of the 62nd Annual Meeting of the Association for Computa-tional Linguistics . 14388–14411. [6] Anthropic. 2024. Claude AI. https://claude.ai/ . Accessed: 2026-05-13. [7] Junyi Chen, Shihao Bai, Zaijun Wang, Siyu Wu, Chuheng Du, Hailong Yang, Ruihao Gong, Shengzhong Liu, Fan Wu, and Guihai Chen. 2025. Pre3: Enabling Deterministic Pushdown Automata for Faster Struc-tured LLM Generation. In Proceedings of the 63rd Annual Meeting of the Association for Computational Linguistics (Volume 1: Long Papers) .11253–11267. [8] Mark Chen, Jerry Tworek, Heewoo Jun, Qiming Yuan, Henrique Ponde De Oliveira Pinto, Jared Kaplan, Harri Edwards, Yuri Burda, Nicholas Joseph, Greg Brockman, et al . 2021. Evaluating Large Language Models Trained on Code. arXiv preprint arXiv:2107.03374 (2021). [9] Tri Dao, Dan Fu, Stefano Ermon, Atri Rudra, and Christopher Ré. 2022. FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness. Advances in Neural Information Processing Systems 35 (2022), 16344–16359. [10] DeepSeek AI. 2024. DeepSeek Large Language Model. https://deepseek. com/ . Accessed: 2026-05-13. [11] Kuntai Du, Bowen Wang, Chen Zhang, Yiming Cheng, Qing Lan, Hejian Sang, Yihua Cheng, Jiayi Yao, Xiaoxuan Liu, Yifan Qiao, et al .2025. PrefillOnly: An Inference Engine for Prefill-Only Workloads in Large Language Model Applications. In Proceedings of the ACM SIGOPS 31st Symposium on Operating Systems Principles . 399–414. [12] Bin Gao, Zhuomin He, Puru Sharma, Qingxuan Kang, Djordje Jevdjic, Junbo Deng, Xingkun Yang, Zhou Yu, and Pengfei Zuo. 2024. Cost-Efficient Large Language Model Serving for Multi-Turn Conversations with CachedAttention. In 2024 USENIX Annual Technical Conference (USENIX ATC 24) . 111–126. [13] Ruihao Gong, Shihao Bai, Siyu Wu, Yunqian Fan, Zaijun Wang, Xi-uhong Li, Hailong Yang, and Xianglong Liu. 2025. Past-Future Sched-uler for LLM Serving Under SLA Guarantees. In Proceedings of the 30th ACM International Conference on Architectural Support for Program-ming Languages and Operating Systems, Volume 2 . 798–813. [14] Junhao Hu, Jiang Xu, Zhixia Liu, Yulong He, Yuetao Chen, Hao Xu, Jiang Liu, Jie Meng, Baoquan Zhang, Shining Wan, et al . 2025. DEEPSERVE: Serverless Large Language Model Serving at Scale. In 
+
+2025 USENIX Annual Technical Conference (USENIX ATC 25) . 57–72. [15] Jianmin Hu, Minxian Xu, Kejiang Ye, and Chengzhong Xu. 2026. BrownoutServe: SLO-Aware Inference Serving under Bursty Work-loads for MoE-Based LLMs. IEEE Trans. Comput. (2026). [16] Shipeng Hu, Guangyan Zhang, Yuqi Zhou, Yaya Wei, Ziyan Zhong, and Jike Chen. 2026. BiDAW: Enhancing Key-Value Caching for Interactive LLM Serving via Bidirectional Computation–Storage Awareness. In 
+
+24th USENIX Conference on File and Storage Technologies (FAST 26) .101–116. [17] Yanping Huang, Youlong Cheng, Ankur Bapna, Orhan Firat, Dehao Chen, Mia Chen, HyoukJoong Lee, Jiquan Ngiam, Quoc V Le, Yonghui Wu, et al . 2019. GPipe: Efficient Training of Giant Neural Networks Using Pipeline Parallelism. Advances in Neural Information Processing Systems 32 (2019). [18] Woosuk Kwon, Zhuohan Li, Siyuan Zhuang, Ying Sheng, Lianmin Zheng, Cody Hao Yu, Joseph Gonzalez, Hao Zhang, and Ion Stoica. 2023. Efficient Memory Management for Large Language Model Serv-ing with PagedAttention. In Proceedings of the 29th Symposium on Operating Systems Principles . 611–626. [19] Wonbeom Lee, Jungi Lee, Junghwan Seo, and Jaewoong Sim. 2024. InfiniGen: Efficient Generative Inference of Large Language Models with Dynamic KV Cache Management. In 18th USENIX Symposium on Operating Systems Design and Implementation (OSDI 24) . 155–172. [20] Dmitry Lepikhin, HyoukJoong Lee, Yuanzhong Xu, Dehao Chen, Orhan Firat, Yanping Huang, Maxim Krikun, Noam Shazeer, and Zhifeng Chen. 2020. GShard: Scaling Giant Models with Conditional Computation and Automatic Sharding. arXiv preprint arXiv:2006.16668 
+
+(2020). [21] Zhuohan Li, Lianmin Zheng, Yinmin Zhong, Vincent Liu, Ying Sheng, Xin Jin, Yanping Huang, Zhifeng Chen, Hao Zhang, Joseph E Gonzalez, et al . 2023. AlpaServe: Statistical Multiplexing with Model Parallelism for Deep Learning Serving. In 17th USENIX Symposium on Operating Systems Design and Implementation (OSDI 23) . 663–679. [22] Chaofan Lin, Zhenhua Han, Chengruidong Zhang, Yuqing Yang, Fan Yang, Chen Chen, and Lili Qiu. 2024. Parrot: Efficient Serving of LLM-Based Applications with Semantic Variable. In 18th USENIX Symposium 
+
+> 13
+
+on Operating Systems Design and Implementation (OSDI 24) . 929–945. [23] Hao Liu, Wilson Yan, Matei Zaharia, and Pieter Abbeel. 2025. World Model on Million-Length Video and Language with Blockwise RingAt-tention. In International Conference on Learning Representations . 45953– 45977. [24] Yuhan Liu, Yihua Cheng, Jiayi Yao, Yuwei An, Xiaokun Chen, Shaoting Feng, Yuyang Huang, Samuel Shen, Rui Zhang, Kuntai Du, et al . 2025. LMCache: An Efficient KV Cache Layer for Enterprise-Scale LLM Inference. arXiv preprint arXiv:2510.09665 (2025). [25] Yang Liu, Yunfei Gu, Liqiang Zhang, Chentao Wu, Guangtao Xue, Jie Li, Minyi Guo, Junhao Hu, and Jie Meng. 2026. CacheSlide: Unlocking Cross Position-Aware KV Cache Reuse for Accelerating LLM Serving. In 24th USENIX Conference on File and Storage Technologies (FAST 26) .83–99. [26] Yuhan Liu, Yuyang Huang, Jiayi Yao, Shaoting Feng, Zhuohan Gu, Kuntai Du, Hanchen Li, Yihua Cheng, Junchen Jiang, Shan Lu, et al .2024. DroidSpeak: KV Cache Sharing for Cross-LLM Communication and Multi-LLM Serving. arXiv preprint arXiv:2411.02820 (2024). [27] ModelTC. 2023. LightLLM: A Lightweight, Scalable, High-Speed LLM Inference and Serving Framework. https://github.com/ModelTC/ lightllm . Version 1.1.0. [28] An open-source universal messaging library. 2010. ZeroMQ. https: //zeromq.org/ . Accessed: 2026-05-13. [29] OpenAI. 2024. ChatGPT. https://chat.openai.com . Accessed: 2026-05-13. [30] OpenAI. 2024. OpenAI Agents Python SDK. https://github.com/ openai/openai-agents-python . Accessed: 2026-05-13. [31] Adam Paszke, Sam Gross, Francisco Massa, Adam Lerer, James Brad-bury, Gregory Chanan, Trevor Killeen, Zeming Lin, Natalia Gimelshein, Luca Antiga, et al . 2019. PyTorch: An Imperative Style, High-Performance Deep Learning Library. Advances in Neural Information Processing Systems 32 (2019). [32] Pratyush Patel, Esha Choukse, Chaojie Zhang, Aashaka Shah, Íñigo Goiri, Saeed Maleki, and Ricardo Bianchini. 2024. Splitwise: Efficient Generative LLM Inference Using Phase Splitting. In 2024 ACM/IEEE 51st Annual International Symposium on Computer Architecture (ISCA) .IEEE, 118–132. [33] Ruoyu Qin, Zheming Li, Weiran He, Jialei Cui, Feng Ren, Mingxing Zhang, Yongwei Wu, Weimin Zheng, and Xinran Xu. 2025. Mooncake: Trading More Storage for Less Computation—A KVCache-Centric Architecture for Serving LLM Chatbot. In 23rd USENIX Conference on File and Storage Technologies (FAST 25) . 155–170. [34] Haoran Qiu, Anish Biswas, Zihan Zhao, Jayashree Mohan, Alind Khare, Esha Choukse, Íñigo Goiri, Zeyu Zhang, Haiying Shen, Chetan Bansal, et al . 2025. ModServe: Modality- and Stage-Aware Resource Disaggre-gation for Scalable Multimodal Model Serving. In Proceedings of the 2025 ACM Symposium on Cloud Computing . 817–830. [35] Sebastián Ramírez. 2018. FastAPI. https://fastapi.tiangolo.com/ . Ac-cessed: 2026-05-13. [36] Philipp Schmid. 2023. ShareGPT 90k Raw Dataset. https: //huggingface.co/datasets/philschmid/sharegpt-raw/tree/main/ sharegpt_90k_raw_dataset . Accessed: 2026-05-13. [37] Ying Sheng, Lianmin Zheng, Binhang Yuan, Zhuohan Li, Max Ryabinin, Beidi Chen, Percy Liang, Christopher Ré, Ion Stoica, and Ce Zhang. 2023. FlexGen: High-Throughput Generative Inference of Large Lan-guage Models with a Single GPU. In International Conference on Ma-chine Learning . PMLR, 31094–31116. [38] Mohammad Shoeybi, Mostofa Patwary, Raul Puri, Patrick LeGresley, Jared Casper, and Bryan Catanzaro. 2019. Megatron-LM: Training Multi-Billion Parameter Language Models Using Model Parallelism. 
+
+arXiv preprint arXiv:1909.08053 (2019). [39] Significant-Gravitas. 2024. AutoGPT: Build, Deploy, and Run AI Agents. 
+
+https://github.com/Significant-Gravitas/AutoGPT/ . Accessed: 2026-05-13. [40] Jiaming Tang, Yilong Zhao, Kan Zhu, Guangxuan Xiao, Baris Kasikci, and Song Han. 2024. Quest: Query-Aware Sparsity for Efficient Long-Context LLM Inference. arXiv preprint arXiv:2406.10774 (2024). [41] Philippe Tillet, Hsiang-Tsung Kung, and David Cox. 2019. Triton: An Intermediate Language and Compiler for Tiled Neural Network Computations. In Proceedings of the 3rd ACM SIGPLAN International Workshop on Machine Learning and Programming Languages . 10–19. [42] Hugo Touvron, Thibaut Lavril, Gautier Izacard, Xavier Martinet, Marie-Anne Lachaux, Timothée Lacroix, Baptiste Rozière, Naman Goyal, Eric Hambro, Faisal Azhar, et al . 2023. LLaMA: Open and Efficient Foundation Language Models. arXiv preprint arXiv:2302.13971 (2023). [43] Hugo Touvron, Louis Martin, Kevin Stone, Peter Albert, Amjad Alma-hairi, Yasmine Babaei, Nikolay Bashlykov, Soumya Batra, Prajjwal Bhargava, Shruti Bhosale, et al. 2023. Llama 2: Open Foundation and Fine-Tuned Chat Models. arXiv preprint arXiv:2307.09288 (2023). [44] Ashish Vaswani, Noam Shazeer, Niki Parmar, Jakob Uszkoreit, Llion Jones, Aidan N Gomez, Łukasz Kaiser, and Illia Polosukhin. 2017. At-tention Is All You Need. Advances in Neural Information Processing Systems 30 (2017). [45] Supercharge Your LLM with the Fastest KV Cache Layer. 2024. LM-Cache. https://github.com/LMCache/LMCache . Accessed: 2026-05-13. [46] Bingyang Wu, Shengyu Liu, Yinmin Zhong, Peng Sun, Xuanzhe Liu, and Xin Jin. 2024. LoongServe: Efficiently Serving Long-Context Large Language Models with Elastic Sequence Parallelism. In Proceedings of the ACM SIGOPS 30th Symposium on Operating Systems Principles .640–654. [47] Bingyang Wu, Yinmin Zhong, Zili Zhang, Shengyu Liu, Fangyue Liu, Yuanhang Sun, Gang Huang, Xuanzhe Liu, and Xin Jin. 2023. Fast Distributed Inference Serving for Large Language Models. arXiv preprint arXiv:2305.05920 (2023). [48] Guangxuan Xiao, Yuandong Tian, Beidi Chen, Song Han, and Mike Lewis. 2024. Efficient Streaming Language Models with Attention Sinks. In International Conference on Learning Representations , Vol. 2024. 21875–21895. [49] An Yang, Anfeng Li, Baosong Yang, Beichen Zhang, Binyuan Hui, Bo Zheng, Bowen Yu, Chang Gao, Chengen Huang, Chenxu Lv, et al . 2025. Qwen3 Technical Report. arXiv preprint arXiv:2505.09388 (2025). [50] Jiayi Yao, Hanchen Li, Yuhan Liu, Siddhant Ray, Yihua Cheng, Qizheng Zhang, Kuntai Du, Shan Lu, and Junchen Jiang. 2025. CacheBlend: Fast Large Language Model Serving for RAG with Cached Knowledge Fu-sion. In Proceedings of the Twentieth European Conference on Computer Systems . 94–109. [51] Gyeong-In Yu, Joo Seong Jeong, Geon-Woo Kim, Soojeong Kim, and Byung-Gon Chun. 2022. Orca: A Distributed Serving System for Transformer-Based Generative Models. In 16th USENIX Symposium on Operating Systems Design and Implementation (OSDI 22) . 521–538. [52] Lingfan Yu, Jinkun Lin, and Jinyang Li. 2025. Stateful Large Language Model Serving with Pensieve. In Proceedings of the Twentieth European Conference on Computer Systems . 144–158. [53] Chen Zhang, Kuntai Du, Shu Liu, Woosuk Kwon, Xiangxi Mo, Yufeng Wang, Xiaoxuan Liu, Kaichao You, Zhuohan Li, Mingsheng Long, et al .2025. JENGA: Effective Memory Management for Serving LLM with Heterogeneity. In Proceedings of the ACM SIGOPS 31st Symposium on Operating Systems Principles . 446–461. [54] Yanqi Zhang, Yuwei Hu, Runyuan Zhao, John CS Lui, and Haibo Chen. 2025. DiffKV: Differentiated Memory Management for Large Lan-guage Models with Parallel KV Compaction. In Proceedings of the ACM SIGOPS 31st Symposium on Operating Systems Principles . 431–445. [55] Zhenyu Zhang, Ying Sheng, Tianyi Zhou, Tianlong Chen, Lianmin Zheng, Ruisi Cai, Zhao Song, Yuandong Tian, Christopher Ré, Clark Barrett, et al . 2023. H2O: Heavy-Hitter Oracle for Efficient Generative Inference of Large Language Models. Advances in Neural Information Processing Systems 36 (2023), 34661–34710. 
+
+> 14
+
+[56] Lianmin Zheng, Liangsheng Yin, Zhiqiang Xie, Chuyue Sun, Jeff Huang, Cody H Yu, Shiyi Cao, Christos Kozyrakis, Ion Stoica, Joseph E Gonzalez, et al . 2024. SGLang: Efficient Execution of Structured Lan-guage Model Programs. Advances in Neural Information Processing Systems 37 (2024), 62557–62583. [57] Xinrui Zheng, Dongliang Wei, Jianxiang Gao, Yixin Song, Zeyu Mi, and Haibo Chen. 2026. SolidAttention: Low-Latency SSD-Based Serving on Memory-Constrained PCs. In 24th USENIX Conference on File and Storage Technologies (FAST 26) . 67–82. [58] Yinmin Zhong, Shengyu Liu, Junda Chen, Jianbo Hu, Yibo Zhu, Xu-anzhe Liu, Xin Jin, and Hao Zhang. 2024. DistServe: Disaggregating Prefill and Decoding for Goodput-Optimized Large Language Model Serving. In 18th USENIX Symposium on Operating Systems Design and Implementation (OSDI 24) . 193–210. [59] Kan Zhu, Yufei Gao, Yilong Zhao, Liangyu Zhao, Gefei Zuo, Yile Gu, Dedong Xie, Zihao Ye, Keisuke Kamahori, Chien-Yu Lin, et al . 2025. NanoFlow: Towards Optimal Large Language Model Serving Through-put. In 19th USENIX Symposium on Operating Systems Design and Implementation (OSDI 25) . 749–765.

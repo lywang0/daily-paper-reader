@@ -1,0 +1,1617 @@
+Title: Communication-Efficient Verifiable Attention for LLM Inference
+
+URL Source: https://arxiv.org/pdf/2606.16352v1
+
+Published Time: Tue, 16 Jun 2026 01:52:04 GMT
+
+Number of Pages: 19
+
+Markdown Content:
+# Communication-Efficient Verifiable Attention for LLM Inference 
+
+## Ziqun Chen 
+
+ziqun001@e.ntu.edu.sg 
+
+Nanyang Technological University Singapore 
+
+## Ming Wu 
+
+ming@0g.ai 
+
+Zero Gravity Labs San Francisco, USA 
+
+## Michael Heinrich 
+
+michael@0g.ai 
+
+Zero Gravity Labs San Francisco, USA 
+
+## Jason Zeng 
+
+jason@0g.ai 
+
+Zero Gravity Labs San Francisco, USA 
+
+## Huiying Lan 
+
+huiying.lan93@gmail.com 
+
+Zero Gravity Labs San Francisco, USA 
+
+## Tianwei Zhang 
+
+tianwei.zhang@ntu.edu.sg 
+
+Nanyang Technological University Singapore 
+
+## Rui Tan 
+
+tanrui@ntu.edu.sg 
+
+Nanyang Technological University Singapore 
+
+## Abstract 
+
+Computation integrity of remote large language model (LLM) serving can be questionable. For conventional deep neural networks (DNNs), the existing TEE-shielded DNN partition-ing (TSDP) approach uses Trusted Execution Environment (TEE) to compute non-linear components and verify the in-tegrity of linear components offloaded to an untrusted GPU. However, directly applying TSDP to Transformer-based LLMs incurs significant TEE computation and TEE-GPU communi-cation overhead. This paper presents Communication-efficient TEE-GPU Attention ( VeriAttn ) for accelerating verifiable LLM inference. VeriAttn offloads both linear and non-linear computations of attention to the GPU, while TEE performs verification. Moreover, for prefill, VeriAttn uses a two-level pipeline to overlap data movement, TEE pre-/post-processing, and GPU computation. For decoding, when the key-value cache exceeds available GPU memory, VeriAttn 
+
+partitions attention across TEE and GPU to reduce repeated key-value transfers. Evaluation on an Intel TDX platform shows that VeriAttn achieves 2.60-3.38 × and 3.86-5.42 ×
+
+acceleration over TSDP for 6k-token prompts and 10k-token outputs during prefill and decoding, respectively. 
+
+## 1 Introduction 
+
+Transformer-based large language models (LLMs) [ 42 ] have become the foundation of modern artificial intelligence sys-tems and are increasingly deployed through cloud-based serving, commonly known as LLM-as-a-Service (LLMaaS) [ 11 ,16 , 52 ]. However, LLMaaS has an inherent trust problem: when users submit inputs to LLMaaS, the software and hard-ware stacks executing the inference may not be fully trusted by the users. In this paper, we particularly focus on the in-tegrity dimension of the trust, where the adversary controls privileged software or exploits system vulnerabilities to tam-per with intermediate computations or manipulate model outputs. This trust issue becomes more pronounced when LLMaaS engages an edge cloud consisting of third-party edge computing powers closer to the users. Existing approaches for verifiable inference mainly fol-low two directions. First, cryptography-based verification ap-proaches use cryptographic proof systems, such as zero-knowledge proofs [ 12 , 22 , 32 , 38 ], to verify that the out-sourced inference results are correctly computed. Their main advantage is strong formal integrity guarantees. However, they typically require encoding model execution into arith-metic circuits or constraint systems, which incurs prohibi-tive proof generation overhead for large Transformer models and long sequence attention. Second, hardware-assisted ap-proaches use Trusted Execution Environment (TEE) as a practical hardware root of trust to protect code and data from compromised privileged software. Recent virtual ma-chine (VM)-based TEEs, such as Intel TDX [ 4 ] and AMD SEV [ 18 ], protect the memory and execution state of the entire VM from external. As they provide large protected memory spaces of up to terabytes and better software com-patibility, they are suitable for hosting LLM states. However, TEEs still have limited computational capability for execut-ing LLM inference compared with GPUs. 
+
+TEE-shielded DNN partitioning (TSDP) paradigm [ 39 , 41 ,46 , 55 ] has been proposed to draw TEE’s and GPU’s respec-tive advantages. It uses TEE as the root of trust, while offload-ing computation-intensive, parallelizable operators to an un-trusted GPU. For conventional deep neural networks (DNNs), such as convolutional neural networks (CNNs), TSDP typi-cally keeps lightweight non-linear operators in TEE, while offloading linear operators to the GPU. When the GPU re-turns the results, TEE performs probabilistic verification over them using Freivalds’ algorithm [ 10 ]. This design is effective when the intermediate activations are relatively small and the non-linear operators such as rectified linear 
+
+> 1
+> arXiv:2606.16352v1 [cs.LG] 15 Jun 2026
+
+unit (ReLU) and pooling are lightweight. As a result, for DNNs, TSDP significantly outperforms both fully TEE-based and cryptography-based approaches in terms of runtime efficiency [22, 29, 34]. Unfortunately, Transformer-based LLMs have distinct com-putation and communication patterns from conventional DNNs. This makes the straw man proposal of applying TSDP to LLM inefficient, in both LLM’s prefill and decoding phases, as well as TEE-GPU collaboration. Three concrete challenges arise, as explained below. First, during the prefill phase, self-attention produces large intermediate attention states, in which the attention score and attention weight matrices scale quadratically with the prompt length. To follow TSDP’s workflow of splitting atten-tion between GPU-side matrix multiplications and TEE-side verification and non-linear processing, large intermediate states need to be moved across the TEE-GPU boundary, mak-ing prefill communication-heavy for long prompts. More-over, the used SoftMax is no longer a lightweight non-linear operator to TEE, since it requires exponentiation and nor-malization over large attention matrices. Second, the decoding phase under TSDP is subjected to a tightened communication bottleneck. Although model weights may fit into GPU memory, the key-value (KV) cache grows with the sequence length and the number of con-current requests, and can eventually exceed the available GPU memory. To address this issue, modern LLM serving systems offload overflowed KV cache blocks to the host mem-ory [ 19 , 20 , 23 ]. To implement TSDP, these non-resident KV entries reside in TEE-protected host memory. As such, the GPU-centric decoding workflow must repeatedly move them across the TEE-GPU boundary for attention computation. Since decoding attention is performance-bounded by the memory bandwidth and of low arithmetic intensity on both GPU and TEE [ 14 , 57 ], the limited computation in each de-coding step cannot amortize repeated KV cache movement. Third, beyond the above data volume-related challenges, TSDP exhibits low efficiency due to its serialized executions across the TEE and GPU. During both the prefill and decod-ing phases, each offloaded step alternates between GPU com-putation, data transfer, TEE-side verification or non-linear processing, and the subsequent GPU execution. As such, one processor often remains idle while waiting for data transfers or for the other processor to complete computation. This serialization reinforces the TEE-GPU communication and the TEE-side processing as performance bottlenecks. The above observations motivate a new design to enable attention computation to be executed across the TEE and GPU in a communication-efficient manner while preserving computation integrity. To this end, we present VeriAttn , a communication-efficient TEE-GPU attention framework for accelerating verifiable LLM inference. VeriAttn addresses TSDP’s major overheads for self-attention computation by two new mechanisms. First, VeriAttn offloads both linear and non-linear atten-tion computations to the GPU, while the TEE performs only lightweight integrity verification and pre-/post-processing. Since attention computation produces floating-point inter-mediate results, we devise two new approaches to verify the integrity of matrix multiplications and SoftMax ’s expo-nentiation. This keeps the main attention path on the GPU, allowing the GPU to proceed without waiting for TEE-side execution and transfer. As a result, VeriAttn avoids the related communication round trip and reduces both TEE-side computation and TEE-GPU idle time while preserving integrity. Second, we design phase-specific execution workflows for prefill and decoding. In prefill, VeriAttn organizes the TEE and GPU processes into a two-level pipeline over attention head blocks and exponentiation row tiles. This overlaps TEE memory copies, data transfers, GPU computation, and veri-fication inside the TEE, thereby reducing synchronization stalls. In decoding, VeriAttn uses a collaborative TEE-GPU execution strategy for attention dominated by KV cache ac-cess. The GPU processes the persistent GPU KV cache and selected KV blocks that are offloaded temporarily, while the TEE locally processes the remaining non-resident KV entries. This allows TEE-side attention to contribute to the attention computation while reducing KV transfer overhead across the TEE-GPU boundary. We evaluate VeriAttn on an Intel TDX platform over four Transformer models of different sizes (3/8/14B) and archi-tectures (LLaMA/Qwen/Phi). We compare VeriAttn with two TEE-based solutions: (i) TSDP and (ii) Full-TEE , which executes protected computation entirely in TEE. At a prompt length of 6,000 tokens, VeriAttn improves full-model time to first token (TTFT) by 2.60 -3.38 × over TSDP and 3.14 -5.19 ×
+
+over Full-TEE. For long-context decoding with an output length of 10,000 tokens, VeriAttn improves full-model time per output token (TPOT) by 3.86 -5.42 × over TSDP and 2.21 -
+
+3.15 × over Full-TEE. We also comparatively benchmark Ve-riAttn and zkLLM [38] that uses cryptographic proof gen-eration for verifiable LLM inference. Although zkLLM pro-vides cryptographic soundness with negligible soundness error [ 38 ], it suffers two orders-of-magnitude longer TTFT and TPOT. 
+
+Paper organization : §2 presents background and reviews related work. §3 presents motivating benchmark results. §4 presents the design of CTGA. §5 presents evaluation results. §6 discusses several relevant issues. §7 concludes this paper. 
+
+## 2 Background and Related Work 
+
+2.1 Transformer Architecture 
+
+Transformer-based LLMs [ 42 ] consist of 𝑁 stacked Trans-former blocks, each containing a multi-head self-attention module with 𝐻 attention heads and a feed-forward layer. 
+
+> 2
+
+The self-attention module is central to Transformer, allow-ing each token to aggregate contextual information from other positions in the sequence. LLM inference consists of 
+
+prefill and decoding phases. Consider one attention head, during prefill, the model processes all prompt tokens in parallel. For an input sequence of 𝐿 tokens, the hidden states are projected into query, key, and value matrices Q, K, V ∈ R𝐿 ×𝑑 ℎ , where 𝑑 ℎ denotes the per-head hidden dimension. Self-attention first computes the scaled and masked attention score matrix S = QK ⊤/√𝑑 ℎ + M
+
+where M is the causal mask that assigns −∞ to future-token positions, ensuring that each token can attend only to itself and preceding tokens. We define the attention states for accumulation and normalization in attention as follows. 
+
+E = exp (S), Z = E1 , U = EV , (1) where E is the unnormalized attention-weight matrix, Z is the row-sum accumulation term, U is the unnormalized value aggregation and 1 is the all-one vector. The final normaliza-tion produces the attention output: 
+
+O = U ⊘ Z = SoftMax (S)V, (2) where ⊘ denotes row-wise division with Z broadcast along the hidden dimension. Since prefill performs attention over the full prompt, it involves large matrix operations such as QK ⊤ and generates attention states whose size scales quadratically with the sequence length 𝐿 . The key and value representations of the prompt tokens are stored as the key-value (KV) cache for later decoding. During decoding, tokens are generated autoregressively, one at a time. At each decoding step 𝑡 , where 𝑡 starts from 
+
+𝐿 + 1, the model computes q𝑡 , k𝑡 , v𝑡 ∈ R𝑑 ℎ for the new token, appends k𝑡 and v𝑡 to the KV cache, and uses q𝑡 to attend over all cached keys and values. Let 
+
+K≤𝑡 = [k⊤ 
+
+> 1
+
+; . . . ; k⊤ 
+
+> 𝑡
+
+] ∈ R𝑡 ×𝑑 ℎ , V≤𝑡 = [v⊤ 
+
+> 1
+
+; . . . ; v⊤ 
+
+> 𝑡
+
+] ∈ R𝑡 ×𝑑 ℎ .
+
+The decoding attention states and attention output are 
+
+e𝑡 = exp 
+
+ q⊤ 
+
+> 𝑡
+
+K⊤≤𝑡 
+
+√𝑑 ℎ
+
+
+
+, 𝑧 𝑡 = e𝑡 1, u𝑡 = e𝑡 V≤𝑡 , o𝑡 = u𝑡 
+
+𝑧 𝑡 
+
+. (3) Here e𝑡 , 𝑧 𝑡 , and u𝑡 are the decoding counterparts of E, Z,and U for the current attention row. Although each decoding step generates only one token, it must repeatedly access the accumulated KV cache. As the generated sequence grows, the KV cache increases linearly with the decoding length, making KV-cache storage and movement a critical bottle-neck in long-context LLM serving. Overall, long-sequence inference places greater pressure on both attention compu-tation and KV-cache access, which calls for optimizations to reduce computation overhead and data movement. 
+
+2.2 Trusted Execution Environments (TEEs) 
+
+TEEs provide hardware-enforced isolation for security-critical computation. A TEE protects the confidentiality and integrity of code and data inside the protected domain, even when privileged software (e.g., operating system, hypervisor, or device drivers) is compromised. Early enclave-based TEEs, such as Intel SGX [ 7 ], are constrained by the limited capac-ity of the Enclave Page Cache (EPC). Exceeding the EPC capacity triggers encrypted paging and incurs substantial performance degradation. Recent VM-based TEEs, such as Intel TDX [ 4 ] and AMD SEV [ 18 ], protect the memory and execution state of an entire VM from the untrustworthy hy-pervisor or host OS. Their larger protected memory space and better software compatibility make them more suitable for hosting large model states and a more practical substrate for cloud LLM inference. When a VM-based TEE interacts with external devices, it typically distinguishes between private memory (PRM) and shared memory (SHM) used for device communication. PRM is protected by the TEE and is not directly accessible to external devices. In contrast, SHM lies outside the trusted memory boundary and serves as the explicit communication region between the TEE and the external devices. Therefore, data movement between the TEE and GPU follows the PRM-SHM-GPU data path. Specifically, data is first copied from PRM to SHM through a TEE-side memory copy, and is then transferred from SHM to GPU memory through Peripheral Component Interconnect Express (PCIe) [ 26 ]. This path pre-serves the TEE protection boundary and defines the basic communication path for TEE-GPU computation. 
+
+2.3 Related Work TSDP for Transformer LLMs. Prior TSDP systems [ 5, 34 ,39 , 41 , 55 ] mainly protect model and input confidentiality in partitioned TEE-GPU execution. They encrypt or mask sensitive intermediate states before offloading computation to an untrusted GPU, and then decrypt and verify the re-turned results inside the TEE. Recent systems extend this paradigm to Transformer-based LLMs [ 46 , 50 ]. These TSDP systems do not consider the communication overhead caused by moving protected states across the TEE-GPU boundary. In contrast, our VeriAttn targets computation integrity and communication-efficient TEE-GPU attention. 
+
+Side-channel attacks on TEEs. TEEs are known to be vulnerable to side-channel attacks. Such attacks primarily threaten confidentiality by leaking information from the protected execution domain, and may undermine integrity when they expose secrets used for verification or authen-tication [ 53 , 54 ]. Various defenses have been proposed to mitigate side-channel leakage, including memory random-ization schemes [21, 48] and runtime profiling-based obfus-cation [ 15 ]. VeriAttn can be combined with such defenses to reduce side channel leakage. 
+
+GPU TEE. Recent studies [ 36 , 43 , 44 ] have explored trusted architectures inside GPUs, including confidential-computing support on high-end GPUs such as NVIDIA H100 [ 30 ]. How-ever, these approaches require specialized GPU hardware and firmware support. The related software ecosystems are 
+
+> 3
+
+Figure 1. Illustration of TSDP for a four-layer DNN model (left) and a Transformer self-attention module (right). 1000 2000 3000 4000 5000 6000         
+
+> 0.0
+> 0.8
+> 1.6
+> 2.4
+> Batch size: 1
+> 1000 2000 3000 4000 5000 6000
+> 0
+> 5
+> 10
+> 15
+> Batch size: 5
+> Time (s)
+> Sequence length
+> GPU comp Transfer TEE verify TEE SoftMax
+
+Figure 2. Latency breakdown of TSDP prefill attention. still maturing [ 47 ]. As a result, they are not yet widely avail-able on commodity GPUs and are less applicable to edge clouds, where GPU resources are heterogeneous and cost-constrained [ 40 ]. In contrast, VeriAttn uses a VM-based CPU TEE as the root of trust and can work with any GPU. 
+
+## 3 Motivation 
+
+This section characterizes the bottlenecks of applying the sequential TSDP workflow to Transformer self-attention in TEE-GPU inference. TSDP offloads matrix multiplications to GPU, while verification and non-linear operations remain in TEE. This design works well for conventional DNNs because their intermediate activations are relatively small and their non-linear operators are lightweight. The left part of Figure 1 illustrates implementing TSDP for a four-layer DNN model, where the convolutional layers are offloaded to the GPU. However, Transformer self-attention has different computa-tion and communication patterns. The right part of Figure 1 illustrates a straw man proposal of applying TSDP to self-attention. This section measures the performance of this straw man proposal with two attention-level microbench-marks for the prefill and decoding phases, respectively, on the LLaMA3-8B [13] model with the WikiText dataset [24]. 
+
+■ Prefill bottleneck. Figure 2 shows the latency break-down of TSDP self-attention computation during prefill. As sequence length grows from 1,000 to 6,000 tokens, atten-tion state transfers and TEE-side SoftMax become major latency components. Thus, the TEE-GPU communication overhead and TEE-side non-linear computation present the main bottlenecks to the straw man proposal. This is because, self-attention produces large intermediate states, whose sizes grow quadratically with the sequence length. These interme-diate states are repeatedly transferred across the TEE-GPU 1000 2000 3000 4000 5000 6000        
+
+> 0
+> 10
+> 20
+> 30
+> Batch size: 1
+> 1000 2000 3000 4000 5000 6000
+> 0
+> 50
+> 100
+> 150
+> 200
+> Batch size: 5
+> Time (ms)
+> KV-cache length
+> TEE comp GPU comp Transfer
+
+Figure 3. Latency breakdown of TEE-based and GPU-based decoding attention. boundary, as illustrated in Figure 1. The serial TSDP work-flow also suffers substantial idle times at the two processors, because the TEE and GPU alternately wait for the states from each other. Moreover, SoftMax is compute-intensive, as it requires element-wise exponentiation and normaliza-tion over the full attention matrix. As the sequence length increases, SoftMax overhead on TEE is more pronounced. The results in Figure 2 suggest the necessity of offload-ing the main attention computation, including non-linear operations, to GPU, in order to reduce TEE-GPU round trips and TEE-side computation overhead. They also motivate a pipelined workflow that overlaps TEE processing, data trans-fer, and GPU computation to reduce cross-device waiting and improve the utilization of both processors. 
+
+■ Decoding bottleneck. Decoding has a different per-formance profile. Each decoding step processes only one new query token, but it must attend to all previous tokens in the KV cache. The KV cache grows with context length and concurrent requests, and can eventually exceed avail-able GPU memory. Modern LLM serving systems there-fore offload inactive or overflowed KV-cache blocks to host memory [ 19 , 20 , 35 , 45 ]. In TEE-GPU attention, these non-resident KV entries reside in TEE-protected memory. Decod-ing attention has low arithmetic intensity and is mainly lim-ited by memory bandwidth on both GPUs and TEE-enabled CPUs [ 14 , 57 ]. Although CPUs are much weaker than GPUs for dense matrix computation, the performance gap is smaller for decoding attention because the bottleneck is KV cache ac-cess rather than peak compute throughput. For example, an NVIDIA H20 GPU provides up to 4 TB/s memory bandwidth and over 145 TFLOPS of compute throughput, whereas mod-ern x86 server-class CPUs, including those used by VM-based TEEs, provide up to 500 GB/s memory bandwidth specifica-tion in accessing multi-channel DDR5 memory, but only around 1.2 TFLOPS of compute throughput [ 8, 14 , 57 ]. This narrower memory bandwidth gap suggests that computation inside the TEE can still be useful for decoding attention. Figure 3 compares TEE-based and GPU-based decoding attention when non-resident KV entries are stored in TEE-protected host memory. The TEE-based strategy computes at-tention over these KV entries directly inside the TEE, whereas the GPU-based strategy first transfers the KV entries to GPU memory and then computes attention on the GPU. Although 
+
+> 4
+
+GPUs provide higher compute throughput and memory band-width than CPUs, this advantage does not always translate to lower latency for single-token decoding. In this setting, as decoding attention has low arithmetic intensity, GPU-based attention is dominated by the cost of transferring KV entries across the TEE-GPU boundary. As a result, GPU-based at-tention can be slower than TEE-based attention despite the GPU’s higher compute capability. This observation motivates a collaborative TEE-GPU de-coding workflow. Instead of transferring all non-resident KV entries to the GPU, the TEE can compute partial attention over KV entries already stored in protected memory, while the GPU processes resident and selected offloaded KV blocks. 
+
+■ TEE-GPU memory boundary. The above bottlenecks are further amplified by the memory boundary between the TEE and GPU. As introduced in §2.2, TEE-GPU communi-cation follows the constrained PRM-SHM-GPU data path. Data in PRM cannot be directly used as a GPU direct mem-ory access (DMA) buffer and must be staged through SHM. Unlike ordinary CPU-GPU execution, where page-locked host memory enables efficient asynchronous DMA trans-fers, TEE-GPU communication may involve page conver-sion, bounce buffers, or additional host-side copies. Recent work on GPU passthrough in Intel TDX reports that pageable transfers achieve only 50 -75% of pinned-DMA throughput due to bounce-buffer overheads [ 33 ]. Therefore, even with unchanged physical PCIe bandwidth, the effective TEE-GPU path can suffer from lower transfer efficiency, less overlap, and extra synchronization, further tightening the bottlenecks of prefill state transfer and decoding KV cache transfer. This highlights the need for a communication-efficient TEE-GPU attention framework that reduces data movements and in-creases computation-communication overlap. 
+
+## 4 VeriAttn System Design 
+
+This section presents VeriAttn , designed to accelerate verifi-able LLM inference by minimizing TEE-GPU communication overhead and reducing attention computation latency. Fig-ure 4 shows the overview of its architecture, which operates on the attention blocks of LLM inference during both the prefill and decoding phases. 
+
+4.1 Design Space Scope. VeriAttn targets verifiable LLM inference under the TEE-GPU setting, where the TEE serves as the trusted com-ponent and the GPU is out of the trusted domain. Model and input confidentiality are orthogonal to this work. VeriAttn 
+
+uses the GPU in an out-of-the-box manner and does not require specific GPU hardware, firmware, or GPU TEE. We focus on Transformer self-attention modules in both the pre-fill and decoding phases. Other model components, such as projection and feed-forward layers, are dominated by linear operations and can adopt TSDP as shown in Figure 1. 
+
+Threat model. Same as prior TEE-based verifiable offload-ing schemes [5, 6, 41], we consider two execution domains. 
+
+• TEE domain: The TEE hardware and the attested Ve-riAttn code running inside the TEE are trusted. The TEE provides isolated memory for trusted code and protects the secret randomness used for verification. 
+
+• GPU domain: The GPU and its software stack are not trusted. They may deviate from the prescribed compu-tation and return incorrect intermediate results. All results returned from GPU are not trusted and must be verified inside the TEE before being accepted. We assume the adversary cannot break TEE isolation. This paper does not consider denial-of-service and side-channel attacks. 
+
+Goals. VeriAttn aims to make TEE-GPU attention com-putation both verifiable and efficient. For integrity, it verifies GPU-returned results before they are used by trusted com-putation. For efficiency, it reduces TEE-GPU communication volume and frequency, and idle time caused by sequential TEE-GPU execution. 
+
+4.2 Attention Computation Verification 
+
+Figure 4 shows how VeriAttn offloads both linear and non-linear attention to GPU, including attention score com-putation, score scaling, causal masking, exponentiation in 
+
+SoftMax , and value aggregation. With TSDP (cf. Figure 1), GPU returns intermediate attention scores to TEE for SoftMax 
+
+computation and then waits for the resulting attention weights to perform value aggregation. In contrast, VeriAttn keeps both linear and non-linear attention on GPU and returns only the intermediate results needed for verification inside the TEE. Specifically, as illustrated in Figure 4, in both prefill and decoding, VeriAttn verifies the attention results returned by the GPU with procedures GVFAVeriMM and LPVeriExp .We explain these two procedures in § 4.2.1 and § 4.2.2, re-spectively, and provide their detailed pseudocode in Appen-dix A.1. 
+
+4.2.1 Linear computation verification. We describe the approach to verifying offloaded linear computations. TSDP systems [ 39 , 41 , 46 , 55 ] typically verify matrix multiplica-tion results returned by the GPU using Freivalds’ algorithm over a finite field [ 10 ]. This requires TEE to quantize model weights and inputs into fixed-point integer representations so that GPU execution preserves exact finite-field arithmetic. However, in VeriAttn , the exponentiation offloaded to GPU is a real-valued non-linear operation that produces floating-point attention weights used by subsequent linear computa-tions, rendering the Freivalds’ algorithm inapplicable. To ad-dress this, VeriAttn adopts the Gaussian Variant of Freivalds’ Algorithm (GVFA) [ 17 ], which is based on Lemma 1. The GVFA-based verification for matrix multiplication is referred to as GVFAVeriMM .
+
+> 5
+
+Figure 4. Overview of VeriAttn for Transformer-based LLMs. 
+
+Lemma 1 (Floating-point Gaussian Freivalds [ 17 ]) . Let A ∈
+
+R𝑚 ×𝑛 , B ∈ R𝑛 ×𝑝 , and C ∈ R𝑚 ×𝑝 be arbitrary real matrices. Let w𝐺 ∼ N ( 0, 𝐼 𝑝 ) be a standard Gaussian random vector, for any tolerance 𝜖 > 0,
+
+Pr  (C − AB )w𝐺 ∞ ≤ 𝜖 | C ≠ AB  ≤ 2Φ  𝜖 𝜎 
+
+ − 1, (4) 
+
+where 𝜎 = max 𝑖 (C − AB )𝑖, : 2, and Φ(·) is the cumulative distribution function of the standard normal distribution. 
+
+Lemma 1 provides a randomized consistency bound for floating-point matrix multiplication. The tolerance 𝜖 is cal-ibrated from honest GPU executions and specifies the ac-cepted numerical error budget. Results whose projected resid-uals fall within this budget are accepted as numerically con-sistent with honest execution and treated as normal floating-point variation. This model is consistent with LLM quanti-zation studies showing that small controlled low-precision perturbations are often tolerated by LLMs [ 9 , 49 ]. We further evaluate the end-to-end impact of such tolerated numerical variation in § 5.4. Deviations outside this budget are detected with the false-acceptance probability bounded by Lemma 1. In practice, the check would be repeated with 𝜏 independent Gaussian vectors, which further reduces the false acceptance probability to  2Φ(𝜖 /𝜎 ) − 1𝜏 . VeriAttn uses this check for attention value aggregation in both prefill and decoding. For prefill, following the notation in §2, VeriAttn verifies whether the value aggregation bU returned by GPU is consis-tent with EV within tolerance 𝜖 . Instead of recomputing EV 
+
+inside the TEE, which requires 𝑂 (𝐿 2𝑑 ℎ ) operations, for one repetition, the TEE uses a secret Gaussian vector w𝐺 ∈ R𝑑 ℎ
+
+that is sampled and stored during the offline phase 
+
+E(Vw 𝐺 ) − bUw 𝐺 ∞ ≤ 𝜖. (5) This reduces verification to matrix-vector products with an overall complexity of 𝑂 (𝐿 2 + 𝐿𝑑 ℎ ).For decoding, each step verifies a vector-matrix product. At step 𝑡 , given the GPU-returned claim bu𝑡 , the TEE checks 
+
+e𝑡 (V≤𝑡 w𝐺 ) − bu𝑡 w𝐺 ≤ 𝜖. (6) A direct computation of V≤𝑡 w𝐺 costs 𝑂 (𝑡𝑑 ℎ ) per step. Since decoding is autoregressive, VeriAttn maintains this pro-jection incrementally. For a fixed Gaussian vector w𝐺 , the TEE stores g𝑡 −1 = V≤𝑡 −1w𝐺 . When a new value vector v𝑡 is appended to the KV cache, the TEE updates g𝑡 = V≤𝑡 w𝐺 = g𝑡 −1
+
+v⊤ 
+
+> 𝑡
+
+w𝐺 
+
+
+
+. Thus, decoding verification requires 𝑂 (𝑡 + 𝑑 ℎ ) op-erations for the check in (6) , compared with 𝑂 (𝑡𝑑 ℎ ) for re-computing u𝑡 .
+
+4.2.2 Non-linear computation verification. This sec-tion describes how to verify exponentiation in SoftMax .Freivalds’ algorithm and GVFA rely on algebraic properties of linear operations and cannot be applied to element-wise non-linear operators. To verify exponentiation, we propose 
+
+LPVeriExp , which uses a log-product consistency property of the exponential function. Specifically, consider the 𝑟 -th row of the attention-score matrix during prefill. Let 𝑠 𝑟,𝑖 be the (𝑟, 𝑖 )-th element of attention score S, where 𝑖 ∈ I 𝑟 and I𝑟 
+
+denotes the valid, unmasked positions in the 𝑟 -th row. The exact real-valued exponentiation output is 𝑦 𝑟,𝑖 = 𝑒 𝑠 𝑟,𝑖 . The GPU returns a claimed exponentiation vector by𝑟 = [b𝑦 𝑟,𝑖 ]𝑖 ∈ I 𝑟 .
+
+For each verification repetition, the TEE uses a global coef-ficient vector a = [𝑎 𝑖 ]1≤𝑖 ≤𝐿 , 𝑎 𝑖 ∈ { 1, . . . , 𝑁 𝑎 }, and an inde-pendent Gaussian scalar 𝑤 ′ 
+
+> 𝐺
+
+∼ N ( 0, 1), where 𝑁 𝑎 is the size of the nonzero coefficient domain. Both a and 𝑤 ′ 
+
+> 𝐺
+
+are sam-pled during the offline phase inside the TEE and kept hidden from the GPU. For exact exponentiation outputs, we have 
+
+log   Î 𝑖 ∈ I 𝑟 (𝑦 𝑟,𝑖 )𝑎 𝑖  = log  𝑒 Í𝑖 ∈I 𝑟 𝑎 𝑖 𝑠 𝑟,𝑖  = Í𝑖 ∈ I 𝑟 𝑎 𝑖 𝑠 𝑟,𝑖 . Next, 
+
+LPVeriExp computes the scalar residual 
+
+𝑅 𝑟 (a) = log   Ö 
+
+> 𝑖 ∈ I 𝑟
+
+b𝑦 𝑎 𝑖 
+
+> 𝑟,𝑖
+
+ −∑︁  
+
+> 𝑖 ∈ I 𝑟
+
+𝑎 𝑖 𝑠 𝑟,𝑖 . (7) Because floating-point arithmetic can introduce small numer-ical residuals even for honest GPU execution, the TEE uses a calibrated tolerance 𝜖 ′. Then, LPVeriExp checks whether 
+
+|𝑅 𝑟 (a)𝑤 ′ 
+
+> 𝐺
+
+| < 𝜖 ′. (8) This log-product verification binds the returned exponenti-ation outputs to the preceding computation. Since each 𝑠 𝑟,𝑖 
+
+is derived from QK ⊤, score scaling, and causal masking, an 
+
+> 6
+
+incorrect score or exponentiation output introduces an ad-ditional log-product residual. The following lemma bounds the false acceptance probability of the check in (8). 
+
+Lemma 2 (False Acceptance of LPVeriExp ). For the 𝑟 -th attention row, let 𝑛 err ,𝑟 denote the number of exponentiation outputs modified from an honest GPU execution and 𝜎 ′ > 0
+
+denote the minimum detectable magnitude of an incorrect verification residual. With 𝜏 𝑎 fresh secret integer vectors and 
+
+𝜏 𝑔 independent Gaussian tolerance checks per coefficient vector, the probability that an incorrect row is accepted is bounded by 
+
+Pr [FA 𝑟 ] ≤  1{𝑛 err ,𝑟 ≥ 2} · 1
+
+𝑁 𝑎 
+
++  2Φ  𝜖 ′
+
+𝜎 ′
+
+ − 1𝜏 𝑔 𝜏 𝑎 . (9) By Lemma 2, increasing 𝑁 𝑎 , 𝜏 𝑎 , and 𝜏 𝑔 reduces the false acceptance probability and can make it sufficiently small. We provide the proof in Appendix A.2, where we also describe a numerically stable implementation of the log-product check in (7) that avoids intermediate underflow and overflow. We now compare the verification cost with directly ex-ecuting the score computation and exponentiation inside the TEE. Direct TEE-side execution requires 𝑂 (𝐿 2𝑑 ℎ ) linear operations for QK ⊤ and 𝑂 (𝐿 2) expensive exponentiations. In contrast, for computing the residual in (7) , LPVeriExp 
+
+first computes the compressed score term for each row by 
+
+Í𝑖 ∈ I 𝑟 𝑎 𝑖 𝑠 𝑟,𝑖 = q⊤
+
+> 𝑟
+
+  Í 𝑖 ∈ I 𝑟 𝑎 𝑖 k𝑖 
+
+/√𝑑 ℎ + Í𝑖 ∈ I 𝑟 𝑎 𝑖 M𝑟,𝑖 , where q⊤
+
+> 𝑟
+
+and k⊤ 
+
+> 𝑖
+
+are the corresponding query and key rows. For a fixed vector a, the weighted key terms Í𝑖 ∈ I 𝑟 𝑎 𝑖 k𝑖 can be computed incrementally and reused across rows. Thus, computing all compressed score terms takes 𝑂 (𝐿𝑑 ℎ + 𝐿 2) linear operations. For the log-product term in (7) , the TEE computes integer powers b𝑦 𝑎 𝑖  
+
+> 𝑟,𝑖
+
+using exponentiation by squaring. This takes 
+
+𝑂 (log 𝑁 𝑎 ) multiplications per element and thus 𝑂 (𝐿 2 log 𝑁 𝑎 )
+
+linear operations over all exponentiation outputs. The only remaining non-linear operations are one logarithm per row, for a total of 𝑂 (𝐿 ) logarithmic operations. During prefill, 𝐿 > 𝑑 ℎ typically holds as 𝑑 ℎ is usually 64 or 
+
+128 [13 , 51 ], and log 𝑁 𝑎 is much smaller than 𝑑 ℎ . Therefore, compared with direct TEE execution, LPVeriExp reduces the linear computation from 𝑂 (𝐿 2𝑑 ℎ ) to 𝑂 (𝐿𝑑 ℎ + 𝐿 2 + 𝐿 2 log 𝑁 𝑎 )
+
+and reduces expensive non-linear operations from 𝑂 (𝐿 2)
+
+exponentiations to 𝑂 (𝐿 ) logarithms. Note that the computa-tional overheads of logarithm and exponentiation are com-parable. Similarly, during decoding, the same strategy is applied only to the current token attention row. At step 
+
+𝑡 , direct TEE execution would require 𝑂 (𝑡𝑑 ℎ ) linear opera-tions and 𝑂 (𝑡 ) exponentiations, whereas LPVeriExp requires 
+
+𝑂 (𝑡𝑑 ℎ + 𝑡 log 𝑁 𝑎 ) linear operations and only one logarithm, i.e., 𝑂 (1) nonlinear operation. Therefore, LPVeriExp is sub-stantially more efficient in both phases than directly per-forming the computation inside the TEE. 
+
+4.3 Prefill Workflow 
+
+We now describe the prefill workflow of VeriAttn , which integrates the verification mechanisms introduced in §4.2. 
+
+Figure 5. Comparison of the TSDP sequential workflow (top) and VeriAttn pipelined workflow (bottom) in prefill. As discussed earlier, TSDP keeps SoftMax inside the TEE and requires quadratic-size attention states to cross the TEE-GPU boundary before and after SoftMax . With LPVeriExp 
+
+and GVFAVeriMM , VeriAttn removes this related round trip. However, existing TSDP offloading schemes still follow a sequential workflow: TEE and GPU cannot proceed until the other side finishes its data transfer or computation, which can leave both sides idle. This issue can be pronounced be-cause the exponentiation outputs are still quadratic in the sequence length and must be returned to the TEE for verifi-cation. Inspired by distributed DNN/LLM pipelines that overlap communication with computation and reduce pipeline bub-bles across GPU stages [ 27 , 28 , 37 ], VeriAttn applies pipelin-ing inside attention computation at the TEE-GPU boundary. It uses a two-level pipeline over attention head blocks and exponentiation row tiles to overlap TEE preprocessing and postprocessing, SHM-GPU communication, and GPU com-putation. Preprocessing copies input blocks from PRM to SHM. Postprocessing copies GPU results from SHM to PRM, verifies them using LPVeriExp and GVFAVeriMM , accumu-lates row sums, and normalizes the verified results. Figure 5 compares the TSDP sequential workflow with the VeriAttn 
+
+pipelined workflow. We describe the details below. 
+
+■ Head block pipeline. At a coarse granularity, Veri-Attn exploits the independence across attention heads and groups them into head blocks. Let B ← { 1, . . . , ⌈𝐻 /𝑏 𝑠 ⌉} de-note the set of head blocks, where 𝑏 𝑠 is the number of heads in each block. Each block 𝑏 ∈ B contains up to 𝑏 𝑠 heads and the corresponding tensors Q𝑏 , K𝑏 , and V𝑏 . While the TEE copies the next head block from PRM to SHM, the GPU transfers a previously ready block from SHM to GPU mem-ory. Once the block arrives on the GPU, the GPU starts to compute the attention scores S𝑏 = Q𝑏 K⊤ 
+
+> 𝑏
+
+/√𝑑 ℎ + M𝑏 , while later blocks are being transferred. This overlaps PRM-SHM memory copy, SHM-GPU PCIe transfer, and GPU computa-tion across head blocks, improving the utilization of both the TEE and GPU. 
+
+■ Row tile pipeline. At a finer granularity, VeriAttn 
+
+further partitions the quadratic-size exponentiation output 
+
+> 7
+
+of each head block 𝑏 into row tiles. Let T ← { 1, . . . , ⌈𝐿 /𝑡 𝑠 ⌉} 
+
+denote the set of row tiles where 𝑡 𝑠 is the number of rows in each tile. Since exponentiation is element-wise, each tile 𝑠 ∈T can be processed independently. Once the GPU finishes computing a tile, it transfers the claimed exponentiation output tile bE𝑏,𝑠 to SHM. The TEE next copies the tile to PRM after it arrives in SHM, verifies it using LPVeriExp ,and accepts it as E𝑏,𝑠 if the check passes. The TEE then accumulates the corresponding row-sum tile Z𝑏,𝑠 = E𝑏,𝑠 1.
+
+These stages are pipelined across different tiles: while the TEE postprocesses an earlier tile, PCIe transfer can move another ready tile to SHM, and the GPU can compute later tiles. This enables an overlap among TEE postprocessing, exponentiation transfer, and GPU computation, allowing verification to start before the full exponentiation matrix of the head block is available. After verifying all exponentiation tiles in head block 𝑏 ,the TEE concatenates them into the verified exponentiation matrix E𝑏 and its row-sum vector Z𝑏 = E𝑏 1. Unlike expo-nentiation, value aggregation is verified at the granularity of an entire head block, because GVFAVeriMM performs a matrix-level check that requires the complete input and out-put matrices. After the GPU finishes value aggregation for block 𝑏 , it returns a claimed result bU𝑏 . The TEE verifies bU𝑏 
+
+using GVFAVeriMM with the accepted E𝑏 and V𝑏 . If the check passes, the result is accepted as U𝑏 , and the TEE computes the normalized output O𝑏 = U𝑏 ⊘ Z𝑏 . Concatenating all head-block outputs gives the final attention output. Pseudocode for the prefill workflow is provided in Appendix A.3.1. 
+
+4.4 Decoding Workflow 
+
+This section describes the decoding workflow of VeriAttn .Unlike prefill, decoding processes one query token at a time, but each step must attend to the growing KV cache. When the KV cache exceeds GPU memory capacity, some KV en-tries only remain in TEE memory. A decoding path that computes attention only on the GPU must repeatedly move these entries through the PRM-SHM-GPU path. This transfer can dominate latency because each decoding step accesses a large amount of KV data but performs limited computation, making the computation insufficient to amortize KV transfer overhead. To address this, VeriAttn introduces a collabo-rative decoding workflow that leverages the computational capability of the TEE and effectively hides transfer latency. Figure 6 compares the TSDP sequential workflow with the collaborative workflow in VeriAttn .
+
+■ Collaborative attention. In contrast to GPU-centric LLM serving and offloading systems that focus on improving GPU utilization and memory efficiency [ 3, 19 , 35 , 52 , 56 ], Ve-riAttn splits the attention computation across the TEE and GPU for long-context decoding. The TEE keeps the complete KV cache KV 𝑡𝑒𝑒 , while the GPU maintains bounded resident 
+
+Figure 6. Comparison of TSDP sequential workflow (top) and VeriAttn collaborative workflow (bottom) in decoding. KV cache KV 𝑔𝑝𝑢 for fast access. At step 𝑡 , the model gener-ates q𝑡 , k𝑡 , and v𝑡 , and appends k𝑡 and v𝑡 to the TEE-resident KV cache. If the GPU still has available memory, the new KV entry is also copied and appended to KV 𝑔𝑝𝑢 for use in subsequent decoding steps. When KV 𝑔𝑝𝑢 reaches its capacity, later KV entries are kept only in the TEE-resident KV cache unless they are temporarily selected for GPU execution. 
+
+VeriAttn uses an offload ratio 𝑝 ∈ [ 0, 1] to partition the KV entries KV 𝑡𝑒𝑒 \KV 𝑔𝑝𝑢 that are not resident on the GPU. It streams ⌊𝑝 · | KV 𝑡𝑒𝑒 \KV 𝑔𝑝𝑢 |⌋ entries to the GPU and pro-cesses the remaining KV entries inside the TEE. Increasing 𝑝 
+
+improves GPU utilization but raises TEE-GPU transfer, while decreasing 𝑝 reduces KV movement but assigns more com-putation to the TEE. Thus, 𝑝 tunes the trade-off among GPU acceleration, TEE-side computation, and transfer overhead. During decoding, the GPU computes attention over its res-ident KV cache and selected non-resident KV entries, while the TEE computes attention over the remaining KV entries in PRM. To avoid exceeding the GPU KV capacity, VeriAttn 
+
+partitions the selected KV entries into blocks and streams them to the GPU through a reusable temporary buffer. The two paths overlap data movement and computation: the TEE copies the current query and selected KV blocks from PRM to SHM and performs local attention, while the GPU trans-fers each block from SHM to the temporary buffer, computes linear and non-linear partial attention, and returns interme-diate results to SHM for TEE-side verification. This design reduces repeated KV transfers and allows TEE and GPU workloads to run concurrently while keeping GPU memory usage bounded. 
+
+■ Partial state merge. Both sides compute attention in an unnormalized form. Let (U𝑔𝑝𝑢 , Z𝑔𝑝𝑢 ) and (U𝑡𝑒𝑒 , Z𝑡𝑒𝑒 ) denote the partial states computed over the KV partitions on the GPU and TEE, respectively. Similar to the prefill workflow, the TEE copies the claimed GPU results for exponentiation and value aggregation from SHM to PRM, and verifies them using LPVeriExp and GVFAVeriMM . The TEE then merges the two partial states to obtain the attention output: o𝑡 =   
+
+> U𝑔𝑝𝑢 +U𝑡𝑒𝑒
+> Z𝑔𝑝𝑢 +Z𝑡𝑒𝑒
+
+. This is equivalent to full attention over the entire KV cache because both the unnormalized numerator and the 
+
+> 8
+
+normalization denominator are additive across disjoint KV partitions. If partition-local max-shifted softmax is used for numerical stability, VeriAttn applies the standard log-sum-exp correction before merging. Detailed pseudocode for the decoding workflow is provided in Appendix A.3.2. 
+
+## 5 Evaluation 
+
+5.1 Experimental Setup Testbed. All experiments were conducted in a TDX-enabled cloud VM hosted on an Intel Xeon Scalable CPU. The VM has 16 vCPUs, 128 GB memory, and access to an NVIDIA H20 GPU with 96 GB device memory through PCIe 5.0. The effective single-thread PRM-SHM copy bandwidth is up to 
+
+32 GB/s, and the SHM-GPU bandwidth is about 15 GB/s. The end-to-end pageable transfer bandwidth remains below the PCIe 5.0 peak because PRM data must be staged through SHM, whose mapping cannot be registered as CUDA-pinned memory inside the TDX VM. 
+
+Models and dataset. We use four open-weight and repre-sentative large Transformer models with varying sizes and architectural designs: LLaMA3-3B [ 25 ], LLaMA3-8B [ 13 ], Qwen3-14B [ 51 ], and Phi4-14B [ 1 ]. Unless otherwise stated, models by default are loaded in FP16 precision. To evalu-ate inference performance, we use the WikiText dataset [ 24 ], which provides natural text sequences for constructing prefill prompts and evaluating long-context decoding workloads. 
+
+Baselines. We compare VeriAttn against three represen-tative approaches for verifiable LLM inference: (1) Full-TEE ,running the entire model inside the TEE without GPU of-floading; (2) TSDP , following the sequential TEE-shielded DNN partition workflow adopted by prior systems [ 39 , 41 ,46 , 55 ]; and (3) zkLLM [38 ], verifying offloaded LLM com-putation using cryptographic proofs. 
+
+5.2 Prefill Performance Sensitivity to block and tile counts. We first study the impact of two pipeline scheduling parameters on prefill self-attention latency of VeriAttn : the number of attention head blocks and the number of exponentiation tiles. These 2                
+
+> 4
+> 8
+> 16
+> Seq. Len. = 1000 Seq. Len. = 3000 Seq. Len. = 6000
+> 2
+> 4
+> 8
+> 16
+> 2
+> 4
+> 8
+> 16
+> 816 32 64 128
+> 2
+> 4
+> 8
+> 16
+> 816 32 64 128 816 32 64 128
+> 1.0
+> 1.3
+> 1.6
+> 1.9
+> 2.2
+> 2.5 Normalized latency
+> Number of exponentiation tiles
+> Number of head blocks
+> LLaMA-3B  LLaMA-8B  Qwen-14B  Phi-14B
+
+Figure 7. Normalized prefill attention latency under different block and tile counts. two parameters determine the granularity of VeriAttn ’s two-level prefill pipeline: head blocks define the outer head-level pipeline; exponentiation tiles define the inner tile-level pipeline for transferring and verifying exponentiation out-puts. For each model, we sweep the number of head blocks over {2, 4, 8, 16 } and the number of exponentiation tiles over 
+
+{8, 16 , 32 , 64 , 128 } under sequence lengths of 1,000, 3,000, and 6,000 tokens. For each model and sequence length, we normalize every measured latency by the minimum latency in the same sweep. Thus, a normalized latency of 1.0 de-notes the fastest configuration, and larger values indicate higher relative overhead. Figure 7 shows a clear trade-off that depends on sequence length. Short prompts favor coarse settings, because excessive head partitioning or exponenti-ation tiling introduces noticeable scheduling overhead. For longer prompts, moderate partitioning improves pipeline parallelism while keeping enough work in each head block and exponentiation tile for efficient GPU execution. Guided by these results, we use length-aware defaults in subsequent prefill experiments: (2, 16 ) head blocks and exponentiation tiles for sequence lengths up to 1,000, (4, 32 ) for sequence lengths up to 3,000, and (8, 32 ) for longer sequences. 
+
+TTFT in the prefill phase. Figure 8 compares prefill Time-To-First-Token (TTFT) for a single request, i.e., batch size 
+
+1, across Full-TEE, TSDP, and VeriAttn . We evaluate four models with sequence lengths ranging from 1,000 to 6,000 tokens. VeriAttn consistently outperforms both baselines across all evaluated sequence lengths. At a sequence length of 6,000, VeriAttn achieves speedups of 2.60 -3.38 × over TSDP and 3.14 -5.19 × over Full-TEE. These results demonstrate that 
+
+VeriAttn effectively reduces prefill latency with verification enabled. We also compare VeriAttn with zkLLM-style proof generation on LLaMA3-8B, as shown in Figure 9. The results show that zkLLM incurs roughly two orders of magnitude higher latency than VeriAttn . This is because VeriAttn 
+
+avoids expensive proof generation and instead uses light-weight TEE-side verification for GPU-returned results. 
+
+Prefill attention latency breakdown. Figure 11 reports the TEE-side latency breakdown of prefill self-attention for Full-TEE, TSDP, and VeriAttn across four models, two batch sizes, and sequence lengths from 1,500 to 6,000 tokens. This experiment isolates the self-attention operator and excludes non-attention layers such as feed-forward layers, layer nor-malization, and projections. Each bar is decomposed into three components: TEE comp/memcopy includes TEE-side at-tention computation and PRM-SHM memory-copy overhead; 
+
+TEE verify is the cost of verifying GPU-returned intermedi-ate results; and TEE idle is the time the TEE waits for GPU computation and SHM-GPU data movement. Full-TEE is dominated by TEE-side computation, as the entire attention operation runs inside the TEE. TSDP offloads linear attention operations to the GPU, but keeps SoftMax 
+
+inside the TEE and uses a sequential TEE-GPU workflow.   
+
+> 92000 4000 6000
+> 0
+> 25
+> 50
+> 75
+> TTFT (s)
+
+LLaMA3-3B   
+
+> 2000 4000 6000
+> 0
+> 50
+> 100
+> 150
+
+LLaMA3-8B   
+
+> 2000 4000 6000
+> 0
+> 100
+> 200
+> 300
+
+Qwen3-14B   
+
+> 2000 4000 6000
+> 0
+> 100
+> 200
+> 300
+
+Phi4-14B 
+
+Sequence length 
+
+Full-TEE TSDP VeriAttn Figure 8. Prefill TTFT comparison among Full-TEE, TSDP, and VeriAttn across four models under varying sequence lengths. 1000 2000 3000 4000 5000 6000  
+
+> Sequence length
+> 10 0
+> 10 1
+> 10 2
+> 10 3
+> 10 4
+> TTFT (s)
+> CTGA zkLLM
+
+Figure 9. VeriAttn vs. zkLLM in prefill TTFT on LLaMA3-8B. LLaMA3-3B LLaMA3-8B Qwen3-14B Phi4-14B  
+
+> Model
+> 0
+> 2
+> 4
+> Time (s)
+> TSDP
+> VeriAttn
+> GPU comp GPU idle
+
+Figure 10. GPU latency breakdown (prefill attention). 1500 3000 4500 6000                         
+
+> 0.0
+> 0.8
+> 1.6
+> 2.4
+> Full-TEE
+> TSDP
+> VeriAttn
+> 1500 3000 4500 6000
+> 0
+> 4
+> 8
+> 12
+> LLaMA-3B
+> 1500 3000 4500 6000
+> 0.0
+> 0.8
+> 1.6
+> 2.4
+> 1500 3000 4500 6000
+> 0
+> 5
+> 10
+> 15
+> LLaMA-8B
+> 1500 3000 4500 6000
+> 0
+> 1
+> 2
+> 3
+> 1500 3000 4500 6000
+> 0
+> 6
+> 12
+> 18
+> Qwen-14B
+> 1500 3000 4500 6000
+> 0
+> 1
+> 2
+> 3
+> 1500 3000 4500 6000
+> 0
+> 6
+> 12
+> 18
+> Phi-14B
+> Batch size = 1 Batch size = 5
+> Time (s)
+> Sequence length
+> TEE comp/memcopy TEE verify TEE idle
+
+Figure 11. TEE latency breakdown of prefill attention. Unlike the full-model TTFT results in Figure 8, TSDP can be slower than Full-TEE when attention is isolated. This is because TSDP is effective for non-attention linear layers, where the TEE handles only lightweight non-linear work and transfers relatively small intermediate states. In self-attention, however, SoftMax is costly inside the TEE, and the intermediate attention states are much larger. Sequential TEE-GPU transfers further increase both communication de-lay and TEE idle time, while TEE-side SoftMax adds substan-tial computation overhead. In contrast, VeriAttn offloads both non-linear exponentiation and linear value aggregation to the GPU and returns only the intermediate results needed for verification inside the TEE. This reduces both TEE-side computation and TEE-GPU transfer overhead. Its two-level pipeline overlaps GPU computation, data movement, and TEE-side verification, which further reduces TEE idle time. The benefit grows with sequence length. For isolated prefill 0 0.2 0.4 0.6 0.8      
+
+> 2000
+> 4000
+> 8000
+> 2000
+> 4000
+> 8000
+> 2000
+> 4000
+> 8000
+> 2000
+> 4000
+> 8000
+> Batch size = 1
+> 00.2 0.4 0.6 0.8
+> Batch size = 5
+> 0.6
+> 1.0
+> 1.4
+> 1.8 Speedup
+> KV-cache length
+> Offload ratio
+> LLaMA-3B  LLaMA-8B  Qwen-14B  Phi-14B
+
+Figure 12. Speedup over pure GPU attention offloading. self-attention at 6,000 tokens and batch size 1, VeriAttn is 
+
+3.05 -3.49 × faster than Full-TEE and 4.19 -4.62 × faster than TSDP across the four models. At batch size 5, VeriAttn 
+
+shows a similar advantage, achieving 3.02 -3.52 × speedup over Full-TEE and 3.87 -4.84 × speedup over TSDP. Figure 10 gives the complementary GPU-side view at sequence length 6,000 and batch size 1. Compared with TSDP, VeriAttn 
+
+spends a larger portion of time in useful GPU computation because more attention work is offloaded to the GPU. Also, 
+
+VeriAttn substantially reduces GPU idle time across all four models, showing that the pipeline keeps the GPU better utilized instead of leaving it stalled by sequential transfers and TEE-side SoftMax .
+
+5.3 Decoding Performance Improvement over pure GPU offloading. We evaluate the benefits of VeriAttn ’s collaborative TEE-GPU attention during decoding across four LLMs, using pure GPU attention offloading (e.g., offload ratio 𝑝 = 1) as the baseline. We set the GPU KV capacity to zero, so all KV entries are initially resident in TEE private memory. Therefore, the pure GPU baseline must transfer all KV entries to GPU memory at each decoding step. We sweep the KV cache size over 2,000, 4,000, and 8,000 tokens, and vary the offload ratio from 0
+
+to 1 with a step size of 0.2. Figure 12 shows the speedup achieved by collaborative TEE-GPU attention. Across mod-els, the best offload ratios are usually intermediate values, especially in the range from 0.4 to 0.6, and reach up to about 
+
+1.7× speedup over 𝑝 = 1. This suggests that VeriAttn bene-fits from keeping part of the attention computation inside the TEE instead of transferring the entire KV cache to the GPU. With an appropriate offload ratio, VeriAttn balances   
+
+> 10 2000 6000 10000
+> 0
+> 1
+> 2
+> 3
+> TPOT (s/token)
+
+LLaMA3-3B   
+
+> 2000 6000 10000
+> 0.0
+> 1.5
+> 3.0
+> 4.5
+
+LLaMA3-8B   
+
+> 2000 6000 10000
+> 0.0
+> 2.5
+> 5.0
+> 7.5
+
+Qwen3-14B   
+
+> 2000 6000 10000
+> 0.0
+> 2.5
+> 5.0
+> 7.5
+
+Phi4-14B 
+
+Output length 
+
+Full-TEE TSDP VeriAttn Figure 13. Decoding TPOT comparison among Full-TEE, TSDP and VeriAttn across four models under varing output length. 2000 4000 6000 8000 10000  
+
+> Output length
+> 10 −1
+> 10 0
+> 10 1
+> 10 2
+> TPOT (s/token)  CTGA zkLLM
+
+Figure 14. VeriAttn vs. zk-LLM in decoding TPOT on LLaMA3-8B. LLaMA3-3B LLaMA3-8B Qwen3-14B Phi4-14B  
+
+> Model
+> 0.0
+> 0.2
+> Time (s)
+> TSDP
+> VeriAttn
+> GPU comp GPU idle
+
+Figure 15. GPU latency breakdown (decoding atten-tion). TEE-side computation, GPU acceleration, and the cost of moving TEE-resident KV entries across the TEE-GPU bound-ary, making it effective for long-context decoding. In subsequent experiments, VeriAttn selects 𝑝 using a lightweight online profiling heuristic. The scheduler moni-tors recent TEE/GPU computation time and TEE-GPU trans-fer time over a short window. If TEE computation repeatedly exceeds the reusable idle budget, it increases 𝑝 to offload more non-resident KV entries to the GPU. If the TEE re-mains idle while GPU execution is delayed by transfers, it decreases 𝑝 so that more KV entries are processed locally inside the TEE. 
+
+TPOT in the decoding phase. Figure 13 compares decod-ing Time-Per-Output-Token (TPOT) for a single request, i.e., batch size 1, across Full-TEE, TSDP, and VeriAttn . We use a fixed 500-token prompt and set the GPU KV-cache capacity to 2,000 tokens. The figure reports average TPOT as output length increases. The average TPOT is derived from mea-sured per-token latency at different KV-cache lengths, cap-turing the increasing decoding cost as the KV cache grows during generation. VeriAttn consistently achieves the low-est TPOT across all models and output lengths. Before the KV cache reaches the GPU capacity, most KV entries remain resi-dent on the GPU, so the decoding cost grows gradually. After the KV cache exceeds the 2,000-token capacity, additional KV entries become non-resident and long-context decod-ing becomes more expensive. TSDP suffers from repeatedly moving non-resident KV-related attention states across the TEE-GPU boundary, while Full-TEE performs the entire at-tention operation inside the TEE. In contrast, VeriAttn uses collaborative attention execution to keep decoding scalable under bounded GPU KV memory. At an output length of 10,000, VeriAttn achieves TPOT speedups of 2.21 -3.15 ×
+
+over Full-TEE and 3.86 -5.42 × over TSDP across the four 2000 5000 8000 10000                         
+
+> 0.00
+> 0.05
+> 0.10
+> 0.15
+> Full-TEE
+> TSDP
+> VeriAttn
+> 2000 5000 8000 10000
+> 0.00
+> 0.25
+> 0.50
+> 0.75
+> LLaMA-3B
+> 2000 5000 8000 10000
+> 0.00
+> 0.06
+> 0.12
+> 0.18
+> 2000 5000 8000 10000
+> 0.0
+> 0.4
+> 0.8
+> 1.2
+> LLaMA-8B
+> 2000 5000 8000 10000
+> 0.00
+> 0.08
+> 0.16
+> 0.24
+> 2000 5000 8000 10000
+> 0.0
+> 0.4
+> 0.8
+> 1.2
+> Qwen-14B
+> 2000 5000 8000 10000
+> 0.00
+> 0.08
+> 0.16
+> 0.24
+> 2000 5000 8000 10000
+> 0.0
+> 0.4
+> 0.8
+> 1.2
+> Phi-14B
+> Batch size = 1 Batch size = 5
+> Time (s)
+> KV-cache length
+> TEE comp/memcopy TEE verify TEE idle
+
+Figure 16. Latency breakdown of decoding attention. models. Figure 14 further compares the TPOT latency of 
+
+VeriAttn with the proof generation overhead of zkLLM on LLaMA3-8B. zkLLM still incurs roughly two orders of magni-tude higher latency than VeriAttn during decoding. These results show that VeriAttn reduces end-to-end decoding latency for long context while operating within a fixed GPU KV-cache budget. 
+
+Decoding attention latency breakdown. Figure 16 iso-lates the decoding self-attention operator and reports single-step attention latency at different KV-cache lengths. We eval-uate four models with KV-cache lengths from 2,000 to 10,000 tokens, batch sizes 1 and 5, and a GPU KV-cache capacity of 2,000 tokens. Each bar is decomposed into TEE comp/mem-copy , TEE verify , and TEE idle , following the same definitions as in the prefill breakdown. The breakdown explains the TPOT trend in Figure 13. Full-TEE is dominated by TEE-side attention computation, and its latency increases as the KV cache grows. TSDP offloads linear attention operations to the GPU, but keeps the non-linear SoftMax path inside the TEE and follows a sequential TEE-GPU workflow. Once the KV cache exceeds the GPU capacity, TSDP repeatedly trans-fers non-resident KV-related intermediate states across the TEE-GPU boundary. This creates substantial TEE idle time and limits the benefit of GPU offloading. In contrast, Veri-Attn offloads the GPU-side attention partition, including its linear and non-linear operations, while processing the 
+
+> 11
+
+remaining TEE-resident KV entries locally inside the TEE. The GPU processes selected offloaded KV blocks, while the TEE locally processes the remaining entries. This collabora-tive execution reduces KV transfer volume and lowers TEE idle time during long-context decoding. At KV cache length 10,000 and batch size 1, VeriAttn is 2.31 -2.70 × faster than Full-TEE and 2.88 -3.12 × faster than TSDP across the four models. At batch size 5, VeriAttn is 3.11 -3.86 × faster than Full-TEE and 3.52 -4.04 × faster than TSDP. Figure 15 also gives the complementary GPU-side view at KV cache length 10,000 and batch size 1. Compared with TSDP, VeriAttn 
+
+spends a larger fraction of time in useful GPU computation because it offloads more of the attention path, including ex-ponentiation and value aggregation to the GPU. Meanwhile, 
+
+VeriAttn substantially reduces GPU idle time across all four models, showing that its KV partitioning and collaborative execution avoid the sequential transfer stalls that dominate TSDP. These results show that VeriAttn improves decod-ing attention by reducing excessive TEE-GPU transfers and using the compute resources of both the TEE and GPU. 
+
+5.4 Verification Effectiveness and Output Quality 
+
+We finally evaluate VeriAttn in terms of verification ef-fectiveness and output quality. For GPU offloading to be beneficial, TEE-side verification should be faster than direct TEE recomputation while still detecting corrupted results returned by the GPU. For output quality, clean VeriAttn 
+
+inference should preserve standard full-attention inference within the calibrated numerical error budget. All experiments in this subsection use WikiText validation prompts. 
+
+Verification efficiency and correctness. Table 1 reports verification cost and fault-injection results on Qwen3-14B, where prefill uses a 6,000-token prompt and decoding uses a 10,000-token KV cache. For each verification, we calibrate the numerical tolerance offline using clean FP16 GPU out-puts. The TEE computes FP32 verification residuals and sets the tolerance to twice the largest observed clean residual. Each verification is run with 10 independent repetitions. The verification checks are 19 .5× and 11 .4× faster than recompu-tation in prefill, and 16 .3× and 13 .8× faster in decoding. Next, we evaluate the verification correctness through fault injection that simulates the manipulations on GPU com-putations. Each trial first runs attention normally and then corrupts GPU-returned tensor entries before TEE-side verifi-cation. Each corrupted entry is sampled uniformly from the verified tensor and overwritten as 𝑥 ′ = 𝑥 +𝛼 ·10 −2 max (1, |𝑥 |) ,
+
+where 𝛼 ∈ {− 1, +1} is chosen uniformly at random. Table 1 reports 1,000 injected-fault trials and 1,000 clean trials for each check. VeriAttn detects all injected corruptions in both exponentiation and value aggregation, with no false rejections on clean executions. 
+
+Output quality. We evaluate output quality using deter-ministic greedy decoding to remove sampling randomness. 
+
+Table 1. Verification cost and fault-injection results on Qwen3-14B.                                     
+
+> Phase Check Veri. Comp. Trials Det. False Rej. Prefill LPVeriExp 0.12 s 2.34 s 1000 100.0% 0.0%
+> GVFAVeriMM 0.036 s 0.41 s 1000 100.0% 0.0% Decode LPVeriExp 0.45 ms 7.34 ms 1000 100.0% 0.0%
+> GVFAVeriMM 0.27 ms 3.73 ms 1000 100.0% 0.0%
+> Veri. denotes verification latency using LPVeriExp for exponentiation and
+> GVFAVeriMM for value aggregation. Comp. denotes direct TEE recomputa-tion latency for the same operation. Det. denotes the fraction of corrupted executions rejected by the verifier. False Rej. denotes the fraction of clean executions falsely rejected.
+
+Table 2. Output quality of VeriAttn vs. standard full-attention inference across four models. 
+
+Model Max |Δlogit | Acc. Model Max |Δlogit | Acc. LLaMA-3B 1.9×10 −3 1.00 Qwen-14B 3.1×10 −3 1.00 LLaMA-8B 2.4×10 −3 1.00 Phi-14B 2.8×10 −3 1.00    
+
+> Acc. denotes ratio of evaluated prediction positions whose top-1 token matches the reference. Max |Δlogit |denotes largest absolute logit difference.
+
+VeriAttn accepts attention results whose verification resid-uals fall within the calibrated numerical error budget. We therefore examine whether such tolerated numerical varia-tion affects final decoding decisions. With each model gen-erating 100 tokens from a 6,000-token prompt, we compare 
+
+VeriAttn against standard full attention inference. Table 2 reports the ratio of evaluated prediction positions whose top-1 token matches the reference and the largest absolute logit difference. VeriAttn achieves 100% top-1 agreement across all tested models, with maximum logit differences below 
+
+3.1 × 10 −3. These results show that VeriAttn preserves full attention inference semantics within the proposed TEE-GPU attention framework in our evaluation. 
+
+## 6 Discussion 
+
+Model and input confidentiality. This work focuses on computation integrity and communication efficiency. Model and input confidentiality can be complementary concerns in practical deployments. Some existing TEE offloading systems protect model weights and user inputs by keeping secrets, such as masks, random transformations, or encryption keys, inside the TEE, while offloading only protected representa-tions to the untrusted GPU [ 39 , 41 , 46 , 55 ]. These schemes are mainly designed for single matrix multiplications in linear layers. Extending such protection to VeriAttn is non-trivial. To reduce communication, VeriAttn does not require the GPU to return results after every attention sub-operation. Instead, the GPU executes a chain of dependent linear and non-linear operations and returns only selected intermediate states for TEE-side processing and verification. Thus, the TEE must recover composed attention states rather than the output of a single linear operator. Existing mechanisms 
+
+> 12
+
+do not directly support such multi-step recovery, especially across non-linear operations. The joint design of model/in-put confidentiality and communication efficient verifiable TEE-GPU attention is still a challenge for future research. 
+
+Support for online serving schedulers. VeriAttn is com-patible with existing schedulers for online LLM serving as an attention backend within each worker. Modern serv-ing systems improve throughput under dynamic request streams through batching and scheduling at fine granularity, including iteration-level scheduling and continuous batch-ing [ 19 , 52 ], chunked prefill and hybrid prefill-decode batch-ing [ 2], and prefill-decode disaggregation [ 31 , 56 ]. These schedulers operate above the attention backend: they decide request admission, batch formation, routing, and stage place-ment. Once a prefill chunk or decoding batch is assigned to a worker equipped with a TEE and GPU, VeriAttn exe-cutes the corresponding prefill or decoding workflow. This separation allows existing schedulers to improve serving throughput at the system level, while VeriAttn reduces TEE-GPU overhead within each assigned attention work-load. 
+
+## 7 Conclusion 
+
+This paper presented VeriAttn , a communication-efficient TEE-GPU attention framework for verifiable LLM inference. We showed that directly applying TSDP-style partitioning to Transformer attention is inefficient: prefill incurs quadratic-size attention-state transfers and expensive TEE-side SoftMax 
+
+computation, while long-context decoding repeatedly moves non-resident KV-cache entries across the TEE-GPU bound-ary. VeriAttn addresses these bottlenecks by offloading the main linear and non-linear attention computation to the GPU, verifying GPU-returned attention states inside the TEE, pipelining prefill execution, and partitioning decoding attention across TEE- and GPU-resident KV blocks. Our eval-uation shows that VeriAttn substantially improves both full-model inference latency and attention-level performance over existing computation integrity solutions, while preserv-ing full attention semantics under the evaluated settings. 
+
+## References 
+
+[1] Marah Abdin, Jyoti Aneja, Harkirat Behl, Sébastien Bubeck, Ronen Eldan, Suriya Gunasekar, Michael Harrison, Russell J Hewett, Mojan Javaheripi, Piero Kauffmann, et al. Phi-4 technical report. arXiv preprint arXiv:2412.08905 , 2024. [2] Amey Agrawal, Nitin Kedia, Ashish Panwar, Jayashree Mohan, Nipun Kwatra, Bhargav Gulavani, Alexey Tumanov, and Ramachandran Ram-jee. Taming {Throughput-Latency } tradeoff in {LLM } inference with 
+
+{Sarathi-Serve }. In 18th USENIX symposium on operating systems design and implementation (OSDI 24) , pages 117–134, 2024. [3] Amey Agrawal, Ashish Panwar, Jayashree Mohan, Nipun Kwatra, Bhargav S Gulavani, and Ramachandran Ramjee. Sarathi: Efficient llm inference by piggybacking decodes with chunked prefills. arXiv preprint arXiv:2308.16369 , 2023. [4] Erdem Aktas, Cfir Cohen, Josh Eads, James Forshaw, and Felix Wilhelm. Intel trust domain extensions (tdx) security review. Google security review , 2023. [5] Aref Asvadishirehjini, Murat Kantarcioglu, and Bradley Malin. Goat: Gpu outsourcing of deep learning training with asynchronous prob-abilistic integrity verification inside trusted execution environment. 
+
+arXiv preprint arXiv:2010.08855 , 2020. [6] Aref Asvadishirehjini, Murat Kantarcioglu, and Bradley Malin. Ginn: fast gpu-tee based integrity for neural network training. In Proceedings of the Twelfth ACM Conference on Data and Application Security and Privacy , pages 4–15, 2022. [7] Victor Costan and Srinivas Devadas. Intel sgx explained. Cryptology ePrint Archive , 2016. [8] Weishu Deng, Yujie Yang, Peiran Du, Lingfeng Xiang, Zhen Lin, Chen Zhong, Song Jiang, Hui Lu, and Jia Rao. Hgca: Hybrid gpu-cpu atten-tion for long context llm inference. arXiv preprint arXiv:2507.03153 ,2025. [9] Elias Frantar, Saleh Ashkboos, Torsten Hoefler, and Dan Alistarh. Gptq: Accurate post-training quantization for generative pre-trained trans-formers. arXiv preprint arXiv:2210.17323 , 2022. [10] Rusins Freivalds. Probabilistic machines can use less running time. In 
+
+IFIP congress , volume 839, page 842, 1977. [11] Yao Fu, Leyang Xue, Yeqi Huang, Andrei-Octavian Brabete, Dmitrii Ustiugov, Yuvraj Patel, and Luo Mai. {ServerlessLLM }:{Low-Latency }
+
+serverless inference for large language models. In 18th USENIX Sym-posium on Operating Systems Design and Implementation (OSDI 24) ,pages 135–153, 2024. [12] Zahra Ghodsi, Tianyu Gu, and Siddharth Garg. Safetynets: Verifiable execution of deep neural networks on an untrusted cloud. Advances in Neural Information Processing Systems , 30, 2017. [13] Aaron Grattafiori, Abhimanyu Dubey, Abhinav Jauhri, Abhinav Pandey, Abhishek Kadian, Ahmad Al-Dahle, Aiesha Letman, Akhil Mathur, Alan Schelten, Alex Vaughan, et al. The llama 3 herd of models. 
+
+arXiv preprint arXiv:2407.21783 , 2024. [14] Jiaao He and Jidong Zhai. Fastdecode: High-throughput gpu-efficient llm serving using heterogeneous pipelines. arXiv preprint arXiv:2403.11421 , 2024. [15] Andrei Homescu, Steven Neisius, Per Larsen, Stefan Brunthaler, and Michael Franz. Profile-guided automated software diversity. In Proceed-ings of the 2013 IEEE/ACM International Symposium on Code Generation and Optimization (CGO) , pages 1–11. IEEE, 2013. [16] Junhao Hu, Jiang Xu, Zhixia Liu, Yulong He, Yuetao Chen, Hao Xu, Jiang Liu, Jie Meng, Baoquan Zhang, Shining Wan, et al. 
+
+{DEEPSERVE }: Serverless large language model serving at scale. In 
+
+2025 USENIX Annual Technical Conference (USENIX ATC 25) , pages 57–72, 2025. [17] Hao Ji, Michael Mascagni, and Yaohang Li. Gaussian variant of freivalds’ algorithm for efficient and reliable matrix product verifi-cation. Monte Carlo Methods and Applications , 26(4):273–284, 2020. [18] David Kaplan, Jeremy Powell, and Tom Woller. Amd memory encryp-tion. White paper , 13:12, 2016. [19] Woosuk Kwon, Zhuohan Li, Siyuan Zhuang, Ying Sheng, Lianmin Zheng, Cody Hao Yu, Joseph Gonzalez, Hao Zhang, and Ion Stoica. Efficient memory management for large language model serving with pagedattention. In Proceedings of the 29th symposium on operating systems principles , pages 611–626, 2023. [20] Wonbeom Lee, Jungi Lee, Junghwan Seo, and Jaewoong Sim. 
+
+{InfiniGen }: Efficient generative inference of large language models with dynamic {KV } cache management. In 18th USENIX Symposium on Operating Systems Design and Implementation (OSDI 24) , pages 155–172, 2024. [21] Mengyuan Li, Luca Wilke, Jan Wichelmann, Thomas Eisenbarth, Radu Teodorescu, and Yinqian Zhang. A systematic look at ciphertext side channels on amd sev-snp. In 2022 IEEE Symposium on Security and 
+
+> 13
+
+Privacy (SP) , pages 337–351. IEEE, 2022. [22] Tianyi Liu, Xiang Xie, and Yupeng Zhang. Zkcnn: Zero knowledge proofs for convolutional neural network predictions and accuracy. In Proceedings of the 2021 ACM SIGSAC Conference on Computer and Communications Security , pages 2968–2985, 2021. [23] Yuhan Liu, Yihua Cheng, Jiayi Yao, Yuwei An, Xiaokun Chen, Shaot-ing Feng, Yuyang Huang, Samuel Shen, Rui Zhang, Kuntai Du, et al. Lmcache: An efficient kv cache layer for enterprise-scale llm inference. 
+
+arXiv preprint arXiv:2510.09665 , 2025. [24] Stephen Merity, Caiming Xiong, James Bradbury, and Richard Socher. Pointer sentinel mixture models. arXiv preprint arXiv:1609.07843 , 2016. [25] Meta AI. Llama 3.2: Revolutionizing edge ai and vision with open, customizable models. https://ai.meta.com/blog/llama-3-2-connect-2024-vision-edge-mobile-devices/ , 2024. Accessed: 2026-05-18. [26] Masanori Misono, Dimitrios Stavrakakis, Nuno Santos, and Pramod Bhatotia. Confidential vms explained: An empirical analysis of amd sev-snp and intel tdx. Proceedings of the ACM on Measurement and Analysis of Computing Systems , 8(3):1–42, 2024. [27] Deepak Narayanan, Aaron Harlap, Amar Phanishayee, Vivek Seshadri, Nikhil R Devanur, Gregory R Ganger, Phillip B Gibbons, and Matei Zaharia. Pipedream: Generalized pipeline parallelism for dnn train-ing. In Proceedings of the 27th ACM symposium on operating systems principles , pages 1–15, 2019. [28] Deepak Narayanan, Mohammad Shoeybi, Jared Casper, Patrick LeGres-ley, Mostofa Patwary, Vijay Korthikanti, Dmitri Vainbrand, Prethvi Kashinkunti, Julie Bernauer, Bryan Catanzaro, et al. Efficient large-scale language model training on gpu clusters using megatron-lm. In 
+
+Proceedings of the international conference for high performance com-puting, networking, storage and analysis , pages 1–15, 2021. [29] Lucien KL Ng, Sherman SM Chow, Anna PY Woo, Donald PH Wong, and Yongjun Zhao. Goten: Gpu-outsourcing trusted execution of neural network training. In Proceedings of the AAAI Conference on Artificial Intelligence , volume 35, pages 14876–14883, 2021. [30] NVIDIA. NVIDIA H100 Tensor Core GPU. https://www.nvidia.com/en-us/data-center/h100/ , 2023. [31] Pratyush Patel, Esha Choukse, Chaojie Zhang, Aashaka Shah, Íñigo Goiri, Saeed Maleki, and Ricardo Bianchini. Splitwise: Efficient genera-tive llm inference using phase splitting. In 2024 ACM/IEEE 51st Annual International Symposium on Computer Architecture (ISCA) , pages 118– 132. IEEE, 2024. [32] Zhizhi Peng, Taotao Wang, Chonghe Zhao, Guofu Liao, Zibin Lin, Yifeng Liu, Bin Cao, Long Shi, Qing Yang, and Shengli Zhang. Asurvey of zero-knowledge proof based verifiable machine learning. 
+
+arXiv preprint arXiv:2502.18535 , 2025. [33] Yoshi Sato, Hidetoshi Uranami, Akihiro Saiki, and Keiji Kimura. To-wards gpu passthrough in intel tdx: Design challenges and early base-lines. In 2025 IEEE Conference on Dependable, Autonomic and Secure Computing (DASC) , pages 144–146. IEEE, 2025. [34] Tianxiang Shen, Ji Qi, Jianyu Jiang, Xian Wang, Siyuan Wen, Xusheng Chen, Shixiong Zhao, Sen Wang, Li Chen, Xiapu Luo, et al. {SOTER }:Guarding black-box inference for general neural networks at the edge. In 2022 USENIX Annual Technical Conference (USENIX ATC 22) , pages 723–738, 2022. [35] Ying Sheng, Lianmin Zheng, Binhang Yuan, Zhuohan Li, Max Ryabinin, Beidi Chen, Percy Liang, Christopher Ré, Ion Stoica, and Ce Zhang. Flexgen: High-throughput generative inference of large language mod-els with a single gpu. In International Conference on Machine Learning ,pages 31094–31116. PMLR, 2023. [36] Supraja Sridhara, Andrin Bertschi, Benedict Schlüter, Mark Kuhne, Fabio Aliberti, and Shweta Shinde. {ACAI }: Protecting accelerator ex-ecution with arm confidential computing architecture. In 33rd USENIX Security Symposium (USENIX Security 24) , pages 3423–3440, 2024. [37] Ao Sun, Weilin Zhao, Xu Han, Cheng Yang, Xinrong Zhang, Zhiyuan Liu, Chuan Shi, and Maosong Sun. Seq1f1b: Efficient sequence-level pipeline parallelism for large language model training. In Proceedings of the 2025 Conference of the Nations of the Americas Chapter of the As-sociation for Computational Linguistics: Human Language Technologies (Volume 1: Long Papers) , pages 8998–9008, 2025. [38] Haochen Sun, Jason Li, and Hongyang Zhang. zkllm: Zero knowledge proofs for large language models. In Proceedings of the 2024 on ACM SIGSAC Conference on Computer and Communications Security , pages 4405–4419, 2024. [39] Zhichuang Sun, Ruimin Sun, Changming Liu, Amrita Roy Chowdhury, Long Lu, and Somesh Jha. Shadownet: A secure and efficient on-device model inference system for convolutional neural networks. In 2023 IEEE Symposium on Security and Privacy (SP) , pages 1596–1612. IEEE, 2023. [40] Chunlin Tian, Xinpeng Qin, Kahou Tam, Li Li, Zijian Wang, Yuanzhe Zhao, Minglei Zhang, and Chengzhong Xu. {CLONE }: Customizing 
+
+{LLMs } for efficient {Latency-Aware } inference at the edge. In 2025 USENIX Annual Technical Conference (USENIX ATC 25) , pages 563–585, 2025. [41] Florian Tramer and Dan Boneh. Slalom: Fast, verifiable and private execution of neural networks in trusted hardware. In International Conference on Learning Representations , 2019. [42] Ashish Vaswani, Noam Shazeer, Niki Parmar, Jakob Uszkoreit, Llion Jones, Aidan N Gomez, Łukasz Kaiser, and Illia Polosukhin. Attention is all you need. Advances in neural information processing systems , 30, 2017. [43] Stavros Volos, Kapil Vaswani, and Rodrigo Bruno. Graviton: Trusted execution environments on {GPUs }. In 13th USENIX Symposium on Operating Systems Design and Implementation (OSDI 18) , pages 681– 696, 2018. [44] Chenxu Wang, Yunjie Deng, Zhenyu Ning, Kevin Leach, Jin Li, Shoumeng Yan, Zhengyu He, Jiannong Cao, and Fengwei Zhang. Build-ing a lightweight trusted execution environment for arm gpus. IEEE Transactions on Dependable and Secure Computing , 21(4):3801–3816, 2023. [45] Jiahao Wang, Jinbo Han, Xingda Wei, Sijie Shen, Dingyan Zhang, Chen-guang Fang, Rong Chen, Wenyuan Yu, and Haibo Chen. {KVCache }
+
+cache in the wild: Characterizing and optimizing {KVCache } cache at a large cloud provider. In 2025 USENIX Annual Technical Conference (USENIX ATC 25) , pages 465–482, 2025. [46] Pengli Wang, Bingyou Dong, Yifeng Cai, Zheng Zhang, Junlin Liu, Huanran Xue, Ye Wu, Yao Zhang, and Ziqi Zhang. Game of arrows: On the ( {In-) Security } of weight obfuscation for {On-Device } { TEE-Shielded } { LLM } partition algorithms. In 34th USENIX Security Sym-posium (USENIX Security 25) , pages 279–298, 2025. [47] Qifan Wang and David Oswald. Confidential computing on heteroge-neous cpu-gpu systems: Survey and future directions. ACM Computing Surveys , 2026. [48] Jan Wichelmann, Anja Rabich, Anna Pätschke, and Thomas Eisenbarth. Obelix: Mitigating side-channels through dynamic obfuscation. In 
+
+2024 IEEE Symposium on Security and Privacy (SP) , pages 4182–4199. IEEE, 2024. [49] Guangxuan Xiao, Ji Lin, Mickael Seznec, Hao Wu, Julien Demouth, and Song Han. Smoothquant: Accurate and efficient post-training quantization for large language models. In International conference on machine learning , pages 38087–38099. PMLR, 2023. [50] Jiaqi Xue, Yifei Zhao, Mengxin Zheng, Fan Yao, Yan Solihin, and Qian Lou. Securing transformer-based ai execution via unified tees and crypto-protected accelerators. arXiv preprint arXiv:2507.03278 , 2025. [51] An Yang, Anfeng Li, Baosong Yang, Beichen Zhang, Binyuan Hui, Bo Zheng, Bowen Yu, Chang Gao, Chengen Huang, Chenxu Lv, et al. Qwen3 technical report. arXiv preprint arXiv:2505.09388 , 2025. [52] Gyeong-In Yu, Joo Seong Jeong, Geon-Woo Kim, Soojeong Kim, and Byung-Gon Chun. Orca: A distributed serving system for 
+
+> 14
+
+{Transformer-Based } generative models. In 16th USENIX sympo-sium on operating systems design and implementation (OSDI 22) , pages 521–538, 2022. [53] Yuanyuan Yuan, Zhibo Liu, Sen Deng, Yanzuo Chen, Shuai Wang, Yinqian Zhang, and Zhendong Su. Hypertheft: Thieving model weights from tee-shielded neural networks via ciphertext side channels. In 
+
+Proceedings of the 2024 on ACM SIGSAC Conference on Computer and Communications Security , pages 4346–4360, 2024. [54] Yuanyuan Yuan, Zhibo Liu, Sen Deng, Yanzuo Chen, Shuai Wang, Yinqian Zhang, and Zhendong Su. Ciphersteal: Stealing input data from tee-shielded neural networks with ciphertext side channels. In 
+
+2025 IEEE Symposium on Security and Privacy (SP) , pages 4136–4154. IEEE, 2025. [55] Ziqi Zhang, Chen Gong, Yifeng Cai, Yuanyuan Yuan, Bingyan Liu, Ding Li, Yao Guo, and Xiangqun Chen. No privacy left outside: On the (in-) security of tee-shielded dnn partition for on-device ml. In 
+
+2024 IEEE Symposium on Security and Privacy (SP) , pages 3327–3345. IEEE, 2024. [56] Yinmin Zhong, Shengyu Liu, Junda Chen, Jianbo Hu, Yibo Zhu, Xu-anzhe Liu, Xin Jin, and Hao Zhang. {DistServe }: Disaggregating prefill and decoding for goodput-optimized large language model serv-ing. In 18th USENIX Symposium on Operating Systems Design and Implementation (OSDI 24) , pages 193–210, 2024. [57] Kan Zhu, Yufei Gao, Yilong Zhao, Liangyu Zhao, Gefei Zuo, Yile Gu, Dedong Xie, Zihao Ye, Keisuke Kamahori, Chien-Yu Lin, et al. 
+
+{NanoFlow }: Towards optimal large language model serving through-put. In 19th USENIX Symposium on Operating Systems Design and Implementation (OSDI 25) , pages 749–765, 2025. 
+
+## A Appendix 
+
+A.1 Detailed Verification Procedures 
+
+This appendix provides the detailed pseudocode for the two verification procedures: GVFAVeriMM and LPVeriExp used by 
+
+VeriAttn . The main text describes their verification princi-ples, while this appendix specifies the concrete offline ran-domness generation and online verification steps. In both procedures, the TEE generates secret random challenges dur-ing the offline phase and keeps them hidden from the GPU. During online verification, the TEE checks the GPU-returned results using these secret challenges and rejects immediately if any check fails. 
+
+A.2 Proof of Lemma 2 
+
+We prove the false acceptance probability of LPVeriExp .The TEE keeps the verification coefficients secret and checks whether the exponentiation results returned by the GPU satisfy a log product consistency relation. A malicious GPU can pass the check only by constructing a forgery that is consistent with the secret coefficients or by relying on the numerical tolerance to hide a nonzero residual. Consider the 𝑟 -th row of the attention score matrix. Let 
+
+𝑠 𝑟,𝑖 = q⊤ 
+
+> 𝑟
+
+k𝑖 /√𝑑 ℎ + M𝑟,𝑖 , 𝑖 ∈ I 𝑟 , where I𝑟 denotes the valid, 
+
+Algorithm 1 GVFAVeriMM : GVFA-based Verification for Value Aggregation 
+
+Require: Mode 𝑚 ∈ { prefill , decode }, tolerance 𝜖 , repetitions 𝜏 , For prefill: 
+
+E, V, claimed output bU, For decoding step 𝑡 : e𝑡 , v𝑡 , claimed output bu𝑡 ,cached projections {g( 𝑗 )  
+
+> 𝑡 −1
+
+}𝜏 𝑗 =1
+
+Ensure: Accept or Reject 
+
+Offline phase in the TEE. 
+
+1: for 𝑗 = 1 to 𝜏 do 
+
+2: Sample Gaussian vector w( 𝑗 ) 
+
+> 𝐺
+
+∼ N ( 0, 𝐼 𝑑 ℎ )
+
+3: Initialize decoding projection cache g( 𝑗 ) 
+
+> 0
+
+← [ ] 
+
+4: end for Online verification phase. 
+
+5: if 𝑚 = prefill then 
+
+6: for 𝑗 = 1 to 𝜏 do 
+
+7: Compute projected value vector 𝜂 ( 𝑗 ) ← Vw ( 𝑗 )
+
+> 𝐺
+
+8: Store g( 𝑗 ) 
+
+> 𝐿
+
+← 𝜂 ( 𝑗 ) for later decoding 9: Compute residual Δ ← E𝜂 ( 𝑗 ) − bUw ( 𝑗 ) 
+
+> 𝐺 ∞
+
+10: if Δ > 𝜖 then 
+
+11: return Reject 
+
+12: end if 
+
+13: end for 
+
+14: else if 𝑚 = decode then 
+
+15: for 𝑗 = 1 to 𝜏 do 
+
+16: Update projection cache g( 𝑗 ) 
+
+> 𝑡
+
+←
+
+"
+
+g( 𝑗 ) 
+
+> 𝑡 −1
+
+v⊤ 
+
+> 𝑡
+
+w( 𝑗 )
+
+> 𝐺
+
+#
+
+17: Compute residual Δ ← e𝑡 g( 𝑗 ) 
+
+> 𝑡
+
+− bu𝑡 w( 𝑗 )
+
+> 𝐺
+
+18: if Δ > 𝜖 then 
+
+19: return Reject 
+
+20: end if 
+
+21: end for 
+
+22: end if 
+
+23: return Accept 
+
+> 15
+
+Algorithm 2 LPVeriExp : Log-Product Verification for Ex-ponentiation 
+
+Require: Maximum sequence length 𝐿 max , coefficient domain size 𝑁 𝑎 ,Repetitions 𝜏 𝑎 , Gaussian checks 𝜏 𝑔 , tolerance 𝜖 ′, Rows to verify R,valid index set I𝑟 for each row 𝑟 , Scores {𝑠 𝑟,𝑖 }, claimed exponentiation outputs { b𝑦 𝑟,𝑖 }
+
+Ensure: Accept or Reject 
+
+Offline phase in the TEE. 
+
+1: for each possible row 𝑟 ≤ 𝐿 max do 
+
+2: for ℓ = 1 to 𝜏 𝑎 do 
+
+3: Sample secret coefficients 𝑎 (ℓ ) 
+
+> 𝑟,𝑖
+
+← { 1, . . . , 𝑁 𝑎 }, 𝑖 ∈ I 𝑟 
+
+4: for 𝑘 = 1 to 𝜏 𝑔 do 
+
+5: Sample Gaussian scalar 𝑤 ′( ℓ ) 
+
+> 𝑟,𝑘
+
+∼ N ( 0, 1)
+
+6: end for 
+
+7: end for 
+
+8: end for Online verification phase. 
+
+9: for each row 𝑟 ∈ R do 
+
+10: for ℓ = 1 to 𝜏 𝑎 do 
+
+11: Compute 𝑅 (ℓ ) 
+
+> 𝑟
+
+← log   Î 𝑖 ∈I 𝑟 b𝑦 𝑎 (ℓ )
+
+> 𝑟,𝑖
+> 𝑟,𝑖
+
+ − Í𝑖 ∈I 𝑟 𝑎 (ℓ ) 
+
+> 𝑟,𝑖
+
+𝑠 𝑟,𝑖 
+
+12: for 𝑘 = 1 to 𝜏 𝑔 do 
+
+13: if |𝑅 (ℓ ) 
+
+> 𝑟
+
+𝑤 ′( ℓ ) 
+
+> 𝑟,𝑘
+
+| ≥ 𝜖 ′ then 
+
+14: return Reject 
+
+15: end if 
+
+16: end for 
+
+17: end for 
+
+18: end for 
+
+19: return Accept 
+
+unmasked positions in row 𝑟 . The exact exponentiation out-put is 𝑦 𝑟,𝑖 = 𝑒 𝑠 𝑟,𝑖 . In floating point execution, let ¯𝑦 𝑟,𝑖 denote the value returned by an honest GPU execution. The vec-tor ¯y𝑟 = [ ¯𝑦 𝑟,𝑖 ]𝑖 ∈ I 𝑟 is considered valid if its honest residual satisfies the calibrated tolerance. Specifically, define 
+
+𝑅 hon  
+
+> 𝑟
+
+(a) = log   Ö 
+
+> 𝑖 ∈ I 𝑟
+
+¯𝑦 𝑎 𝑖 
+
+> 𝑟,𝑖
+
+ −∑︁  
+
+> 𝑖 ∈ I 𝑟
+
+𝑎 𝑖 𝑠 𝑟,𝑖 . (10) The tolerance 𝜖 ′ is calibrated so that honest floating point executions satisfy |𝑅 hon  
+
+> 𝑟
+
+(a)𝑤 ′ 
+
+> 𝐺
+
+| < 𝜖 ′ for any 𝑤 ′ 
+
+> 𝐺
+
+. Thus, the tolerance accounts for normal floating point rounding error in honest GPU execution. The GPU returns a claimed vector by𝑟 = [b𝑦 𝑟,𝑖 ]𝑖 ∈ I 𝑟 . If any returned value is not positive, NaN, or Inf, the TEE rejects immediately. Otherwise, for each coefficient repetition ℓ =
+
+1, . . . , 𝜏 𝑎 , the TEE samples a fresh secret coefficient vector 
+
+a(ℓ ) = [𝑎 (ℓ ) 
+
+> 𝑖
+
+]𝑖 ∈ I 𝑟 , 𝑎 (ℓ ) 
+
+> 𝑖
+
+← { 1, . . . , 𝑁 𝑎 }, where {1, . . . , 𝑁 𝑎 } is a nonzero integer coefficient domain of size 𝑁 𝑎 . For each coef-ficient vector, the TEE also samples 𝜏 𝑔 independent Gaussian scalars 𝑤 ′
+
+> 𝐺,ℓ, 1
+
+, . . . , 𝑤 ′ 
+
+> 𝐺,ℓ,𝜏 𝑔
+
+← N ( 0, 1). All coefficient vectors and Gaussian scalars are sampled inside the TEE and are not revealed to the GPU before verification. For exact exponentiation outputs, the following identity holds: 
+
+log   Ö 
+
+> 𝑖 ∈ I 𝑟
+
+(𝑒 𝑠 𝑟,𝑖 )𝑎 (ℓ )
+
+> 𝑖
+
+ = log  𝑒 Í𝑖 ∈I 𝑟 𝑎 (ℓ )  
+
+> 𝑖 𝑠 𝑟,𝑖
+
+ =∑︁  
+
+> 𝑖 ∈ I 𝑟
+
+𝑎 (ℓ ) 
+
+> 𝑖
+
+𝑠 𝑟,𝑖 . (11) Thus, LPVeriExp computes the residual 
+
+𝑅 𝑟 (a(ℓ ) ) = log   Ö 
+
+> 𝑖 ∈ I 𝑟
+
+b𝑦 𝑎 (ℓ )
+
+> 𝑖
+> 𝑟,𝑖
+
+ −∑︁  
+
+> 𝑖 ∈ I 𝑟
+
+𝑎 (ℓ ) 
+
+> 𝑖
+
+𝑠 𝑟,𝑖 . (12) The row is accepted only if all checks pass: 
+
+|𝑅 𝑟 (a(ℓ ) )𝑤 ′ 
+
+> 𝐺,ℓ,𝑗
+
+| < 𝜖 ′, ℓ = 1, . . . , 𝜏 𝑎 , 𝑗 = 1, . . . , 𝜏 𝑔 . (13) For a possibly corrupted output by𝑟 , define the logarithmic deviation as Δ𝑟,𝑖 = log b𝑦 𝑟,𝑖 − log ¯ 𝑦 𝑟,𝑖 . Let 𝑇 𝑟 = {𝑖 ∈ I 𝑟 : Δ𝑟,𝑖 ≠
+
+0} be the set of entries modified relative to the honest floating point output, and let 𝑛 err ,𝑟 = |𝑇 𝑟 |. If 𝑛 err ,𝑟 = 0, the returned exponentiation results are identical to the honest floating point outputs for row 𝑟 .Let 
+
+𝑅 adv  
+
+> 𝑟
+
+(a(ℓ ) ) = log   Ö 
+
+> 𝑖 ∈ I 𝑟
+
+b𝑦 𝑎 (ℓ )
+
+> 𝑖
+> 𝑟,𝑖
+
+ −∑︁  
+
+> 𝑖 ∈ I 𝑟
+
+𝑎 (ℓ ) 
+
+> 𝑖
+
+𝑠 𝑟,𝑖 . (14) be the residual produced by the possibly corrupted output 
+
+by𝑟 . The additional residual introduced by the attack is 
+
+e𝑅 𝑟 (a(ℓ ) ) = 𝑅 adv  
+
+> 𝑟
+
+(a(ℓ ) ) − 𝑅 hon  
+
+> 𝑟
+
+(a(ℓ ) )
+
+=∑︁  
+
+> 𝑖 ∈ I 𝑟
+
+𝑎 (ℓ )
+
+> 𝑖
+
+  log b𝑦 𝑟,𝑖 − log ¯ 𝑦 𝑟,𝑖 
+
+
+
+=∑︁  
+
+> 𝑖 ∈𝑇 𝑟
+
+𝑎 (ℓ ) 
+
+> 𝑖
+
+Δ𝑟,𝑖 .
+
+(15) Therefore, the honest floating point residual is handled by the calibrated tolerance, while e𝑅 𝑟 (a(ℓ ) ) captures the additional residual caused by malicious modification. 
+
+Specific attack types. We first show that common output manipulations all reduce to the same residual form 
+
+e𝑅 𝑟 (a(ℓ ) ) =∑︁  
+
+> 𝑖 ∈𝑇 𝑟
+
+𝑎 (ℓ ) 
+
+> 𝑖
+
+Δ𝑟,𝑖 . (16) 
+
+■ Exponent domain tampering. The attacker may re-turn 
+
+b𝑦 𝑟,𝑖 = ¯𝑦 𝑟,𝑖 𝑒 𝛿 𝑖 , 𝛿 𝑖 ≠ 0. (17) Then Δ𝑟,𝑖 = 𝛿 𝑖 , and the residual introduced by the attack becomes 
+
+e𝑅 𝑟 (a(ℓ ) ) =∑︁  
+
+> 𝑖 ∈𝑇 𝑟
+
+𝑎 (ℓ ) 
+
+> 𝑖
+
+𝛿 𝑖 . (18) 
+
+■ Output domain additive tampering. The attacker may return 
+
+b𝑦 𝑟,𝑖 = ¯𝑦 𝑟,𝑖 + 𝜂 𝑖 . (19) If b𝑦 𝑟,𝑖 ≤ 0, the TEE rejects immediately. Otherwise, 
+
+Δ𝑟,𝑖 = log ( ¯𝑦 𝑟,𝑖 + 𝜂 𝑖 ) − log ¯ 𝑦 𝑟,𝑖 
+
+= log  1 + 𝜂 𝑖 
+
+¯𝑦 𝑟,𝑖 
+
+. (20) Thus, additive tampering is also converted into a logarithmic error Δ𝑟,𝑖 .
+
+> 16
+
+■ Position swapping or replay. The attacker may per-mute outputs or replay stale outputs. If b𝑦 𝑟,𝑖 = ¯𝑦 𝑟,𝜋 (𝑖 ) for a nonidentity permutation 𝜋 , then 
+
+Δ𝑟,𝑖 = log ¯ 𝑦 𝑟,𝜋 (𝑖 ) − log ¯ 𝑦 𝑟,𝑖 . (21) If the attacker replays a wrong value 𝑦 ′ 
+
+> 𝑖
+
+, then 
+
+Δ𝑟,𝑖 = log 𝑦 ′ 
+
+> 𝑖
+
+− log ¯ 𝑦 𝑟,𝑖 . (22) If the swapped or replayed values are identical to the honest floating point values, there is no effective tampering. Other-wise, the attack again induces a nonzero logarithmic error vector and is captured by e𝑅 𝑟 (a(ℓ ) ) = Í𝑖 ∈𝑇 𝑟 𝑎 (ℓ ) 
+
+> 𝑖
+
+Δ𝑟,𝑖 .
+
+Therefore, regardless of the concrete manipulation, an in-correct accepted row must fall into one of two cases for each coefficient repetition: either the attacker makes the resid-ual introduced by the attack cancel exactly, or a remaining nonzero residual passes the Gaussian tolerance checks. 
+
+Forgery under secret coefficients. First, consider the case where the attacker tries to make the residual introduced by the attack cancel exactly for the ℓ-th coefficient vector: 
+
+e𝑅 𝑟 (a(ℓ ) ) = Í𝑖 ∈𝑇 𝑟 𝑎 (ℓ ) 
+
+> 𝑖
+
+Δ𝑟,𝑖 = 0. If this exact cancellation suc-ceeds, the corrupted output produces the same log product residual as the honest floating point output under a(ℓ ) and is therefore accepted for this coefficient repetition whenever the honest residual is accepted by the calibrated tolerance. If only one entry is modified, i.e., 𝑇 𝑟 = { 𝑗 }, then e𝑅 𝑟 (a(ℓ ) ) =
+
+𝑎 (ℓ ) 
+
+> 𝑗
+
+Δ𝑟,𝑗 . Since 𝑎 (ℓ ) 
+
+> 𝑗
+
+≠ 0 and Δ𝑟,𝑗 ≠ 0, we have e𝑅 𝑟 (a(ℓ ) ) ≠
+
+0. Thus, a single modified exponentiation output cannot create exact cancellation. If 𝑛 err ,𝑟 ≥ 2, the attacker may try to modify multiple entries in a coordinated way so that their weighted logarithmic errors cancel out: Í𝑖 ∈𝑇 𝑟 𝑎 (ℓ ) 
+
+> 𝑖
+
+Δ𝑟,𝑖 = 0.
+
+Since the GPU must commit to by𝑟 before the TEE samples 
+
+a(ℓ ) , the logarithmic error vector Δ𝑟 = [Δ𝑟,𝑖 ]𝑖 ∈𝑇 𝑟 is fixed independently of the secret coefficients. Exact cancellation therefore requires the random coefficient vector to fall into the cancellation hyperplane defined by this fixed error vector. Choose any index 𝑗 ∈ 𝑇 𝑟 with Δ𝑟,𝑗 ≠ 0. For any fixed assignment of the coefficients {𝑎 (ℓ ) 
+
+> 𝑖
+
+: 𝑖 ∈ 𝑇 𝑟 , 𝑖 ≠ 𝑗 }, there is at most one real value of 𝑎 (ℓ ) 
+
+> 𝑗
+
+that satisfies the cancella-tion equation: 𝑎 (ℓ ) 
+
+> 𝑗
+
+= −     
+
+> Í𝑖 ∈𝑇𝑟 ,𝑖 ≠𝑗 𝑎 (ℓ)
+> 𝑖 Δ𝑟,𝑖
+> Δ𝑟,𝑗
+
+. Since 𝑎 (ℓ ) 
+
+> 𝑗
+
+is sampled uniformly from {1, . . . , 𝑁 𝑎 }, the probability that the sampled value equals this specific value is at most 1/𝑁 𝑎 . Therefore, for one fresh coefficient vector, 
+
+Pr e𝑅 𝑟 (a(ℓ ) ) = 0 ≤ 1{𝑛 err ,𝑟 ≥ 2} · 1
+
+𝑁 𝑎 
+
+. (23) 
+
+Gaussian tolerance bypass. If the attacker does not create exact cancellation for the ℓ-th coefficient vector, then the residual introduced by the attack remains nonzero: e𝑅 𝑟 (a(ℓ ) ) ≠
+
+0. The verifier checks the total residual 𝑅 adv  
+
+> 𝑟
+
+(a(ℓ ) ) rather than the attack component alone. Perturbations whose total ver-ification residual remains within the calibrated numerical error budget are treated as floating point noise and are not considered detectable attacks. For the remaining detectable perturbations, let 𝜎 ′ > 0 be a lower bound on the magnitude of the total verification residual: |𝑅 adv  
+
+> 𝑟
+
+(a(ℓ ) )| ≥ 𝜎 ′, whenever the corrupted output does not create exact cancellation and its total residual lies outside the calibrated numerical error budget. Conditioned on a fixed nonzero total residual, we have 
+
+𝑅 adv  
+
+> 𝑟
+
+(a(ℓ ) )𝑤 ′ 
+
+> 𝐺
+
+∼ N  0, 𝑅 adv  
+
+> 𝑟
+
+(a(ℓ ) )2. Then, for one Gaussian repetition, 
+
+Pr |𝑅 adv  
+
+> 𝑟
+
+(a(ℓ ) )𝑤 ′ 
+
+> 𝐺
+
+| < 𝜖 ′ | | 𝑅 adv  
+
+> 𝑟
+
+(a(ℓ ) )| ≥ 𝜎 ′
+
+= Pr |𝑤 ′ 
+
+> 𝐺
+
+| < 𝜖 ′
+
+|𝑅 adv  
+
+> 𝑟
+
+(a(ℓ ) )| 
+
+ ≤ Pr |𝑤 ′ 
+
+> 𝐺
+
+| < 𝜖 ′
+
+𝜎 ′
+
+ (24) 
+
+= 2Φ  𝜖 ′
+
+𝜎 ′
+
+ − 1,
+
+where Φ(·) is the cumulative distribution function of the standard normal distribution. Because the 𝜏 𝑔 Gaussian scalars are independent, the probability that all tolerance checks hide a nonzero total residual for the ℓ-th coefficient vector is bounded by  2Φ  𝜖 ′
+
+> 𝜎 ′
+
+ − 1𝜏 𝑔 .
+
+False acceptance probability for one row. Let FA 𝑟 denote the event that row 𝑟 contains at least one maliciously modi-fied exponentiation output but is still accepted. Combining the exact cancellation bound and the Gaussian tolerance bound, one coefficient repetition accepts a corrupted row with probability at most 1{𝑛 err ,𝑟 ≥ 2} · 1 
+
+> 𝑁 𝑎
+
++  2Φ( 𝜖 ′ 
+
+> 𝜎 ′
+
+) − 1𝜏 𝑔 .
+
+With the 𝜏 𝑎 coefficient repetitions, we have 
+
+Pr [FA 𝑟 ] ≤ 
+
+
+
+1{𝑛 err ,𝑟 ≥ 2} · 1
+
+𝑁 𝑎 
+
++  2Φ  𝜖 ′
+
+𝜎 ′
+
+ − 1𝜏 𝑔 
+
+𝜏 𝑎 
+
+. (25) Since 0 < 2Φ  𝜖 ′
+
+> 𝜎 ′
+
+ − 1 < 1, the false acceptance probability decreases with larger 𝑁 𝑎 , 𝜏 𝑎 , and 𝜏 𝑔 , and with a smaller ratio 
+
+𝜖 ′/𝜎 ′. Thus, it can be made small by appropriate parameter choices. 
+
+Numerical stability of LPVeriExp . LPVeriExp evaluates the log-product term in (14) . Although the final quantity is logarithmic, directly forming 
+
+𝑃 (ℓ ) 
+
+> 𝑟
+
+=
+
+Ö 
+
+> 𝑖 ∈ I 𝑟
+
+b𝑦 𝑎 (ℓ ) 
+
+> 𝑖
+> 𝑟,𝑖
+
+(26) and then computing log 𝑃 (ℓ ) 
+
+> 𝑟
+
+is numerically unsafe. Over long attention rows, the intermediate product can underflow to zero or overflow to ∞ before the logarithm is applied. For example, finite positive float32 values cover only a bounded range, approximately [1.4 × 10 −45 , 3.4 × 10 38 ]. Once the product leaves this range, the resulting logarithm no longer gives a valid finite residual. To avoid this problem, the TEE does not store 𝑃 (ℓ ) 
+
+> 𝑟
+
+as an ordinary floating-point product. It first rejects any returned 
+
+> 17
+
+value b𝑦 𝑟,𝑖 that is non-positive, NaN, or Inf, and then accumu-lates the product using a normalized representation 
+
+𝑃 (ℓ ) 
+
+> 𝑟
+
+= 𝑚 exp (𝑐 ), log 𝑃 (ℓ ) 
+
+> 𝑟
+
+= log 𝑚 + 𝑐, (27) where the mantissa 𝑚 > 0 is kept in a safe range. Let 𝐵 > 0
+
+be chosen with sufficient margin for the working precision. After each elementary multiplication used to form b𝑦 𝑎 (ℓ ) 
+
+> 𝑖
+> 𝑟,𝑖
+
+and the row product, the verifier renormalizes 
+
+(𝑚, 𝑐 ) ← 
+
+
+
+(𝑚 exp (𝐵 ), 𝑐 − 𝐵 ), 𝑚 < exp (− 𝐵 ),
+
+(𝑚 exp (− 𝐵 ), 𝑐 + 𝐵 ), 𝑚 > exp (𝐵 ),
+
+(𝑚, 𝑐 ), otherwise .
+
+(28) This update only transfers scale between 𝑚 and 𝑐 and there-fore preserves the represented log value: 
+
+log (𝑚 exp (± 𝐵 )) + ( 𝑐 ∓ 𝐵 ) = log 𝑚 + 𝑐. (29) After all factors have been accumulated, LPVeriExp com-putes the verification residual using the stable value log 𝑚 +𝑐 :
+
+𝑅 adv  
+
+> 𝑟
+
+(a(ℓ ) ) = (log 𝑚 + 𝑐 ) − ∑︁  
+
+> 𝑖 ∈ I 𝑟
+
+𝑎 (ℓ ) 
+
+> 𝑖
+
+𝑠 𝑟,𝑖 . (30) The same Gaussian tolerance check is then applied to this residual. Thus, the implementation realizes the original log-product verification relation while avoiding intermediate underflow and overflow. 
+
+A.3 Detailed Prefill and Decoding Workflows 
+
+This section gives detailed pseudocode for the prefill and decoding workflows of VeriAttn . The main text focuses on the design principles, while this appendix specifies the concrete data movement, GPU computation, and TEE-side verification steps. Because VM-based TEEs, such as Intel TDX, isolate private memory from untrusted devices, GPU communication must be staged through the PRM-SHM-GPU data path. VeriAttn therefore implements each workflow with two concurrent processes: a TEE process for PRM-SHM copies, local attention or verification, and normalization, and a GPU process for SHM-GPU transfers and GPU kernels. A single synchronous process would serialize these operations, because waiting for a transfer or GPU result would prevent the TEE from performing useful local computation or verifi-cation. The two-process design realizes the overlap between TEE-side work, data movement, and GPU execution in the prefill and decoding workflows. In the algorithms, MemCpy denotes a TEE-side memory copy between PRM and SHM, and PCIeXfer denotes a PCIe transfer between SHM and GPU memory. All copy and kernel launches are asynchronous unless a Wait statement explic-itly enforces a data dependency. GPU-returned tensors are written with hats before verification and without hats after the TEE accepts them. 
+
+Algorithm 3 VeriAttn Prefill Phase                                                                                                                                                                                                          
+
+> Require: 𝑄, 𝐾, 𝑉 , number of heads 𝐻 , sequence length 𝐿 , head block size
+> 𝑏 𝑠 , exp row tile size 𝑡 𝑠 , causal mask 𝑀
+> Ensure: Prefill Attention Output O
+> // TEE process 1: B ← { 1, . . . , ⌈𝐻 /𝑏 𝑠 ⌉ } ⊲HeadBlocks
+> 2: T ← { 1, . . . , ⌈𝐿 /𝑡 𝑠 ⌉ } ⊲RowTiles
+> 3: for all head block 𝑏 =[ℎ0, ℎ 1) ∈ B do
+> 4: Q𝑏 ,K𝑏 ,V𝑏 ←Q[:, ℎ 0:ℎ1,:,:],K[:, ℎ 0:ℎ1,:,:],V[:, ℎ 0:ℎ1,:,:]
+> 5: MemCpy (Q𝑏 ,K𝑏 ,V𝑏 )from PRM to SHM 6: end for
+> 7: for all head block 𝑏 ∈ B do
+> 8: for all row tile 𝑠 =[𝑟 0, 𝑟 1) ∈ T do
+> 9: Wait until bE𝑏,𝑠 is ready in SHM and MemCpy it to PRM 10: E𝑏,𝑠 ←LPVeriExp (Q𝑏 ,K𝑏 ,bE𝑏,𝑠 )if verification passes 11: Z𝑏,𝑠 ←E𝑏,𝑠 1
+> 12: end for
+> 13: E𝑏 ←ConcatTiles ( { E𝑏,𝑠 }𝑠 ∈T )
+> 14: Z𝑏 ←ConcatTiles ( { Z𝑏,𝑠 }𝑠 ∈T )
+> 15: Wait until bU𝑏 is ready in SHM and MemCpy it to PRM 16: U𝑏 ←GVFAVeriMM (E𝑏 ,V𝑏 ,bU𝑏 )if verification passes 17: O𝑏 ←U𝑏 ⊘Z𝑏
+> 18: end for
+> 19: return O←ConcatHeads ( { O𝑏 }𝑏 ∈B )
+> // GPU process 20: Launch PCIeXfer the first ready (Q1,K1,V1)from SHM to GPU 21: for all head block 𝑏 ∈ B do
+> 22: Wait until (Q𝑏 ,K𝑏 ,V𝑏 )is ready on GPU 23: Launch PCIeXfer (Q𝑏 +1,K𝑏 +1,V𝑏 +1)from SHM to GPU once ready 24: S𝑏 ←Q𝑏 K⊤
+> 𝑏 /√︁ 𝑑 ℎ+𝑀 𝑏
+> 25: for all row tile 𝑠 =[𝑟 0, 𝑟 1) ∈ T do
+> 26: bE𝑏,𝑠 ←exp (S𝑏 [:,:, 𝑟 0:𝑟 1,:] )
+> 27: Launch PCIeXfer bE𝑏,𝑠 from GPU to SHM 28: end for
+> 29: bE𝑏 ←ConcatTiles ( { bE𝑏,𝑠 }𝑠 ∈T )
+> 30: bU𝑏 ←bE𝑏 V𝑏
+> 31: Launch PCIeXfer bU𝑏 from GPU to SHM 32: end for
+
+A.3.1 Prefill Pseudocode. Algorithm 3 shows the detailed prefill workflow. It uses the same notation as Section 4.3. The TEE process performs preprocessing by copying input head blocks from PRM to SHM, and performs postprocessing by copying GPU results from SHM to PRM, verifying them, ac-cumulating row sums, and normalizing accepted outputs. The GPU process transfers prepared blocks from SHM to GPU memory and executes attention kernels. Head-block partitioning overlaps PRM-SHM memory copy, SHM-GPU transfer, and GPU computation. Row-tile partitioning further overlaps exponentiation transfer, TEE-side verification, and GPU computation. 
+
+A.3.2 Decoding Pseudocode. Algorithm 4 shows the de-tailed decoding workflow at step 𝑡 . The TEE maintains the complete protected KV cache KV 𝑡𝑒𝑒 , while the GPU main-tains a bounded resident cache KV 𝑔𝑝𝑢 . If KV 𝑔𝑝𝑢 has available capacity, the new KV entry is appended to both caches. Other-wise, VeriAttn forms the non-resident cache KV 𝑡𝑒𝑒 \ KV 𝑔𝑝𝑢 
+
+and splits it into KV 𝑜 𝑓 𝑓 and KV 𝑟𝑒𝑚 using the offload ratio 𝑝 .
+
+> 18
+
+Algorithm 4 VeriAttn Decoding Phase at step 𝑡 
+
+Require: 𝑞 𝑡 , 𝑘 𝑡 , 𝑣 𝑡 , TEE KV cache KV 𝑡𝑒𝑒 , GPU KV cache KV 𝑔𝑝𝑢 , GPU KV cache capacity 𝐶 𝑔𝑝𝑢 , offload ratio 𝑝 , KV block size 𝑏 ′
+
+> 𝑠
+
+Ensure: Decoding Attention Output O
+
+// TEE process 1: KV 𝑡𝑒𝑒 ← KV 𝑡𝑒𝑒 ∥ ( k𝑡 , v𝑡 )
+
+2: if |KV 𝑔𝑝𝑢 | < 𝐶 𝑔𝑝𝑢 then 
+
+3: KV 𝑜 𝑓 𝑓 , KV 𝑟𝑒𝑚 , B𝑘𝑣 ← ∅ , ∅, ∅
+
+4: MemCpy (𝑞 𝑡 , 𝑘 𝑡 , 𝑣 𝑡 ) from PRM to SHM 5: else 
+
+6: 𝜏 ← ⌊ 𝑝 · | 𝐾𝑉 𝑡𝑒𝑒 \ 𝐾𝑉 𝑔𝑝𝑢 | ⌋ 
+
+7: 𝐾𝑉 𝑜 𝑓 𝑓 ← 𝐾𝑉 𝑡𝑒𝑒 \ 𝐾𝑉 𝑔𝑝𝑢 [:, :, : 𝜏, :]
+
+8: 𝐾𝑉 𝑟𝑒𝑚 ← 𝐾𝑉 𝑡𝑒𝑒 \ 𝐾𝑉 𝑔𝑝𝑢 [:, :, 𝜏 :, :]
+
+9: B𝑘𝑣 = {1, ..., ⌈ | 𝐾𝑉 𝑜 𝑓 𝑓 |/ 𝑏 ′ 
+
+> 𝑠
+
+⌉ } ⊲ KVBlocks 
+
+10: MemCpy 𝑞 𝑡 from PRM to SHM 11: for all 𝑏 ∈ B 𝑘𝑣 do 
+
+12: MemCpy KV 𝑜 𝑓 𝑓 ,𝑏 from PRM to SHM 13: end for 
+
+14: end if 
+
+15: (U𝑡𝑒𝑒 , Z𝑡𝑒𝑒 ) ← TEEAttnComp (q𝑡 , KV 𝑟𝑒𝑚 )
+
+16: Wait until bE𝑔𝑝𝑢 is ready in SHM and MemCpy it to PRM 17: E𝑔𝑝𝑢 ←LPVeriExp (q𝑡 , K𝑔𝑝𝑢 , bE𝑔𝑝𝑢 ) if verification passes 18: Z𝑔𝑝𝑢 ← E𝑔𝑝𝑢 1
+
+19: for all 𝑏 ∈ B 𝑘𝑣 do 
+
+20: Wait until E𝑏 is ready in SHM and MemCpy it to PRM 21: E𝑏 ← LPVeriExp (q𝑡 , K𝑜 𝑓 𝑓 ,𝑏 , bE𝑏 ) if verification passes 22: Z𝑔𝑝𝑢 ← Z𝑔𝑝𝑢 + E𝑏 1
+
+23: end for 
+
+24: Wait until bU𝑔𝑝𝑢 is ready in SHM and MemCpy it to PRM 25: E ← { E𝑔𝑝𝑢 } ∪ { E𝑏 }𝑏 ∈B 𝑘𝑣 , V ← { V𝑔𝑝𝑢 } ∪ { V𝑜 𝑓 𝑓 ,𝑏 }𝑏 ∈B 𝑘𝑣 
+
+26: U𝑔𝑝𝑢 ←GVFAVeriMM ( E , V, bU𝑔𝑝𝑢 ) if verification passes 27: return o𝑡 ← ( U𝑔𝑝𝑢 + U𝑡𝑒𝑒 )/( Z𝑔𝑝𝑢 + Z𝑡𝑒𝑒 )
+
+// GPU process 28: if |𝐾𝑉 𝑔𝑝𝑢 | < 𝐶 𝑔𝑝𝑢 then 
+
+29: Wait until (q𝑡 , k𝑡 , v𝑡 ) is ready in SHM and PCIeXfer them to GPU 30: KV 𝑔𝑝𝑢 ← KV 𝑔𝑝𝑢 ∥ ( k𝑡 , v𝑡 ) once (k𝑡 , v𝑡 ) is ready in GPU 31: end if 
+
+32: bE𝑔𝑝𝑢 ← exp (q𝑡 K⊤ 
+
+> 𝑔𝑝𝑢
+
+/√︁ 𝑑 ℎ )
+
+33: Launch PCIeXfer bE𝑔𝑝𝑢 from GPU to SHM 34: bU𝑔𝑝𝑢 ← bE𝑔𝑝𝑢 V𝑔𝑝𝑢 
+
+35: Wait until q𝑡 , KV 𝑜 𝑓 𝑓 , 1 is ready in SHM and PCIeXfer them to GPU 36: for all 𝑏 ∈ B 𝑘𝑣 do 
+
+37: Wait until KV 𝑜 𝑓 𝑓 ,𝑏 is ready in GPU 38: Launch PCIeXfer KV 𝑜 𝑓 𝑓 ,𝑏 +1 from SHM to a temp. GPU workspace 39: bE𝑏 ← exp (q𝑡 K⊤ 
+
+> 𝑜 𝑓 𝑓 ,𝑏
+
+/√︁ 𝑑 ℎ )
+
+40: Launch PCIeXfer bE𝑏 from GPU to SHM 41: bU𝑔𝑝𝑢 ← bU𝑔𝑝𝑢 + bE𝑏 V𝑜 𝑓 𝑓 ,𝑏 
+
+42: end for 
+
+43: Launch PCIeXfer bU𝑔𝑝𝑢 from GPU to SHM 
+
+The GPU processes KV 𝑔𝑝𝑢 and the selected offloaded blocks from KV 𝑜 𝑓 𝑓 , while the TEE locally processes KV 𝑟𝑒𝑚 . The TEE verifies the GPU-returned exponentiation and value aggregation states and then merges the verified GPU-side state with the TEE-side state. 
+
+19
