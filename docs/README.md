@@ -6,32 +6,34 @@
 </div>
 
 ## 每次日报
-- 最新运行日期：2026-06-19
-- 运行时间：2026-06-19 21:56:06 UTC
+- 最新运行日期：2026-06-20
+- 运行时间：2026-06-20 21:20:13 UTC
 - 运行状态：成功
 - 本次总论文数：3
 - 精读区：0
 - 速读区：3
 
 ### 今日简报（AI）
-1) 今日聚焦三项LLM优化技术：KV缓存解耦、状态空间模型剪枝与边缘端LoRA微调内存缩减。
-2) 最高分(7.0)的《SAC》提出基于CXL的稀疏注意力KV缓存解耦系统，是提升LLM推理效率的关键方向。
-3) 建议优先阅读SAC论文，重点关注CXL如何实现缓存分离以加速大模型推理。
-- 详情：[/202606/19/README](/202606/19/README)
+今日速读3篇论文，聚焦多模态大模型高效推理、ReRAM硬件感知微调及Attention蒸馏加速。
+
+最值得关注方向为多模态大模型逐步Token选择与ReRAM非线性误差矫正，均获7.0分。
+
+建议普通读者优先阅读前两篇，把握边缘设备部署与存算一体芯片的最新优化方案。
+- 详情：[/202606/20/README](/202606/20/README)
 
 ### 精读区论文标签
 - 本次无精读推荐。
 
 ### 速读区论文标签
-1. [SAC: Disaggregated KV Cache System for Sparse Attention LLMs with CXL](/202606/19/2606.19746v1-sac-disaggregated-kv-cache-system-for-sparse-attention-llms-with-cxl)  
+1. [Stepwise Token Selection for Efficient Multimodal Large Language Models](/202606/20/2606.16067v1-stepwise-token-selection-for-efficient-multimodal-large-language-models)  
    标签：评分：7.0/10、query:edge-llm
-   evidence：基于CXL的LLM服务端KV缓存分离系统
-2. [S4oP: Operator-level Pruning of Structured State Space Models for Resource-Constrained Devices](/202606/19/2606.18096v1-s4op-operator-level-pruning-of-structured-state-space-models-for-resource-constrained-devices)  
+   evidence：多模态LLM推理的高效token选择
+2. [ReRAM-aware Model Finetuning addressing I-V Non-linearity and Retention Errors](/202606/20/2606.17471v1-reram-aware-model-finetuning-addressing-i-v-non-linearity-and-retention-errors)  
+   标签：评分：7.0/10、query:edge-llm
+   evidence：针对ReRAM的硬件感知微调，用于LLM部署
+3. [StreamKL: Fast and Memory-Efficient KL Divergence for Boosting Attention Distillation](/202606/20/2606.20005v1-streamkl-fast-and-memory-efficient-kl-divergence-for-boosting-attention-distillation)  
    标签：评分：6.0/10、query:edge-llm
-   evidence：面向资源受限设备的算子级剪枝方法
-3. [Techniques for Peak Memory Reduction for LoRA Fine-tuning of LLMs on Edge Devices](/202606/19/2606.19528v1-techniques-for-peak-memory-reduction-for-lora-fine-tuning-of-llms-on-edge-devices)  
-   标签：评分：6.0/10、query:edge-llm
-   evidence：边缘设备上LoRA微调的内存减少技术
+   evidence：内存高效的KL散度用于注意力蒸馏，支持模型压缩
 
 
 <div class="dpr-home-promo-card">
