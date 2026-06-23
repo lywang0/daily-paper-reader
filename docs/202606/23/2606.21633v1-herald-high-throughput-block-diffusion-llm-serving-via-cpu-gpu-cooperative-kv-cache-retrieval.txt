@@ -1,0 +1,976 @@
+Title: HERALD: High-Throughput Block Diffusion LLM Serving via CPU-GPU Cooperative KV Cache Retrieval
+
+URL Source: https://arxiv.org/pdf/2606.21633v1
+
+Published Time: Tue, 23 Jun 2026 01:11:53 GMT
+
+Number of Pages: 14
+
+Markdown Content:
+# HERALD: High-Throughput Block Diffusion LLM Serving via CPU-GPU Cooperative KV Cache Retrieval 
+
+Omin Kwon 
+
+Seoul National University Seoul, Republic of Korea 
+
+Doyeon Kim 
+
+Seoul National University Seoul, Republic of Korea 
+
+Jongseok Park 
+
+UC Berkeley Berkeley, CA, USA 
+
+Seung Yul Lee 
+
+Seoul National University Seoul, Republic of Korea 
+
+Ion Stoica 
+
+UC Berkeley Berkeley, CA, USA 
+
+Jae W. Lee 
+
+Seoul National University Seoul, Republic of Korea 
+
+Abstract 
+
+Diffusion LLMs (dLLMs) improve GPU utilization over au-toregressive decoding by generating multiple tokens per forward pass, but their KV cache still grows linearly with context, limiting throughput at long contexts. KV cache of-floading to host DRAM alleviates this memory pressure, but the limited PCIe bandwidth necessitates recalling only a sparse subset of KV entries. In block dLLMs, the relevant KV entries remain consistent across denoising steps within a block, enabling high-accuracy selection by identifying the top-𝑘 entries once and reusing them throughout all denois-ing steps. This property appears attractive for offloading as it amortizes the selection overhead across the entire block, but it requires exact attention over the full KV cache, which is too expensive under offloading. We present HERALD, a KV-offloading system for block dLLMs that resolves this through two opportunities that reduce the required selection compute by a factor of the block size and enable selection to be overlapped with denoising. Across three block dLLMs and five long-context tasks, HERALD achieves near-lossless accuracy at 5–10% KV budget and up to 1.59 × lower per-block latency and 2.47 × higher throughput over GPU-only inference, with speedups growing with context length. 
+
+1 Introduction 
+
+Large Language Model (LLM) inference under the autoregres-sive (AR) decoding paradigm suffers from two well-known inefficiencies. First, each decode step generates a single to-ken while re-reading the entire model weights and KV cache, yielding low arithmetic intensity that severely underutilizes GPU compute. Second, the KV cache grows linearly with sequence length, consuming GPU memory and limiting the batch size, and thus throughput, the system can sustain. 
+
+Diffusion LLMs (dLLMs), now deployed in production sys-tems such as Google’s Gemini Diffusion [ 10 ], have emerged as an alternative that generates multiple tokens per forward pass through iterative denoising, achieving higher arith-metic intensity and better GPU utilization than AR decod-ing. Among them, Block dLLMs [ 3, 5, 41 ] have become the dominant paradigm: they generate output one block of 𝐵 In Block dLLM , first -step exact (attention using Full KV) selection      
+
+> is used for sparse attention, due to superior accuracy.
+> Step 0 + select + recall Step
+> 1
+> Dependency
+> Step
+> 2…
+> S2) Use Draft of Current Block
+> CPU attention speedup up to
+
+24x 
+
+Our Solution         
+
+> DRAM
+> KV cache
+> C1) Where to compute exact attention?
+> CPU GPU
+> PCIE
+> ①GPU Exact Select ion
+> PCIe Bottleneck
+> ②CPU Exact Select ion
+> Compute Bottleneck Selection + KV recall in Critical Path
+> Overlap Selection with Denoising
+> Step
+> 1
+> Step
+> N
+> Step
+> 0…Step
+> 0
+> select +
+> recall
+> …GPU
+> CPU Draft
+> Block
+> S1) Only Compute for Single Token
+> C2) How to hide selection latency?
+
+vs Full KV GPU Inference 
+
+up to 1.59x Speedup / 2.47x Throughput 
+
+Figure 1. Challenges HERALD addresses and its key ideas. consecutive tokens at a time, starting from 𝐵 MASK place-holders that mark undetermined positions and refining them over 𝑇 (< 𝐵 ) denoising steps. Each step performs a single forward pass over all 𝐵 positions, unmasking multiple posi-tions in parallel, so an entire block is decoded in only 𝑇 steps, whereas AR decoding requires 𝐵 separate forward passes. The KV cache memory pressure, however, persists. A block dLLM’s prefix KV cache still grows linearly with context and dominates GPU capacity. The standard remedy is KV cache offloading : storing the cache in host DRAM, whose capacity is an order of magnitude larger than GPU HBM. However, PCIe bandwidth is roughly two orders of magnitude below GPU memory bandwidth, so fetching the full cache at every attention computation is prohibitive. Existing AR offloading systems [ 23 , 26 , 36 , 37 , 44 ] therefore recall only a dynamically selected sparse subset of KV entries per decode forward pass. The quality of this selection is critical: selecting too few relevant entries degrades generation quality, while recalling too many amplifies PCIe transfer latency. 
+
+1
+
+> arXiv:2606.21633v1 [cs.LG] 19 Jun 2026 Omin Kwon, Doyeon Kim, Jongseok Park, Seung Yul Lee, Ion Stoica, and Jae W. Lee
+
+Fortunately, block dLLMs possess a structural property that enables substantially higher selection accuracy than existing AR approaches achieve. Across the denoising steps of a block, attention patterns exhibit strong temporal con-sistency : the top-𝑘 KV entries at the first step (step 0) are similar to top-𝑘 of subsequent denoising step. Recent dLLM sparse-attention work [ 20 , 34 , 39 ] exploits this by perform-ing exact attention over the full KV cache once at step 0 to identify the top-𝑘 entries, then reusing that selection for the remaining 𝑇 −1 steps. Realizing this sparse selection under KV offloading, how-ever, is fundamentally difficult, posing two challenges. The first is a hardware mapping challenge : when the KV cache re-sides in CPU DRAM, this full-cache exact attention at step 0 can run on either the CPU or the GPU, but the two face oppo-site bottlenecks. The CPU is closest to the KV cache, and prior AR offloading systems place attention there to avoid PCIe traffic [ 13 , 33 ]. However, block dLLMs attend with 𝐵 query tokens instead of one, and the CPU lacks matrix-multiply units to handle this 𝐵 × longer latency. The GPU has ample compute but is separated from the KV cache by PCIe, whose transfer latency alone is prohibitive. The second is a depen-dency challenge : this expensive operation sits on the critical path of every block, and a natural way to hide this cost is to overlap block 𝑁 +1’s selection with block 𝑁 ’s denoising, but this is blocked by a data dependency. Block 𝑁 +1’s selection needs block 𝑁 ’s finalized tokens as prefix context, which are unavailable until denoising completes. We identify two structural opportunities, unique to block dLLMs, that resolve these challenges. 
+
+Opportunity 1: A single center-[MASK] query suffices. Ev-ery selection targets a block still entirely [MASK] tokens, so the 𝐵 query vectors share an identical pre-RoPE embedding and differ only through RoPE’s positional rotation. A single 
+
+[MASK] token at the block-center position can faithfully rep-resent the entire set, empirically recovering 84% of the top-𝑘 
+
+selected by the full 𝐵 -query attention at 𝐵 =32 . This reduces CPU-side attention compute by 𝐵 ×, cutting its latency by up to 24 ×. With this speedup, full-KV attention tractable on the CPU—the device where the data already resides—eliminating the need to transfer the full cache to the GPU. 
+
+Opportunity 2: Step-0 logits provide a free semantic proxy for the finalized block. At step 0 of a block, the model produces logits at every one of the 𝐵 positions conditioned on the full preceding context. The confidence-based scheduler commits only the highest-confidence positions and discards the rest, but these discarded logits are the model’s own best single-shot prediction for the entire block—and thus a semantically rich approximation of what the finalized block will become. Decoding all 𝐵 positions via argmax on these logits yields a draft block, whose KV cache can serve as prefix context for the next block’s selection while the current block is still being denoised. The draft is not identical to the finalized block, but it is enough to guide the top-𝑘 selection: empir-ically, near-lossless accuracy is preserved with only a few additional percentage points of KV budget. This breaks the data dependency and lets the next block’s selection run con-currently with the current block’s remaining 𝑇 −1 denoising steps, hiding retrieval entirely within the denoising window. Leveraging these two opportunities, we present HERALD, the first KV-offloading system for block dLLMs that hides the entire retrieval cost behind GPU denoising, achieving per-block latency as if the full KV cache resided in GPU memory. HERALD is built on a dual-stream decode pipeline with double-buffered sparse KV pools. While the GPU de-noises block 𝑁 on its active sparse pool ( main stream ), the step-0 draft of block 𝑁 triggers a concurrent retrieval stream 
+
+in which the CPU—sitting closest to the full KV cache in DRAM—scans it with a single center-[MASK] query using a fused online-softmax and top-𝑘 selection kernel. The CPU sends the attention output to the GPU for FFN computa-tion and transfers the selected top-𝑘 KV entries into the GPU’s idle pool while the GPU executes the FFN, repeating this pipeline across layers. By the time block 𝑁 ’s denoising completes, block 𝑁 +1’s sparse KV pool is already prepared; the pool pointers swap and the pattern repeats. Each de-vice performs the work best matched to its strengths—the CPU handles full-cache scan where data already resides, and the GPU runs compute-heavy denoising on in-HBM sparse entries—maximizing utilization of both. We evaluate HERALD on three production block dLLMs: SDAR-8B-Chat, TraDo-8B-Instruct, and LLaDA 2.0-mini 16B— against Dense (full GPU), InfiniGen [ 23 ], and MAGE-Offload, an offloading adaptation of the dLLM sparse-attention state of the art. On LongBench across five long-context tasks, HER-ALD reaches near-lossless accuracy at a 5–10% KV budget, within a few percentage points of in-GPU MAGE, while AR LLM based offloading methods remain significantly inaccu-rate even at 20%. At matched quality, HERALD’s per-block decode latency matches or even beats the Dense in-HBM baseline despite operating on an offloaded cache, because its sparse 5% attention on the GPU outpaces Dense’s full-cache attention as context grows. On maximum decode through-put, HERALD achieves 1.34 –1.40 × speedup over Dense at 8K, 1.81 –2.13 × at 16K, and 1.92 –2.47 × at 32K; the gap widens with context because longer contexts intensify GPU mem-ory pressure, and HERALD relieves it through offloading without adding latency overhead. We make the following contributions: 
+
+• We analyze the challenges of realizing sparse KV se-lection under offloading for block dLLMs and identify two fundamental obstacles: a hardware mapping chal-lenge and a dependency challenge. 
+
+• We uncover two structural opportunities in block dLLMs, a center-[MASK] query sufficiency and step-0 draft proxy, that together resolve both challenges, making           
+
+> 2(b) Block Diffusion LLM : multiple tokens decoded per forward pass
+> (a) AR LLM : 1 token decoded per forward pass
+> Cached token
+> Time
+> Causal attention
+> Block Causal attention
+> Time
+> Decod ed token
+> [MASK] token Forward using Transformer Decoder
+> Attention Mask
+
+Figure 2. Comparison of decoding processes. (a) AR LLM: Token-by-token generation per forward pass using standard causal attention. (b) Block Diffusion LLM: Block-wise par-allel generation over multiple forward passes. Block causal attention mask enables bidirectional attention within the current block while attending to fixed cached tokens. KV selection tractable on the CPU and removing it from the critical path. 
+
+• We design and implement HERALD, the first KV of-floading system for block dLLMs, built on a dual-stream decode pipeline with double-buffered sparse KV pools that cooperatively run selection on the CPU and denoising on the GPU in parallel. 
+
+• Across three production block dLLMs and five long-context tasks, HERALD achieves near-lossless accu-racy at a 5–10% KV budget, up to 1.59 × lower per-block latency, and up to 2.47 × decode throughput over the Dense GPU baseline, with the speedup growing 
+
+with context length. 
+
+2 Background 
+
+2.1 Limitations of Autoregressive LLM Inference 
+
+Typically, LLM inference consists of two phases: a prefill phase that processes the input prompt, and a decode phase 
+
+that generates output tokens autoregressively. Many LLM in-ference scenarios, decode dominates the end-to-end latency as the number of output tokens grows, making it the primary optimization target [ 21 , 33 , 49 ]. The decode phase suffers from two compounding bottlenecks. First, each forward pass of a query only produces a single token while reading the model weights and entire KV cache, resulting in extremely low arithmetic intensity that leaves GPU compute severely underutilized [ 17 , 22 , 24 , 35 ]. Second, the KV cache itself grows linearly with sequence length, occupying a dominant share of GPU memory and limiting the batch size—and thus throughput—that the system can sustain. 
+
+2.2 Diffusion Large Language Models 
+
+Diffusion LLMs (dLLMs) have recently emerged as a promis-ing architecture that directly addresses this inefficiency. Goo-gle’s Gemini Diffusion [ 10 ] was released as a production-level dLLM, demonstrating that dLLMs have moved beyond the research stage into practical deployment. Unlike AR models, dLLMs generate multiple tokens in a single for-ward pass, achieving higher decoding throughput [ 18 ]. Early dLLMs [ 8 , 9 , 29 , 31 , 32 , 45 ] apply bidirectional attention over the entire sequence at every denoising step, precluding KV caching and limiting practical efficiency. Block Diffu-sion [ 1 , 3 , 5 , 19 , 41 ] resolves this by partitioning the output into fixed-size blocks of 𝐵 tokens, generating blocks autore-gressively while applying diffusion-based parallel decoding 
+
+within each block, thereby restoring compatibility with stan-dard KV caching. Block Diffusion has since become the dominant paradigm in practical dLLMs, adopted by state-of-the-art models in-cluding LLaDA 2.0 [ 3], Fast-dLLM v2 [ 41 ], SDAR [ 5 ], all of which achieve competitive accuracy with leading AR models. 
+
+Inference process. Figure 2 illustrates the decoding pro-cess of Block Diffusion. Generation begins with a block of 
+
+𝐵 [MASK] tokens. At each denoising step, the entire block is forwarded as a single chunk through the Transformer decoder. Within the block, tokens attend to each other via bidirectional attention, while attending causally to the KV cache of all previously finalized blocks. The model produces logits at each position, from which candidate tokens are predicted. A subset of positions is then unmasked—either a fixed count or an adaptive number based on prediction con-fidence [ 15 , 42 ]—while the remaining positions are retained as [MASK] for further refinement. After 𝑇 denoising steps, all positions in the block are decoded, the block’s KV states are appended to the cache, and generation advances to the next block. 
+
+2.3 Long-Context KV Cache Offloading 
+
+While Block Diffusion addresses the decode-phase compute underutilization of AR models, the KV cache of block dLLMs still grows linearly with the prefix length: every finalized block appends its KV states to the cache, and every subse-quent forward pass must access them. This memory pressure caused by KV cache is accelerated by the rapid adoption of long-context workloads, modern applications such as multi-turn conversation and use of RAG require LLM inference to be routinely performed on queries with KV cache upward of 32K-token [ 2, 4 , 7 , 25 ], causing the KV cache to dominate GPU memory consumption, making it difficult to scale the batch size and directly degrading throughput. Figure 3(a) illustrates this on LLaDA 2.0-mini (16B): at a fixed batch size of 𝐵 = 64 on a single H100 80GB GPU, the KV cache grows linearly with context length and exceeds the GPU memory capacity at long contexts. Consequently, to stay within the 
+
+> 3
+
+Omin Kwon, Doyeon Kim, Jongseok Park, Seung Yul Lee, Ion Stoica, and Jae W. Lee 8K 16K 32K   
+
+> Context Length
+> (a)
+> 0
+> 50
+> 100
+> 150
+> Memory (GB)
+> Memory Limit
+> Model Weights
+> KV Cache
+> Static
+> 8K 16K 32K
+> Context Length
+> (b)
+> 0
+> 2
+> 4
+> 6
+> 8
+> 10
+> Normalized Latency (x)
+> 3.1x
+> 1.0
+> 5.4x
+> 1.0
+> 7.6x
+> 1.0
+> Model Forward
+> Full KV Fetch
+
+Figure 3. KV cache pressure and offloading overhead in LLaDA 2.0 ( 𝐵 = 64 , 8K–32K context). (a) GPU memory break-down showing KV cache scaling beyond the 80 GB limit of a single H100. (b) Latency of fetching the full KV cache from host DRAM, normalized to the model forward time. memory limit, the maximum achievable batch size must be significantly scaled back as context increases: it drops from 70 at 8K context to merely 17 at 32K, causing the peak de-code throughput to fall from 2,712 tok/s to 1,097 tok/s—a 60% reduction. To address this GPU memory constraint, the most promi-nent approach is KV offloading , which stores the KV cache in host CPU DRAM—offering an order-of-magnitude larger capacity—and fetches it back to the GPU when needed for attention computation. However, the PCIe interconnect be-tween host and device provides roughly two orders of magni-tude lower bandwidth than HBM in GPUs, making the trans-fer cost a critical bottleneck. As illustrated in Figure 3(b), at a batch size of 𝐵 = 64 , the per-step latency of fetching the full KV cache already surpasses the model forward la-tency starting from 8K context, where it is 3.12 × slower. This gap widens drastically as the sequence extends, reach-ing 7.61 × at 32K context. Even with a hypothetically perfect overlap of communication and computation, the per-step latency would still be limited by max (forward, fetch ). Once the fetch latency exceeds the forward pass, the data trans-fer itself becomes the primary bottleneck that dictates the overall inference speed. To mitigate this transfer cost, existing offloading systems recall only a dynamically selected subset of KV entries at each decoding step rather than the full cache. The selection targets the entries most relevant to the current token gen-eration, performing attention over only this sparse subset. The quality of this selection is critical: including too few relevant entries degrades generation quality, while recalling too many will make KV recall the latency bottleneck. InfiniGen [ 23 ] pioneered this approach by speculatively prefetching important KV entries for layer 𝑖 using the at-tention input from layer 𝑖 −1, which allows for reduced KV and also overlapped communication and computation. Shad-owKV [ 36 ] retains a low-rank key cache and outlier entries on the GPU for lightweight selection, fetching only the value Attn  FFN                                                                
+
+> Sparse KV Prefetch
+> Attn FFN Sel Sel
+> Forward 0
+> Time
+> (a) Maintaining Full KV in GPU :High memory usage
+> (b) Prior AR -LLM Offloading Methods :Sparse KV recall latency bottleneck
+> Attn FFN Attn FFN Attn FFN Attn FFN
+> (c) MAGE -Offload :Full KV recall latency bottleneck in block’s forward 0
+> Forward 0
+> Time
+> Forward 0
+> Time
+> …
+> Selection + Sparse KV Prefetch for next block
+> (d) HERALD :Overlapped KV recall by p er -block KV prefetch
+> Attn FFN Attn FFN Attn FFN Attn FFN
+> Time
+> Attn FFN …
+> Attn
+> +Top K FFN …
+> Full KV fetch for Sparse KV selection
+> Sparse KV Prefetch
+> Forward 1 Forward 2 Forward 3 Forward 4 Forward 5 Forward 6
+> Forward 1 Forward 2
+> Sparse KV
+> Prefetch
+> Attn FF
+> N
+> Forward 1 Forward 2
+> Forward 0 Forward 1 +
+> Draft Forward 2 Forward 3 Forward 4 Forward 5 Forward 6 Forward 0
+> …
+> …
+> Attn FFN …
+> …
+> …
+> …
+> Next block
+
+Figure 4. Comparison of Offloading Methods applied to Block Diffusion LLM cache from CPU on demand. SpeContext [ 44 ] employs a learned distilled language model as a retrieval head to de-couple KV selection from LLM inference, and transfers only the delta between consecutive selections to reduce fetch vol-ume. A broader line of sparse-attention and retrieval works— such as Quest [ 37 ], FreeKV [ 26 ], LouisKV [ 43 ], and Clus-terKV [ 27 ]—pursues the same goal of minimizing the set of KV entries touched per step. These systems relieve KV cache pressure and enable larger batch sizes. However, since AR models decode one token at a time and each step attends to a different set of KV entries, the recall latency must be comparable to a single forward pass to avoid becoming the bottleneck (Figure 4(b)). 
+
+2.4 Sparse Attention in Diffusion LLMs 
+
+Block dLLMs possess a unique structural advantage for sparse KV selection absent in AR models: attention patterns exhibit strong temporal consistency across denoising steps within a block (Figure 5(a)). That is, the KV entries receiving high attention scores at the first denoising step remain largely the same throughout subsequent steps. MAGE [ 20 ], SparseD [ 39 ], and Sparse-dLLM [ 34 ] exploit this property by performing exact attention over the full KV cache at the first denoising step to identify the top-𝑘 entries, then reusing this selection for the remaining 𝑇 −1 steps. As shown in Figure 5(b), this exact selection with reuse achieves 82–88% selection accuracy, substantially higher than per-step approximate methods applied to dLLMs (54– 69%). Moreover, since selection is performed only once per block rather than at every step, the selection overhead is 
+
+4(b)         
+
+> Top -K Recall (%)
+> Denoising Progress
+> 0.0 0.2 0. 40.6 0.8 1. 0
+> k=512 k=1024 k=2048
+> (a )
+> 0
+> 50
+> 100
+> dLLM Selectio nAR -LLM Selectio n
+
+Figure 5. Analysis of KV cache selection strategies on LLaDA 2.0. (a) Temporal consistency of top-𝑘 recall across the de-noising progress, comparing different 𝑘 values. (b) top-𝑘 se-lection accuracy against oracle: the dLLM selection method (MAGE) using first-step exact selection with reuse vs. the AR-LLM selection method (Quest) using every-step approxi-mate selection. Results are averaged over LongBench tasks. amortized over 𝑇 denoising steps. Due to high accuracy, ex-act selection with reuse has consequently become the de facto approach for sparse attention in block dLLMs. 
+
+3 Motivation 
+
+3.1 Full KV Exact Selection under KV Offloading 
+
+Applying KV cache offloading to block dLLMs requires de-ciding how to select the sparse KV subset recalled to the GPU for each block. As established in Section 2, selection accuracy directly governs recall latency: a less accurate se-lection must recall a larger KV subset to preserve generation quality, proportionally amplifying the PCIe transfer latency. The exact-selection-with-reuse approach is therefore partic-ularly attractive, by performing full-cache attention once at the first denoising step and reusing the result for 𝑇 −1 sub-sequent steps, it achieves 82–88% selection accuracy while amortizing the selection cost across the entire block. 
+
+Challenge. However, realizing this approach under KV of-floading is fundamentally difficult. Under exact-selection-with-reuse, full-cache exact attention must run at step 0 of each block to identify the top-𝑘 entries before sparse de-noising begins at steps 1 through 𝑇 . Because the full KV cache resides in CPU DRAM, this selection is inherently ex-pensive: transferring the entire cache to the GPU incurs a PCIe cost that far exceeds the model forward latency (Fig-ure 3(b)), while computing attention directly on the CPU, as done in prior AR offloading systems [ 13 , 14 , 33 ], faces a computational challenge because dLLMs require attending with all 𝐵 block tokens simultaneously, costing 𝐵 × more than the single-query AR case on CPUs as they lack dedicated matrix-multiply units. This expensive operation sits on the 32 64        
+
+> Block size B
+> (a)
+> 0
+> 20
+> 40
+> 60
+> 80
+> 100
+> Top-K Recall (%)  83.9% 79.3%
+> 32 16 841
+> N(# queries)
+> (b)
+> ×8
+> ×16
+> ×24
+> ×32
+> Speedup
+> N=1
+> (ours)
+> 8K
+> 16K
+> 32K
+
+Figure 6. (a) Top-𝑘 recall of a single center [MASK] query vs. the full 𝐵 -query union. (b) CPU attention speedup when reducing from 𝐵 =32 queries to 𝑁 (8K–32K; measured on Intel Xeon Platinum 8481C). Reducing to 𝑁 =1 yields 22– 24 × speedup while retaining 84% top-𝑘 recall. critical path: steps 1– 𝑇 must stall until selection completes, and selection dominates per-block latency. A natural remedy is to begin block 𝑁 +1’s selection earlier, overlapping it with block 𝑁 ’s denoising to hide the cost behind the 𝑇 denoising steps. Yet this is not straightforward: block 𝑁 +1’s selection requires block 𝑁 ’s finalized tokens as prefix context, creating a data dependency that prevents selection from starting before block 𝑁 ’s denoising completes. Addressing both the high cost of full-KV selection and the data dependency on finalized tokens is essential to make high-accuracy KV selection viable under KV offloading. 
+
+3.2 Key Opportunities 
+
+We identify two structural properties of block dLLMs that together resolve these challenges. 
+
+Opportunity 1: A Single [MASK] Query Suffices for Block-wide Selection, Yielding Huge CPU Attention Speedup. 
+
+We observe that the selection over 𝐵 [MASK] query tokens can be reduced to a single query without meaningful loss in selection accuracy, owing to a structural property of the next block at the moment selection is performed. By construction, step 0 of every block starts from the fully masked state, so the full KV selection query is always an all-[MASK] block. All 𝐵 positions therefore share an identical token embedding e[MASK] and differ only in their RoPE posi-tional encodings. Concretely, the pre-RoPE query vector is the same for all positions, q = 𝑊 𝑄 e[MASK] , and the attention score between position 𝑖 in the block and a prefix key at position 𝑠 is score (𝑖, 𝑠 ) =  𝑅 𝜃, 𝑝 𝑖 q⊤  𝑅 𝜃, 𝑠 k𝑠 
+
+ = q⊤𝑅 𝜃, 𝑝 𝑖 −𝑠 k𝑠 , (1) where 𝑅 𝜃, 𝛿 is the RoPE rotation matrix for relative offset 
+
+𝛿 = 𝑝 𝑖 − 𝑠 . The scores across the 𝐵 positions differ only through this relative offset. To best represent the aggregate attention pattern of the entire block with a single query, we 
+
+> 5Omin Kwon, Doyeon Kim, Jongseok Park, Seung Yul Lee, Ion Stoica, and Jae W. Lee
+
+want the position whose offsets to all prefix tokens are as rep-resentative as possible. The center position 𝑝 𝑐 = 𝑝 start + ⌊ 𝐵 /2⌋
+
+minimizes the mean squared deviation of relative offsets to any prefix token: 
+
+𝑝 𝑐 = arg min 
+
+> 𝑖
+
+∑︁ 𝑠 ∈prefix 
+
+(𝑝 𝑖 − 𝑠 − ¯𝛿 )2, (2) making it the natural single-query representative for the block. Figure 6(a) confirms this empirically: at 𝐵 =32 , the single center [MASK] query recovers 83.9% of the top-𝐾 entries selected by the full 𝐵 -query union, and still 79.3% at 𝐵 =64 —covering the large majority of the relevant KV cache with just one query. Crucially, this 𝐵 →1 reduction comes with a substantial computational payoff: as Figure 6(b) shows, reducing from 𝐵 =32 queries to a single query yields a 22–24 ×
+
+speedup in CPU attention across 8K–32K context lengths. The same query that achieves 84% top-𝐾 recall thus also makes CPU-side selection fast enough to be practical under KV offloading. 
+
+Opportunity 2: Step-0 Logits Provide a Free Seman-tic Proxy for the Finalized Block. By Opportunity 1, block 𝑁 +1’s selection query is already fixed as the center 
+
+[MASK] token at a known position, so the only piece still missing to launch selection in parallel with block 𝑁 ’s de-noising is block 𝑁 ’s KV cache serving as prefix context—a dependency that, on a strict reading, delays selection until all 𝑇 denoising steps of block 𝑁 complete. A closer look at the forward pass shows the prefix depen-dency is not a hard wall either. At step 0, the model already produces logits at every one of the 𝐵 positions of block 𝑁 ,conditioned on the full preceding context; the confidence-based scheduler then commits only a few high-confidence positions and discards the rest. If we put these otherwise-discarded logits to use and decode all 𝐵 positions via argmax ,we obtain a draft of block 𝑁 whose KV cache can stand in for block 𝑁 ’s not-yet-finalized prefix when issuing block 𝑁 +1’s selection. The draft is not token-identical to the finalized block, but it is the model’s own best single-shot guess at block 𝑁 and carries substantially more of its semantic con-tent than the all-[MASK] alternative. Crucially, the draft is used only to fill the prefix gap for block 𝑁 +1’s selection—by the time block 𝑁 +1 begins its own denoising, block 𝑁 will have completed all 𝑇 steps, and its finalized KV cache replaces the draft in the prefix. The draft’s approximation error therefore does not propagate into block 𝑁 +1’s actual denoising; its only effect is a mild perturbation of which top-𝑘 entries are selected. This per-turbation is itself small because top-𝑘 selection is governed by the ranking of attention logits q⊤Kprefix induced over the prefix, and a draft preserving coarse semantics is sufficient to preserve this ranking where an all-[MASK] block 𝑁 is not. Section 6 confirms empirically that the substitution costs only a few percentage points of KV budget at near-lossless accuracy. 
+
+4 HERALD 
+
+4.1 Overview 
+
+We present HERALD, a high-throughput KV offloading sys-tem for dLLM serving that leverages the two opportunities from Section 3.2. Opportunity 1 reduces the CPU attention cost of retrieval through a single center [MASK] query in-stead of all 𝐵 block positions, resolving the CPU bottleneck and thus avoiding the costly transfer of the full KV cache to the GPU. Opportunity 2 uses the step-0 argmax draft as a reliable proxy for block 𝑁 ’s finalized prefix, removing the inter-block data dependency so that block 𝑁 +1’s retrieval can begin immediately after step 0. Combining the two, HER-ALD overlaps block 𝑁 +1’s retrieval entirely with block 𝑁 ’s 
+
+𝑇 -step denoising, hiding the full selection cost behind the main denoising path. HERALD realizes this overlap through a dual-stream de-code pipeline backed by double-buffered sparse KV pools (Figure 7). The GPU maintains two sparse KV pools in mem-ory, one serving the current denoising block and the other be-ing prepared for the next. While the main stream (Section 4.2) denoises block 𝑁 , the retrieval stream concurrently populates the idle KV pool with the top-𝑘 KV entries for block 𝑁 +1
+
+via cooperative CPU–GPU execution. The retrieval stream is triggered immediately after step 1 of block 𝑁 : the main stream materializes the KV cache of the step-0 argmax draft and sends it to the CPU as block 𝑁 +1’s prefix context. While the main stream continues the remaining 𝑇 −1 denoising steps, the retrieval stream performs a cooperative forward pass over the full prefix with the single center [MASK] query, the CPU executes full-KV attention and top-𝑘 selection for each layer, and the selected entries are transferred back to the GPU in parallel with the retrieval stream’s FFN execution on the GPU, progressively filling the idle KV pool. By the time block 𝑁 ’s denoising completes, the sparse KV pool is ready, and block 𝑁 +1 proceeds without stall. 
+
+4.2 HERALD Execution Walkthrough 
+
+The main stream drives block denoising on the GPU and, at every block, produces a lookahead draft that triggers block 𝑁 +1’s retrieval stream without adding any extra for-ward pass (Figure 7). We first describe how prefill bootstraps the prefetching, then the per-block decode procedure. 
+
+Prefill phase. When a new request arrives, HERALD first runs a prefill pass over the prompt, computing each layer’s KV states on the GPU and asynchronously copying them to CPU DRAM in a layer-wise fashion (Figure 7-Left). HER-ALD then appends a [MASK] block of 𝐵 tokens and runs one lightweight 𝐵 -token forward pass attending to the prompt KV cache just produced; this pass is identical to block 0’s first denoising step, with the only addition being a top-𝑘    
+
+> 6[MASK]
+> [MASK]
+> [MASK]
+> [MASK]
+> [MASK]
+> The
+> [MASK]
+> [MASK]
+> to
+> [MASK]
+> The
+> cat
+> ran
+> to
+> house
+> ❷Argmax Unmasking
+> ❶ Step 0 Forward
+> The
+> dog
+> [MASK]
+> to
+> [MASK]
+> ❸ Step 1 + Draft Forward
+> The
+> dog
+> ran
+> to
+> home
+> ❹ Keep Forward
+> ❺ Generate KV
+> [MASK]
+> [MASK]
+> [MASK]
+> [MASK]
+> [MASK]
+> [MASK]
+> top -k
+> Indices Sparse KV
+> for Block N+1
+> Proxy
+> Block N+1
+
+⑧ Select  
+
+> Center Token
+
+Repeat for each L layers   
+
+> Full KV Pool
+> (Block 0 –N-1)
+
+Block N Denoising     
+
+> KV of Block N
+> Drafted KV
+> of Block N
+> KV for Block N
+> KV for Block N+1
+
+CPU 
+
+GPU   
+
+> KV for Block N+2
+> KV for Block N+1
+> KV Gather
+
+⑨ CPU -GPU Cooperative KV Selection   
+
+> Full KV
+> Selection
+> (Attn + top -k)
+> Full KV Pool
+> (Block 0 –N)
+
++ 
+
+> QKV Projection + MLP
+
+CPU 
+
+GPU    
+
+> dLLM forward
+> Custom
+> Attention mask
+> KV cache
+> (N_block x block size)
+> ❻Write KV of block N
+> to GPU & CPU
+
+⑦Offload drafted KV 
+
+> Data movement
+
+Block N+1 Denoising ❶ ~ ❻ : main stream 
+
+⑦ ~ ⑨ : retrieval stream 
+
+GPU 
+
+CPU 
+
+Prompt 
+
+Block 0
+
+Prompt 
+
+Block 1
+
+[MASK] 
+
+Block 3 
+
+> [MASK]
+> [MASK]
+> [MASK]
+> [MASK]
+> [MASK]
+
+Prompt 
+
+Block 2       
+
+> Full KV Pool
+> (Block 0 –N-1)
+> The
+> [MASK]
+> [MASK]
+> to
+> [MASK]
+> KV for Block 3
+> KV for Block 4
+> Forward
+> Save for
+> Block 3’s
+> decodin g
+
+Prefill 
+
+> top -k
+> select
+
+Figure 7. System overview of Herald . Left : the prefill phase appends a [MASK] block to the prompt, offloads KV states to CPU DRAM layer-wise, and performs top-𝑘 selection to bootstrap the sparse KV pool. Right : the decode phase operates two concurrent streams with double-buffered KV pools; the retrieval stream writes the next block’s entries to the idle pool while the main stream denoises from the active pool. Block  N
+
+> Final KV D2H
+
+CPU 
+
+GPU 
+
+Time 
+
+Main 
+
+stream  GPU 
+
+Retrieval 
+
+stream  Comm  L2 sparse  
+
+> KV H2D
+
+∙∙∙  Lfinal sparse 
+
+> KV H2D
+
+... 
+
+Block N Denoising      
+
+> Block N Draft KV
+> & QKV D2H
+> L0FFN
+> L1QKV
+> proj
+> L3sparse
+> KV H2D
+> L2Full KV
+> Selection
+> Use in block N+1 Sparse KV for layer 2+
+
+Step 0  Step 1 + Draft  Step 2  Step 3  Step T  Step 0 ∙∙∙ Step 4   
+
+> L1Attn L0Attn
+> L0
+> Attn
+
+GPU  L0       
+
+> FFN
+> L1
+> Attn
+> L1
+> FFN
+> L2
+> Attn
+> L2
+> FFN
+> Gath
+> er
+> L0QKV
+> proj
+> L1FFN
+> L2QKV
+> proj
+> L2FFN
+> L3QKV
+> proj
+> L3FFN
+> L4QKV
+> proj
+
+1 step  L3 Full KV  
+
+> Selection
+> Gath
+> er
+> L4Full KV
+> Selection
+
+Figure 8. Full pipeline of HERALD over two consecutive blocks. The main stream denoises block 𝑁 while the retrieval stream concurrently prepares block 𝑁 +1’s Top-𝑘 entries through cooperative CPU–GPU execution, completing before denoising finishes. At the block boundary, the double-buffered KV pools are swapped and the pattern repeats for block 𝑁 +1.selection over the prompt’s KV cache using its attention scores. The selected entries are retained in the GPU’s sparse KV pool while the rest are discarded, with Layers 0 and 1 keeping their full KV cache without sparsification. As this pass replaces what would otherwise be block 0’s first step in the decode phase, the net overhead to end-to-end generation time is negligible. 
+
+Decode phase. In the steady state, HERALD repeats the following pipeline for each block 𝑁 (Figure 7-Right). It first performs the step 0 forward pass with confidence-aware unmasking ( 1 ), then fills all remaining masked positions with argmax predictions to obtain the full draft of block 𝑁 
+
+( 2 ), exploiting Opportunity 2 (Section 3.2) that the step-0 logits serve as a reliable semantic proxy for the finalized block. Step 1 and the draft forward pass are fused into a single forward pass over 2𝐵 tokens ( 3 ) under a custom attention mask: both groups share attention to the same prefix KV cache, but the two groups are masked off from each other. The step 0 output tokens continue denoising, while the argmax draft tokens produce block 𝑁 ’s drafted KV cache in parallel. Because the two are fused, drafting introduces no additional forward pass. Immediately after this fused pass, the main and retrieval streams proceed in parallel. On the main stream, denoising continues with the remaining forward-and-unmask itera-tions until all tokens in block 𝑁 are revealed ( 4 ). On the retrieval stream, the drafted block 𝑁 KV cache is appended to the full KV cache in CPU DRAM ( 7 ) and the center [MASK] 
+
+7Omin Kwon, Doyeon Kim, Jongseok Park, Seung Yul Lee, Ion Stoica, and Jae W. Lee 
+
+token of block 𝑁 +1 is selected as the representative query ( 8 ), exploiting Opportunity 1 (Section 3.2) to replace the block’s 𝐵 queries with a single one. Taking this query as in-put, the retrieval stream runs a cooperative one-step forward pass over the full prefix ( 9 ) that produces, for each layer, the top-𝑘 KV entries most relevant to block 𝑁 +1, which are staged into the GPU’s idle sparse KV pool. When the main stream finishes, a final forward pass yields block 𝑁 ’s finalized KV cache ( 5 ). This finalized cache is added to the sparse pool that block 𝑁 +1 will use ( 6 ) and also offloaded to CPU DRAM to replace the drafted cache there ( 7 ), so that block 𝑁 +1 attends to block 𝑁 ’s finalized tokens, not the draft, during both denoising and retrieval. 
+
+4.3 CPU-GPU Cooperative KV Cache Retrieval 
+
+The retrieval stream must complete within the main stream’s 
+
+𝑇 -step denoising window. HERALD meets this budget with a three-way pipeline that keeps the CPU, GPU, and PCIe DMA engine simultaneously busy. Since the full KV cache resides in CPU DRAM, the CPU handles fused attention and top-𝑘 
+
+selection, while DMA carries attention outputs and selected entries across PCIe to let the GPU run the post-attention FFN and stage the entries into the sparse pool. Within the cooperative forward pass, each Transformer block is processed in three steps—GPU QKV projection, CPU fused attention with top-𝑘 selection over the offloaded KV cache, and GPU FFN—which repeats 𝐿 times across all layers (Figure 8). While the GPU executes layer ℓ’s QKV projection and FFN, the CPU concurrently gathers the top-𝑘 entries selected for layer ℓ into a contiguous pinned buffer. This gather incurs a large volume of random DRAM reads, since the 𝐾 chosen entries are scattered across CPU DRAM and scale with the batch dimension. While this takes non-trivial time, overlapping it with GPU execution hides most of the overhead. Once gather completes, the CPU issues an asyn-chronous DMA transfer of these entries to the GPU’s idle sparse KV pool; this DMA overlaps with the next layer’s CPU full KV selection, adding no additional latency. Overall, the retrieval stream’s end-to-end latency becomes roughly the sum of CPU full KV selection and GPU QKV+FFN times across the 𝐿 layers, with gather mostly hidden and DMA fully hidden. 
+
+4.4 Optimized CPU Kernel for Full KV Selection 
+
+The CPU online full KV selection kernel fuses attention and top-𝑘 selection into a single streaming pass over the KV cache. The challenge is that while attention can be computed tile-by-tile without materializing the full score matrix, top-𝑘 
+
+selection must revisit all 𝑆 scores at once. Storing the full score matrix in DRAM and re-reading it at selection time is prohibitively expensive; under GQA, running 𝐺 separate top-
+
+𝑘 passes—one per query head—compounds this cost further. HERALD addresses this with two key design choices. First, the kernel manages scores at the granularity of a single KV head: for each KV head ℎ, it streams the KV cache through cache in tiles, accumulating the raw attention scores s[𝑔, 𝑠 ]
+
+for all 𝐺 query heads alongside the FlashAttention [ 6 ] run-ning statistics (𝑚 𝑔 , ℓ 𝑔 , o𝑔 ). Once all tiles of a KV head are consumed, the scores for all 𝐺 heads remain cache-resident— eliminating the DRAM re-read that a separate top-𝑘 pass would require. Second, rather than running a separate top-𝑘 
+
+pass for each of the 𝐺 query heads, the kernel reuses the already-computed online softmax statistics (𝑚 𝑔 , ℓ 𝑔 ) to aggre-gate their scores into a single softmax-normalized impor-tance vector per KV position: ˆ𝑠 ℎ [𝑠 ] = Í𝑔 exp (s[𝑔, 𝑠 ] − 𝑚 𝑔 )/ ℓ𝑔 .A single min-heap top-𝑘 pass over this cache-resident vector then suffices to extract the 𝐾 most attended positions for the entire KV head, reducing the number of top-𝑘 passes from 𝐺 
+
+to one. Once all KV heads are processed, the attention output is immediately transferred to the GPU to unblock the FFN. 
+
+5 Implementation 
+
+We implement HERALD on top of SGLang [ 48 ], a widely used serving framework with official support for diffusion LLM inference. The main stream reuses SGLang’s existing block diffusion decoding pipeline, including its paged KV cache management [ 21 ], continuous batching scheduler [ 47 ], and CUDA graph launch for low-overhead kernel dispatch. All GPU-side attention operations are built on top of Flash-Infer [ 46 ], a highly optimized attention kernel library that provides fused prefill and decode kernels with support for variable-length sequences and paged KV cache layouts; lever-aging FlashInfer allows HERALD to achieve near-peak mem-ory bandwidth utilization during denoising without imple-menting custom CUDA kernels. The retrieval stream is imple-mented as an asynchronous background worker that shares the GPU context with the main stream via CUDA streams, en-suring that retrieval GPU operations (draft, QKV projection, FFN) do not block the main stream’s denoising kernels. The CPU retrieval kernels (fused attention + top-𝑘 and gather) are implemented in C++ with AVX-512 intrinsics and in-tegrated via a custom PyTorch extension. Communication between GPU and CPU is managed through pinned mem-ory buffers with asynchronous DMA transfers. The double-buffered sparse KV pool is allocated at initialization and reused across blocks, avoiding dynamic memory allocation during decoding. The entire system comprises approximately 3,700 lines of C++ and 9,600 lines of Python on top of the SGLang codebase. 
+
+6 Evaluation 
+
+6.1 Experimental Setup Hardware. All experiments are conducted on a server with an Intel Xeon Platinum 8481C (Sapphire Rapids, 52 cores / 104 threads) equipped with 936 GB DDR5-4800 DRAM (307 .2 GB/s memory bandwidth) and a single NVIDIA H100                                                                 
+
+> 812.5 510 20
+> 30.0
+> 40.0
+> 50.0
+> 60.0
+> LLaDA 2.0-mini 16B  HotpotQA
+> 12.5 510 20
+> 12.0
+> 18.0
+> 24.0
+> 30.0
+> NarrativeQA
+> 12.5 510 20
+> 30.0
+> 45.0
+> 60.0
+> LCC
+> 12.5 510 20
+> 30.0
+> 40.0
+> 50.0
+> 60.0 RepoBench-P
+> 12.5 510 20
+> 18.0
+> 20.0
+> 22.0
+> 24.0
+> QMSum
+> 12.5 510 20
+> 30.0
+> 45.0
+> 60.0
+> SDAR-8B-Chat
+> 12.5 510 20
+> 0.0
+> 10.0
+> 20.0
+> 30.0
+> 12.5 510 20
+> 15.0
+> 30.0
+> 45.0
+> 12.5 510 20
+> 20.0
+> 30.0
+> 40.0
+> 50.0
+> 12.5 510 20
+> 10.0
+> 15.0
+> 20.0
+> 25.0
+> 12.5 510 20
+> KV Cache Budget (%)
+> 30.0
+> 45.0
+> 60.0
+> TraDo-8B-Instruct
+> 12.5 510 20
+> KV Cache Budget (%)
+> 0.0
+> 10.0
+> 20.0
+> 30.0
+> 12.5 510 20
+> KV Cache Budget (%)
+> 15.0
+> 30.0
+> 45.0
+> 60.0
+> 12.5 510 20
+> KV Cache Budget (%)
+> 30.0
+> 45.0
+> 12.5 510 20
+> KV Cache Budget (%)
+> 10.0
+> 15.0
+> 20.0
+> 25.0
+> Dense InfiniGen MAGE-Offload HERALD
+
+Figure 9. LongBench accuracy across all three models and five tasks. HERALD closely tracks the Dense baseline at 5–10% KV cache budget, while InfiniGen degrades substantially even at high budgets. MAGE is consistently robust across all settings. SXM 80 GB GPU ( 3.35 TB/s HBM3 bandwidth), connected via PCIe 5.0 ×16 ( 64 GB/s). 
+
+Models. We evaluate on three block diffusion LLMs: SDAR-8B-Chat [ 5], TraDo-8B-Instruct [ 38 ], and LLaDA 2.0-mini 16B [ 3 ]. TraDo-8B-Instruct is obtained by applying RL post-training to SDAR-8B-Chat and shares an identical model architecture; throughput and latency experiments are there-fore reported only for SDAR-8B-Chat as a representative of both models. 
+
+Baselines. We compare HERALD against three baselines, all built on SGLang [ 48 ] with FlashInfer [ 46 ] kernels and CUDA Graph capture. Dense runs full GPU-only inference without sparsity or offloading. InfiniGen [23 ] performs approximate attention-based Top-𝐾 selection and fetching at every de-noising step. MAGE [20 ], adapted to the offloading setting, computes exact attention at the first denoising step of each block to select Top-𝐾 entries and reuses that selection for all subsequent steps. 
+
+Configuration. Following the conventional block dLLM setting [ 3], we use block size 𝐵 =32 and confidence-based dynamic unmasking with threshold 0.95 for all experiments, where the number of denoising steps 𝑇 per block adapts to per-token confidences. For accuracy experiments, we cap the maximum generation length at 512 tokens (i.e., 8 blocks). For 
+
+throughput and latency experiments, we fix 𝑇 to the average number of steps observed on LongBench ( 𝑇 =20 ) across all context lengths. 
+
+6.2 Accuracy Evaluation 
+
+We evaluate generation quality on long-context tasks us-ing LongBench [ 2 ], covering five tasks (HotpotQA, LCC, RepoBench-P, NarrativeQA, QMSum) spanning multi-hop reasoning, code completion, single-document QA, and sum-marization. Figure 9 shows the results across KV cache bud-gets from 1% to 20%. HERALD reaches near-lossless accuracy at a 5–10% budget across all three models, MAGE reaches the same quality even earlier at 2.5–5% , while InfiniGen remains visibly below Dense even at a 20% budget. MAGE attains the lowest-budget near-lossless point be-cause it performs exact attention over the finalized full KV cache, giving its top-𝑘 selection access to the true prefix con-text. HERALD instead runs selection against a drafted KV cache so that it can overlap with the main denoising pass, which introduces a small approximation and places HERALD slightly below MAGE at the same budget. The gap closes with only a few additional percentage points of KV budget, con-firming that lookahead selection enables prefetching while preserving sufficient quality. InfiniGen’s low accuracy con-firms that block dLLMs require exact-selection-with-reuse for accurate sparse KV selection, as prior diffusion sparse-attention work has also observed [20]. 
+
+6.3 Performance Evaluation 
+
+We evaluate per-block latency and maximum decode through-put of HERALD and three baselines. To ensure an accuracy-equivalent comparison, each method is evaluated at the smallest KV cache sparsity at which it reaches near-lossless accuracy against Dense, as established in Section 6: 2.5% for MAGE, 5% for HERALD, and 20% for InfiniGen. 
+
+Latency Evaluation. We measure TPOB (Time Per Output Block) at batch sizes of 1, 16 , 32 , and 64 across context lengths (Figure 10). HERALD matches or even outperforms Dense across all context lengths and batch sizes, while MAGE is 
+
+1.22 –2.74 × slower and InfiniGen is 2.25 –4.50 × slower than 
+
+9Omin Kwon, Doyeon Kim, Jongseok Park, Seung Yul Lee, Ion Stoica, and Jae W. Lee 8K 16K 32K                   
+
+> 0
+> 200
+> TPOB (ms)
+> B=1
+> LLaDA 2.0-mini 16B
+> 8K 16K 32K
+> 0
+> 250
+> 500
+> SDAR-8B-Chat
+> 8K 16K 32K
+> 0
+> 1000
+> TPOB (ms)
+> B=16
+> 8K 16K 32K
+> 0
+> 2500
+> 5000
+> OOM
+> 8K 16K 32K
+> 0
+> 2000
+> 4000
+> OOM
+> TPOB (ms)
+> B=32
+> 8K 16K 32K
+> 0
+> 5000
+> OOM
+> OOM
+> OOM
+> 8K 16K 32K
+> Context Length
+> 0
+> 2000
+> 4000
+> OOM
+> OOM
+> OOM
+> OOM
+> TPOB (ms)
+> B=64
+> 8K 16K 32K
+> Context Length
+> 0
+> 5000
+> OOM
+> OOM
+> OOM
+> OOM
+> OOM
+> OOM
+> OOM
+> Dense InfiniGen MAGE-Offload HERALD OOM
+
+Figure 10. Per-block decode latency (TPOB, ms) at batch sizes 𝐵 =1, 16 , 32 , and 64 across context lengths. Columns correspond to models. Dense runs the full KV cache in HBM; all other methods offload KV to host DRAM. Dashed red bars indicate GPU out-of-memory. Dense. At the largest feasible batch sizes, HERALD is up to 
+
+8.9× faster than InfiniGen and 4.9× faster than MAGE. HERALD achieves Dense-level or even lower TPOB (up to 1.59 × on SDAR-8B and 1.28 × on LLaDA 2.0), because it pipelines the per-layer KV gather and DMA transfer within the per-block denoising window, overlapping them entirely with the main stream so that retrieval overhead stays off the critical path. MAGE, in contrast, streams the entire KV cache to the GPU via PCIe at every block to perform exact atten-tion for selection at step 0; this full-KV transfer dominates per-block latency regardless of the chosen sparsity, and the dedicated HBM staging buffer it requires causes MAGE to reach HBM OOM earlier than HERALD despite its lower KV budget. InfiniGen fares worst because its CPU-side token-wise Top-𝐾 selection runs within each per-layer window and cannot overlap with GPU computation, so its cost falls directly on the critical path and grows with context length. 
+
+Throughput Evaluation. Table 1 reports the throughput-maximizing batch size and the resulting peak decode through-put at 8K, 16K, and 32K. HERALD achieves the highest throughput at every context length and on both models, and its advantage over Dense grows with context : 1.34 –1.40 × at 8K, 1.81 –2.13 × at 16K, and 1.92 –2.47 × at 32K. InfiniGen and 
+
+Table 1. Peak decode throughput (tokens/s) with the batch size that maximizes it. Ctx Method LLaDA 2.0-mini 16B SDAR-8B-Chat B Throughput B Throughput 8K Dense 70 2712 ( 1.00 ×) 31 1107 ( 1.00 ×)InfiniGen 32 867 ( 0.32 ×) 16 364 ( 0.33 ×)MAGE-Offload 128 1369 ( 0.50 ×) 16 414 ( 0.37 ×)HERALD 200 3813 ( 1.40 ×) 160 1484 ( 1.34 ×)16K Dense 35 1629 ( 1.00 ×) 15 754 ( 1.00 ×)InfiniGen 16 555 ( 0.34 ×) 16 178 ( 0.24 ×)MAGE-Offload 128 796 ( 0.49 ×) 16 238 ( 0.32 ×)HERALD 161 3475 ( 2.13 ×) 90 1364 ( 1.81 ×)32K Dense 17 1098 ( 1.00 ×) 7 429 ( 1.00 ×)InfiniGen 16 340 ( 0.31 ×) 16 89 ( 0.21 ×)MAGE-Offload 56 390 ( 0.36 ×) 56 121 ( 0.28 ×)HERALD 89 2717 ( 2.47 ×) 50 823 ( 1.92 ×)MAGE, despite accommodating larger batches than Dense, deliver only 0.21 –0.34 × and 0.28 –0.50 × of Dense’s through-put respectively. This trend reflects a structural difference between block dLLMs and AR LLMs. Since AR LLMs start from low GPU utilization, batch scaling yields a steep throughput gain that easily absorbs offloading’s latency overhead. Block dLLMs already process 𝐵 tokens per forward pass, so the gain from larger batches is far smaller and any latency overhead is proportionally more damaging. InfiniGen and MAGE inflate per-block latency substantially, so their larger batches cannot translate into throughput gains. In contrast, HERALD keeps latency at or below Dense, turning every additional batch directly into throughput. HERALD’s advantage further grows 
+
+with context, since longer contexts intensify Dense’s HBM pressure and force smaller batch sizes, whereas HERALD offloads the KV cache to host DRAM and sustains larger batches. 
+
+6.4 HERALD Latency Breakdown 
+
+Figure 11 decomposes per-block latency of HERALD’s Main and Retrieval streams on LLaDA 2.0-mini 16B for 8K/32K contexts length and across batch sizes 𝐵 =16 , 32 , 64 . At both 8K and 32K, the Retrieval Stream completes before the Main Stream at every operating point, so per-block latency is bounded by denoising alone and HERALD pays no overhead over the dense baseline. That said, the headroom between the Main and Retrieval streams shrinks as sequence length          
+
+> 10 0200 400 600
+> Per-block latency (ms)
+> B=16
+> B=32
+> B=64
+> 318
+> 98
+> Main
+> Retr.
+> 431
+> 159
+> Main
+> Retr.
+> 628
+> 270
+> Main
+> Retr.
+> 8K
+> 0250 500 750
+> Per-block latency (ms)
+> B=16
+> B=32
+> B=64
+> 344
+> 228
+> Main
+> Retr.
+> 500
+> 429
+> Main
+> Retr.
+> 785
+> 719
+> Main
+> Retr.
+> 32K
+> Main Stream IDLE CPU Full KV Selection Kernel GPU FFN
+
+Figure 11. Per-block latency breakdown of HERALD on LLaDA 2.0-mini 16B at two context lengths (8K, 32K) and three batch sizes ( 𝐵 =16 , 32 , 64 ). and batch size grow. We believe this is because the CPU’s weaker compute is already fully utilized by the retrieval ker-nel, so its latency scales linearly with the workload, while the GPU still has compute headroom and grows sublinearly. 
+
+6.5 Ablation Study 
+
+To isolate each component’s contribution, we progressively enable them starting from MAGE and measure per-block latency (TPOB) on LLaDA 2.0-mini 16B at 𝐵 =16 (Figure 12). Naïvely moving MAGE’s full-block attention selection to the CPU—where the entire KV cache already resides—is 2.3–3.9×
+
+slower than GPU-side MAGE. Although this eliminates the PCIe full-cache transfer, the CPU’s limited compute through-put cannot sustain the full attention over all query tokens against the entire context, making CPU selection the new bottleneck. Replacing the full query set with a single [MASK] 
+
+representative token cuts the CPU workload by 24 .2× on average, yielding a 3.0–8.2× speedup that brings TPOB be-low MAGE’s baseline. However, the CPU selection still lies on the critical path: the main GPU denoising stream must wait for the selection result before proceeding. Finally, HER-ALD’s step-0 draft overlap hides the remaining CPU latency behind GPU denoising by issuing the next block’s selection against a drafted KV cache produced at the end of the cur-rent block. This provides an additional 1.2–1.5× gain, and the final HERALD system achieves 1.5–3.1× lower TPOB than MAGE overall, with the advantage growing at longer contexts. 
+
+7 Related Works 
+
+Acceleration Methods of Diffusion LLMs. Prior dLLM acceleration work targets sampling efficiency [ 31 , 40 , 42 ], feature caching [ 28 , 30 ], or sparse attention [ 20 , 39 ]. These techniques reduce the computational cost of denoising but do not address the memory capacity bottleneck—the full KV cache still resides on the GPU and grows linearly with sequence length, leaving the throughput constraint unre-solved. HERALD is orthogonal and complementary to all of 8K 16K 32K 
+
+> Context Length (B=16)
+> 0
+> 1000
+> 2000
+> 3000
+> 4000
+> TPOB (ms)
+> 490
+> 680
+> 1072
+> 1103
+> 2158
+> 4200
+> 372
+> 480
+> 514
+> 318
+> 329
+> 344
+> MAGE
+> (GPU Selection)
+> (1) MAGE
+> (CPU Selection)
+> (2) + Single [MASK]
+> Query CPU Selection
+> (3) + Step0-Draft
+> Overlap (HERALD)
+
+Figure 12. Ablation of HERALD’s design components on LLaDA 2.0-mini 16B at batch size 𝐵 =16 across context lengths (8K, 16K, 32K). Each configuration progressively adds one optimization on top of the previous one, reducing TPOB from the naïve CPU selection baseline to the final HERALD system. the above, targeting the memory wall via CPU–GPU cooper-ative KV retrieval. 
+
+KV Cache Compression and Quantization. An orthogo-nal line of work reduces the KV cache footprint itself. Com-pression methods such as KVzip [ 16 ] evict less important KV pairs based on importance scoring, while quantization approaches like KVQuant [ 12 ] represent cached activations at low bit-widths, enabling up to 4.8× longer contexts within the same memory budget. Although these techniques allevi-ate memory pressure, the KV cache size still scales linearly with sequence length; at sufficiently long contexts, it once again exceeds GPU capacity. HERALD addresses this resid-ual gap through offloading rather than shrinking, and the two strategies can be combined for further gains. 
+
+Heterogeneous LLM Inference. In AR-LLM decoding, at-tention’s low operational intensity underutilizes GPUs, mo-tivating works that offload attention to higher-bandwidth devices such as CPUs [ 13 , 33 ], CXL-PIM [ 11 ], CXL-PNM [ 17 ], or AMX-enabled CPUs [ 14 ]. In dLLMs, however, decoding 
+
+𝐵 tokens per step raises attention’s compute demand by 
+
+𝐵 ×, challenging these high-bandwidth but compute-limited devices. HERALD sidesteps this with asymmetric latency windows: the CPU performs query-subsampled top-𝑘 selec-tion once per block, while the GPU executes sparse attention every denoising step. 
+
+8 Conclusion 
+
+Block diffusion LLMs generate multiple tokens per forward pass for higher GPU utilization, but their KV cache still grows linearly with context, necessitating offloading to host DRAM where selection accuracy critically governs PCIe recall cost. Block dLLMs possess an exact-selection-with-reuse strategy that achieves high accuracy via temporal consistency within a block, yet realizing it under offloading is prohibitive due to 
+
+> 11
+
+Omin Kwon, Doyeon Kim, Jongseok Park, Seung Yul Lee, Ion Stoica, and Jae W. Lee 
+
+the full-cache attention cost at step 0 and a data dependency on finalized prefix tokens. HERALD resolves both obstacles by exploiting two structural properties of block dLLMs: a single center [MASK] query that reduces the CPU selection cost by 24 .2× on average, and step-0 logits as a semantic proxy that loosens the inter-block dependency to enable prefetching, fully overlapping the next block’s KV retrieval with the current block’s denoising. Across three production block dLLMs and five LongBench tasks, HERALD achieves near-lossless accuracy at a 5–10% KV budget and up to 2.47 ×
+
+decode throughput over a Dense GPU baseline, with the gap widening as context grows. 
+
+References 
+
+[1] Marianne Arriola, Aaron Gokaslan, Justin T. Chiu, Zhihan Yang, Zhix-uan Qi, Jiaqi Han, Subham Sekhar Sahoo, and Volodymyr Kuleshov. 2025. Block Diffusion: Interpolating Between Autoregressive and Dif-fusion Language Models. In The Thirteenth International Conference on Learning Representations, ICLR 2025, Singapore, April 24-28, 2025 .OpenReview.net. https://openreview.net/forum?id=tyEyYT267x 
+
+[2] Yushi Bai, Xin Lv, Jiajie Zhang, Hongchang Lyu, Jiankai Tang, Zhid-ian Huang, Zhengxiao Du, Xiao Liu, Aohan Zeng, Lei Hou, Yuxiao Dong, Jie Tang, and Juanzi Li. 2024. LongBench: A Bilingual, Multitask Benchmark for Long Context Understanding. In Proceedings of the 62nd Annual Meeting of the Association for Computational Linguis-tics (Volume 1: Long Papers) , Lun-Wei Ku, Andre Martins, and Vivek Srikumar (Eds.). Association for Computational Linguistics, Bangkok, Thailand, 3119–3137. https://doi.org/10.18653/v1/2024.acl-long.172 
+
+[3] Tiwei Bie, Maosong Cao, Kun Chen, Lun Du, Mingliang Gong, Zhuochen Gong, Yanmei Gu, Jiaqi Hu, Zenan Huang, Zhenzhong Lan, Chengxi Li, Chongxuan Li, Jianguo Li, Zehuan Li, Huabin Liu, Lin Liu, Guoshan Lu, Xiaocheng Lu, Yuxin Ma, Jianfeng Tan, Lanning Wei, Ji-Rong Wen, Yipeng Xing, Xiaolu Zhang, Junbo Zhao, Da Zheng, Jun Zhou, Junlin Zhou, Zhanchao Zhou, Liwang Zhu, and Yihong Zhuang. 2025. LLaDA2.0: Scaling Up Diffusion Language Models to 100B. arXiv:2512.15745 [cs.LG] https://arxiv.org/abs/2512.15745 
+
+[4] Josue Caldas and Elvis de Souza. 2025. A Comprehensive Evaluation of Large Language Models for Retrieval-Augmented Generation under Noisy Conditions. In Proceedings of the 1st Workshop on Confabulation, Hallucinations and Overgeneration in Multilingual and Practical Settings (CHOMPS 2025) , Aman Sinha, Raúl Vázquez, Timothee Mickus, Rohit Agarwal, Ioana Buhnila, Patrícia Schmidtová, Federica Gamba, Dilip K. Prasad, and Jörg Tiedemann (Eds.). Association for Computational Linguistics, Mumbai, India, 60–69. https://doi.org/10.18653/v1/2025. chomps-main.6 
+
+[5] Shuang Cheng, Yihan Bian, Dawei Liu, Linfeng Zhang, Qian Yao, Zhongbo Tian, Wenhai Wang, Qipeng Guo, Kai Chen, Biqing Qi, and Bowen Zhou. 2025. SDAR: A Synergistic Diffusion-AutoRegression Paradigm for Scalable Sequence Generation. arXiv:2510.06303 [cs.LG] 
+
+https://arxiv.org/abs/2510.06303 
+
+[6] Tri Dao, Daniel Y. Fu, Stefano Ermon, Atri Rudra, and Christopher Ré. 2022. FLASHATTENTION: fast and memory-efficient exact attention with IO-awareness. In Proceedings of the 36th International Conference on Neural Information Processing Systems (New Orleans, LA, USA) 
+
+(NIPS ’22) . Curran Associates Inc., Red Hook, NY, USA, Article 1189, 16 pages. [7] Yunfan Gao, Yun Xiong, Xinyu Gao, Kangxiang Jia, Jinliu Pan, Yuxi Bi, Yixin Dai, Jiawei Sun, and Haofen Wang. 2023. Retrieval-augmented generation for large language models: A survey. arXiv preprint arXiv:2312.10997 2, 1 (2023), 32. [8] Shansan Gong, Shivam Agarwal, Yizhe Zhang, Jiacheng Ye, Lin Zheng, Mukai Li, Chenxin An, Peilin Zhao, Wei Bi, Jiawei Han, Hao Peng, and Lingpeng Kong. 2025. Scaling Diffusion Language Models via Adaptation from Autoregressive Models. In The Thirteenth Interna-tional Conference on Learning Representations . https://openreview.net/ forum?id=j1tSLYKwg8 
+
+[9] Shansan Gong, Mukai Li, Jiangtao Feng, Zhiyong Wu, and Lingpeng Kong. 2023. DiffuSeq: Sequence to Sequence Text Generation with Diffusion Models. In The Eleventh International Conference on Learning Representations . https://openreview.net/forum?id=jQj-_rLVXsj 
+
+[10] Google DeepMind. 2025. Gemini Diffusion. https://deepmind.google/ models/gemini-diffusion/ . Accessed: 2026-04-14. [11] Yufeng Gu, Alireza Khadem, Sumanth Umesh, Ning Liang, Xavier Servot, Onur Mutlu, Ravi Iyer, and Reetuparna Das. 2025. Pim is all you need: A cxl-enabled gpu-free system for large language model inference. In Proceedings of the 30th ACM International Conference on Architectural Support for Programming Languages and Operating Systems, Volume 2 . 862–881. [12] Coleman Richard Charles Hooper, Sehoon Kim, Hiva Moham-madzadeh, Michael W. Mahoney, Sophia Shao, Kurt Keutzer, and Amir Gholami. 2024. KVQuant: Towards 10 Million Context Length LLM Inference with KV Cache Quantization. In The Thirty-eighth Annual Conference on Neural Information Processing Systems . https: //openreview.net/forum?id=0LXotew9Du 
+
+[13] Xuanlin Jiang, Yang Zhou, Shiyi Cao, Ion Stoica, and Minlan Yu. 2025. NEO: Saving GPU Memory Crisis with CPU Offload-ing for Online LLM Inference. In Proceedings of Machine Learn-ing and Systems , M. Zaharia, G. Joshi, and Y. Lin (Eds.), Vol. 7. MLSys. https://proceedings.mlsys.org/paper_files/paper/2025/file/ 66a026c0d17040889b50f0dfa650e5e0-Paper-Conference.pdf 
+
+[14] Hyungyo Kim, Nachuan Wang, Qirong Xia, Jinghan Huang, Amir Yazdanbakhsh, and Nam Sung Kim. 2025. LIA: A Single-GPU LLM Inference Acceleration with Cooperative AMX-Enabled CPU-GPU Computation and CXL Offloading. In Proceedings of the 52nd Annual International Symposium on Computer Architecture (ISCA ’25) . As-sociation for Computing Machinery, New York, NY, USA, 544–558. 
+
+https://doi.org/10.1145/3695053.3731092 
+
+[15] Jaeyeon Kim, Kulin Shah, Vasilis Kontonis, Sham Kakade, and Sitan Chen. 2025. Train for the Worst, Plan for the Best: Understanding Token Ordering in Masked Diffusions. arXiv:2502.06768 [cs.LG] 
+
+https://arxiv.org/abs/2502.06768 
+
+[16] Jang-Hyun Kim, Jinuk Kim, Sangwoo Kwon, Jae W. Lee, Sangdoo Yun, and Hyun Oh Song. 2025. KVzip: Query-Agnostic KV Cache Compression with Context Reconstruction. In The Thirty-ninth An-nual Conference on Neural Information Processing Systems . https: //openreview.net/forum?id=JFygzwx8SJ 
+
+[17] KyungSoo Kim, Omin Kwon, Yeonhong Park, and Jae W. Lee. 2025. AiDE: Attention-FFN Disaggregated Execution for Cost-Effective LLM Decoding on CXL-PNM . IEEE Computer Architecture Letters 24, 02 (July 2025), 285–288. https://doi.org/10.1109/LCA.2025.3597323 
+
+[18] Minseo Kim, Coleman Hooper, Aditya Tomar, Chenfeng Xu, Mehrdad Farajtabar, Michael W. Mahoney, Kurt Keutzer, and Amir Gholami. 2025. Beyond Next-Token Prediction: A Performance Characterization of Diffusion versus Autoregressive Language Models. arXiv preprint arXiv:2510.04146 (2025). https://arxiv.org/abs/2510.04146 
+
+[19] Minseo Kim, Chenfeng Xu, Coleman Hooper, Harman Singh, Ben Athiwaratkun, Ce Zhang, Kurt Keutzer, and Amir Gholami. 2026. CDLM: Consistency Diffusion Language Models For Faster Sampling. arXiv:2511.19269 [cs.LG] https://arxiv.org/abs/2511.19269 
+
+[20] Omin Kwon, Yeonjae Kim, Doyeon Kim, Minseo Kim, Yeonhong Park, and Jae W. Lee. 2026. MAGE: All-[MASK] Block Already Knows Where to Look in Diffusion LLM. arXiv:2602.14209 [cs.LG] https: //arxiv.org/abs/2602.14209 
+
+12 [21] Woosuk Kwon, Zhuohan Li, Siyuan Zhuang, Ying Sheng, Lianmin Zheng, Cody Hao Yu, Joseph Gonzalez, Hao Zhang, and Ion Stoica. 2023. Efficient Memory Management for Large Language Model Serving with PagedAttention. In Proceedings of the 29th Symposium on Operating Systems Principles (Koblenz, Germany) (SOSP ’23) . As-sociation for Computing Machinery, New York, NY, USA, 611–626. 
+
+https://doi.org/10.1145/3600006.3613165 
+
+[22] Haeun Lee, Omin Kwon, Yeonhong Park, and Jae W. Lee. 2026. Nest-edFP: High-Performance, Memory-Efficient Dual-Precision Floating Point Support for LLMs. In The Thirty-ninth Annual Conference on Neural Information Processing Systems . https://openreview.net/forum? id=WDAKFpWftI 
+
+[23] Wonbeom Lee, Jungi Lee, Junghwan Seo, and Jaewoong Sim. 2024. InfiniGen: efficient generative inference of large language models with dynamic KV cache management. In Proceedings of the 18th USENIX Conference on Operating Systems Design and Implementation 
+
+(Santa Clara, CA, USA) (OSDI’24) . USENIX Association, USA, Article 9, 18 pages. [24] Yaniv Leviathan, Matan Kalman, and Yossi Matias. 2023. Fast Inference from Transformers via Speculative Decoding. arXiv:2211.17192 [cs.LG] https://arxiv.org/abs/2211.17192 
+
+[25] Patrick Lewis, Ethan Perez, Aleksandra Piktus, Fabio Petroni, Vladimir Karpukhin, Naman Goyal, Heinrich Küttler, Mike Lewis, Wen-tau Yih, Tim Rocktäschel, Sebastian Riedel, and Douwe Kiela. 2020. Retrieval-Augmented Generation for Knowledge-Intensive NLP Tasks. In Ad-vances in Neural Information Processing Systems , H. Larochelle, M. Ran-zato, R. Hadsell, M.F. Balcan, and H. Lin (Eds.), Vol. 33. Curran Asso-ciates, Inc., 9459–9474. https://proceedings.neurips.cc/paper_files/ paper/2020/file/6b493230205f780e1bc26945df7481e5-Paper.pdf 
+
+[26] Guangda Liu, Chengwei Li, Zhenyu Ning, Jing Lin, Yiwu Yao, Dan-ning Ke, Minyi Guo, and Jieru Zhao. 2026. FreeKV: Boosting KV Cache Retrieval for Efficient LLM Inference. In The Fourteenth Inter-national Conference on Learning Representations . https://openreview. net/forum?id=wXAn7orB1H 
+
+[27] Guangda Liu, Chengwei Li, Jieru Zhao, Chenqi Zhang, and Minyi Guo. 2025. ClusterKV: Manipulating LLM KV Cache in Semantic Space for Recallable Compression. In 2025 62nd ACM/IEEE Design Automation Conference (DAC) . 1–7. https://doi.org/10.1109/DAC63849. 2025.11132479 
+
+[28] Zhiyuan Liu, Yicun Yang, Yaojie Zhang, Junjie Chen, Chang Zou, Qingyuan Wei, Shaobo Wang, and Linfeng Zhang. 2025. dLLM-Cache: Accelerating Diffusion Large Language Models with Adaptive Caching. arXiv:2506.06295 [cs.LG] https://arxiv.org/abs/2506.06295 
+
+[29] Aaron Lou, Chenlin Meng, and Stefano Ermon. 2024. Discrete dif-fusion modeling by estimating the ratios of the data distribution. In 
+
+Proceedings of the 41st International Conference on Machine Learning 
+
+(Vienna, Austria) (ICML’24) . JMLR.org, Article 1333, 30 pages. [30] Xinyin Ma, Runpeng Yu, Gongfan Fang, and Xinchao Wang. 2025. dKV-Cache: The Cache for Diffusion Language Models. In The Thirty-ninth Annual Conference on Neural Information Processing Systems .
+
+https://openreview.net/forum?id=Gppo2JImHs 
+
+[31] Shen Nie, Fengqi Zhu, Zebin You, Xiaolu Zhang, Jingyang Ou, Jun Hu, JUN ZHOU, Yankai Lin, Ji-Rong Wen, and Chongxuan Li. 2025. Large Language Diffusion Models. In The Thirty-ninth Annual Conference on Neural Information Processing Systems . https://openreview.net/forum? id=KnqiC0znVF 
+
+[32] Subham Sekhar Sahoo, Marianne Arriola, Aaron Gokaslan, Edgar Mar-iano Marroquin, Alexander M Rush, Yair Schiff, Justin T Chiu, and Volodymyr Kuleshov. 2024. Simple and Effective Masked Diffusion Language Models. In The Thirty-eighth Annual Conference on Neural Information Processing Systems . https://openreview.net/forum?id= L4uaAR4ArM 
+
+[33] Ying Sheng, Lianmin Zheng, Binhang Yuan, Zhuohan Li, Max Ryabinin, Beidi Chen, Percy Liang, Christopher Ré, Ion Stoica, and Ce Zhang. 2023. FlexGen: high-throughput generative inference of large language models with a single GPU. In Proceedings of the 40th International Conference on Machine Learning (Honolulu, Hawaii, USA) 
+
+(ICML’23) . JMLR.org, Article 1288, 23 pages. [34] Yuerong Song, Xiaoran Liu, Ruixiao Li, Zhigeng Liu, Zengfeng Huang, Qipeng Guo, Ziwei He, and Xipeng Qiu. 2025. Sparse-dLLM: Accelerating Diffusion LLMs with Dynamic Cache Eviction. arXiv:2508.02558 [cs.CL] https://arxiv.org/abs/2508.02558 
+
+[35] Jovan Stojkovic, Chaojie Zhang, Íñigo Goiri, Josep Torrellas, and Esha Choukse. 2025. DynamoLLM: Designing LLM Inference Clusters for Performance and Energy Efficiency. In 2025 IEEE International Symposium on High Performance Computer Architecture (HPCA) . IEEE, 1348–1362. https://doi.org/10.1109/hpca61900.2025.00102 
+
+[36] Hanshi Sun, Li-Wen Chang, Wenlei Bao, Size Zheng, Ningxin Zheng, Xin Liu, Harry Dong, Yuejie Chi, and Beidi Chen. 2025. SHADOWKV: KV cache in shadows for high-throughput long-context LLM inference. In Proceedings of the 42nd International Conference on Machine Learning 
+
+(Vancouver, Canada) (ICML’25) . JMLR.org, Article 2276, 19 pages. [37] Jiaming Tang, Yilong Zhao, Kan Zhu, Guangxuan Xiao, Baris Kasikci, and Song Han. 2024. QUEST: Query-Aware Sparsity for Efficient Long-Context LLM Inference. In Forty-first International Conference on Machine Learning . https://openreview.net/forum?id=KzACYw0MTV 
+
+[38] Yinjie Wang, Ling Yang, Bowen Li, Ye Tian, Ke Shen, and Mengdi Wang. 2025. Revolutionizing Reinforcement Learning Framework for Diffusion Large Language Models. arXiv:2509.06949 [cs.CL] https: //arxiv.org/abs/2509.06949 
+
+[39] Zeqing Wang, Gongfan Fang, Xinyin Ma, Xingyi Yang, and Xinchao Wang. 2026. SparseD: Sparse Attention for Diffusion Language Models. In The Fourteenth International Conference on Learning Representations .
+
+https://openreview.net/forum?id=dwbrZtYP04 
+
+[40] Qingyan Wei, Yaojie Zhang, Zhiyuan Liu, Puyu Zeng, Yuxuan Wang, Biqing Qi, Dongrui Liu, and Linfeng Zhang. 2026. Accelerating Dif-fusion Large Language Models with SlowFast Sampling: The Three Golden Principles. In The Fourteenth International Conference on Learn-ing Representations . https://openreview.net/forum?id=Uh17FiwF4q 
+
+[41] Chengyue Wu, Hao Zhang, Shuchen Xue, Shizhe Diao, Yonggan Fu, Zhijian Liu, Pavlo Molchanov, Ping Luo, Song Han, and Enze Xie. 2026. Fast-dLLM v2: Efficient Block-Diffusion LLM. In The Four-teenth International Conference on Learning Representations . https: //openreview.net/forum?id=1NZ3DHF9nT 
+
+[42] Chengyue Wu, Hao Zhang, Shuchen Xue, Zhijian Liu, Shizhe Diao, Ligeng Zhu, Ping Luo, Song Han, and Enze Xie. 2025. Fast-dLLM: Training-free Acceleration of Diffusion LLM by Enabling KV Cache and Parallel Decoding. arXiv:2505.22618 [cs.CL] https://arxiv.org/ abs/2505.22618 
+
+[43] Wenbo Wu, Qingyi Si, Xiurui Pan, Ye Wang, and Jie Zhang. 2025. LouisKV: Efficient KV Cache Retrieval for Long Input-Output Se-quences. arXiv:2510.11292 [cs.LG] https://arxiv.org/abs/2510.11292 
+
+[44] Jiaming Xu, Jiayi Pan, Hanzhen Wang, Yongkang Zhou, Jiancai Ye, Yu Wang, and Guohao Dai. 2026. SpeContext: Enabling Efficient Long-context Reasoning with Speculative Context Sparsity in LLMs. In 
+
+Proceedings of the 31st ACM International Conference on Architectural Support for Programming Languages and Operating Systems, Volume 2 (USA) (ASPLOS ’26) . Association for Computing Machinery, New York, NY, USA, 1832–1847. https://doi.org/10.1145/3779212.3790224 
+
+[45] Jiacheng Ye, Zhihui Xie, Lin Zheng, Jiahui Gao, Zirui Wu, Xin Jiang, Zhenguo Li, and Lingpeng Kong. 2025. Dream 7B: Diffusion Large Language Models. arXiv preprint arXiv:2508.15487 (2025). https: //arXiv.org/abs/2508.15487 
+
+[46] Zihao Ye, Lequn Chen, Ruihang Lai, Wuwei Lin, Yineng Zhang, Stephanie Wang, Tianqi Chen, Baris Kasikci, Vinod Grover, Arvind Krishnamurthy, and Luis Ceze. 2025. FlashInfer: Efficient and Cus-tomizable Attention Engine for LLM Inference Serving. In Eighth Conference on Machine Learning and Systems . https://openreview.net/ 
+
+13 Omin Kwon, Doyeon Kim, Jongseok Park, Seung Yul Lee, Ion Stoica, and Jae W. Lee forum?id=RXPofAsL8F 
+
+[47] Gyeong-In Yu, Joo Seong Jeong, Geon-Woo Kim, Soojeong Kim, and Byung-Gon Chun. 2022. Orca: A Distributed Serving System for Transformer-Based Generative Models. In 16th USENIX Symposium on Operating Systems Design and Implementation (OSDI 22) . USENIX Asso-ciation, Carlsbad, CA, 521–538. https://www.usenix.org/conference/ osdi22/presentation/yu 
+
+[48] Lianmin Zheng, Liangsheng Yin, Zhiqiang Xie, Chuyue Sun, Jeff Huang, Cody Hao Yu, Shiyi Cao, Christos Kozyrakis, Ion Stoica, Joseph E. Gonzalez, Clark Barrett, and Ying Sheng. 2024. SGLang: effi-cient execution of structured language model programs. In Proceedings of the 38th International Conference on Neural Information Processing Systems (Vancouver, BC, Canada) (NIPS ’24) . Curran Associates Inc., Red Hook, NY, USA, Article 2000, 27 pages. [49] Yinmin Zhong, Shengyu Liu, Junda Chen, Jianbo Hu, Yibo Zhu, Xu-anzhe Liu, Xin Jin, and Hao Zhang. 2024. DistServe: disaggregating prefill and decoding for goodput-optimized large language model serv-ing. In Proceedings of the 18th USENIX Conference on Operating Systems Design and Implementation (Santa Clara, CA, USA) (OSDI’24) . USENIX Association, USA, Article 11, 18 pages. 14

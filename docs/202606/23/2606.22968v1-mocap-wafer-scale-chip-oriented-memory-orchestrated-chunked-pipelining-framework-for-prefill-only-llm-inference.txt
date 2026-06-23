@@ -1,0 +1,507 @@
+Title: MOCAP: Wafer-Scale-Chip-Oriented Memory-Orchestrated Chunked Pipelining Framework for Prefill-Only LLM Inference
+
+URL Source: https://arxiv.org/pdf/2606.22968v1
+
+Published Time: Tue, 23 Jun 2026 02:46:34 GMT
+
+Number of Pages: 15
+
+Markdown Content:
+# MOCAP: Wafer-Scale-Chip-Oriented Memory-Orchestrated Chunked Pipelining Framework for Prefill-Only LLM Inference 
+
+Zichuan Wang 1∗, Huizheng Wang 1∗, Yuheng Xiao 1, Haonan Zuo 1, Taiquan Wei 1, Jinyi Deng 1, Chao Li 2, Yang Hu 1B, and Shouyi Yin 1,3 
+
+> 1
+
+School of Integrated Circuits, BNRist, Tsinghua University, Beijing, China, 100084  
+
+> 2
+
+School of Computer Science and Engineering, Shanghai Jiao Tong University, Shanghai, China, 200240  
+
+> 3
+
+Shanghai Artificial Intelligence Laboratory, Shanghai, China, 200433 
+
+> B
+
+Corresponding author, hu_yang@tsinghua.edu.cn  
+
+> ∗
+
+These authors contributed equally 
+
+Abstract. Large language models (LLMs) are increasingly used in prefill-only workloads, where end-to-end latency is dominated by the prefill phase. For long-context prefill, communication overhead grows with se-quence length and quickly becomes a bottleneck on conventional GPU systems, making wafer-scale chips (WSCs) a promising substrate due to their high communication bandwidth and large aggregate compute and memory capacity. A natural way to accelerate prefill is to partition a long input sequence into multiple chunks and execute them in a finer-grained pipeline across devices. However, directly applying this idea to long-context prefill on WSCs remains challenging. First, causal dependency across chunks causes KV cache to accumulate unevenly across pipeline stages, creating severe memory imbalance and limiting the feasible se-quence length. Second, later chunks require more attention computation because each chunk depends on preceding chunks, leading to chunk-level latency imbalance. To address these challenges, we present MOCAP, a memory-orchestrated chunked pipelining framework for prefill-only LLM inference on WSCs. MOCAP introduces Memory-Balanced KV Reallocation (MBKR) to al-leviate memory imbalance by redistributing KV cache across pipeline stages, thereby extending the feasible sequence length. It further incor-porates Latency-Balanced Chunk Partitioning (LBCP) to balance chunk execution cost under both attention-cost growth and KV reallocation overhead, improving pipeline efficiency. Experimental results show that, compared with GPipe, MOCAP achieves 76.4% lower end-to-end latency and 3.24 × higher throughput on average. MOCAP also extends the maxi-mum supported sequence length by up to 1.31 × compared with Terapipe. 
+
+Keywords: Wafer-Scale Chips, KV Cache Management, Prefill-Only LLM Inference 
+
+> arXiv:2606.22968v1 [cs.AR] 22 Jun 2026
+
+2 Authors Suppressed Due to Excessive Length Prefill “Who are you? ”           
+
+> KV Cache “Who are you? ”
+> “I”
+> “Who are you? I ”
+> Decoding “Why use AI? I am ”
+> “am ”
+> Prefill
+> “1 + 1 = 2 ? ”
+> ...
+> “1 + 1 = 2? ”
+> KV Cache
+> True
+> Reuse
+> Reuse
+> Only output
+> one token
+> Will not be reused
+> for future decoding
+> (a) Generative LLM inference
+> (b) Prefill -only LLM inference
+> Decoding
+> Reuse
+> 0
+> 25
+> 50
+> 75
+> 100
+> WSC average total latency
+> 46.8%
+> (c) GR24 performance on HGX B200 and wafer -scale chip
+> 512 1024 2048 8192 512 1024 2048 8192
+> Sequence Length
+> GPU average total latency
+> Normalized Latency
+> GPU communication GPU communication GPU computation GPU computation GPU total latency
+> WSC computation WSC computation WSC communication WSC communication WSC total latency
+> “LLM ”
+
+Fig. 1. (a)(b) LLM inference process. (c) End-to-end latency comparison between HGX B200 GPU systems and wafer-scale chips under equivalent compute and memory ca-pacity on the GR24 [40]. 
+
+## 1 Introduction 
+
+Large language models (LLMs) have transformed AI across a broad range of applications. Beyond generative appliccations [41], LLM-style transformer infer-ence is increasingly used in prefill-only scenarios [1, 40], where the system only needs to process the input context and produce one output token, as shown in Fig. 1 (b). In these workloads, the end-to-end latency is largely determined by the prefill phase, making prefill optimization essential. However, since the communication volume in prefill grows proportionally with sequence length, communication becomes the dominant bottleneck on widely deployed GPU systems, as illustrated in Fig. 1 (c). Recently, chip integration has advanced toward wafer-scale chips (WSCs) [4, 10, 11, 18, 21, 22], which provide much higher compute density, memory capacity, and communication bandwidth. This makes WSCs a promising substrate for communication-intensive prefill. As shown in Fig. 1 (c), the communication advantage of WSCs reduces end-to-end latency by 46.8% compared with GPU systems. However, existing studies [3, 37] mainly focus on general inference, and do not specifically optimize prefill-only execution. Terapipe [9] proposes a token-wise pipeline for the forward pass of LLM training, which exploits the causal dependency along the token dimension to enable token-wise pipelined execution across devices. Inspired by this idea, prefill can similarly partition the sequence into multiple chunks and execute them as a fine-grained chunked pipeline to reduce pipeline bubbles and improve utilization. However, directly extending such a pipeline to prefill remains challenging. First, causal dependency across chunks causes the KV cache to accumulate un-evenly across pipeline stages, and the resulting memory pressure quickly becomes a bottleneck, limiting the feasible sequence length. Second, the execution cost of 1. INTRODUCTION 3Stage 1        
+
+> Stage 2
+> Stage 3
+> Stage 4
+> Time
+> Stage 1
+> Stage 2
+> Stage 3
+> Stage 4
+> (a) Microbatch -based pipeline (Gpipe) (d) Timeline of token -based pipeline (b) Token -based pipeline (Terapipe)
+> Stage 3 Transformer Layers 3 Transformer Layers 3
+> Stage 4 Transformer Layers 4 Transformer Layers 4 Transformer Layers 4 Transformer Layers 4
+> Stage 2 Transformer Layers 2 Transformer Layers 2
+> Stage 1
+> Transformer Layers 1 Transformer Layers 1
+> Less E2E Latency
+> Higher
+> Throughput
+> Less Fill Latency
+> (c) Timeline of microbatch -based pipeline Time
+
+Fig. 2. Overview of microbatch-based pipeline and token-based pipeline. 
+
+different chunks is inherently imbalanced: later chunks incur higher attention la-tency due to their longer prefixes, so uniform chunk partitioning creates pipeline bubbles and degrades pipeline efficiency. Therefore, making the chunked prefill pipeline effective requires jointly addressing both KV cache accumulation and chunk-level latency imbalance. To this end, we present MOCAP, a memory-orchestrated chunked pipelin-ing framework for efficient prefill-only LLM inference on wafer-scale chips. First, MOCAP introduces Memory-Balanced KV Reallocation, which redistributes KV cache across pipeline stages to mitigate memory imbalance and relieve KV cache buildup at earlier stages, thereby enabling longer sequence execution under lim-ited memory. Second, MOCAP incorporates Latency-Balanced Chunk Partition-ing, which adaptively partitions the input sequence into non-uniform chunks to balance KV cache reallocation overhead and reduce pipeline bubbles caused by the increasing attention latency of later chunks. Together, MOCAP transforms the chunked pipeline into a scalable and efficient execution paradigm for prefill-only LLM inference on WSCs. Our contributions are summarized as follows: (1) We propose MOCAP, a memory-orchestrated chunked pipelining frame-work for prefill-only LLM inference on wafer-scale chips. To the best of our knowledge, this is the first work to systematically optimize prefill-only LLM inference on WSCs .(2) We develop Memory-Balanced KV Reallocation, which mitigates stage-wise KV cache accumulation by redistributing KV cache across pipeline stages, improving memory utilization and enabling longer sequence execution. (3) We design Latency-Balanced Chunk Partitioning, which balances KV cache reallocation overhead and compute imbalance through non-uniform parti-tioning. (4) On average, MOCAP reduces end-to-end latency by 76.4% and improves throughput by 3.24 × over GPipe. It also extends the maximum supported se-quence length by up to 1.31 × compared with Terapipe. 4 Authors Suppressed Due to Excessive Length 
+
+## 2 Background 
+
+2.1 Prefill-Only LLM Inference 
+
+Prefill-only LLM inference [1,40] represents an emerging class of workloads where the model processes the entire input sequence to produce only one token, with-out long autoregressive decoding. Unlike generative inference, which repeatedly reuses the KV cache during decoding, as shown in Fig. 1 (a), prefill-only inference does not require the generated KV cache to be reused for future long decoding. Because the output is produced immediately after prefilling, the overall service latency is largely determined by the prefill phase. This execution pattern leads to several distinctive system characteristics. First, although the KV cache is generated during prefilling, it does not need to be persistently stored for future decoding reuse, fundamentally changing the role of KV-cache management. Second, practical prefill-only workloads often involve long input contexts of up to 10 5 [40], so the system bottleneck shifts from iterative decoding efficiency to efficient processing of long sequences. 
+
+2.2 Chunked Pipeline 
+
+Terapipe [9] introduces chunked pipeline to alleviate the coarse granularity of microbatch-based pipeline parallelism. Unlike GPipe [5], which pipelines micro-batches across stages as shown in Fig. 2(a), Terapipe pipelines token chunks across stages (Fig. 2(b)), thereby shortening pipeline fill time and improving throughput, as illustrated in Fig. 2(c)(d). Inspired by this idea, prefill can like-wise partition the input sequence into chunks and execute them in a chunked pipeline. Chunked pipeline induces a cross-chunk dependency through causal atten-tion. As shown in Fig. 2(b), each chunk must attend to the key-value tensors generated by all preceding chunks. This dependency has two implications: 1) KV caches from earlier chunks must remain live for subsequent computation, causing progressive accumulation over the pipeline lifetime. 2) Later chunks face longer prefixes and therefore higher attention latency, which can manifest as pipeline bubbles. 
+
+2.3 Wafer-Scale Chips 
+
+Wafer-scale chips (WSCs) [4, 10, 21, 22] extend chip integration beyond the con-ventional reticle limit through advanced packaging technologies. As illustrated in Fig. 3 (a), WSCs consist of an interposer and multiple known-good dies (KGDs). The interposer provides dense on-package interconnects, in which die-to-die spac-ing is minimized to satisfy signal integrity constraints and maximize communi-cation bandwidth. To preserve ultra-short inter-die links while maintaining scal-able routing complexity, wafer-scale chips commonly adopt a nearest-neighbor 2D mesh topology, where each die physically connects to adjacent neighbors. Fig. 3 (b) further shows a representative die architecture, where each compute 3. MOTIVATION 5218mm     
+
+> 190mm
+> HBM4
+> HBM4
+> HBM4
+> HBM4
+> HBM4
+> 53 mm
+> 46mm
+> (a) Overview of wafer -level architecture (b) Overview of die architecture
+> Round Hole Core
+> Interposer IO Die
+> HBM Compute Die
+> Fig. 3. Overview of wafer-scale chip architecture.
+
+die contains an array of compute cores equipped with distributed SRAM for local buffering, while HBM stacks are placed around the compute die to provide large-capacity off-die storage and high memory access bandwidth. A key architectural distinction between wafer-scale chips and conventional GPU systems lies in the communication fabric. 1) Wafer-scale chips provide up to 10 TB/s die-to-die bandwidth, which is sufficient to largely mask KV-cache transfer overhead compared with the 900 GB/s NVLink [17] bandwidth in widely deployed GPU systems. 2) The same communication interface can also be used by edge IO dies, extending the high-bandwidth domain beyond a local package region. 3) D2D bandwidth becomes comparable to HBM bandwidth, making cross-die data movement a practical option. 
+
+## 3 Motivation 
+
+3.1 Memory Imbalance Limits Feasible Sequence Length Challenge: As the sequence length grows, stage-wise KV-cache ac-cumulation becomes increasingly imbalanced, eventually limiting the feasible sequence length. As illustrated in Sec. 2.2, earlier stages start accu-mulating KV cache earlier and keep it for longer, while later stages experience a much shorter accumulation window. This asymmetric KV-cache lifetime causes the peak memory occupancy to concentrate on the earliest stages. As illustrated in Fig. 4 (a), the system is effectively bounded by the earliest-stage memory bottleneck: once the earliest stage reaches its memory limit, the execution can no longer scale to longer sequences, even though substantial memory capacity on later stages remains unused. In other words, the feasible sequence length is constrained by the peak per-stage occupancy rather than by the aggregate 6 Authors Suppressed Due to Excessive Length 3 51 2 4 63 51 2 4 6                                
+
+> 654123654123
+> 412356412356
+> 412356412356
+> ichunk i
+> Stage 0
+> Stage 1
+> Stage 2
+> Stage 3
+> Time
+> Stage 0
+> Stage 1
+> Stage 2
+> Stage 3
+> (a) Memory utilization in chunked pipeline Time Request 1
+> Memory Utilization
+> chunk i in request jBubble Remote access blocking
+> (b) Stage -wise execution timeline in Chunked pipeline
+> Request 2
+> Memory Bottleneck
+> Wasted
+> Transfer partial KV
+> Saved
+
+Fig. 4. Stage-wise memory and execution latency imbalance introduced by chunked pipeline. 
+
+memory capacity of the system, leaving a large fraction of memory stranded on non-bottleneck stages. 
+
+Insight: Such skewed memory utilization creates an opportunity to extend sequence headroom through stage-aware KV-cache realloca-tion. Although KV-cache accumulation is highly skewed, the memory pressure is not simultaneously saturated across all stages. In particular, when the ear-liest stage approaches its memory limit, later stages may still have substantial available space. As highlighted by the wasted and saved regions in Fig. 4 (a), transferring part of the accumulated KV cache away from the bottleneck stage can reduce the peak memory occupancy and convert otherwise wasted memory on other stages into effective sequence headroom. Motivated by this opportunity, we propose Memory-Balanced KV Reallocation (MBKR) to mitigate memory imbalance and extend the feasible sequence length without requiring additional hardware memory. 
+
+3.2 Latency Imbalance Limits Compute Utilization Challenge: Chunk latency becomes increasingly imbalanced as execu-tion progresses, which limits the compute utilization of the chunked pipeline. The latency of each chunk consists of two major components: the attention latency and the GEMM latency, where the latter includes the QKV projection, the output projection, and the FFN computation. For the i-th chunk with length ci, these two components can be approximated as 
+
+Ti, attn ∝ ci(pi + ci), p i =
+
+> i−1
+
+X
+
+> j=1
+
+cj Ti, gemm ∝ ci, (1) 4. MOCAP FRAMEWORK 7
+
+where pi denotes the prefix length preceding the i-th chunk. This decompo-sition reveals the source of imbalance: as execution proceeds, the prefix length grows monotonically, causing later chunks to incur increasingly higher atten-tion latency, while the GEMM latency only scales with the chunk size itself. As shown in Fig. 4 (b), uniformly partitioned chunks therefore exhibit increasingly imbalanced execution time, which manifests as visible pipeline bubbles. More-over, once KV cache is reallocated across stages, some stages must fetch KV data from remote stages during execution. These remote fetches do not merely add communication overhead; the accessed stage must spend time serving the re-quest, which can delay its own local computation and thereby extend the critical path. As shown by the blue shaded blocks in Fig. 4(b), this additional blocking further aggravates chunk-level latency imbalance. 
+
+Insight: This inefficiency can be mitigated by reshaping chunk boundaries to compensate for both prefix-induced attention growth and reallocation-induced blocking. Since later chunks are inherently more expensive, assigning them the same size as earlier chunks is suboptimal. Instead, later chunks can be made smaller while earlier chunks take relatively larger por-tions of the sequence, so that the reduction in chunk size offsets the growth of attention latency as well as the additional delay caused by remote KV accesses. As suggested by the reduced bubbles and blocking intervals in Fig. 4(b), such latency-aware partitioning can better balance chunk execution time, shorten the critical path, and improve effective overlap across stages. To address this issue, we propose Latency-Balanced Chunk Partitioning (LBCP) to mitigate latency imbalance and improve compute utilization in chunked pipeline execution. 
+
+## 4 MOCAP Framework 
+
+4.1 Memory-Balanced KV Reallocation 
+
+As discussed in Sec. 3.1, the chunked pipeline creates a predictable stage-wise KV-cache imbalance. Exploiting this opportunity faces two challenges: (1) iden-tifying a stage-pairing strategy that maximizes usable memory capacity, and (2) minimizing the communication cost introduced by KV-cache transfers. There-fore, an effective reallocation scheme must jointly optimize memory utilization and transfer overhead. To this end, we propose Memory-Balanced KV Reallocation (MBKR). MBKR first identifies a stage placement strategy that maximizes memory utilization, and then applies a runtime reallocation policy. To describe this interaction, we refer to stages under excessive memory pressure as debtor stages , since they need to spill part of their KV cache, and stages with sufficient residual capacity as 
+
+creditor stages , since they host spilled KV data and serve remote KV requests. For stage placement, prior work on LLM training [6,29] adopts a head-to-tail pairing strategy, which pairs the stage with the highest memory pressure with the stage that has the lowest memory pressure, as shown in Fig. 5 (b, left). Such a placement is effective when the memory-pressure pattern remains stable. 8 Authors Suppressed Due to Excessive Length Memory utilization  
+
+> Stage 0
+> Stage 1
+> Stage 2
+> Stage 3
+> Stage 7
+> Stage 6
+> Stage 5
+> Stage 4
+> Stage 0
+> Stage 1
+> Stage 2
+> Stage 3
+> Stage 7
+> Stage 6
+> Stage 5
+> Stage 4
+> 1
+> 0
+> Pipeline path Debtor to creditor path
+
+(a) The proposed SCKP strategy :                 
+
+> Input: chunk scheme {c 1,c2,…,cM},stage
+> count N ,thresholds p 1,p2,memory
+> occupancy of stage isi
+> 1
+> 2
+> 3
+> 4
+> 5
+> 6
+> 7
+> 8
+> 9
+> 10
+> 11
+> 12
+> 13
+> Memory utilization
+> 1
+> 0
+> Stage 0
+> Stage 1
+> Stage 2
+> Stage 3
+> Stage 4
+> Stage 5
+> Stage 6
+> Stage 7
+> Stage 0
+> Stage 1
+> Stage 2
+> Stage 3
+> Stage 4
+> Stage 5
+> Stage 6
+> Stage 7
+> for each stage i do
+> compute KV inew
+> // local only state
+> if s i< p 1then
+> load KV ilocal
+> // creditor state
+> else if s i< p 2then
+> store KV i+N/2 new to local
+> load KV ilocal
+> send KV i+N/2 global to stage i-N/2
+> // debtor state
+> else
+> load KV iglobal from stage i+N/2
+> load KV ilocal from stage i
+> end if
+> end for
+> (b) Naï ve head -to -tail stage placement
+> (c) MBKR ’s fixed cross -half pairing stage placement
+
+Fig. 5. Overview of memory-balanced KV reallocation. 
+
+However, in chunked pipeline execution, the imbalance pattern changes during request transitions, causing the pairing to become mismatched. In particular, when the hotspot shifts to Stage 3, its original paired stage, Stage 4, differs from it by only one chunk in memory occupancy, which means this head-to-tail strategy provides at most half a chunk of additional usable space. Fig. 5(b, right) illustrates a natural remedy to dynamically rematch debtor and creditor stages according to instantaneous memory usage, so that the most heavily loaded stage is always paired with the least loaded one. However, such dynamic rematching would require previously spilled KV cache to be migrated again whenever the pairing changes, introducing substantial extra communication and severe link contention. To avoid this overhead, MBKR adopts a fixed cross-half pairing, i.e., Stage i
+
+is paired with Stage i + N 
+
+> 2
+
+, and allows each paired stage to dynamically assume debtor or creditor roles according to runtime memory pressure. As shown in Fig. 5 (c, left), this pairing is effective in the steady phase because the two paired stages consistently differ by N 
+
+> 2
+
+chunks in memory pressure, thereby preserving the maximum spill capacity. More importantly, the same relation remains valid in the switching phase. As shown in Fig. 5 (c, right), although the memory hotspot shifts across stages during request transitions, each stage is still paired with another stage whose pressure differs by N 
+
+> 2
+
+chunks, so the fixed pairing continues to provide sufficient spill space without online rematching. In addition, MBKR places stage i adjacent to stage i+ N 
+
+> 2
+
+, so that KV-cache transfers between paired stages traverse the shortest path. This minimizes communication overhead and reduces link contention caused by spill and remote-access traffic. In this way, MBKR simultaneously maximizes usable spill space and minimizes transfer cost under a fixed pairing strategy. 4. MOCAP FRAMEWORK 9
+
+Algorithm 1: Latency-balanced Chunk Partitioning Scheme 
+
+Input: #Stage N , #Chunk M , sequence length S
+
+Output: Optimal batch size B∗, chunk slice scheme ss ∗, E2E latency T ∗ 
+
+> 1
+
+for m ← M to 1 do  
+
+> 2
+
+for s ← S − 1 to 0 do  
+
+> 3
+
+for k ← 1 to S − s − (M − m) do  
+
+> 4
+
+t ← EvaluateChunk (k, s ); 
+
+> 5
+
+t′ 
+
+> max
+
+← max( tmax [m + 1][ s + k], t ), t′P ← tP[m + 1][ s + k] + t; 
+
+> 6
+
+if t′P + ( N − 1) t′ 
+
+> max
+
+< t P[m][ s] + ( N − 1) tmax [m][ s] then  
+
+> 7
+
+tmax [m][ s] ← t′
+
+> max
+
+, tP[m][ s] ← t′P, ss [m][ s] ← k; 
+
+> 8
+
+while T emp > T emp min do  
+
+> 9
+
+for r ← 1 to R do  
+
+> 10
+
+ss ′ ← Perturb (ss ); 
+
+> 11
+
+(B′, T ′
+
+> pre
+
+) ← EvaluatePrefill (ss ′), T ′ ← EvaluateE2E (B′, T ′
+
+> pre
+
+); 
+
+> 12
+
+if T ′ < T or Rand (0 , 1) < exp( −(T ′ − T )/T emp ) then  
+
+> 13
+
+ss ← ss ′, B ← B′, T ← T ′; 
+
+> 14
+
+if T < T ∗ then  
+
+> 15
+
+ss ∗ ← ss , B∗ ← B, T ∗ ← T ; 
+
+> 16
+
+T emp ← α · T emp ;
+
+Fig. 5 (a) further illustrates the runtime policy of MBKR in an SPMD form. At the beginning of the chunked pipeline, every stage computes the newly gen-erated KV cache (lines 1-2). If si < p 1, the stage remains local-only and loads all required KV cache locally (lines 3-4). If p1 ≤ si < p 2, the stage acts as a creditor: it stores newly spilled KV cache from its paired stage while still serving its own local accesses, and sends the globally visible remote portion to the corresponding debtor stage when needed (lines 5-8). Otherwise, when si ≥ p2, the stage acts as a debtor and splits its KV accesses into a remote portion loaded from stage 
+
+i + N 
+
+> 2
+
+and a local portion loaded from itself (lines 9-11). In this way, MBKR turns a fixed cross-half pairing into a threshold-driven runtime KV-reallocation policy, without incurring the migration cost of online rematching. 
+
+4.2 Latency-Balanced Chunk Partitioning 
+
+As illustrated in Sec. 2.2, chunked pipeline suffers from two sources of chunk-level latency imbalance: the monotonic growth of attention latency with prefix length, and the additional KV reallocation overhead introduced by remote KV accesses. Together, these factors make chunk latency depend not only on the chunk size, but also on the chunk position and cross-stage KV reallocation. Under this coupled effect, end-to-end latency depends on the full chunk slice scheme and therefore no longer admits the local optimal substructure required by exact dynamic programming. 10 Authors Suppressed Due to Excessive Length #Chunk 8 16 32 8 16 32 8 16 32 8 16 32                  
+
+> Llama3 -70B Mistral -123B Qwen3 -235B Llama3 -405B
+> Terapipe MOCAP
+> Max Seq. Length (K) Gpipe+WSC Terapipe+WSC MOCAP+WSC
+> Norm. Throughput
+> Norm. E2E Latency
+> 4.5K 5K 5.6K 6K 6.4K 1.6K 1.8K 2K
+> Mistral -123B Qwen3 -235B Llama3 -405B
+> Sequence
+> Length(K)
+> 4K 8K 8.4K
+> Llama3 -70B
+> 7.6K
+> (a) (b)
+> 0
+> 3K
+> 6K
+> 9K
+> 12K
+> 0
+> 12
+> 24
+> 36
+> 48
+> 0
+> 12
+> 24
+> 36
+> 48
+> 0
+> 4
+> 8
+> 12
+> 16
+> 0
+> 4
+> 8
+> 12
+> 16
+
+Fig. 6. (a) Performance of GPipe, Terapipe and MOCAP on WSCs. Red crossed marks indicate that the corresponding prefill jobs fail to run due to out-of-memory errors. (b) Maximum sequence length of Terapipe and MOCAP across different models and number of chunks. 
+
+To address this challenge, we propose Latency-Balanced Chunk Partitioning 
+
+(LBCP). LBCP first derives a compute-balanced chunk slicing scheme as an initialization, and then refines it under the full MBKR-enabled execution model, allowing it to efficiently optimize chunk boundaries for end-to-end latency. In the first stage, LBCP uses dynamic programming to derive a compute-balanced chunk slice scheme, which serves as the initialization for the subsequent search for the partition that minimizes end-to-end latency (lines 1-7 in Alg. 1). The loops enumerate the chunk index m, the current position s, and the candi-date chunk size k (lines 1-3). EvaluateChunk returns the compute latency t
+
+(line 4), which is combined with the suffix state at (m+1 , s +k) to form t′ 
+
+> max
+
+and 
+
+t′P (line 5). The algorithm selects the candidate that minimizes t′P +( N −1) t′
+
+> max
+
+and records the corresponding k in the chunk slice scheme ss (lines 6-7). This proxy yields a compute-balanced partition that provides a robust initialization for the second-stage search. Since it captures only deterministic compute cost, varying the batch size does not affect the relative ranking of candidate partitions. In the second stage, LBCP refines the partition via simulated annealing un-der the full MBKR-enabled execution model (lines 8-16 in Alg. 1). Each iteration perturbs one chunk boundary while preserving S and M (lines 8–10). Evalu-atePrefill returns the maximum feasible batch size B′ and prefill latency T ′
+
+> pre
+
+.
+
+EvaluateE2E then computes the corresponding end-to-end latency T ′ based on B′ and T ′ 
+
+> pre
+
+(line 11). Better candidates are accepted directly, while worse ones are accepted with a temperature-controlled probability (lines 12-13). The algorithm updates the best solution and gradually cools the temperature (lines 14-16). This refinement captures the coupled effect of compute growth and KV reallocation overhead ignored by the first-stage proxy, and further improves the partition for end-to-end latency. In this way, LBCP efficiently optimizes chunk boundaries for end-to-end latency under both compute growth and KV reallo-cation overhead. 5. EVALUATION 11 
+
+## 5 Evaluation 
+
+5.1 Experimental Setup Hardware Configuration : We configure each die in the WSC to be equiva-lent to an NVIDIA Blackwell GPU [17] capable of 4.5 PFLOPS, equipped with 180GB HBM featuring 7.7 TB/s access bandwidth. According to SoW-X [21], D2D bandwidth and cross-wafer bandwidth are both set at 5 TB/s. A 4 ×4 WSC configuration delivers 72 PFLOPS and 2.8TB memory capacity. 
+
+Workload : Given that model size is a key factor influencing performance, we select a series of models from 70B to 405B for our experiments, including Llama3-70B [13], Mistral-123B [15], Qwen3-235B [19], and Llama3-405B [14]. 
+
+Methodology : To evaluate our proposed strategies, we develop a custom event-driven simulator built upon ASTRA-sim 2.0 [35]. We adopt end-to-end (E2E) latency and throughput as our primary evaluation metrics. E2E latency denotes the average time elapsed per request from arrival to completion, encom-passing queuing delays and prefill execution latency. Throughput is defined as the total number of requests processed per second (req/s). 
+
+5.2 Performance on Wafer-scale Chips Performance compared with GPipe and Terapipe. We first evaluate MO-CAP against two baselines, GPipe [5] and Terapipe [9]. GPipe serves as a conven-tional microbatch-based pipeline, while Terapipe represents a chunked pipeline. We perform this comparison on a 4 × 4 WSC across four representative LLMs and vary the sequence length. This setting allows us to jointly evaluate MOCAP under diverse model scales and attention characteristics. Fig. 6(a) presents the performance comparison among MOCAP, GPipe, and Terapipe on the WSC across multiple LLM models and sequence lengths. MO-CAP consistently achieves the lowest normalized end-to-end latency and the highest normalized throughput across all evaluated settings. On average, com-pared with GPipe, MOCAP reduces end-to-end latency by 76.4% and improves throughput by 3.24 ×. These gains mainly arise from two factors: 1) KV re-allocation recovers memory headroom under severe KV accumulation, allow-ing chunked pipelining to remain effective in the long-context regime; and 2) imbalance-aware partitioning reduces pipeline bubbles and mitigates the perfor-mance impact of the additional reallocation overhead. Furthermore, the results reveal two additional insights: 1) MOCAP’s gain is shaped not only by nomi-nal model size, but also by model architecture. Qwen3-235B is an MoE model, whose sparse activation lowers effective per-token compute, while Llama3-405B adopts a larger GQA ratio, which reduces KV-cache footprint and weakens the memory bottleneck from KV accumulation. 2) MOCAP’s relative gain decreases with sequence length, indicating that the increasing KV reallocation overhead gradually offsets a larger fraction of the benefit from chunked pipeline. 
+
+Maximum sequence length compared with Terapipe. We further eval-uate the maximum feasible sequence length of MOCAP relative to Terapipe, and 12 Authors Suppressed Due to Excessive Length 
+
+observe an average improvement of up to 1.31 ×, as shown in Fig. 6 (b). We also find that using fewer chunks generally allows longer feasible sequences. Under a fixed sequence length, fewer chunks imply a larger chunk size, which enlarges the memory imbalance across stages: earlier stages accumulate KV cache more aggressively, while later stages leave more memory space unused. This stronger stage-wise imbalance creates more reallocation headroom for MBKR and thus supports a larger amount of spilled KV cache. However, larger chunks increase pipeline fill time, reducing pipeline efficiency. This reveals a fundamental trade-off in chunked pipeline: fewer chunks favor longer feasible sequences, while more chunks favor higher pipeline efficiency. 
+
+## 6 Related Work 
+
+Prior studies [2–4,8,11,20,23,29,31–34,36–38] have explored architecture–system co-design for wafer-scale AI systems across LLM training and inference. Repre-sentative efforts such as WSC-LLM [37] jointly optimize LLM inference serving and wafer-scale architectures, whereas WATOS [29] co-explores LLM recompu-tation strategies and wafer-scale architectures for training. Nevertheless, these studies focus on general serving or training scenarios, rather than the unique memory-access and scheduling challenges of prefill-only inference. Beyond WSCs, prior LLM accelerators [12,24–28,30,39] improve Transformer inference at the operator or standalone-accelerator scale through attention spar-sity [24, 28], bit-level compute–memory co-optimization [25, 30], and data com-pression [7, 16]. Nevertheless, they do not address orchestration and scheduling for multi-die parallel execution. In contrast, MOCAP targets prefill-only LLM inference on WSCs with a memory-orchestrated chunked pipelining framework. 
+
+## 7 Conclusion 
+
+This paper presents MOCAP, a memory-orchestrated chunked pipelining frame-work for prefill-only LLM inference on wafer-scale chips. By combining MBKR and LBCP, MOCAP jointly mitigates memory imbalance and compute imbal-ance in chunked pipeline execution, thereby extending the feasible sequence length and improving compute utilization. Compared with GPipe, MOCAP achieves 76.4% lower end-to-end latency and 3.24 × higher throughput on av-erage. Compared with Terapipe, MOCAP extends the maximum supported se-quence length by up to 1.31 ×.
+
+## Acknowledgments 
+
+This work was supported in part by the National Science and Technology Major Project under Grant 2022ZD0115200; by NSFC under Grant 92464302, Grant 62125403, Grant U24B20164, Grant U24A20234 and Grant 62502255; in part by the Beijing S&T Project Z251100008425010; Shanghai Municipal Science and 7. CONCLUSION 13 
+
+Technology Major project; the Natural Science Foundation of Jiangsu Province Basic Research Program under Grant BK20243042; the BNRist; and the Beijing Advanced Innovation Center for Integrated Circuits. 
+
+## Declaration on the Use of Artificial Intelligence 
+
+Artificial intelligence tools, if used, were used only for language organization and figure/table polishing, and did not participate in the generation of the core ideas or technical content. 
+
+## References 
+
+1. Du, K., Wang, B., Zhang, C., Cheng, Y., Lan, Q., Sang, H., et al.: Prefillonly: An inference engine for prefill-only workloads in large language model applications. In: Proceedings of the ACM SIGOPS 31st Symposium on Operating Systems Princi-ples. pp. 399–414 (2025) 2. Fang, J., Wang, H., Yang, Q., Kong, D., Dai, X., Deng, J., et al.: PALM: A efficient performance simulator for tiled accelerators with large-scale model training. arXiv preprint arXiv:2406.03868 (2024) 3. He, C., Huang, Y., Mu, P., Miao, Z., Xue, J., Ma, L., et al.: WaferLLM: Large language model inference at wafer scale. arXiv preprint arXiv:2502.04563 (2025) 4. Hu, Y., Lin, X., Wang, H., He, Z., Yu, X., Zhang, J., et al.: Wafer-scale computing: Advancements, challenges, and future perspectives. IEEE Circuits and Systems Magazine 24 (1), 52–81 (2024) 5. Huang, Y., Cheng, Y., Bapna, A., Firat, O., Chen, D., Chen, M., et al.: Gpipe: Efficient training of giant neural networks using pipeline parallelism. Advances in neural information processing systems 32 (2019) 6. Kim, T., Kim, H., Yu, G.I., Chun, B.G.: Bpipe: Memory-balanced pipeline paral-lelism for training large language models. In: International Conference on Machine Learning. pp. 16639–16653. PMLR (2023) 7. Lee, S., Kim, B., Park, J., Jeon, D.: Clat: A clustering-based attention transformer accelerator for low-latency text generation in llms. IEEE Transactions on Circuits and Systems I: Regular Papers (2025) 8. Li, C., Wang, H., Liu, J., Liu, J., Yue, Z., Li, X., et al.: Rethermal: Co-design of thermal-aware static and dynamic scheduling for llm training on liquid-cooled wafer-scale chips. In: 2026 IEEE International Symposium on High Performance Computer Architecture (HPCA). pp. 1–15. IEEE (2026) 9. Li, Z., Zhuang, S., Guo, S., Zhuo, D., Zhang, H., Song, D., et al.: Terapipe: Token-level pipeline parallelism for training large-scale language models. In: International Conference on Machine Learning. pp. 6543–6552. PMLR (2021) 10. Lie, S.: Cerebras architecture deep dive: First look inside the hw/sw co-design for deep learning: Cerebras systems. In: 2022 IEEE Hot Chips 34 Symposium (HCS). pp. 1–34. IEEE Computer Society (2022) 11. Liu, Y., Pan, Y., Wang, M., Zhao, S., Zhu, H., Han, Y., et al.: Ouroboros: Wafer-scale sram cim with token-grained pipelining for large language model inference. In: Proceedings of the 31st ACM International Conference on Architectural Support for Programming Languages and Operating Systems, Volume 2. pp. 1349–1365 (2026) 14 Authors Suppressed Due to Excessive Length 12. Lu, L., Jin, Y., Bi, H., Luo, Z., Li, P., Wang, T., et al.: Sanger: A co-design frame-work for enabling sparse attention using reconfigurable architecture. In: MICRO-54: 54th Annual IEEE/ACM International Symposium on Microarchitecture. pp. 977–991 (2021) 13. Meta: Meta-Llama-3-70B (2024), [Online]. Available: https://huggingface.co/ meta-llama/Meta-Llama-3-70B 
+
+14. Meta AI: Llama-3.1-405B (2024), [Online]. Available: https://huggingface.co/ meta-llama/Llama-3.1-405B 
+
+15. Mistral AI: Mistral-Large-Instruct-2407 (2024), [Online]. Available: https:// huggingface.co/mistralai/Mistral-Large-Instruct-2407 
+
+16. Moon, S., Li, M., Chen, G.K., Knag, P.C., Krishnamurthy, R.K., Seok, M.: T-REX: A 68-to-567 μs/token 0.41-to-3.95 μJ/token transformer accelerator with reduced external memory access and enhanced hardware utilization in 16nm FinFET. In: 2025 IEEE International Solid-State Circuits Conference (ISSCC). vol. 68, pp. 406–408. IEEE (2025) 17. NVIDIA: NVIDIA DGX Vera Rubin NVL72 (2026), [Online]. Available: https: //www.nvidia.com/en-us/data-center/dgx-vera-rubin-nvl72/ 
+
+18. Pal, S., Liu, J., Alam, I., Cebry, N., Suhail, H., Bu, S., et al.: Designing a 2048-chiplet, 14336-core waferscale processor. In: 2021 58th ACM/IEEE Design Au-tomation Conference (DAC). pp. 1183–1188. IEEE (2021) 19. Qwen: Qwen3-235B-A22B (2025), [Online]. Available: https://huggingface.co/ Qwen/Qwen3-235B-A22B 
+
+20. Rashidi, S., Won, W., Srinivasan, S., Gupta, P., Krishna, T.: FRED: Flexible reduction-distribution interconnect and communication implementation for wafer-scale distributed training of DNN models. arXiv preprint arXiv:2406.19580 (2024) 21. Shih, P.C., Su, A.J., Tam, K.H., Huang, T.C., Chuang, K., Yeh, J.: SoW-X: A novel system-on-wafer technology for next generation AI server application. In: 2025 IEEE 75th Electronic Components and Technology Conference (ECTC). pp. 1–6. IEEE (2025) 22. Talpes, E., Williams, D., Sarma, D.D.: Dojo: The microarchitecture of Tesla’s exa-scale computer. In: 2022 IEEE Hot Chips 34 Symposium (HCS). pp. 1–28. IEEE Computer Society (2022) 23. Tang, X., Hou, J., Jiang, D., Wei, T., Liu, J., Deng, J., et al.: Moentwine: Unleash-ing the potential of wafer-scale chips for large-scale expert parallel inference. In: 2026 IEEE International Symposium on High Performance Computer Architecture (HPCA). pp. 1–15. IEEE (2026) 24. Wang, H., Fang, J., Tang, X., Yue, Z., Li, J., Qin, Y., et al.: SOFA: A compute-memory optimized sparsity accelerator via cross-stage coordinated tiling. In: 2024 57th IEEE/ACM International Symposium on Microarchitecture (MICRO). pp. 1247–1263. IEEE (2024) 25. Wang, H., Wang, H., Wang, Z., Yue, Z., Wang, Y., Li, C., et al.: Pade: A predictor-free sparse attention accelerator via unified execution and stage fusion. In: 2026 IEEE International Symposium on High Performance Computer Archi-tecture (HPCA). pp. 1–19. IEEE (2026) 26. Wang, H., Wang, H., Wei, S., Hu, Y., Yin, S.: Bitstopper: An efficient transformer attention accelerator via stage-fusion and early termination. In: 2026 31st Asia and South Pacific Design Automation Conference (ASP-DAC). pp. 162–169. IEEE (2026) 27. Wang, H., Wang, H., Wei, S., Hu, Y., Yin, S.: Lapa: Log-domain prediction-driven dynamic sparsity accelerator for transformer model. In: 2026 31st Asia and South Pacific Design Automation Conference (ASP-DAC). pp. 154–161. IEEE (2026) 7. CONCLUSION 15 28. Wang, H., Wang, H., Yue, Z., Liu, J., Wei, T., Hu, S.W.Y., et al.: BETA: A bit-Grained Transformer attention accelerator With efficient early termination. IEEE Transactions on Circuits and Systems II: Express Briefs (2025) 29. Wang, H., Wang, Z., Wang, H., Hou, J., Wei, T., Li, C., et al.: Watos: Efficient llm training strategies and architecture co-exploration for wafer-scale chip. In: 2026 IEEE International Symposium on High Performance Computer Architec-ture (HPCA). pp. 1–19. IEEE (2026) 30. Wang, H., Wang, Z., Yue, Z., Long, Y., Wei, T., Yang, J., et al.: MCBP: A memory-compute efficient LLM inference accelerator leveraging bit-slice-enabled sparsity and repetitiveness. In: Proceedings of the 58th IEEE/ACM International Sympo-sium on Microarchitecture ®. pp. 1592–1608 (2025) 31. Wang, H., Wei, T., Wang, H., Wang, Z., Tang, X., Yue, Z., et al.: Designing spatial architectures for sparse attention: Star accelerator via cross-stage tiling. IEEE Transactions on Computers (2025) 32. Wang, H., Wei, T., Wang, Z., Jiang, D., Yang, Q., Liu, J., et al.: Temp: A memory efficient physical-aware tensor partition-mapping framework on wafer-scale chips. In: 2026 IEEE International Symposium on High Performance Computer Archi-tecture (HPCA). pp. 1–18. IEEE (2026) 33. Wang, H., Yang, Q., Wei, T., Yu, X., Li, C., Fang, J., et al.: TMAC: Training-targeted mapping and architecture co-exploration for wafer-scale chips. Integrated Circuits and Systems (2024) 34. Wei, T., Wang, H., Wang, Z., Yin, S., Hu, Y.: Spatial-aware orchestration of LLM attention on waferscale chips. In: International Symposium on Advanced Parallel Processing Technologies. pp. 386–391. Springer (2025) 35. Won, W., Heo, T., Rashidi, S., Sridharan, S., Srinivasan, S., Krishna, T.: Astra-sim2. 0: Modeling hierarchical networks and disaggregated systems for large-model training at scale. In: 2023 IEEE International Symposium on Performance Analysis of Systems and Software (ISPASS). pp. 283–294. IEEE (2023) 36. Xu, Z., Kong, D., Liu, J., Jiang, D., Dai, X., Deng, J., et al.: Face: Fully overlapped pd scheduling and multi-level architecture co-exploration on wafer. In: 2026 IEEE International Symposium on High Performance Computer Architecture (HPCA). pp. 1–16. IEEE (2026) 37. Xu, Z., Kong, D., Liu, J., Li, J., Hou, J., Dai, X., et al.: WSC-LLM: Efficient LLM service and architecture co-exploration for wafer-scale chips. In: Proceedings of the 52nd Annual International Symposium on Computer Architecture. pp. 1–17 (2025) 38. Yang, Q., Wei, T., Guan, S., Li, C., Shang, H., Deng, J., et al.: PD constraint-aware physical/logical topology co-design for network on wafer. In: Proceedings of the 52nd Annual International Symposium on Computer Architecture. pp. 49–64 (2025) 39. Yue, Z., Wang, H., Fang, J., Deng, J., Lu, G., Tu, F., et al.: Exploiting similarity opportunities of emerging vision ai models on hybrid bonding architecture. In: 2024 ACM/IEEE 51st Annual International Symposium on Computer Architecture (ISCA). pp. 396–409. IEEE (2024) 40. Zhai, J., Liao, L., Liu, X., Wang, Y., Li, R., Cao, X., et al.: Actions speak louder than words: Trillion-parameter sequential transducers for generative recommenda-tions. arXiv preprint arXiv:2402.17152 (2024) 41. Zhang, C., You, Y., Wang, N., Park, J., Zhang, L.: Generative ai through cas lens: An integrated overview of algorithmic optimizations, architectural advances, and automated designs. IEEE Journal on Emerging and Selected Topics in Circuits and Systems (2025)
