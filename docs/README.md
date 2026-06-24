@@ -6,50 +6,46 @@
 </div>
 
 ## 每次日报
-- 最新运行日期：2026-06-23
-- 运行时间：2026-06-23 22:01:44 UTC
+- 最新运行日期：2026-06-24
+- 运行时间：2026-06-24 21:49:32 UTC
 - 运行状态：成功
-- 本次总论文数：10
-- 精读区：6
-- 速读区：4
+- 本次总论文数：8
+- 精读区：2
+- 速读区：6
 
 ### 今日简报（AI）
-今日聚焦LLM服务优化，10篇推荐中精读2篇高关注；几何感知调度理论到系统实践、端侧推理能耗优化是核心方向；建议优先精读这两篇9分论文，兼顾理论深度与落地方法。
-- 详情：[/202606/23/README](/202606/23/README)
+今日精选8篇论文，重点覆盖大模型量化、蒸馏与推理加速方向。  
+精读推荐无乘法器在线向量量化方法Fast-TurboQuant与任务特定蒸馏缩放律，均获8分高评价。  
+建议优先了解语义缓存校准方案与变宽Transformer在实际部署中的潜力。
+- 详情：[/202606/24/README](/202606/24/README)
 
 ### 精读区论文标签
-1. [Geometry-Aware Online Scheduling for LLM Serving: From Theoretical Bound to System Practice](/202606/23/2606.22327v1-geometry-aware-online-scheduling-for-llm-serving-from-theoretical-bound-to-system-practice)  
-   标签：评分：9.0/10、query:edge-llm
-   evidence：基于几何感知的LLM服务在线调度算法SVF
-2. [EnerInfer: Energy-Aware On-Device LLM Inference](/202606/23/2606.23001v1-enerinfer-energy-aware-on-device-llm-inference)  
-   标签：评分：9.0/10、query:edge-llm
-   evidence：设备端LLM推理能量感知，通过NPU调频降低能耗
-3. [GRINQH: Graded Input-based Quantization Hierarchy for Efficient LLM Generation](/202606/23/2606.23419v1-grinqh-graded-input-based-quantization-hierarchy-for-efficient-llm-generation)  
-   标签：评分：9.0/10、query:edge-llm
-   evidence：面向边缘设备高效LLM生成的量化方法
-4. [HERALD: High-Throughput Block Diffusion LLM Serving via CPU-GPU Cooperative KV Cache Retrieval](/202606/23/2606.21633v1-herald-high-throughput-block-diffusion-llm-serving-via-cpu-gpu-cooperative-kv-cache-retrieval)  
+1. [Fast-TurboQuant: A Multiplier-Free Online Vector Quantization Approach](/202606/24/2606.21448v1-fast-turboquant-a-multiplier-free-online-vector-quantization-approach)  
    标签：评分：8.0/10、query:edge-llm
-   evidence：CPU-GPU协同KV缓存检索，异构计算
-5. [Keyless Attention: Value-Space Routing and Value-Only Caching for Efficient Transformers](/202606/23/2606.21848v1-keyless-attention-value-space-routing-and-value-only-caching-for-efficient-transformers)  
+   evidence：面向边缘LLM推理的无乘法器量化方法
+2. [Scaling Laws for Task-Specific LLM Distillation](/202606/24/2606.24747v1-scaling-laws-for-task-specific-llm-distillation)  
    标签：评分：8.0/10、query:edge-llm
-   evidence：通过无键注意力将KV缓存减少50%
-6. [Enabling Cloud-Level Accuracy in Edge AI through IoT Data Preprocessing](/202606/23/2606.22496v1-enabling-cloud-level-accuracy-in-edge-ai-through-iot-data-preprocessing)  
-   标签：评分：8.0/10、query:edge-llm
-   evidence：通过提示端预处理提升边缘LLM准确性
+   evidence：蒸馏缩放定律用于压缩LLM以降低部署成本
 
 ### 速读区论文标签
-1. [Closing the Calibration Gap in Semantic Caching](/202606/23/2606.19719v2-closing-the-calibration-gap-in-semantic-caching)  
+1. [Variable-Width Transformers](/202606/24/2606.18246v1-variable-width-transformers)  
    标签：评分：7.0/10、query:edge-llm
-   evidence：面向LLM推理成本降低的语义缓存校准指标
-2. [Recency/Frequency Adaptive KV Caching for Large Language Model Serving](/202606/23/2606.21238v1-recencyfrequency-adaptive-kv-caching-for-large-language-model-serving)  
+   evidence：变宽Transformer在固定预算下减少计算量
+2. [Closing the Calibration Gap in Semantic Caching](/202606/24/2606.19719v1-closing-the-calibration-gap-in-semantic-caching)  
+   标签：评分：7.0/10、query:edge-llm
+   evidence：LLM服务的语义缓存
+3. [Forget Without Compromise: Nexus Sampling for Streaming KV-Cache Eviction Under Fixed Budgets](/202606/24/2606.23961v1-forget-without-compromise-nexus-sampling-for-streaming-kv-cache-eviction-under-fixed-budgets)  
+   标签：评分：7.0/10、query:edge-llm
+   evidence：固定预算下LLM推理的KV缓存驱逐策略
+4. [CompressKV: Semantic-Retrieval-Guided KV-Cache Compression for Resource-Efficient Long-Context LLM Inference](/202606/24/2606.24467v1-compresskv-semantic-retrieval-guided-kv-cache-compression-for-resource-efficient-long-context-llm-inference)  
+   标签：评分：7.0/10、query:edge-llm
+   evidence：面向资源受限硬件的KV缓存压缩
+5. [CrossPool: Efficient Multi-LLM Serving for Cold MoE Models through KV-Cache and Weight Disaggregation](/202606/24/2606.24506v1-crosspool-efficient-multi-llm-serving-for-cold-moe-models-through-kv-cache-and-weight-disaggregation)  
+   标签：评分：7.0/10、query:edge-llm
+   evidence：用于冷MoE模型的高效多LLM服务框架
+6. [Deeper is Not Always Better: Mitigating the Alignment Tax via Confident Layer Decoding](/202606/24/2606.21906v1-deeper-is-not-always-better-mitigating-the-alignment-tax-via-confident-layer-decoding)  
    标签：评分：6.0/10、query:edge-llm
-   evidence：自适应KV缓存管理优化LLM服务
-3. [SpotAttention: Plug-In Block-Sparse Routing for Pretrained Long-Context Transformers](/202606/23/2606.22874v1-spotattention-plug-in-block-sparse-routing-for-pretrained-long-context-transformers)  
-   标签：评分：6.0/10、query:edge-llm
-   evidence：稀疏注意力减少长上下文计算开销，适用于资源高效推理
-4. [MOCAP: Wafer-Scale-Chip-Oriented Memory-Orchestrated Chunked Pipelining Framework for Prefill-Only LLM Inference](/202606/23/2606.22968v1-mocap-wafer-scale-chip-oriented-memory-orchestrated-chunked-pipelining-framework-for-prefill-only-llm-inference)  
-   标签：评分：6.0/10、query:edge-llm
-   evidence：面向晶圆级芯片的LLM推理软硬件协同设计
+   evidence：无训练层选择解码提升LLM效率
 
 
 <div class="dpr-home-promo-card">
