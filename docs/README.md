@@ -6,46 +6,40 @@
 </div>
 
 ## 每次日报
-- 最新运行日期：2026-06-24
-- 运行时间：2026-06-24 21:49:32 UTC
+- 最新运行日期：2026-06-25
+- 运行时间：2026-06-25 22:18:49 UTC
 - 运行状态：成功
-- 本次总论文数：8
-- 精读区：2
-- 速读区：6
+- 本次总论文数：6
+- 精读区：4
+- 速读区：2
 
 ### 今日简报（AI）
-今日精选8篇论文，重点覆盖大模型量化、蒸馏与推理加速方向。  
-精读推荐无乘法器在线向量量化方法Fast-TurboQuant与任务特定蒸馏缩放律，均获8分高评价。  
-建议优先了解语义缓存校准方案与变宽Transformer在实际部署中的潜力。
-- 详情：[/202606/24/README](/202606/24/README)
+今日报告处理6篇论文，精读两篇9分研究《EnerInfer: Energy-Aware On-Device LLM Inference》和《Speculation at a Distance: Where Edge-Cloud Speculative Decoding Actually Pays Off》。  
+最值得关注的方向：能效感知的端侧大模型推理，以及边缘-云端推测解码的实际收益条件。  
+建议普通读者先扫读这两篇精读论文，重点关注能效优化和分布式推理的成本效益分析。
+- 详情：[/202606/25/README](/202606/25/README)
 
 ### 精读区论文标签
-1. [Fast-TurboQuant: A Multiplier-Free Online Vector Quantization Approach](/202606/24/2606.21448v1-fast-turboquant-a-multiplier-free-online-vector-quantization-approach)  
+1. [EnerInfer: Energy-Aware On-Device LLM Inference](/202606/25/2606.23001v2-enerinfer-energy-aware-on-device-llm-inference)  
+   标签：评分：9.0/10、query:edge-llm
+   evidence：基于NPU频率调节的能效感知端侧LLM推理
+2. [Speculation at a Distance: Where Edge-Cloud Speculative Decoding Actually Pays Off](/202606/25/2606.25091v1-speculation-at-a-distance-where-edge-cloud-speculative-decoding-actually-pays-off)  
+   标签：评分：9.0/10、query:edge-llm
+   evidence：边缘-云推测解码分析，广域网下延迟效益
+3. [Agentic evolution of physically constrained foundation models](/202606/25/2606.25532v1-agentic-evolution-of-physically-constrained-foundation-models)  
+   标签：评分：9.0/10、query:edge-llm
+   evidence：智能体演化出硬件感知的压缩方法
+4. [Geometry-Aware Online Scheduling for LLM Serving: From Theoretical Bound to System Practice](/202606/25/2606.22327v2-geometry-aware-online-scheduling-for-llm-serving-from-theoretical-bound-to-system-practice)  
    标签：评分：8.0/10、query:edge-llm
-   evidence：面向边缘LLM推理的无乘法器量化方法
-2. [Scaling Laws for Task-Specific LLM Distillation](/202606/24/2606.24747v1-scaling-laws-for-task-specific-llm-distillation)  
-   标签：评分：8.0/10、query:edge-llm
-   evidence：蒸馏缩放定律用于压缩LLM以降低部署成本
+   evidence：面向LLM服务的几何感知在线调度
 
 ### 速读区论文标签
-1. [Variable-Width Transformers](/202606/24/2606.18246v1-variable-width-transformers)  
-   标签：评分：7.0/10、query:edge-llm
-   evidence：变宽Transformer在固定预算下减少计算量
-2. [Closing the Calibration Gap in Semantic Caching](/202606/24/2606.19719v1-closing-the-calibration-gap-in-semantic-caching)  
-   标签：评分：7.0/10、query:edge-llm
-   evidence：LLM服务的语义缓存
-3. [Forget Without Compromise: Nexus Sampling for Streaming KV-Cache Eviction Under Fixed Budgets](/202606/24/2606.23961v1-forget-without-compromise-nexus-sampling-for-streaming-kv-cache-eviction-under-fixed-budgets)  
-   标签：评分：7.0/10、query:edge-llm
-   evidence：固定预算下LLM推理的KV缓存驱逐策略
-4. [CompressKV: Semantic-Retrieval-Guided KV-Cache Compression for Resource-Efficient Long-Context LLM Inference](/202606/24/2606.24467v1-compresskv-semantic-retrieval-guided-kv-cache-compression-for-resource-efficient-long-context-llm-inference)  
-   标签：评分：7.0/10、query:edge-llm
-   evidence：面向资源受限硬件的KV缓存压缩
-5. [CrossPool: Efficient Multi-LLM Serving for Cold MoE Models through KV-Cache and Weight Disaggregation](/202606/24/2606.24506v1-crosspool-efficient-multi-llm-serving-for-cold-moe-models-through-kv-cache-and-weight-disaggregation)  
-   标签：评分：7.0/10、query:edge-llm
-   evidence：用于冷MoE模型的高效多LLM服务框架
-6. [Deeper is Not Always Better: Mitigating the Alignment Tax via Confident Layer Decoding](/202606/24/2606.21906v1-deeper-is-not-always-better-mitigating-the-alignment-tax-via-confident-layer-decoding)  
+1. [Spectral Evolution-Guided Token Pruning in Multimodal Large Language Models](/202606/25/2606.24165v1-spectral-evolution-guided-token-pruning-in-multimodal-large-language-models)  
    标签：评分：6.0/10、query:edge-llm
-   evidence：无训练层选择解码提升LLM效率
+   evidence：无需训练的令牌剪枝加速多模态LLM推理，与边缘设备优化相关
+2. [BitNet Text Embeddings](/202606/25/2606.25674v1-bitnet-text-embeddings)  
+   标签：评分：6.0/10、query:edge-llm
+   evidence：对基于LLM的嵌入器进行极低比特量化，实现高效编码，与硬件感知的LLM推理加速相关
 
 
 <div class="dpr-home-promo-card">
