@@ -6,40 +6,35 @@
 </div>
 
 ## 每次日报
-- 最新运行日期：2026-06-25
-- 运行时间：2026-06-25 22:18:49 UTC
+- 最新运行日期：2026-06-26
+- 运行时间：2026-06-26 20:36:37 UTC
 - 运行状态：成功
-- 本次总论文数：6
-- 精读区：4
-- 速读区：2
+- 本次总论文数：5
+- 精读区：2
+- 速读区：3
 
 ### 今日简报（AI）
-今日报告处理6篇论文，精读两篇9分研究《EnerInfer: Energy-Aware On-Device LLM Inference》和《Speculation at a Distance: Where Edge-Cloud Speculative Decoding Actually Pays Off》。  
-最值得关注的方向：能效感知的端侧大模型推理，以及边缘-云端推测解码的实际收益条件。  
-建议普通读者先扫读这两篇精读论文，重点关注能效优化和分布式推理的成本效益分析。
-- 详情：[/202606/25/README](/202606/25/README)
+今日聚焦5篇论文，精读2篇聚焦端侧LLM推理优化，速读3篇涉及量化、容错与神经符号推理。最值得关注的是Cascaded多粒度剪枝（9.0分）和激活稀疏性结合FP4量化的SharQ方法（8.0分）。建议优先精读这两篇，把握工业IoT场景下的剪枝策略与低比特量化融合方向。
+- 详情：[/202606/26/README](/202606/26/README)
 
 ### 精读区论文标签
-1. [EnerInfer: Energy-Aware On-Device LLM Inference](/202606/25/2606.23001v2-enerinfer-energy-aware-on-device-llm-inference)  
+1. [Cascaded Multi-Granularity Pruning for On-Device LLM Inference in Industrial IoT](/202606/26/2606.26861v1-cascaded-multi-granularity-pruning-for-on-device-llm-inference-in-industrial-iot)  
    标签：评分：9.0/10、query:edge-llm
-   evidence：基于NPU频率调节的能效感知端侧LLM推理
-2. [Speculation at a Distance: Where Edge-Cloud Speculative Decoding Actually Pays Off](/202606/25/2606.25091v1-speculation-at-a-distance-where-edge-cloud-speculative-decoding-actually-pays-off)  
-   标签：评分：9.0/10、query:edge-llm
-   evidence：边缘-云推测解码分析，广域网下延迟效益
-3. [Agentic evolution of physically constrained foundation models](/202606/25/2606.25532v1-agentic-evolution-of-physically-constrained-foundation-models)  
-   标签：评分：9.0/10、query:edge-llm
-   evidence：智能体演化出硬件感知的压缩方法
-4. [Geometry-Aware Online Scheduling for LLM Serving: From Theoretical Bound to System Practice](/202606/25/2606.22327v2-geometry-aware-online-scheduling-for-llm-serving-from-theoretical-bound-to-system-practice)  
+   evidence：面向边缘设备LLM推理的多粒度剪枝
+2. [SharQ: Bridging Activation Sparsity and FP4 Quantization for LLM Inference](/202606/26/2606.26587v1-sharq-bridging-activation-sparsity-and-fp4-quantization-for-llm-inference)  
    标签：评分：8.0/10、query:edge-llm
-   evidence：面向LLM服务的几何感知在线调度
+   evidence：结合激活稀疏和FP4量化的训练自由LLM推理方法
 
 ### 速读区论文标签
-1. [Spectral Evolution-Guided Token Pruning in Multimodal Large Language Models](/202606/25/2606.24165v1-spectral-evolution-guided-token-pruning-in-multimodal-large-language-models)  
-   标签：评分：6.0/10、query:edge-llm
-   evidence：无需训练的令牌剪枝加速多模态LLM推理，与边缘设备优化相关
-2. [BitNet Text Embeddings](/202606/25/2606.25674v1-bitnet-text-embeddings)  
-   标签：评分：6.0/10、query:edge-llm
-   evidence：对基于LLM的嵌入器进行极低比特量化，实现高效编码，与硬件感知的LLM推理加速相关
+1. [Concordia: JIT-Compiled Persistent-Kernel Checkpointing for Fault-Tolerant LLM Inference](/202606/26/2606.23521v1-concordia-jit-compiled-persistent-kernel-checkpointing-for-fault-tolerant-llm-inference)  
+   标签：评分：7.0/10、query:edge-llm
+   evidence：针对LLM服务的持久化内核检查点容错机制
+2. [CAT-Q: Cost-efficient and Accurate Ternary Quantization for LLMs](/202606/26/2606.26650v1-cat-q-cost-efficient-and-accurate-ternary-quantization-for-llms)  
+   标签：评分：7.0/10、query:edge-llm
+   evidence：面向LLM的三元量化压缩加速方法
+3. [Resource-Aware Neuro-Symbolic Reasoning for Local Small Language Models](/202606/26/2606.27281v1-resource-aware-neuro-symbolic-reasoning-for-local-small-language-models)  
+   标签：评分：7.0/10、query:edge-llm
+   evidence：面向消费级硬件的本地小语言模型神经符号推理
 
 
 <div class="dpr-home-promo-card">
