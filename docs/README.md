@@ -6,35 +6,37 @@
 </div>
 
 ## 每次日报
-- 最新运行日期：2026-06-26
-- 运行时间：2026-06-26 20:36:37 UTC
+- 最新运行日期：2026-06-27
+- 运行时间：2026-06-27 21:28:58 UTC
 - 运行状态：成功
 - 本次总论文数：5
 - 精读区：2
 - 速读区：3
 
 ### 今日简报（AI）
-今日聚焦5篇论文，精读2篇聚焦端侧LLM推理优化，速读3篇涉及量化、容错与神经符号推理。最值得关注的是Cascaded多粒度剪枝（9.0分）和激活稀疏性结合FP4量化的SharQ方法（8.0分）。建议优先精读这两篇，把握工业IoT场景下的剪枝策略与低比特量化融合方向。
-- 详情：[/202606/26/README](/202606/26/README)
+1) 今日5篇论文聚焦大模型推理优化，精读涵盖华为昇腾NPU量化与GB级末级缓存常驻推理。  
+2) 最值得关注：OpenPangu在昇腾上的量化方案与Cache-Resident LLM利用大容量缓存加速推理，均指向硬件定制化推理优化。  
+3) 建议关注量化与缓存机制相结合的方向，尝试将大模型部署到资源受限或边缘设备。
+- 详情：[/202606/27/README](/202606/27/README)
 
 ### 精读区论文标签
-1. [Cascaded Multi-Granularity Pruning for On-Device LLM Inference in Industrial IoT](/202606/26/2606.26861v1-cascaded-multi-granularity-pruning-for-on-device-llm-inference-in-industrial-iot)  
-   标签：评分：9.0/10、query:edge-llm
-   evidence：面向边缘设备LLM推理的多粒度剪枝
-2. [SharQ: Bridging Activation Sparsity and FP4 Quantization for LLM Inference](/202606/26/2606.26587v1-sharq-bridging-activation-sparsity-and-fp4-quantization-for-llm-inference)  
+1. [An Empirical Study of OpenPangu Quantization on Ascend NPUs](/202606/27/2606.21257v1-an-empirical-study-of-openpangu-quantization-on-ascend-npus)  
    标签：评分：8.0/10、query:edge-llm
-   evidence：结合激活稀疏和FP4量化的训练自由LLM推理方法
+   evidence：在昇腾NPU上进行量化的实证研究，直接涉及硬件感知加速
+2. [Cache-Resident LLM Inference in GB-Scale Last-Level Caches](/202606/27/2606.25353v1-cache-resident-llm-inference-in-gb-scale-last-level-caches)  
+   标签：评分：8.0/10、query:edge-llm
+   evidence：利用GB级末级缓存的硬件感知加速
 
 ### 速读区论文标签
-1. [Concordia: JIT-Compiled Persistent-Kernel Checkpointing for Fault-Tolerant LLM Inference](/202606/26/2606.23521v1-concordia-jit-compiled-persistent-kernel-checkpointing-for-fault-tolerant-llm-inference)  
+1. [ASAP: A Disaggregated and Asynchronous Inference System for MoE Prefill](/202606/27/2606.22541v1-asap-a-disaggregated-and-asynchronous-inference-system-for-moe-prefill)  
    标签：评分：7.0/10、query:edge-llm
-   evidence：针对LLM服务的持久化内核检查点容错机制
-2. [CAT-Q: Cost-efficient and Accurate Ternary Quantization for LLMs](/202606/26/2606.26650v1-cat-q-cost-efficient-and-accurate-ternary-quantization-for-llms)  
+   evidence：面向MoE预填充的解耦异步推理系统
+2. [PersistentKV: Page-Aware Decode Scheduling for Long-Context LLM Serving on Commodity GPUs](/202606/27/2606.26666v1-persistentkv-page-aware-decode-scheduling-for-long-context-llm-serving-on-commodity-gpus)  
    标签：评分：7.0/10、query:edge-llm
-   evidence：面向LLM的三元量化压缩加速方法
-3. [Resource-Aware Neuro-Symbolic Reasoning for Local Small Language Models](/202606/26/2606.27281v1-resource-aware-neuro-symbolic-reasoning-for-local-small-language-models)  
-   标签：评分：7.0/10、query:edge-llm
-   evidence：面向消费级硬件的本地小语言模型神经符号推理
+   evidence：具有页面感知解码调度的服务框架
+3. [Information-Aware KV Cache Compression for Long Reasoning](/202606/27/2606.26875v1-information-aware-kv-cache-compression-for-long-reasoning)  
+   标签：评分：6.0/10、query:edge-llm
+   evidence：面向高效LLM推理的信息感知KV缓存压缩
 
 
 <div class="dpr-home-promo-card">
