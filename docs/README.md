@@ -6,46 +6,46 @@
 </div>
 
 ## 每次日报
-- 最新运行日期：2026-07-01
-- 运行时间：2026-07-01 22:08:40 UTC
+- 最新运行日期：2026-07-02
+- 运行时间：2026-07-02 21:39:13 UTC
 - 运行状态：成功
 - 本次总论文数：8
-- 精读区：1
-- 速读区：7
+- 精读区：3
+- 速读区：5
 
 ### 今日简报（AI）
-今日聚焦边缘部署推理LLM的负载感知早退服务。
-最值得关注：LASER的负载感知早退机制与CrossPool的冷MoE缓存分离方案，共同攻克边缘端推理延迟与资源瓶颈。
-建议深入阅读LASER论文，其早退策略对边端长推理任务尤其具有参考价值。
-- 详情：[/202607/01/README](/202607/01/README)
+今天聚焦大模型推理优化，深入解析了三篇精读论文，重点关注Apple Silicon原生Metal推理和长上下文GPU调度方案。  
+最值得看的是满分论文《BaseRT》展示了Apple Silicon上Native Metal的最佳性能，以及9分论文《PersistentKV》提出的页面感知调度应对长上下文瓶颈。  
+建议优先精读这两篇，把握硬件特定优化与长上下文服务的关键技术。
+- 详情：[/202607/02/README](/202607/02/README)
 
 ### 精读区论文标签
-1. [LASER: Load-Aware Serving with Early-Exit for Reasoning LLMs at the Edge](/202607/01/2606.31580v1-laser-load-aware-serving-with-early-exit-for-reasoning-llms-at-the-edge)  
+1. [BaseRT: Best-in-Class LLM Inference on Apple Silicon via Native Metal](/202607/02/2607.00501v1-basert-best-in-class-llm-inference-on-apple-silicon-via-native-metal)  
+   标签：评分：10.0/10、query:edge-llm
+   evidence：专为Apple Silicon设计的原生Metal LLM推理运行时
+2. [PersistentKV: Page-Aware Decode Scheduling for Long-Context LLM Serving on Commodity GPUs](/202607/02/2606.26666v2-persistentkv-page-aware-decode-scheduling-for-long-context-llm-serving-on-commodity-gpus)  
    标签：评分：9.0/10、query:edge-llm
-   evidence：边缘设备上推理LLM的负载感知早退服务
+   evidence：面向长上下文LLM服务的页面感知解码调度引擎
+3. [KernelFlume: Elastic Core-Attention Scaling for Agentic Long-Context Decoding](/202607/02/2606.29207v1-kernelflume-elastic-core-attention-scaling-for-agentic-long-context-decoding)  
+   标签：评分：8.0/10、query:edge-llm
+   evidence：弹性核心注意力缩放，面向LLM服务的解码中心架构
 
 ### 速读区论文标签
-1. [CrossPool: Efficient Multi-LLM Serving for Cold MoE Models through KV-Cache and Weight Disaggregation](/202607/01/2606.24506v2-crosspool-efficient-multi-llm-serving-for-cold-moe-models-through-kv-cache-and-weight-disaggregation)  
+1. [Beyond Activation Alignment:The Alignment-Diversity Tradeoff in Task-Aware LLM Quantization](/202607/02/2607.00908v1-beyond-activation-alignmentthe-alignment-diversity-tradeoff-in-task-aware-llm-quantization)  
    标签：评分：7.0/10、query:edge-llm
-   evidence：通过KV缓存和权重分离实现冷MoE模型的高效多LLM服务
-2. [DiLaServe: High SLO Attainment Serving for Diffusion Language Models](/202607/01/2606.29094v1-dilaserve-high-slo-attainment-serving-for-diffusion-language-models)  
-   标签：评分：7.0/10、query:edge-llm
-   evidence：面向扩散语言模型的高SLO达标服务系统
-3. [Beyond Uniform Experts: Cost-Aware Expert Execution for Efficient Multi-Device MoE Inference](/202607/01/2606.29982v1-beyond-uniform-experts-cost-aware-expert-execution-for-efficient-multi-device-moe-inference)  
-   标签：评分：7.0/10、query:edge-llm
-   evidence：硬件引导的成本感知专家执行优化多设备MoE推理
-4. [SeKV: Resolution-Adaptive KV Cache with Hierarchical Semantic Memory for Long-Context LLM Inference](/202607/01/2606.31145v1-sekv-resolution-adaptive-kv-cache-with-hierarchical-semantic-memory-for-long-context-llm-inference)  
-   标签：评分：7.0/10、query:edge-llm
-   evidence：面向高效长上下文LLM推理的分辨率自适应KV缓存压缩，适用于服务框架
-5. [RaBitQCache: Rotated Binary Quantization for KVCache in Long Context LLM Inference](/202607/01/2606.31519v1-rabitqcache-rotated-binary-quantization-for-kvcache-in-long-context-llm-inference)  
-   标签：评分：7.0/10、query:edge-llm
-   evidence：硬件感知的二进制量化与算术优化KV缓存
-6. [Attend, Transform, or Silence: Operator-Level Visual Skipping for Efficient Multimodal LLM Inference](/202607/01/2606.31903v1-attend-transform-or-silence-operator-level-visual-skipping-for-efficient-multimodal-llm-inference)  
-   标签：评分：7.0/10、query:edge-llm
-   evidence：算子级视觉跳过减少多模态LLM推理计算量，适用于边缘高效推理
-7. [Omni-Flow: A Unified Workflow Orchestration and Distributed KV Cache Sharing Framework for Multimodal Inference](/202607/01/2606.31093v1-omni-flow-a-unified-workflow-orchestration-and-distributed-kv-cache-sharing-framework-for-multimodal-inference)  
+   evidence：混合精度量化用于资源受限的LLM部署
+2. [NLL-Guided Full-Attention Layer Selection for Training-Free Sliding-Window Adaptation](/202607/02/2606.27791v1-nll-guided-full-attention-layer-selection-for-training-free-sliding-window-adaptation)  
    标签：评分：6.0/10、query:edge-llm
-   evidence：异构计算运行时与KV缓存共享的多模态推理
+   evidence：无训练层选择以实现高效注意力计算
+3. [Energy-Efficient Multimodal Inference Serving with Tri-serve](/202607/02/2606.29629v1-energy-efficient-multimodal-inference-serving-with-tri-serve)  
+   标签：评分：6.0/10、query:edge-llm
+   evidence：面向多模态推理服务的硬件感知功率低效分析
+4. [Energy-Efficient Multimodal Inference Serving with Tri-serve](/202607/02/2606.29629v2-energy-efficient-multimodal-inference-serving-with-tri-serve)  
+   标签：评分：6.0/10、query:edge-llm
+   evidence：高效多模态推理服务框架
+5. [GSRQ: Gain-Shape Residual Quantization for Sub-1-bit KV Cache](/202607/02/2607.01065v1-gsrq-gain-shape-residual-quantization-for-sub-1-bit-kv-cache)  
+   标签：评分：6.0/10、query:edge-llm
+   evidence：子1比特KV缓存量化，提升LLM推理资源效率
 
 
 <div class="dpr-home-promo-card">

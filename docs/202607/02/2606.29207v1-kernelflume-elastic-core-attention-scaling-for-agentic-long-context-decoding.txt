@@ -1,0 +1,843 @@
+Title: KernelFlume: Elastic Core-Attention Scaling for Agentic Long-Context Decoding
+
+URL Source: https://arxiv.org/pdf/2606.29207v1
+
+Published Time: Tue, 30 Jun 2026 00:58:59 GMT
+
+Number of Pages: 14
+
+Markdown Content:
+# KernelFlume: Elastic Core-Attention Scaling for Agentic Long-Context Decoding 
+
+## Guangyu Xiang #
+
+HKUST(GZ) 
+
+gxiang190@connect.hkust-gz.edu.cn 
+
+## Xueze Kang #
+
+HKUST(GZ) 
+
+xkang507@connect.hkust-gz.edu.cn 
+
+## Lin Zhang 
+
+HKUST 
+
+lzhangbv@connect.ust.hk 
+
+## Wenxiang Lin 
+
+HIT(SZ) 
+
+wenxianglin@stu.hit.edu.cn 
+
+## Shaohuai Shi 
+
+HIT(SZ) 
+
+shaohuais@hit.edu.cn 
+
+## Yuxin Wang *
+
+No affiliation 
+
+yxwang.ele@gmail.com 
+
+## Xiaowen Chu 
+
+HKUST(GZ) 
+
+xwchu@hkust-gz.edu.cn 
+
+## Abstract 
+
+LLM serving is increasingly dominated by long and dynamic decode workloads from agents, reasoning models, and ex-tended conversations. When bursty long-context demand exceeds the deployed capacity, existing serving systems typi-cally scale out by launching additional serving instances with model replicas. This instance-level elasticity increases KV capacity only by provisioning another full copy of the model, thereby inheriting the startup latency, memory overhead, and batch fragmentation. We present KernelFlume, a decode-centric architecture that disaggregates the stable projection/FFN path from core-attention computation: weight nodes execute dense projec-tion/FFN kernels, while weightless attention nodes store token-range KV partitions and scale with request-state de-mand. To make this separation elastic, KernelFlume main-tains a routing table that maps token ranges to attention-node endpoints. It updates routes at token boundaries and uses host-visible graph signals to drive pre-registered UCX endpoint communication outside the captured CUDA Graph. To preserve low per-token latency after disaggregation, Ker-nelFlume combines query-first core-attention dispatch with inter-layer kernel pipelining, overlapping remote attention and communication with local projection/FFN work. On real GPU testbeds (intra-node A6000 and cross-node H100), under a dynamic long-context agentic workload serving Llama-3.1-8B, KernelFlume sustains flat p99 TPOTs of ∼74 ms on A6000 and ∼34 ms on H100, while lowering cost per million out-put tokens by up to 32% and 61%, respectively, relative to full-instance elastic scaling with ServerlessLLM, a state-of-the-art instance-startup method. Replaying the same trace at larger model scale in simulation projects a 56–66% cost reduc-tion over ServerlessLLM, widening to 80–85% with cheaper heterogeneous attention-node hardware and persisting into the million-token context range. 
+
+CCS Concepts: • Computer systems organization →
+
+Cloud computing ; Distributed architectures .
+
+Keywords: LLM serving, disaggregated inference, KV cache, context parallelism, elastic scaling 
+
+## 1 Introduction 
+
+Large language models (LLMs) are increasingly deployed in decode-heavy, long-context workloads, including deep rea-soning, autonomous agents, and multi-turn interactions [ 2 ,6 , 7 , 10 , 21 , 32 , 35 ]. In these settings, the model does not simply process one large input and produce a short answer. It generates tokens over many turns, carries intermediate state forward, and gradually builds a long live context. LLM serving has two main phases: prefill processes the input context and builds the KV cache, while decode generates to-kens one by one by reading and extending that cache. When cross-turn KV-cache hits are high, repeated prefill work is largely reused; the remaining online work is sustained de-code over a growing cache. Recent Codex/SWE-bench Pro traces illustrate this pattern: agentic sessions carry a median context of roughly 80K tokens, with tails over 200K, and 94.2% cross-turn KV-cache hits [10, 23]. This shift makes KV cache capacity the central challenge of long-context decode. LLM decoding relies on storing keys and values for all previously processed tokens, so KV mem-ory grows linearly with both batch size and sequence length, while model weights remain fixed. In these decode-heavy workloads, context expands continuously during decoding and quickly exhausts available high-bandwidth memory (HBM). For example, when serving Llama-3.1-8B (FP16) on an NVIDIA A6000 (48 GB), a practical batch size of 64 leaves room for only about 4K tokens per request. Beyond this point, supporting longer sequences requires either reducing     
+
+> #Equal contribution. ∗Corresponding author. 1
+> arXiv:2606.29207v1 [cs.DC] 28 Jun 2026 1×
+> 2×
+> 3×
+> KV capacity
+> Scaling full instances
+> Scaling within an instance
+> KV demand ServerlessLLM KernelFlume
+> Time
+> (KV demand grows with sequence length )
+> 1×
+> 2×
+> 3×
+> TPOT
+> SLO
+
+Figure 1. Conceptual KV-capacity scaling during long-context decode (schematic; measured results in §6). Server-lessLLM adds KV capacity only by scaling full instances; each scale-out (shaded) incurs an instance-start spike that pushes TPOT past the decode SLO. KernelFlume scales KV capacity within the instance via weightless route updates that track demand, keeping TPOT flat. batch size, which hurts throughput, or provisioning more GPU memory capacity, typically by adding more GPUs. However, in long-context decode, sequence length and KV growth are dynamic and unpredictable [ 28 , 31 ]. Even when the serving stack smooths request arrivals, the rele-vant demand is not just the admitted request rate, but the accumulated KV state. As a result, static provisioning either under-provisions dynamic KV bursts, delaying admission or reducing active decode concurrency, or over-provisions for peak demand, leaving expensive GPUs underused during common non-peak periods [ 1 , 5, 12 , 17 , 34 ]. Efficient serv-ing therefore requires elastic provisioning that adapts GPU capacity to changing KV demand. Existing elastic serving methods typically use full-instance scaling , adding or removing full instances, each carrying a complete model replica with the same parallelism config-uration, as demand changes. As Figure 1 illustrates, each scale-out incurs an instance-start spike that pushes time-per-output-token (TPOT) past the decode service-level objective (SLO). This approach remains inadequate for decode-heavy long-context workloads (§2): instance starts are too slow for decode-time SLOs even with ServerlessLLM [ 5 ], a state-of-the-art instance-startup method; each scaling step carries a full weight copy that consumes HBM otherwise available for KV; and partitioning requests across instances shrinks the per-GPU batch and degrades utilization [5, 16]. Ultimately, these limitations highlight that the fundamen-tal problem lies in the monolithic scaling unit. Because full-instance scaling intrinsically couples KV capacity with model weights, it forces a severe trade-off between elasticity, mem-ory footprint, and compute efficiency. To expand KV capacity without replicating weights or fracturing the active batch, a serving system must scale KV capacity within the serving instance by disaggregating attention-side capacity from model weights , so that dense projection and FFN operations remain pinned to large, stable batches on dedicated GPUs, while only the KV cache dynamically scales up. In this work, we present KernelFlume , a decode-centric serving architecture that isolates projection and FFN on 
+
+weight nodes , while placing KV cache on scalable, weightless attention nodes .This disaggregation introduces two requirements. R1: fine-grained online elasticity. Scale events must reconfigure KV capacity at token boundaries with minimal overhead. Route changes should not require model loading, communicator re-builds, CUDA Graph recaptures, or pausing in-flight decode steps. R2: SLO and cost efficiency. After KV capacity is scaled across attention nodes, KernelFlume must still meet strict TPOT SLOs and maintain low $/Mtok. The execution path should avoid duplicating weights or fragmenting the active batch, while overlapping remote attention with projection and FFN work to keep TPOT low. This paper makes three contributions: 
+
+• We identify the scaling mismatch between projection/FFN and attention during decode, and propose a disaggre-gated architecture that decouples KV capacity scaling from model-weight placement, enabling attention nodes to scale independently without replicating weights or shrinking the projection batch. 
+
+• We design an elastic routing control plane that manages attention-node membership through point-to-point routes, leaving the GPU execution graph unchanged across scale events. Once endpoints are prewarmed, activating a pre-pared route takes 7.2 𝜇 s on the critical path, avoiding model reloads, communicator rebuilds, and disruption to in-flight decode steps. 
+
+• We introduce query-first attention disaggregation (QFA) and inter-layer kernel pipelining. Query-first dispatch allows 𝑄 transfer to overlap with the remaining projec-tion work, while the pipeline overlaps remote attention with weight-node projection and FFN work, keeping disaggregated decode within a few percent of the non-disaggregated reference. Our measured evaluation on a real intra-node NVIDIA RTX A6000 testbed and a cross-node H100 testbed demon-strates that under a real-world dynamic, long-context agentic workload from the Codex/SWE-bench Pro serving trace [ 10 ,23 ], KernelFlume maintains a flat, tight p99 TPOT ( ∼74 ms on A6000 and ∼34 ms on H100), with up to 32% (A6000) and 61% (H100) lower cost per million output tokens than full-instance elastic scaling with ServerlessLLM. Beyond the measured testbeds, we replay the same trace at Llama-70B scale using measured hardware parameters, after validat-ing the model against the measured cross-node 8B H100 testbed. The simulation projects a 56–66% cost reduction over ServerlessLLM at 70B scale, widening to 80–85% with heterogeneous attention-node hardware, and preserves Ker-nelFlume’s cost advantage into the million-token context range (§6.5).        
+
+> 2Attn.
+> Attn.
+> .
+> .
+> .
+> .AllReduce
+> Time
+> Different requests Communication Computation
+> Time
+> (a) Data Parallelism (b) Context Parallelism
+
+Figure 2. Two static scaling strategies for KV capacity. Data Parallelism (DP) replicates the full model and isolates re-quests, suiting large batches of shorter sequences. Context Parallelism (CP) partitions a single sequence’s KV cache across GPUs, suiting long sequences. 
+
+## 2 Background and Motivation 
+
+2.1 Agentic Long-Context Decoding 
+
+LLM deployment is rapidly shifting from single-turn chatbots to decode-heavy long-context tasks such as deep reasoning and autonomous agentic workflows [ 7 , 10 , 11 , 31 , 32 ]. In these workloads almost all GPU time goes to autoregres-sive decoding rather than prefill: on Codex/SWE-bench Pro traces, 94.2% of each turn’s prompt tokens are served from the cross-turn KV cache [ 10 , 23 ], amortizing repeated prefill so that decode dominates end-to-end time. Decode efficiency therefore becomes the primary factor governing two key serving objectives: TPOT, which determines SLO compli-ance, and serving cost per million output tokens ($/Mtok), which determines serving economy [6, 17]. Achieving both goals is particularly difficult because these decode-heavy workloads share two distinguishing proper-ties. First, they produce ❶ long contexts : Codex/SWE-bench Pro agentic sessions carry a median context of roughly 80K tokens, with tails over 200K [ 10 , 23 ]. Second, they exhibit ❷
+
+high dynamism . The growth rate varies unpredictably across requests and over time. Real-world traces show that request output lengths can span two orders of magnitude within the same workload, and bursty arrivals cause aggregate KV demand to swing sharply within minutes [ 28 , 31 ]. A serving system must therefore handle both large KV footprints and their rapid, unpredictable fluctuations. 
+
+2.2 Scaling Long-Context Decoding 
+
+Each autoregressive decode step (illustrated in Figure 4a) performs three operations per layer: a QKV projection that produces query ( 𝑄 ), key ( 𝐾 ), and value ( 𝑉 ) from the token embedding, an attention kernel that reads the full KV cache to compute attention scores against 𝑄 , and a feed-forward network (FFN) that yields the next-token logits. Projection and FFN are compute-bound over fixed model weights; at-tention is memory-bound and scales linearly with the accu-mulated KV cache length, making it the dominant bottleneck as sequences grow. As noted in §2.1, modern reasoning and agentic workloads routinely generate tens of thousands of 0 5 10 15         
+
+> Time (s)
+> 50
+> 100
+> 150
+> 200
+> Seq. length (K)
+> (a) Sequence length over time. 105
+> 135
+> 0510 15
+> Time (s)
+> 40
+> 60
+> 80 SLO
+> TPOT (ms)
+> Under-prov. Over-prov. (b) TPOT over time.
+
+Figure 3. Dynamic workloads make elasticity necessary. Replaying a dynamic long-context agentic workload [ 10 ,23 ], under-provisioning violates the SLO, whereas over-provisioning meets it but leaves excess capacity idle (TPOT sits far below the SLO), increasing $/Mtok by 21.6%. tokens per session, quickly exhausting the KV capacity of a deployed GPU pool. 
+
+Multi-GPU parallelism. To accommodate this memory demand, serving systems organize multi-GPU deployments in two ways (Figure 2). Data Parallelism (DP) creates mul-tiple serving instances, while Context Parallelism (CP) [ 16 ]places multiple GPUs inside one serving instance. In both strategies, serving ranks remain weight-bearing; the distinc-tion is how requests and KV are mapped. Under DP, each request is assigned to one instance, and its KV cache remains within that instance. Under CP, an instance partitions each request’s KV cache across its GPUs, allowing a sequence to span their aggregate memory. In short, DP splits the batch across independent serving instances, reducing per-instance KV pressure by shrinking the local batch, while CP extends per-sequence KV memory within a serving instance. Both, however, are static configurations fixed at deployment time. 
+
+2.3 Need for Elasticity in Dynamic Decoding 
+
+The scaling strategies above assume a fixed workload, but the high dynamism identified in §2.1 means real KV demand fluctuates sharply over time. Figure 3 makes this concrete by replaying a bursty long-context trace on a statically pro-visioned baseline. As shown in Figure 3a, recurring bursts of long-context requests cause aggregate KV demand to swing well above and below the provisioned capacity, exposing a fundamental provisioning trade-off. In under-provisioning , the system is provisioned for typ-ical demand. When bursts arrive, KV capacity is exceeded, forcing the engine to queue or preempt requests and shrink the active batch. As Figure 3b shows, in our measurement this leads to only 68.8% SLO attainment [ 12 ], with tail la-tency spiking during burst windows. In over-provisioning ,reserving enough capacity for the worst-case burst keeps TPOT within the SLO, but the extra GPUs sit idle during the far more common non-burst periods, increasing $/Mtok by 21.6% [ 5 , 17 ]. Neither regime is satisfactory, because both 
+
+> 3
+
+commit to a fixed amount of KV capacity at deployment time while the workload’s KV demand is inherently dynamic. This motivates an elastic serving architecture that can expand KV capacity when bursts arrive and release it when demand subsides, achieving both low TPOT and low $/Mtok with-out a static provisioning compromise. The key question is the granularity of this elasticity: should the system scale an entire instance, or only the part of decode whose resource demand is growing? 
+
+2.4 Limitations of Existing Elastic Scaling 
+
+When aggregate KV demand exceeds the deployed pool, a serving system needs elasticity to add capacity. Scaling the two strategies above is constrained in different ways. 
+
+Scaling full instances. DP-style scale-out can add an instance and split the batch across instances, making ex-pansion simple. This physically increases KV capacity, but only at the granularity of an instance, forcing KV capacity to scale together with compute capacity. The approach in-curs three limitations for decode-heavy workloads. L1 , high instance-start overhead . Bringing up a new instance requires loading model weights and initializing the serving runtime, and even optimized designs remain too slow for decode-time SLOs [ 5 ]. L2 , low memory efficiency . Each scaling step carries a complete set of model weights (e.g., 18 GB for Llama-3.1-8B), consuming precious HBM that could otherwise hold KV cache. L3 , low compute efficiency . Splitting the batch across instances shrinks each instance’s local batch; in our measure-ment, halving the batch drops per-step decode throughput by 13–14%, reducing GEMM utilization. 
+
+Scaling within an instance. CP naturally matches se-quence growth by partitioning KV across GPUs within an instance, but the participating GPU set is fixed at launch, so KV capacity cannot grow online with the context. Fixed-pool sequence-parallel systems such as LoongServe [ 30 ]improve the use of this predeployed pool through group reconfiguration, placement, and query dispatch, while avoid-ing resident-KV migration. These mechanisms improve pool utilization but do not change its physical KV-capacity ceiling. Expanding the pool online would require preparing a new weight-bearing rank, loading its model weights, changing the CP collective membership, and deciding how to han-dle resident KV. The collective step alone is too slow for decode-time elasticity: rebuilding NCCL communicators for multi-GPU CP groups stalls execution for 550–662 ms on our testbed. Repartitioning resident KV is even more expensive: under high memory pressure on our testbed, a full-load re-size can stall decode for seconds. Thus, intra-instance scaling improves how a fixed pool absorbs long contexts, but adding KV capacity online beyond that pool is too expensive for decode-time elasticity. Together, these two paths expose the missing scaling unit. Inter-instance scaling can add capacity online, but it expands KV capacity together with compute capacity. Intra-instance FFN Kernel       
+
+> KV Cache
+> Attention Kernel
+> Projection Kernel
+> ,,,,
+> FFN Kernel
+> KV Cache
+> Attention Kernel
+> Projection Kernel
+> ,,,,
+> Extra HBM Occupation
+> Scale out overheads
+
+(a) Instance-level elasticity for context growth (e.g., Serverless-LLM [5]) FFN Kernel           
+
+> Projection Kernel
+> ,,,,
+> Weight Nodes
+> KV Cache
+> [100K,..)
+> Attention
+> Kernel
+> KV Cache
+> [50-100K)
+> Attention
+> Kernel
+> KV Cache
+> [0-50K)
+> Attention
+> Kernel A0 A1 A2 Routing Table Token Range Mapped Node
+> [0, 50K) A0
+> [50K, 100K) A1
+> [100K, ...) A2 (new)
+> ①②③
+> ④Merge
+> ⑤
+> Fixed HBM Occupation
+> Near zero overheads
+
+(b) Architecture of KernelFlume 
+
+Figure 4. KernelFlume’s architecture comprises weight nodes and an elastic set of attention nodes. (a) Full-instance scaling adds a complete weight-bearing instance. (b) Ker-nelFlume adds a weightless attention node and extends the token-range routing table. CP supports long sequences by partitioning each sequence’s KV across GPUs, but only within a fixed pool. Long-context decode instead needs elasticity at the granularity of the growing KV state: expand KV-side capacity without copy-ing model weights, changing the model-side execution path, or fragmenting the active batch. Turning this finer-grained scaling unit into a practical decode system imposes two re-quirements: 
+
+R1. Fine-grained online elasticity. The system must recon-figure KV capacity at token-step granularity with minimal overhead. Route changes should not require model loading, communicator rebuilds, or pausing in-flight decode steps. R2. SLO and cost efficiency. After KV capacity is scaled across multiple nodes, the system must still meet strict TPOT SLOs and maintain low $/Mtok. 
+
+## 3 System Overview 
+
+Prefill/decode disaggregation [ 22 , 24 , 37 ] has shown that separating inference phases onto specialized hardware im-proves utilization. KernelFlume extends this philosophy to a finer granularity, within the decode phase itself , separating projection/FFN from attention so that the attention/KV path scales elastically with growing request state. Concretely, KernelFlume places weight (W) nodes along-side an elastic pool of weightless attention (A) nodes. Fig-ure 4 contrasts the scaling unit: full-instance scaling adds another weight-bearing replica, whereas KernelFlume adds 
+
+> 4
+
+only a weightless A node and extends the routing table. KernelFlume addresses R1 with this routing-table interface: routed communication sends tensors according to the table (§4.1), and the scaling policy decides when to prepare and publish A nodes (§4.2). It addresses R2 with QFA, which over-laps 𝑄 transfer with remaining projection work (§5.1), and inter-layer kernel pipelining, which overlaps A-side atten-tion with W-side work across adjacent microbatches (§5.2). This section gives the architectural map and a decode-step walkthrough. 
+
+3.1 Kernel-level Disaggregation 
+
+KernelFlume’s base architecture uses two node types, illus-trated in Figure 4b. A weight node is the weight-bearing deployment unit: a single GPU when the model fits on one device, or a tensor-parallel group for larger models. The elastic dimension is implemented by weightless attention nodes, so ranks added for attention/KV capacity do not carry model weights. A weight (W) node owns the model-weight path during decode, executing 𝑊 𝑄 , 𝑊 𝐾 , 𝑊 𝑉 , merging atten-tion partials, applying 𝑊 𝑂 , and running FFN locally. Keep-ing these kernels on weight nodes preserves large projec-tion/FFN batches and avoids weight movement during elas-ticity events. An attention (A) node is a weightless worker that stores a token-range KV partition and computes local core attention over that partition. Adding one changes only KV ownership and routing, so KernelFlume uses sequence partitioning as an attention-only scaling mechanism rather than a full-model parallel execution strategy. This architecture aligns the scaling unit with the re-source asymmetry identified in §2: model weights stay on W nodes, while A nodes scale with the context-dependent attention/KV demand. 
+
+3.2 Workflow of Elastic Decoding 
+
+Figure 4b also summarizes the layer-level decode flow. For each request, the routing table maps token ranges to the A nodes that store their KV cache (§4.1). With this mapping, each decode layer proceeds as follows. 
+
+❶ Projection on weight nodes. Weight nodes run QKV pro-jection for the current decode step. ❷ Routed dispatch by QFA. With QFA (§5.1), weight nodes dispatch 𝑄 through the routed communication path (§4.1) to all A nodes that hold KV ranges for the request, as soon as 𝑄 is ready and before the full QKV projection completes. The newly gener-ated (𝐾 new , 𝑉 new ) is routed only to the request’s tail attention node , which owns the newest token range. Tail nodes change only at step boundaries. ❸ Local attention on the attention nodes. After QFA dispatch, A nodes that own only historical ranges for a request can begin attention as soon as 𝑄 ar-rives. A nodes that own live tail ranges wait for (𝐾 new , 𝑉 new ),append them, and then compute attention on the updated tail partitions. ❹ Partial-result return and merge. Each at-tention node returns its local attention partials (𝑜 𝑖 , 𝑚 𝑖 , ℓ 𝑖 )
+
+to weight nodes, which combine them with the standard online-softmax (log-sum-exp) reduction [ 3 , 16 , 18 ] and apply 
+
+𝑊 𝑂 . ❺ FFN and next layer. Weight nodes run FFN locally and advance to the next layer; inter-layer kernel pipelining (§5.2) schedules this post-attention work against projection and remote attention from adjacent microbatches. Scale events are applied between decode steps: the scal-ing policy prepares new A nodes in the background and publishes route updates only at token boundaries (§4.2). An in-flight token therefore uses one consistent routing snap-shot, while future tokens can append KV to newly added A nodes. The next two sections detail the elasticity mecha-nisms and execution optimizations, respectively. 
+
+## 4 Elastic Core Attention on Static Graphs 
+
+R1 requires scale events to take effect between decode steps without draining in-flight requests or rebuilding the execu-tion path. In KernelFlume, core-attention elasticity is im-plemented as dynamic routing: token ranges may map to different A node endpoints, while the W node execution graph remains unchanged. This design must address three questions. ❶ How can attention communication change its endpoints without rebuilding a collective group? ❷ How can dynamic routes be exercised from a static CUDA Graph without graph recapture or serializing remote attention? ❸
+
+How can KernelFlume decide when to prepare and activate new attention nodes so that growing KV demand is absorbed without violating the TPOT SLO? KernelFlume answers the first two questions with elastic attention communication (§4.1), which separates endpoint selection from graph execu-tion, and answers the third with a scaling policy (§4.2). 
+
+4.1 Elastic Communication Routing table. Collective communication with a fixed peer set, such as an NCCL communicator [ 19 ] or an NVSHMEM processing-element group [ 20 ], exposes the wrong granular-ity for online attention-node elasticity. With collective-based communication, changing that peer set typically requires communicator rebuild or heap re-creation, participant re-binding, and draining in-flight work before the new topol-ogy becomes usable. Those steps are appropriate for static tensor-parallel deployments, but they are too heavy for the sub-millisecond route switches that KernelFlume targets on the request-state path: on our testbed, rebuilding NCCL com-municators alone takes 550–662 ms. The mismatch is that collective membership is part of the communication object: a newly added attention node cannot enter the decode path without rebuilding that object. KernelFlume instead defines attention communication around a routing table rather than a collective group. The routing table maps logical token ranges to UCX endpoint han-dles [ 25 ], along with metadata such as the active attention-node set. For each request, it identifies the endpoints that 
+
+> 5
+
+own historical KV ranges and the endpoint that owns the live tail. Weight nodes then communicate directly with those endpoints: they dispatch 𝑄 to the owners of the request’s token ranges, send (𝐾 new , 𝑉 new ) only to the tail endpoint, and gather local attention partials from the same set. Un-der batching, the transport-visible active set is the union of per-request endpoint sets. A scale event edits entries for future KV ranges and updates the derived endpoint set, with-out changing any collective execution group. This is the only decode-path state it changes: future token ranges are assigned to the new endpoint, while graph-captured compu-tation remains unchanged. UCX implements the data movement and lets the same routed endpoint abstraction use the best available GPU-aware transport for each endpoint pair. The CPU only initi-ates transfers and never touches payloads, so the data plane runs at transport-native bandwidth. Receives are pre-posted at the beginning of each decode step into GPU buffers con-sumed by the receiver’s graph. This zero-copy, pre-posted de-sign eliminates staging copies and protocol-level rendezvous stalls: when a send arrives, the transport can begin DMA immediately without waiting for a matching receive. 
+
+Graph progress signaling. The routing table determines where tensors should be sent; the remaining question is how to issue those sends as soon as graph-produced buffers are ready. CUDA Graph replay creates two constraints. Encod-ing communication targets inside the graph would bind it to a fixed attention-node set and require recapture after scale events, while waiting until graph completion would serialize communication with computation and eliminate query-first overlap (§5.1). KernelFlume therefore separates graph exe-cution from communication decisions. Figure 5 illustrates the two paths: the upper path is a topology-unaware weight-node CUDA Graph that produces tensors and writes host-visible readiness signals, while the lower path is a CPU-side routing loop that reads those signals, consults the current routing table, and posts UCX sends to the selected endpoints. A scale-up event updates the routing table, not the weight-node execution graph. 
+
+GPU path. The weight-node CUDA Graph contains only local compute and signal writes. KernelFlume inserts signal points where outbound buffers become ready, such as after the 𝑄 projection and after the 𝐾 /𝑉 projection. Each signal uses a WriteValue32 -style write to set a flag in host-visible memory, allowing the CPU to observe graph progress with-out ending replay or embedding communication targets in the graph. Because token ranges and attention-node mem-bership are absent from the graph, route changes do not require graph recapture. CPU path. A CPU polling loop runs alongside the graph. When a readiness flag is set, it consults the current routing table and posts UCX sends for the ready buffer to the selected A-node endpoints. After all receives for a layer complete, the CPU writes a completion flag to GPU memory so the receiver-side graph’s Routing Table           
+
+> Token Range UCX Endpoint
+> [0, T/2) A0
+> [T/2, T) A1
+> [T, ...) A2 (new)
+> Post UCX
+> P2P Send
+> Weight Nodes
+> GPU Execution
+> CUDA Graph
+> Projection Signal Merge + W O+FFN
+> Attention Nodes
+> CPU Control
+> WriteValue32
+> Host-Mapped
+> Pinned Memory
+> ReadValue32
+> Device-mapped host pointer
+> A0
+> P2P
+> H2D/D2D/D2H
+> Device Memory A1 A2
+> New node Flag
+
+Figure 5. Elastic routing on a static graph. The topology-unaware weight-node CUDA Graph (top) contains local com-pute and host-visible readiness signals. The CPU-side rout-ing loop (bottom) reads those signals and uses the routing table that maps token ranges to UCX endpoints. In this ex-ample, a request’s KV cache initially spans A0 [0,𝑇 /2) and A1 [𝑇 /2,𝑇 ). When the context grows beyond 𝑇 , the routing table is extended with a new entry [𝑇 , . . . ) → A2 without modifying the weight-node execution graph, turning scale-up into a routing-table update. 
+
+ReadValue32 -style wait can resume. This write uses a ded-icated signaling stream rather than the graph’s execution stream: the execution stream is already blocked on that wait, so enqueuing the flag write on the same stream would place it behind the wait and deadlock. 
+
+Transport pre-registration. KernelFlume exposes a route only after its transport state is ready. Before an A node receives routed KV ranges, KernelFlume creates its UCX endpoints and registers the GPU buffers on the routed path. This moves CUDA IPC setup and GPUDirect RDMA registration outside graph replay, leaving decode steps to post sends to ready endpoints. The same rule applies during scale-up: KernelFlume prewarms the new A node and publishes it in the routing table only after these registrations finish (§4.2). Together, endpoint routing, graph-external signaling, and pre-registered routes keep scale events outside the captured graph. A route update changes only CPU-side destination metadata; tensor shapes and the W node graph remain un-changed. The CPU path is lightweight in practice: each routing-loop operation costs only a few microseconds in our measurements (§6.2). Because the loop runs alongside CUDA Graph replay and reacts to readiness signals, com-munication is issued when individual buffers become ready rather than after graph completion. 
+
+4.2 Elastic Scaling Policy 
+
+Given elastic communication and static-graph support, the remaining policy question is when to prewarm a new A node, including its endpoint and buffer registrations, and when to publish its route in the routing table. 
+
+> 6
+
+Algorithm 1: A-node scaling policy 
+
+Input: batch {𝑠 1, . . . , 𝑠 𝐵 }; model constants 𝐻 𝑘𝑣 , 𝑑 ℎ, 𝐿 ;policy constants 𝛽 mem , 𝛽 slo , 𝛾 ; SLO-derived 
+
+𝑇 max  
+
+> 𝐴
+
+; profiled 𝐵𝑊 HBM , 𝐶 kv_cap ,𝑇 step ,𝑇 prewarm  
+
+> 1
+
+𝐶 thresh ← min (𝛽 mem 𝐶 kv_cap , 𝛽 slo 𝑇 max  
+
+> 𝐴
+
+𝐵𝑊 HBM ); 
+
+> 2
+
+𝐶 total ← Í𝑖 2𝑠 𝑖 𝐻 𝑘𝑣 𝑑 ℎ𝐿 · 2B;  
+
+> 3
+
+𝑁 𝐴 ← ⌈ 𝐶 total /𝐶 thresh ⌉; 
+
+> 4
+
+Partition token ranges to balance aggregate KV bytes across the batch;  
+
+> 5
+
+Initialize tail [𝑟 ] for each request 𝑟 ; 
+
+> 6
+
+foreach tail-holding A-node 𝑖 do  
+
+> 7
+
+𝑛 𝑖 ← |{ 𝑟 : tail [𝑟 ] = 𝑖 and 𝑟 active }| ; 
+
+> 8
+
+𝑔 𝑖 ← 𝑛 𝑖 · 2𝐻 𝑘𝑣 𝑑 ℎ𝐿 · 2B;  
+
+> 9
+
+𝑏 𝑖 ← KVBytes (𝐴 𝑖 ); 
+
+> 10
+
+if 𝑔 𝑖 > 0 then  
+
+> 11
+
+𝜏 (𝑖 ) 
+
+> fill
+
+← ( 𝐶 thresh − 𝑏 𝑖 )/ 𝑔 𝑖 ; 
+
+> 12
+
+if 𝜏 (𝑖 ) 
+
+> fill
+
+𝑇 step < 𝑇 prewarm and no pending prewarm for 𝑖 then  
+
+> 13
+
+prewarm [𝑖 ] ← spawn prewarm task;  
+
+> 14
+
+end  
+
+> 15
+
+end  
+
+> 16
+
+if 𝑏 𝑖 ≥ 𝛾𝐶 thresh and prewarm [𝑖 ] ready then  
+
+> 17
+
+At the next token boundary, publish the route and redirect active tails on 𝑖 to prewarm [𝑖 ]; 
+
+> 18
+
+end  
+
+> 19
+
+end Per-node budget. The scaling policy provisions A nodes against two constraints: KV capacity and the TPOT SLO. HBM capacity gives a hard memory limit. The SLO gives a latency limit: even when the KV state fits, the predicted exposed decode time must remain below the TPOT target. Query-first dispatch reduces layer-local exposure by sending 
+
+𝑄 before the full projection finishes (§5.1), while kernel pipelining overlaps remaining attention-side time with W node projection and post-attention work (§5.2). The pipeline model in §5.2 predicts the exposed per-layer time as max (𝑇 𝑝 + 𝑇 𝑓 , 𝑇 𝐴 ), where 𝑇 𝑝 + 𝑇 𝑓 is the W-side stage and 𝑇 𝐴 is the routed attention stage. Given a TPOT target 
+
+𝑇 slo , KernelFlume subtracts measured per-token overheads outside this two-stage model and divides the remaining budget across layers, yielding a per-layer budget 𝑇 bud layer . For the chosen W-side configuration, satisfying the SLO requires 
+
+max (𝑇 𝑝 + 𝑇 𝑓 , 𝑇 𝐴 ) ≤ 𝑇 bud layer , so the largest admissible routed-attention time is 𝑇 max  
+
+> 𝐴
+
+= 𝑇 bud layer . KernelFlume then converts this time bound into a KV-byte budget for each A node. Because decode attention is bandwidth-bound, scanning a KV footprint of 𝐶 bytes takes approximately 𝐶 /𝐵𝑊 HBM ; the SLO-derived budget therefore gives 𝐶 slo = 𝛽 slo 𝑇 max  
+
+> 𝐴
+
+𝐵𝑊 HBM ,where 𝐵𝑊 HBM is the effective HBM bandwidth of one weightless A node. The factor 𝛽 slo < 1 reserves headroom for profiling error, kernel variability, and communication jitter. The memory budget is 𝐶 mem = 𝛽 mem 𝐶 kv_cap , where 
+
+𝐶 kv_cap is the usable KV capacity of one A node. The factor 
+
+𝛽 mem < 1 leaves space for allocator fragmentation, runtime buffers, and transient non-KV state. The policy therefore caps each A node at 
+
+𝐶 thresh = min (𝛽 mem 𝐶 kv_cap , 𝛽 slo 𝑇 max  
+
+> 𝐴
+
+𝐵𝑊 HBM ), (1) where 𝐶 thresh is the effective per-node threshold used by the policy, i.e., min (𝐶 mem , 𝐶 slo ). The tighter of the memory and latency bounds determines when another A node is needed. 
+
+Post-prefill initialization. After prefill, the batch has total KV footprint 𝐶 total = Í𝑖 2𝑠 𝑖 𝐻 𝑘𝑣 𝑑 ℎ𝐿 · 2B, where 𝑠 𝑖 is request 𝑖 ’s token length, 𝐻 𝑘𝑣 the number of KV heads, 𝑑 ℎ
+
+the per-head dimension, 𝐿 the number of layers, and 2BFP16 storage per key or value element. The policy provisions 
+
+𝑁 𝐴 = ⌈𝐶 total /𝐶 thresh ⌉ A nodes and initializes the routing table by assigning existing token ranges to balance aggregate KV bytes across them. For each request, the node that owns its highest token range becomes the current tail. 
+
+Predictive scale-up. During decode, only tail nodes grow. Non-tail nodes hold fixed historical ranges, while each active request whose tail is on node 𝑖 appends 2𝐻 𝑘𝑣 𝑑 ℎ𝐿 · 2B bytes per step. For a tail-holding node 𝑖 with 𝑛 𝑖 > 0 active requests and current KV occupancy 𝑏 𝑖 , KernelFlume estimates the fill horizon under the current growth rate as 
+
+𝜏 (𝑖 ) 
+
+> fill
+
+= 𝐶 thresh − 𝑏 𝑖 
+
+𝑛 𝑖 · 2𝐻 𝑘𝑣 𝑑 ℎ𝐿 · 2B, (2) and recomputes this estimate every step from exact KV occu-pancy and tail ownership. Here 𝑇 step is the predicted decode-step time, 𝑇 prewarm is the measured time to prepare a new route, and 𝛾 is the activation watermark. When 𝜏 (𝑖 ) 
+
+> fill
+
+𝑇 step <
+
+𝑇 prewarm , KernelFlume prewarms a fresh A node in the back-ground. After the watermark is reached and the prewarmed node is ready, KernelFlume publishes the prepared route at the next token boundary. Future appends use the new A node, while existing KV ranges remain in place. The critical-path route installation measured in §6.2 takes 7.2 𝜇 s, with all endpoint setup performed off the critical path during back-ground pre-warming. Algorithm 1 summarizes the post-prefill initialization and the per-step monitor. 
+
+## 5 Disaggregated Kernel Execution 
+
+This section addresses R2 by showing how KernelFlume sustains strict TPOT SLOs and low $/Mtok when decode execution spans multiple nodes. It targets two sources of underutilization: exposed communication within each layer, which query-first attention reduces by overlapping commu-nication with computation, and staggered work across layers, which inter-layer kernel pipelining reduces by overlapping adjacent microbatches.    
+
+> 7Weight nodes Q/K/V S
+> Historical Attn. S
+> Tail Attn.
+> K/V S
+> Historical Attn.
+> Tail Attn.
+> Q
+
+Query-First Attention  
+
+> Computation Communication Attention
+> S
+
+Vanilla  Attention     
+
+> Time Time
+> S
+> R
+> R
+> RS
+> RS
+> Weight nodes A nodes A nodes
+
+Figure 6. Layer-level timelines for normal attention (left) and query-first attention (right). With query-first attention, 
+
+𝑄 is dispatched before the full QKV projection completes, allowing attention nodes to begin computing on historical KV in parallel with weight nodes’ remaining K/V projection. 
+
+5.1 Query-First Attention 
+
+Query-first attention exposes and exploits the fact that many decode-time attention partitions depend only on the new query. For a decode token, an attention partition that owns only historical KV already has its 𝐾 /𝑉 inputs; its only new dependency is 𝑄 . In a non-disaggregated layer, this 𝑄 -only dependency is hidden by the usual kernel boundary: atten-tion starts after the full QKV projection has produced all 𝑄 ,
+
+𝐾 , and 𝑉 outputs. KernelFlume implements this idea with 
+
+query-first attention disaggregation . As soon as 𝑄 is produced, KernelFlume routes it to the A nodes that already hold his-torical KV, allowing their remote attention work to overlap with the remaining 𝐾 /𝑉 projection and other local work on W nodes. Figure 6 illustrates the resulting overlap. Once 𝑄 is dis-patched, non-tail A nodes can begin attention over their historical KV partitions while W nodes continue 𝐾 /𝑉 projec-tion and other local work. For tail A nodes, the current token also extends the local KV range: they wait for both 𝑄 and 
+
+(𝐾 new , 𝑉 new ), append the new entries, and then compute at-tention on the updated tail partitions. Each attention node re-turns local partials (𝑜 𝑖 , 𝑚 𝑖 , ℓ 𝑖 ), which the weight nodes merge via the associative online-softmax reduction [ 3 , 18 ] before applying 𝑊 𝑂 and FFN. This merge produces the same result as computing attention over the full KV range, so query-first dispatch and the later tail-node appends of (𝐾 new , 𝑉 new ) pre-serve the kernel semantics. Starting historical-KV attention as soon as 𝑄 is ready lets A nodes work during the remaining 
+
+𝐾 /𝑉 projection window, making added attention capacity effective within the layer. The challenge is to expose 𝑄 early while preserving CUDA Graph replay on W nodes. W nodes run projection as a CUDA Graph for low-overhead replay, but once launched the graph is a fixed GPU command sequence: the CPU cannot inter-rupt it after 𝑄 to issue a routed send before 𝐾 /𝑉 completes. Splitting the projection into multiple graph launches would add launch and synchronization overhead, while waiting for graph completion would serialize communication and lose query-first overlap. KernelFlume keeps the projection path in a single CUDA Graph and moves endpoint selection and send issuance to a CPU-side loop. The graph writes 𝑄 and (𝐾 new , 𝑉 new ) into pre-registered GPU buffers and emits a host-visible readiness flag when each buffer is complete. A dedicated CPU polling thread observes these flags, consults the current routing table, and posts non-blocking UCX sends to the selected A nodes. Thus, 𝑄 can be in flight while the same graph launch continues the remaining 𝐾 /𝑉 projection. On the receiver side, each A node launches attention only after transport completion marks the input buffers ready, ensuring that kernels consume complete tensors. This split preserves the invariants needed for query-first execution. The W node graph remains a deterministic, fixed-shape projection path and retains the efficiency of CUDA Graph replay. At the same time, endpoint choices stay outside the graph: route updates described in §4 change only the CPU-side routing table and do not trigger graph recapture. 
+
+5.2 Kernel Pipelining 
+
+The query-first kernel schedule reduces layer-local commu-nication exposure. Across layers, however, W nodes can still wait for remote attention partials before they can merge the result, apply 𝑊 𝑂 , and execute FFN for the same micro-batch. KernelFlume addresses this with an inter-layer kernel pipeline .Rather than processing all active decode requests as a single decode batch, KernelFlume groups the current de-code traffic into 𝑀 microbatches with target size 𝐵 𝜇 . Write the 𝑘 th microbatch as 𝜇 𝑘 . For each layer, W nodes execute 
+
+proj (𝜇 𝑘 , 𝐿 ) and dispatch 𝑄 to the A nodes. While A nodes compute attention for 𝜇 𝑘 , W nodes use the wait time to complete the merge, 𝑊 𝑂 , and FFN work for the previous microbatch 𝜇 𝑘 −1 whose attention result has already returned. Once the pipeline is filled, W nodes alternate between pro-jection and post-attention work across microbatches, while A nodes process the corresponding attention work. Figure 7 illustrates the effect with 𝑀 =2. The serialized schedule (top) leaves W nodes idle whenever they wait for remote atten-tion, while the pipelined schedule (bottom) fills those gaps, keeping both W and A nodes close to continuously busy. For the chosen microbatch size 𝐵 𝜇 , let 𝑇 𝑝 be the profiled W-node projection time, 𝑇 𝑓 be the profiled W-node post-attention time including merge, 𝑊 𝑂 , and FFN, and let 𝑇 𝐴 (𝑁 𝐴 )
+
+be the predicted A-side attention-stage time with 𝑁 𝐴 ac-tive A nodes, including attention compute and communica-tion. In a simplified two-stage model, serial execution spends 
+
+𝑇 𝑝 + 𝑇 𝐴 (𝑁 𝐴 ) + 𝑇 𝑓 per layer for one microbatch, while the filled pipeline completes one microbatch every max (𝑇 𝑝 +
+
+𝑇 𝑓 , 𝑇 𝐴 (𝑁 𝐴 )) . The resulting ratio of pipelined throughput to                            
+
+> 8PP FFN P FFN P FFN P FFN P FFN P FFN P FFN FFN
+> Attn. Attn. Attn. Attn. Attn. Attn. Attn. Attn.
+> Layer 0 - 3
+> PFFN PFFN
+> Attn. Attn. Time
+> Send Q/KV Resv. partial
+> PFFN PFFN
+> Attn. Attn.
+> Time
+> Non-Pipeline Pipeline
+> Idle
+
+Figure 7. Serialized (top) vs. pipelined (bottom) execution with 𝑀 =2 microbatches across four layers. Pipelining fills weight nodes’ idle gaps by interleaving projection and FFN from alternating microbatches. serial throughput is 
+
+𝐺 pipe = 𝑇 𝑝 + 𝑇 𝐴 (𝑁 𝐴 ) + 𝑇 𝑓 
+
+max (𝑇 𝑝 + 𝑇 𝑓 , 𝑇 𝐴 (𝑁 𝐴 )) .
+
+The ideal upper bound is 2× when the W-side stage and the A-side attention stage take similar time. The same model gives the exposed per-layer time, max (𝑇 𝑝 + 𝑇 𝑓 , 𝑇 𝐴 (𝑁 𝐴 )) ,which KernelFlume uses to predict decode-step latency for SLO-aware scaling. As sequences grow, the scaling policy in §4.2 uses this estimate to add A nodes before the attention stage threatens the TPOT SLO. 
+
+## 6 Evaluation 
+
+6.1 Implementation and Setup Implementation. We implement KernelFlume ( ∼6 K LoC in Python, C++, and CUDA) on top of vLLM 0.14, reusing its kernels. 
+
+Hardware and models. We evaluate on two real testbeds: (A) an intra-node 8 ×RTX A6000 testbed (48 GB GDDR6, 
+
+∼768 GB/s, hybrid NVLink/PCIe) and (B) a cross-node 16 ×H100 testbed (two nodes, 8 ×H100 each, 80 GB HBM3, 
+
+∼3.35 TB/s per GPU, NVSwitch intra-node and 400 Gb/s RoCE with GPUDirect-RDMA inter-node). Both run Llama-3.1-8B-Instruct with real weights. For the large-scale simulation (§6.5), we simulate Llama-70B, and Llama-3.1-405B for the ultra-large-scale projection, using profiled H100 parameters. 
+
+6.2 Online Elasticity and Scalability 
+
+This section evaluates whether adding A nodes reduces atten-tion latency, and quantifies the topology-switch overhead. 
+
+Attention-node scaling. We evaluate whether Ker-nelFlume can add KV capacity without degrading decode latency, by elastically scaling from one attention node (1A) to seven attention nodes (7A) as each request’s context grows autoregressively (Figure 8): when the tail A node’s KV approaches its budget, the controller appends a new weightless A node. We sweep six batch sizes (2–64), filling every A node to its maximum HBM budget for KV. 1A 2A 3A 4A 5A 6A 7A 
+
+> Active A nodes (elastic scale-out)
+> 50
+> 60
+> 70
+> 80
+> 90
+> 100
+> TPOT (ms/step)  TPOT (mean over BS)
+> TPOT range (BS 2-64)
+> Total KV capacity
+> 0
+> 100
+> 200
+> 300
+> Total KV capacity (GB)
+
+Figure 8. Elastic attention-node scaling from one to seven A nodes (1A →7A; A6000, Llama-3.1-8B). As nodes are added, total KV capacity grows linearly (red) while per-step TPOT stays flat (blue; mean over batch sizes 2–64, band = min– max spread). A weightless A node adds capacity with low measured latency overhead. Up   
+
+> (7.2 s)
+> Down
+> (8.3 s)
+> 4
+> 6
+> 8
+> 10
+> 12
+> 14
+> Time (  s)
+
+(a) Route-install 10000    
+
+> 12000 10.8 s KV alloc (163ms)
+> UCX setup (72ms)
+> CUDA init (177ms)
+> KernelFlume
+> prewarm
+> KernelFlume
+> no-prewarm
+> Serverless
+> LLM
+> Full-inst.
+> cold start
+> 0
+> 500
+> 1000
+> Time (ms)
+> 7.2 s
+> 412 ms
+> 1.1 s
+
+(b) Scaling overhead comparison 
+
+Figure 9. Topology-switch overhead. (a) Prepared route-install overhead distribution (mean scale-up: 7.2 𝜇 s, scale-down: 8.3 𝜇 s). (b) Comparison with full-instance scaling: pre-warmed route-install takes 7.2 𝜇 s, and even no-prewarm A-node bring-up (412 ms, no weights) is shorter than the 1.1 s ServerlessLLM and 10.8 s full-instance disk cold start. As KernelFlume scales from one to seven A nodes, total KV capacity grows linearly from 47 to 330 GB while per-step TPOT stays nearly flat ( ∼72 ms). The narrow min–max band shows only small variation across batch sizes, with TPOT remaining stable as A nodes are added. The small rise before the first A-node scale-up is the normal effect of growing sequence length, before elasticity is needed; after scale-up, weightless A nodes absorb the incremental KV demand while keeping per-step latency nearly flat. 
+
+Topology-switch overhead. We measure topology-switch overhead over ∼30 elasticity events (Figure 9). With background pre-warming, activating an A node only installs a route ( a_eps.append ); CUDA context, UCX transport, and KV-cache setup occur off the critical path, and no model weights are loaded. We compare against two full-instance startup methods: ServerlessLLM [ 5 ], a state-of-the-art optimized loader, and a full-instance disk cold start. Prepared route-install takes 7.2 𝜇 s on scale-up and 8.3 𝜇 son scale-down, because activation changes only the routing    
+
+> 9Llama-8B
+> (GQA)
+> Llama-16B
+> (GQA)
+> GQA-Giant
+> (GQA)
+> MHA-7B
+> (MHA)
+> MHA-13B
+> (MHA)
+> MHA-20B
+> (MHA)
+> 0.95
+> 1.00
+> 1.05
+> 1.10
+> Decode latency /
+> non-disaggregated ( ×) 1.11 ×
+> 1.08 ×
+> 1.10 ×
+> 1.07 ×
+> 1.09 ×
+> 1.06 ×1.05 ×
+> 0.99 ×
+> 1.03 ×
+> 0.97 ×
+> 1.03 ×
+> 0.96 ×
+> Non-disaggregated (reference) KernelFlume w/o QFA KernelFlume w/ QFA
+
+Figure 10. Decode latency of disaggregated execution rela-tive to the non-disaggregated reference (a single GPU, no W– A split; 1.0×, lower is better) across six GQA/MHA models. With QFA, disaggregated decode stays within a few percent of the reference, and runs faster than it for the MHA models. table: A node setup is prewarmed and never loads model weights. The predictive policy (§4.2) normally starts this setup 𝜏 fill steps before activation. If a burst outruns pre-warming, a weightless A node can still be built from scratch in 412 ms (CUDA context, UCX init, and KV allocation), shorter than the 1.1 s ServerlessLLM loader and the 10.8 s full-instance disk cold start. 
+
+6.3 Asynchronous Kernel Execution 
+
+This section evaluates the two execution mechanisms in §5: query-first attention disaggregation and kernel pipelining. 
+
+Disaggregation overhead and query-first attention. 
+
+We evaluate the overhead of W–A disaggregation and how much query-first attention (QFA) recovers. To isolate the effect of the query-to-KV-head ratio, we use six represen-tative GQA/MHA configurations that vary query-head and KV-head counts (GQA: Q32:KV8, Q48:KV8, Q64:KV8; MHA: Q32:KV32, Q40:KV40, Q48:KV48), and sweep batch sizes 8–128, sequence lengths 2K–32K, and multiple 𝑁 𝐴 settings. For each model we compare three setups: non-disaggregated reference (a single GPU running attention and projection together, i.e., a W–A split with zero split overhead), Ker-nelFlume w/o QFA (synchronous W–A split), and KernelFlume w/ QFA (with query-first overlap enabled). We report each disaggregated setup’s decode latency relative to this refer-ence (measured / reference latency; 1.0× is on par, lower is better), averaged across all (batch, seq) combinations per model (Figure 10). Without QFA, disaggregation adds 3% overhead for the large MHA configurations and up to 11% for the smallest GQA configuration (Q32:KV8), mainly from per-layer UCX round trips that are better amortized by larger GEMMs. QFA hides this communication behind local projection, recovering 2–3% for GQA models and 5–7% for MHA models ( ≈4% on average). The effect is strongest for MHA: its heavier K/V projection gives QFA more local work to overlap with remote attention, so the 5–7% recovery more than absorbs the split 1.75 2.00 
+
+> Predicted ( ×)
+> 1.6
+> 1.7
+> 1.8
+> 1.9
+> 2.0
+> Measured ( ×)
+> MAE
+> 3.1%
+> Ideal
+
+(a) Predicted vs. mea-sured 16/8K    
+
+> 32/4K
+> 64/2K
+> 128/1K
+> 32/8K
+> 64/4K
+> 128/2K
+> 64/8K
+> 128/4K
+> 0.0
+> 0.5
+> 1.0
+> 1.5
+> 2.0
+> Throughput vs. serial ( ×)
+> 2× upper bound
+> 1.91
+> 1.91
+> 1.94
+> 1.89
+> 1.91
+> 1.92
+> 1.88
+> 1.90
+> 1.87
+> NA=1 NA=2 NA=4
+
+(b) Pipelined / serial throughput 
+
+Figure 11. Pipeline-model validation and measured kernel-pipeline throughput ratio across 9 workloads. (a) Predicted and measured 𝑀 =2 pipelined-to-serial ratios agree with 3.1% mean absolute error. (b) With 𝑁 ∗ 
+
+> 𝐴
+
+provisioned by the elastic scaling policy (colors), all configurations approach the 2×
+
+upper bound. overhead, making disaggregated MHA decode faster than the non-disaggregated reference (0.96–0.99 ×). 
+
+Kernel pipelining. We evaluate kernel pipelining by measuring pipelined throughput divided by serial decode throughput across a range of workloads. We sample 9 workloads covering batch sizes 16–128 and sequence lengths 2K–16K. For each workload, the elastic scaling policy chooses 𝑀 thresh from the KV and TPOT constraints and sets 
+
+𝑁 ∗ 
+
+> 𝐴
+
+from total KV demand. The resulting configurations use one, two, or four A nodes. We then deploy the correspond-ing 1W+ 𝑁 ∗
+
+> 𝐴
+
+A topology and compare the model’s predicted throughput ratio against measurement (Figure 11). Figure 11 shows that the pipeline model predicts the mea-sured pipelined-to-serial throughput ratio with 3.1% mean ab-solute error, supporting its use in the scaling policy. Pipelin-ing then consistently approaches the 2× upper bound: mea-sured ratios range from 1.87 × to 1.94 × (mean 1.90 ×), with the residual gap attributable to communication overhead. This indicates that the 𝐶 thresh -based provisioning keeps ex-posed attention-side work within the modeled SLO budget, and kernel pipelining effectively recovers the utilization lost to disaggregation. 
+
+6.4 End-to-End Elasticity 
+
+This end-to-end experiment evaluates KernelFlume on the real Codex/SWE-bench Pro agentic workload, against static and full-instance elastic baselines. We report p99 TPOT, SLO attainment, and cost per million output tokens ($/Mtok). SLO attainment is the fraction of decode steps within the per-testbed TPOT target (80 ms on A6000, 50 ms on H100); cost is active GPU-hours times the per-GPU hourly price [ 13 ], normalized by output tokens. We use the open-sourced Codex/SWE-bench Pro serving trace [ 10 , 23 ], which contains 610 tool-augmented coding                          
+
+> 10 50 100
+> 0.0
+> 0.5
+> 1.0
+> CDF
+> A6000
+> Low
+> 50 100 150
+> Medium
+> 50 100 150
+> High
+> 0250 500 750
+> 50
+> 100
+> 150
+> TPOT (ms)
+> Low
+> 0250 500 750
+> Medium
+> 0500
+> High
+> 50 100
+> TPOT (ms)
+> 0.0
+> 0.5
+> 1.0
+> CDF
+> H100
+> 50 100
+> TPOT (ms)
+> 50 100
+> TPOT (ms)
+> 0100 200 300
+> Time (s)
+> 50
+> 100
+> TPOT (ms)
+> 0200
+> Time (s)
+> 0200 400
+> Time (s)
+> 50
+> 100
+> 150
+> 50
+> 100
+> 150
+> 50
+> 100
+> 150
+> 50
+> 100
+> 50
+> 100
+> 50
+> 100
+> Latency distribution (CDF) Latency over time (TPOT)
+> Under-provisioning Over-provisioning ServerlessLLM KernelFlume
+
+Figure 12. End-to-end elasticity under the Codex/SWE-bench Pro agentic trace on both testbeds. Top row: intra-node A6000; bottom row: cross-node 16 ×H100. Within each row, the left panels show TPOT CDFs and the right panels show TPOT over time for the Low , Medium , and High workloads. KernelFlume (green) keeps TPOT tight as variance grows; the static and ServerlessLLM baselines develop heavier tails. sessions with long contexts (median roughly 80K tokens, tail to ∼273K). To stress the systems under increasing request-length dynamics, we replay three 100-session workloads, 
+
+Low , Medium , and High , that sample low-, medium-, and high-dynamics slices of the real session-length distribution; 
+
+Low fluctuates mildly around the trace median while High 
+
+has the heaviest length spread. We compare against the baselines from §2: fixed-pool under-provisioning, fixed-pool over-provisioning, and full-instance elastic scaling realized with ServerlessLLM [ 5], the state-of-the-art instance-startup method. The baselines use vLLM [ 12 ]-style decode execution aligned with KernelFlume on decode kernels; they differ in provisioning/scaling policy and DP ×CP layout. We replay the same trace on A6000 at batch size 8 and on a cross-node 16 ×H100 testbed at batch size 32. In all non-KernelFlume baselines, each serving rank is weight-bearing: HBM is first reserved for model weights, and only the remaining capac-ity is available for KV. In KernelFlume, only W nodes store weights, while weightless A nodes devote their HBM to KV and are appended on demand. For fixed-pool provisioning, we give each GPU budget its strongest DP ×CP capacity envelope by sweeping all factor-izations and reporting the best result, using a KV-resident CP implementation consistent with KernelFlume’s attention-side CP. Under- and over-provisioning size the pool for trace-average and trace-maximum KV demand, respectively, with over-provisioning requiring six GPUs on A6000 and fourteen on H100. Figure 12 and Table 1 summarize the end-to-end results on both testbeds. KernelFlume is the lowest-cost strategy on all six workloads, cutting cost over ServerlessLLM by 21–32% (A6000) and 27–61% (H100) while holding 100% SLO attain-ment at flat p99 TPOT ( ∼74 ms and ∼34 ms, respectively). The baselines expose the expected tradeoff: under-provisioning 
+
+Table 1. End-to-end under the Codex/SWE-bench Pro trace on an intra-node A6000 and a cross-node 16 ×H100 testbed. Each cell reports p99 TPOT (ms) / SLO attainment and cost ($/Mtok), defined in §6.4. Best $/Mtok bolded; the last column (vs. SLLM) is KernelFlume’s reduction over ServerlessLLM (SLLM) [5], the full-instance baseline. 
+
+Static deployment Elastic scaling Under-prov. Over-prov. ServerlessLLM KernelFlume Level p99/slo $/Mtok p99/slo $/Mtok p99/slo $/Mtok p99/slo $/Mtok vs. SLLM 
+
+8×A6000 (48 GB), intra-node, batch size 8 
+
+Low 136/81 4.8 102/94 5.9 124/85 5.3 74/100 4.2 ▼ 21% 
+
+Medium 136/62 5.5 102/82 6.5 146/64 6.4 74/100 4.5 ▼ 29% 
+
+High 136/40 6.5 102/54 7.6 146/42 7.8 74/100 5.3 ▼ 32% 
+
+16 ×H100 (80 GB), cross-node, batch size 32 
+
+Low 62/76 5.6 30/99 7.2 85/94 5.7 32/100 4.1 ▼ 27% 
+
+Medium 89/58 6.7 59/95 8.2 126/81 8.7 34/100 4.8 ▼ 45% 
+
+High 119/34 9.6 60/67 12.5 148/55 17.7 34/100 6.9 ▼ 61% 
+
+overflows under long contexts, ServerlessLLM pays cold-start latency, and over-provisioning pays for trace-maximum capacity. KernelFlume avoids this tradeoff in two ways: it removes repeated weight copies when HBM is the binding resource, and it expands dynamic KV capacity with weight-less A nodes without fixed-pool overflow or full-instance cold starts [2, 5, 32]. 
+
+6.5 Simulation 
+
+To study larger models, longer contexts, and heterogeneous hardware, we replay the trace workloads in a simulator using measured hardware parameters. It uses the same metrics and GPU-hour accounting as §6.4. 
+
+11 Table 2. Simulation: Llama-70B TP=8, BS=128. Cells report p99 TPOT (ms) / SLO attainment (%) and $/Mtok; best $/Mtok per row bolded.                        
+
+> Under-prov. Over-prov. ServerlessLLM KernelFlume p99/slo $/Mtok p99/slo $/Mtok p99/slo $/Mtok p99/slo $/Mtok vs. SLLM Low 171/40 28.9 41/100 56.0 175/72 28.9 49/100 12.6 ▼56% Medium 173/31 32.8 41/100 57.7 197/70 40.3 49/100 14.5 ▼64% High 323/18 39.5 54/100 60.7 329/69 51.9 50/100 17.8 ▼66%
+
+Validation and 70B-scale simulation. We validate the simulator against the measured cross-node 8B H100 setup in §6.4, matching p99 TPOT and cost with 2.8% mean ab-solute error (7.5% max), and then replay the Codex/SWE-bench Pro trace [ 10 , 23 ] at Llama-70B scale (tensor paral-lelism TP=8, batch size BS=128). The simulator uses standard compute [ 29 ] and communication [ 8 ] models with H100-measured parameters; heterogeneous W/A placement substi-tutes an H20 profile for A nodes. We use an 80 ms TPOT SLO for the 70B study, preserving comparable headroom over measured decode. Table 2 shows that KernelFlume keeps p99 TPOT at 49– 50 ms with 100% SLO attainment and reduces cost by 56– 66% over ServerlessLLM. The 70B simulation reproduces the measured trend: KernelFlume matches over-provisioning’s 100% SLO attainment at 3.4–4.4 × lower cost. Disaggregation also unlocks a cheaper heterogeneous deployment: because A nodes are memory-bandwidth-bound, they need not sit on expensive high-compute GPUs. Placing them on bandwidth-rich H20 GPUs while keeping W nodes on H100, beyond the homogeneous numbers in Table 2, would widen the cost reduction to 80–85%. 
+
+Projection to ultra-large scale. We use the simulator to project to ultra-large scale: Llama-3.1-405B in its deployment (FP8 weights on a single 8 ×H100 node, TP=8) under contexts extended to 1M– 100 M tokens, far beyond today’s trace tail. At this model size the weights dominate every GPU: the 405B FP8 weights occupy 50 .6 GB of each 80 GB card (TP-sharded), leaving only ∼29 GB for KV, whereas KernelFlume’s weight-less A nodes spend their full ∼78 GB on KV, a 2.65 × higher KV density per GPU. KernelFlume therefore requires only 30–38% as many GPUs as ServerlessLLM and cuts cost by 65–72% across the 1M– 100 M range, widening to 88–89% with the same heterogeneous H20 placement. 
+
+## 7 Related Work 
+
+General serving optimizations. Existing LLM serving sys-tems improve decode efficiency through scheduling, batch-ing, memory management, and parallel execution, includ-ing continuous batching [ 34 ], chunked prefill [ 1 ], prefix reuse [ 36 ], paged attention [ 12 ], tensor parallelism [ 27 ], and MoE expert placement [ 4, 15 , 38 ]. Other systems extend ef-fective KV capacity through compression or offloading [ 26 ]. These techniques are complementary to KernelFlume: they improve execution within a fixed deployment or move KV along the memory hierarchy, whereas KernelFlume changes the marginal scaling unit for decode-time KV capacity. 
+
+Prefill/decode disaggregation. DistServe [ 37 ] and Split-wise [ 22 ] separate the compute-bound prefill phase from the memory-bound decode phase onto specialized hardware, significantly improving GPU utilization. Mooncake [ 24 ] ex-tends this idea with a KVCache-centric architecture for cross-datacenter serving. KernelFlume inherits this disaggregation philosophy but pushes it to a finer granularity: it separates two kernel classes (projection/FFN and attention) within 
+
+every decode step, rather than two phases that run sequen-tially. This intra-decode split exposes an elastic dimension that phase-level PD systems leave inside the decode unit. 
+
+Disaggregated KV and remote attention. Distributed-KV systems are related to KernelFlume in how they decouple KV capacity from a single model instance. MemServe [ 9 ] ex-poses an elastic memory pool that manages and transfers KV blocks across serving instances, and Infinite-LLM [ 14 ]partitions KV blocks and can compute attention near the remote KV; both establish that KV placement can be decou-pled from a single model instance. KernelFlume differs in the 
+
+scaling unit : it adds weightless KV-resident attention nodes that store KV and compute attention locally, returning com-pact partial-attention results (𝑜, 𝑚, ℓ ), so aggregate KV/HBM capacity grows without replicating projection/FFN weights on the unit that scales. 
+
+Context-parallel reconfiguration. LoongServe [ 30 ] ad-dresses online reconfiguration. Unlike static context paral-lelism [ 16 , 33 ], it forms sequence-parallel groups from a fixed pool of weight-bearing instances, with KV placement and query dispatch. KernelFlume shares query dispatch to nodes that hold KV, but targets a different elastic unit: LoongServe improves packing within a fixed pool of weight-bearing ranks, whereas KernelFlume appends weightless A nodes to expand physical KV capacity. 
+
+## 8 Discussion 
+
+KernelFlume targets decode-time elasticity, where KV state grows while model weights remain fixed. Scale-up appends token ranges to A nodes through routing-table updates, in-stead of rebuilding collective groups or launching another model replica. This focus leaves prefill-side optimizations in-dependent: prefix caching, chunked prefill, and prefill/decode disaggregation can be used alongside KernelFlume. Under the scaling policy in §4.2, KernelFlume assigns newly generated token ranges to newly added A nodes and releases a retiring A node once the requests holding its ranges complete. End-to-end cost is computed from active GPU-hours rather than a static capacity label (§6.4). A W node may itself be a tensor-parallel group for large models. In that 
+
+> 12
+
+case, TP all-reduces remain inside the W group, while A-node scale events only update attention routes. Thus, adding or removing A nodes does not change the W-side TP group. KernelFlume currently partitions KV by sequence ranges, matching the dominant growth dimension in long-context decode. Production deployments can further add KV replica-tion, failure recovery, and migration-based compaction on top of the same routing-table abstraction. Extending the rout-ing policy to hybrid sequence, batch, and head partitioning is a natural direction for future work. 
+
+## 9 Conclusion 
+
+KernelFlume is built on a simple claim: in decode-heavy long-context serving, fixed model weights and growing per-request KV state should not share the same elastic unit. It keeps model weights on weight nodes, scales weightless at-tention nodes with request-state demand, and makes this split practical through step-boundary route updates, query-first attention disaggregation, and inter-layer kernel pipelin-ing. On a real intra-node A6000 testbed and a cross-node H100 testbed under a real-world dynamic long-context agen-tic workload, KernelFlume delivers a flat p99 TPOT with up to 32% (A6000) and 61% (H100) lower cost per million output tokens than full-instance elastic scaling with Server-lessLLM. Beyond the measured testbeds, replaying the same trace at Llama-70B scale with measured hardware parameters projects a 56–66% cost reduction over ServerlessLLM, widen-ing to 80–85% with heterogeneous attention-node hardware, with the advantage persisting into the million-token context range. These results show that aligning elasticity with KV demand turns capacity changes from heavyweight instance management into lightweight route updates, improving both tail latency and serving cost. 
+
+## References 
+
+[1] Amey Agrawal, Nitin Kedia, Ashish Panwar, Jayashree Mohan, Nipun Kwatra, Bhargav S Gulavani, Alexey Tumanov, and Ramachandran Ramjee. 2024. Taming Throughput-Latency Tradeoff in LLM Infer-ence with Sarathi-Serve. In 18th USENIX Symposium on Operating Systems Design and Implementation (OSDI 24) . USENIX Association, Santa Clara, CA, 117–134. https://www.usenix.org/conference/osdi24/ presentation/agrawal 
+
+[2] Qiaoling Chen, Zhisheng Ye, Tian Tang, Peng Sun, Boyu Tian, Guoteng Wang, Shenggui Li, Yonggang Wen, Zhenhua Han, and Tianwei Zhang. 2026. CONCUR: High-Throughput Agentic Batch Inference of LLM via Congestion-Based Concurrency Control. arXiv preprint arXiv:2601.22705. https://arxiv.org/abs/2601.22705 
+
+[3] Tri Dao, Dan Fu, Stefano Ermon, Atri Rudra, and Christopher Ré. 2022. Flashattention: Fast and memory-efficient exact attention with io-awareness. Advances in neural information processing systems 35 (2022), 16344–16359. [4] DeepSeek-AI. 2025. DeepEP: An Efficient Expert-Parallel Communi-cation Library. https://github.com/deepseek-ai/DeepEP . Accessed: 2025-03-01. [5] Yao Fu, Leyang Xue, Yeqi Huang, Andrei-Octavian Brabete, Dmitrii Ustiugov, Yuvraj Patel, and Luo Mai. 2024. ServerlessLLM: Low-Latency Serverless Inference for Large Language Models. In Proceed-ings of the 18th USENIX Symposium on Operating Systems Design and Implementation (OSDI) . USENIX Association, 135–153. [6] Bin Gao, Zhuomin He, Puru Sharma, Qingxuan Kang, Djordje Jevdjic, Junbo Deng, Xingkun Yang, Zhou Yu, and Pengfei Zuo. 2024. Cost-Efficient Large Language Model Serving for Multi-turn Conversations with CachedAttention. In 2024 USENIX Annual Technical Conference (USENIX ATC 24) . USENIX Association, Santa Clara, CA, 111–126. 
+
+https://www.usenix.org/conference/atc24/presentation/gao-bin-cost 
+
+[7] Daya Guo, Dejian Yang, He Zhang, Junxiao Song, Runxin Zhang, Ruoyu Xu, Qihao Zhu, Shirong Ma, Peiyi Wang, Xiao Bi, et al . 2025. DeepSeek-R1: Incentivizing Reasoning Capability in LLMs via Re-inforcement Learning. arXiv preprint arXiv:2501.12948. https: //arxiv.org/abs/2501.12948 
+
+[8] Roger W Hockney. 1994. The communication challenge for MPP: Intel Paragon and Meiko CS-2. Parallel Comput. 20, 3 (1994), 389–398. [9] Cunchen Hu, Heyang Huang, Junhao Hu, Jiang Xu, Xusheng Chen, Tao Xie, Chenxi Wang, Sa Wang, Yungang Bao, Ninghui Sun, and Yizhou Shan. 2024. MemServe: Context Caching for Disaggregated LLM Serving with Elastic Memory Pool. arXiv preprint arXiv:2406.17565. 
+
+https://arxiv.org/abs/2406.17565 
+
+[10] Inferact. 2026. Codex SWE-bench Pro Agentic Serving Traces. https: //huggingface.co/datasets/Inferact/codex_swebenchpro_traces . Hug-ging Face Datasets. [11] Benjamin Kubwimana and Qijing Huang. 2025. EdgeReasoning: Char-acterizing Reasoning LLM Deployment on Edge GPUs. arXiv preprint arXiv:2511.01866. https://arxiv.org/abs/2511.01866 
+
+[12] Woosuk Kwon, Zhuohan Li, Siyuan Zhuang, Ying Sheng, Lianmin Zheng, Cody Hao Yu, Joseph E. Gonzalez, Hao Zhang, and Ion Stoica. 2023. vLLM: Efficient Memory Management for Large Language Model Serving with PagedAttention. In Proceedings of the 29th Symposium on Operating Systems Principles (SOSP) . ACM, 611–626. doi: 10.1145/ 3600006.3613165 
+
+[13] Lambda, RunPod, and BurnCloud. 2026. Cloud GPU On-Demand Hourly Pricing. https://lambda.ai/pricing ; https://www.runpod.io/ gpu-models/rtx-a6000 ; https://www.autodl.com/ . On-demand rates: NVIDIA H100 80 GB ∼$3/hr (Lambda, $2.99–3.29); RTX A6000 48 GB $0.49/hr (RunPod); H20 96 GB $1/hr (AutoDL, CNY 7.58 ≈ $1.05). Ac-cessed June 2026.. [14] Bin Lin, Tao Peng, Chen Zhang, Minmin Sun, Lanbo Li, Hanyu Zhao, Wencong Xiao, Qi Xu, Xiafei Qiu, Shen Li, Zhigang Ji, Yong Li, and Wei Lin. 2024. Infinite-LLM: Efficient LLM Service for Long Con-text with DistAttention and Distributed KVCache. arXiv preprint arXiv:2401.02669. https://arxiv.org/abs/2401.02669 
+
+[15] Aixin Liu, Bei Feng, Bing Xue, Bingxuan Wang, Bochao Wu, Chengda Lu, Chenggang Zhao, Chengqi Deng, Chenyu Zhang, Chong Ruan, et al .2024. Deepseek-v3 technical report. arXiv preprint arXiv:2412.19437. 
+
+https://arxiv.org/abs/2412.19437 
+
+[16] Hao Liu, Matei Zaharia, and Pieter Abbeel. 2023. Ring attention with blockwise transformers for near-infinite context. arXiv preprint arXiv:2310.01889. https://arxiv.org/abs/2310.01889 
+
+[17] Xupeng Miao, Chunan Shi, Jiangfei Duan, Xiaoli Xi, Dahua Lin, Bin Cui, and Zhihao Jia. 2024. SpotServe: Serving Generative Large Language Models on Preemptible Instances. In Proceedings of the 29th ACM International Conference on Architectural Support for Programming Languages and Operating Systems (ASPLOS) . ACM, 1112–1126. doi: 10. 1145/3620665.3640411 
+
+[18] Maxim Milakov and Natalia Gimelshein. 2018. Online normalizer calculation for softmax. arXiv preprint arXiv:1805.02867. https: //arxiv.org/abs/1805.02867 
+
+[19] NVIDIA. 2023. NCCL: NVIDIA Collective Communications Library. 
+
+https://developer.nvidia.com/nccl .13 [20] NVIDIA Corporation. 2024. NVSHMEM: NVIDIA OpenSHMEM Li-brary for GPU Clusters. https://developer.nvidia.com/nvshmem .[21] Charles Packer, Vivian Fang, Shishir_G Patil, Kevin Lin, Sarah Wooders, and Joseph_E Gonzalez. 2023. MemGPT: Towards LLMs as Operating Systems. arXiv preprint arXiv:2310.08560. https://arxiv.org/abs/2310. 08560 Accessed: 2026-03-22. [22] Pratyush Patel, Esha Choukse, Chaojie Zhang, Aashaka Shah, Íñigo Goiri, Saeed Maleki, and Ricardo Bianchini. 2024. Splitwise: Efficient Generative LLM Inference Using Phase Splitting. In Proceedings of the 51st Annual International Symposium on Computer Architecture . IEEE, Los Alamitos, CA, USA, 118–132. doi: 10.1109/ISCA59077.2024.00019 
+
+[23] Yifan Qiao, Trong Dao Le, Ao Shen, Zhewen Li, and Bowen Wang. 2026. Serving Agentic Workloads at Scale with vLLM × Mooncake. 
+
+https://vllm.ai/blog/2026-05-06-mooncake-store . vLLM Blog. [24] Ruoyu Qin, Zheming Li, Weiran He, Jialei Cui, Heyi Tang, Feng Ren, Teng Ma, Shangming Cai, Yineng Zhang, Mingxing Zhang, et al . 2025. Mooncake: A KVCache-centric Disaggregated Architecture for LLM Serving. ACM Transactions on Storage, online first. doi: 10.1145/ 3773772 
+
+[25] Pavel Shamis, Manjunath Gorentla Venkata, M. Graham Lopez, Matthew B. Baker, Oscar Hernandez, Yossi Iber, Jose L. Abellan, Aure-lien Bouteiller, George Bosilca, Jack Dongarra, et al . 2015. UCX: An Open Source Framework for HPC Network APIs and Beyond. In Pro-ceedings of the 2015 IEEE 23rd Annual Symposium on High-Performance Interconnects . IEEE, Santa Clara, CA, USA, 40–43. doi: 10.1109/HOTI. 2015.13 
+
+[26] Ying Sheng, Lianmin Zheng, Binhang Yuan, Zhuohan Li, Max Ryabinin, Beidi Chen, Percy Liang, Christopher Ré, Ion Stoica, and Ce Zhang. 2023. FlexGen: High-Throughput Generative Inference of Large Lan-guage Models with a Single GPU. In Proceedings of the 40th Interna-tional Conference on Machine Learning (ICML) . 31094–31116. [27] Mohammad Shoeybi, Mostofa Patwary, Raul Puri, Patrick LeGresley, Jared Casper, and Bryan Catanzaro. 2019. Megatron-lm: Training multi-billion parameter language models using model parallelism. arXiv preprint arXiv:1909.08053. https://arxiv.org/abs/1909.08053 
+
+[28] Yuxin Wang, Yuhan Chen, Zeyu Li, Xueze Kang, Yuchu Fang, Yeju Zhou, Yang Zheng, Zhenheng Tang, Xin He, Rui Guo, et al . 2025. Burstgpt: A real-world workload dataset to optimize llm serving sys-tems. In Proceedings of the 31st ACM SIGKDD Conference on Knowledge Discovery and Data Mining V. 2 . 5831–5841. [29] Samuel Williams, Andrew Waterman, and David Patterson. 2009. Roofline: An insightful visual performance model for multicore archi-tectures. Commun. ACM 52, 4 (2009), 65–76. [30] Bingyang Wu, Shengyu Liu, Yinmin Zhong, Peng Sun, Xuanzhe Liu, and Xin Jin. 2024. LoongServe: Efficiently Serving Long-Context Large Language Models with Elastic Sequence Parallelism. In Proceedings of the ACM SIGOPS 30th Symposium on Operating Systems Principles .Association for Computing Machinery, New York, NY, USA, 640–654. doi: 10.1145/3694715.3695948 
+
+[31] Haoran Wu, Can Xiao, Jiayi Nie, Xuan Guo, Binglei Lou, Jeffrey T. H. Wong, Zhiwen Mo, Cheng Zhang, Przemyslaw Forys, Wayne Luk, Hongxiang Fan, Jianyi Cheng, Timothy M. Jones, Rika Antonova, Robert Mullins, and Aaron Zhao. 2025. Combating the Memory Walls: Optimization Pathways for Long-Context Agentic LLM Inference. arXiv preprint arXiv:2509.09505. https://arxiv.org/abs/2509.09505 
+
+[32] Yongtong Wu, Shaoyuan Chen, Yinmin Zhong, Rilin Huang, Yixuan Tan, Wentao Zhang, Liyue Zhang, Shangyan Zhou, Yuxuan Liu, Shun-feng Zhou, Mingxing Zhang, Xin Jin, and Panpan Huang. 2026. Du-alPath: Breaking the Storage Bandwidth Bottleneck in Agentic LLM Inference. arXiv preprint arXiv:2602.21548 (2026). [33] Amy Yang, Jingyi Yang, Aya Ibrahim, Xinfeng Xie, Bangsheng Tang, Grigory Sizov, Jeremy Reizenstein, Jongsoo Park, and Jianyu Huang. 2024. Context Parallelism for Scalable Million-Token Inference. arXiv preprint arXiv:2411.01783 (2024). [34] Gyeong-In Yu, Joo Seong Jeong, Geon-Woo Kim, Soojeong Kim, and Byung-Gon Chun. 2022. Orca: A Distributed Serving System for Transformer-Based Generative Models. In Proceedings of the 16th USENIX Symposium on Operating Systems Design and Implementation (OSDI) . USENIX Association, 521–538. [35] Lianmin Zheng, Wei-Lin Chiang, Ying Sheng, Tianle Li, Siyuan Zhuang, Zhanghao Wu, Yonghao Zhuang, Zhuohan Li, Zi Lin, Eric P Xing, et al . 2023. Lmsys-chat-1m: A large-scale real-world llm conversation dataset. arXiv preprint arXiv:2309.11998 (2023). [36] Lianmin Zheng, Liangsheng Yin, Zhiqiang Xie, Jeff Huang, Chuyue Sun, Cody Hao Yu, Shiyi Cao, Christos Kober, Liang Shi, Ziniu Wu, et al .2024. SGLang: Efficient Execution of Structured Language Model Pro-grams. In Advances in Neural Information Processing Systems (NeurIPS) .[37] Yinmin Zhong, Shengyu Liu, Junda Chen, Jianbo Hu, Yibo Zhu, Xu-anzhe Liu, Xin Jin, and Hao Zhang. 2024. {DistServe }: Disaggregating prefill and decoding for goodput-optimized large language model serving. In 18th USENIX Symposium on Operating Systems Design and Implementation (OSDI 24) . 193–210. [38] Ruidong Zhu, Ziheng Jiang, Chao Jin, Peng Wu, Cesar A Stuardo, Dongyang Wang, Xinlei Zhang, Huaping Zhou, Haoran Wei, Yang Cheng, et al . 2025. MegaScale-Infer: Serving Mixture-of-Experts at Scale with Disaggregated Expert Parallelism. arXiv preprint arXiv:2504.02263 (2025). 14
