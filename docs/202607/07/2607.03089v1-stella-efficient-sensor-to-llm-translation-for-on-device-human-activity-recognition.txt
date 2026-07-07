@@ -1,0 +1,635 @@
+Title: STELLA: Efficient Sensor-to-LLM Translation for On-Device Human Activity Recognition
+
+URL Source: https://arxiv.org/pdf/2607.03089v1
+
+Published Time: Tue, 07 Jul 2026 00:39:20 GMT
+
+Number of Pages: 17
+
+Markdown Content:
+# STELLA: Efficient Sensor-to-LLM Translation for On-Device Human Activity Recognition 
+
+# Nirhoshan Sivaroopan 
+
+The University of Sydney Australia 
+
+# Albert Zomaya 
+
+The University of Sydney Australia 
+
+# Kanchana Thilakarathna 
+
+The University of Sydney Australia 
+
+## Abstract 
+
+HAR is increasingly expected to run continuously on edge devices, yet recent LLM-based methods remain hard to deploy: raw sensor prompts are long, cloud inference adds latency and privacy risk, and fine-tuned LLM pipelines turn general-purpose models into task-specific classifiers. We present STELLA , an efficient sensor-to-LLM translation framework for on-device HAR that shifts the burden from LLM adaptation to sensor tokenization. A lightweight hierarchical tokenizer compresses an entire multi-channel inertial window into a fixed set of compact latent sensor tokens, which are projected into the embedding space of a frozen pretrained LLM and combined with a natural-language prompt for label scoring. This preserves activity-relevant temporal and cross-channel struc-ture while keeping LLM-side computation predictable across sensor configurations. STELLA also supports on-device personalization, adapting only the lightweight tokenizer on small amounts of user-specific labelled data and augmenting inference with a local re-trieval context, keeping the LLM, user data, and retrieval on device. Across seven public HAR datasets and eight benchmark settings, 
+
+STELLA achieves new state-of-the-art performance, improving over prior methods by up to 11.83% F1; on-device personalization yields up to a further 21.91% F1 as user data accumulates after deployment. 
+
+STELLA also outperforms representative time-series tokenizers un-der the same LLM pipeline and achieves real-time inference under practical mobile and edge budgets, showing that efficient sensor tokenization is a practical path toward accurate, private, and per-sonalized LLM-based HAR on edge devices. 
+
+## Keywords 
+
+Large Language Models, Human Activity Recognition, On-device personalization, Sensor Tokenizer, Language Alignment 
+
+## 1 Introduction 
+
+Human Activity Recognition (HAR) from IMU sensors is a core building block for mobile and ubiquitous computing applications, including health monitoring [ 21 ], rehabilitation [ 25 ], fitness track-ing [ 4], smart environments, and industrial sensing [ 8]. Modern smartphones, smartwatches, and wearable devices continuously capture accelerometer, gyroscope, and magnetometer signals, en-abling fine-grained understanding of human behaviour without explicit user input. As these devices become increasingly capable, HAR systems are expected to be not only accurate, but also efficient enough for real-time execution on resource-constrained edge de-vices. They must also adapt after deployment: the same activity can produce different motion signatures across users due to differences in gait, speed, posture, device placement, and execution style [30]. For many years, deep learning has been the dominant paradigm for sensor-based HAR. CNN [ 38 ], recurrent [ 9 ], and attention-based models [ 2] have produced strong results by learning discriminative patterns directly from labelled sensor windows. More recently, however, Large Language Models (LLMs) have reshaped a wide range of machine learning problems by providing strong sequence modelling ability, semantic priors, and flexible reasoning over task descriptions and label spaces [ 30 ]. These capabilities are especially attractive for HAR: activity labels such as running , cycling , or ironing 
+
+are not arbitrary class IDs, but semantically meaningful descriptions of human motion. This opens a new opportunity: instead of treating HAR purely as closed-set signal classification, we can formulate activity recognition as a sensor-to-language reasoning problem, where sensor observations are interpreted in the context of natural-language activity descriptions [16]. Early LLM-based HAR studies [ 14 , 16 , 30 ] confirm the promise of this direction: LLMs can label activities from sensor-derived prompts, draw on pretrained knowledge of human behaviour, and generalize across several HAR settings. Their successes, however, expose a deeper obstacle that becomes decisive on-device, and it stems from a single mismatch: LLMs are built to reason over short sequences of discrete language tokens, whereas an activity win-dow for time-series sensor data stream is a long, multi-channel stream of continuous floating-point values. This mismatch surfaces as three concrete problems. (i) Serializing a window as text is both ineffective and expensive. Numerical arrays are foreign to text tok-enizers, which fragment each value into many sub-tokens that the model reasons over poorly [ 31 ]; and a single window already holds hundreds to thousands of scalars across channels, so the resulting prompt is very long. Such prompts inflate the LLM’s quadratic at-tention cost and KV-cache memory, driving latency and footprint past what edge compute and memory budgets allow. (ii) Adapting the LLM itself trades generality for a task-specific model. Fine-tuning or surgically rewriting the LLM so it ingests sensors directly turns a general-purpose model into a HAR-specific classifier; on the edge this is self-defeating, because each new sensing task would then need its own specialized model, and hosting several such mod-els exceeds the memory and compute of phones and wearables, which can realistically run only one local LLM. (iii) Offloading to the cloud breaks the deployment guarantees. Sending sensor data to a hosted LLM avoids both on-device costs but reintroduces network dependency and unbounded latency that undermine real-time op-eration [ 30 ], while streaming behaviourally sensitive sensor data off-device raises clear privacy concerns [37]. Together, these obstacles indicate where on-device LLM-based HAR should go. Edge platforms increasingly host a single small, general-purpose LLM as a shared system-level service for text, voice, and multimodal reasoning, and the natural way to add HAR is to admit sensors as one more modality for this shared model, rather than compressing it, rewriting it, duplicating it per task, or shipping data to the cloud. What is missing is an efficient sensor-to-LLM 
+
+> arXiv:2607.03089v1 [cs.LG] 3 Jul 2026 Nirhoshan Sivaroopan, Albert Zomaya, and Kanchana Thilakarathna
+
+interface : a compact front-end that translates a raw multi-channel window into a short, language-model-compatible representation the frozen LLM can consume, preserving activity-relevant temporal and cross-channel structure while keeping the LLM general and reusable. In other words, efficient on-device LLM-based HAR should not begin by compressing or rewriting the LLM; it should begin by learning to tokenize sensor data well [20]. In this paper, we propose STELLA :Sensor Tokenization for Edge 
+
+LL M Activity Recognition, an efficient sensor-to-LLM translation framework for on-device HAR. The central idea is a lightweight sensor tokenizer that converts a raw multi-channel window into a compact set of latent sensor tokens; a shallow projection then maps these tokens into the embedding space of a pretrained LLM, where they are combined with a natural-language task prompt so the LLM can score candidate activity labels by language-model likelihood. Rather than processing raw numerical streams, the LLM thus re-ceives a short, semantically rich token sequence, while the learned front-end performs all sensor-specific work. This design targets three goals: inference cost should be governed by the learned token budget rather than the raw window length; the tokens should pre-serve multi-scale motion structure, capturing both local primitives such as step transients and longer-range dynamics such as periodic gait; and the LLM should remain a frozen, reusable reasoning back-end rather than being modified for a single HAR configuration. The same design also supports on-device personalization: after deploy-ment, only the lightweight sensor-side module is adapted using a small amount of user-specific labelled data, while the LLM remains frozen and reusable. We evaluate STELLA on seven public HAR datasets across eight benchmark settings, spanning 6 to 60 sensor channels and 6 to 18 activity classes and covering locomotion, daily-living activities, exercise, and industrial gestures. STELLA sets new state-of-the-art (SOTA) performance on every benchmark, improving over the strongest prior methods by approximately 5.5 accuracy points and 3.6 F1 points on average, with the largest gains on low-channel single-IMU datasets and consistent improvements even on near-saturated benchmarks where prior methods already perform strongly. With on-device personalization, adapting only the lightweight tok-enizer together with a local retrieval context lifts the hardest subject from 71% to 93% F1 while adding under 1 ms of retrieval overhead. Two further studies establish why STELLA works and is deploy-able. First, under a fixed frozen-LLM pipeline and a matched token budget, the STELLA tokenizer outperforms representative SOTA time-series encoders, showing that the gains come from a learned sensor-to-LLM translation layer rather than from generic time-series encoding. Second, an on-device feasibility analysis shows that STELLA achieves real-time inference within practical mobile and edge budgets: because each window is compressed to a fixed token set, LLM-side computation stays predictable across channel counts and window lengths, and because inference and personaliza-tion run locally, sensor data and user-specific context never leave the device. In summary, this paper makes the following contribu-tions: 
+
+• Reframing efficient on-device LLM-based HAR as a sensor-tokenization problem. Prior work either prompts a cloud LLM or compresses/fine-tunes the LLM into a task-specific model, trading away privacy, predictable latency, or general-purpose reusability. We instead argue that the real bottleneck is the sensor-to-LLM interface , and solve the efficiency problem entirely on the sensor side, so HAR can be attached to a shared local LLM as one more input modality rather than as a separate, fine-tuned model stack. 
+
+• A hierarchical tokenizer that decouples LLM cost from sensor configuration. The STELLA -Tower compresses an 
+
+entire multi-channel window jointly into a fixed set of 𝑁 =16 
+
+latent tokens, via local temporal mixing, progressive down-sampling, and multi-scale aggregation, rather than tokeniz-ing each channel separately. Because the token budget is fixed, LLM-side compute and latency become invariant to channel count and window length ( up to 262 .5× fewer tokens than per-scalar encoding). 
+
+• Lightweight, private on-device personalization. After deployment, STELLA adapts only the tokenizer ( ∼10% of parameters) to a user and augments inference with a lo-cal retrieval memory that is re-encoded as the tokenizer evolves. This improves the hardest subjects by up to +21 .91 
+
+F1 with < 1 ms retrieval overhead, while the LLM stays frozen and all user data and context remain on-device. 
+
+• State-of-the-art accuracy that remains deployable on-device. Across seven datasets and eight benchmark settings, 
+
+STELLA achieves new SOTA (up to +11 .83 F1) using only a frozen GPT-2 backbone, surpassing methods built on far larger LLMs. Under a matched pipeline and token budget, it likewise outperforms representative time-series tokeniz-ers. Crucially, it runs in real time across the full hardware spectrum, from a server GPU to a commodity smartphone CPU, within practical streaming-stride budgets. 
+
+By relocating the difficulty of LLM-based HAR from the language model to the sensor interface, STELLA delivers a striking payoff: fed only sixteen compact tokens per window, a single frozen, unmodified 
+
+GPT-2 sets a new SOTA across diverse benchmark settings, outper-forms pipelines built on LLMs orders of magnitude larger, runs in real time on a commodity smartphone, and personalizes to individ-ual users without any data ever leaving the device. To the best of our knowledge, STELLA is the first LLM-based HAR framework that is edge-deployable, configuration-invariant, and personalizable on-device at once, turning HAR into a lightweight, private modality that plugs into the shared local LLMs edge platforms already run, rather than yet another task-specific model to deploy and maintain. 
+
+## 2 Related Work 2.1 Deep Learning for HAR 
+
+Sensor-based HAR has long been studied as a time-series classifica-tion problem over wearable and mobile signals. Early deep learning approaches used CNNs to learn local temporal patterns from raw inertial data [ 38 ], while recurrent models such as LSTMs and GRUs captured sequential dependencies across activity windows [ 9 , 10 ], and hybrid architectures such as DeepConvLSTM combined the two [ 24 ]. More recent systems adopt attention, transformer-style ar-chitectures, contrastive and metric learning, domain adaptation, and augmentation-based training to improve activity representations across users, devices, and sensor placements [ 1, 2 , 11 , 12 , 17 , 40 ]. In STELLA: Efficient Sensor-to-LLM Translation for On-Device Human Activity Recognition 
+
+parallel, Large Language Models (LLMs) have surpassed conven-tional deep models on many sequence understanding and reasoning tasks, motivating the HAR community to ask whether their seman-tic knowledge and sequence modelling can also benefit HAR. 
+
+## 2.2 LLMs for HAR 
+
+A growing body of work explores LLMs for HAR and related wear-able sensing. The key motivation is semantic: activity labels such as walking upstairs or vacuuming are physical behaviours already represented in natural language, so an LLM can potentially con-nect low-level sensor evidence to high-level activity semantics. HARGPT [ 16 ] directly prompts an LLM with sensor readings for zero-shot recognition, while other work uses learned activity em-beddings [ 14 ], personalized wearable reasoning [ 18 ], and LLM-based contextualization of activity events [ 6 , 27 ]. SensorLLM [ 20 ]aligns sensor signals with language-model representations through sensor-language alignment and task-aware tuning, LLM4HAR [ 13 ]adapts pretrained LLMs for cross-domain HAR, and RAG-HAR [ 30 ]uses retrieval-augmented prompting to supply similar activity ex-amples for strong training-free performance. These studies establish LLMs as a promising direction for HAR. HAR ultimately targets wearable and mobile devices, however, raising a distinct challenge: how can LLM-based HAR be made efficient enough for edge devices without losing the benefits of pretrained language models? 
+
+## 2.3 Edge-efficient Inference with LLMs for HAR 
+
+There are two broad routes to practical LLM-based HAR. The first keeps the LLM off-device and queries it remotely via API. Work such as RAG-HAR [ 30 ] takes this route: sensor-derived descriptions and retrieved examples are sent to a hosted LLM, which returns a prediction. This avoids local deployment but carries two costs for HAR. First, wearable data exposes sensitive information about gait, health, and routines, so transmitting it to the cloud raises privacy concerns. Second, even with a compact representation, network dependency and API latency are difficult to guarantee under the real-time constraints of continuous recognition. The second route brings the LLM on-device, and can be ap-proached in two ways. One rebuilds or compresses the LLM into a HAR-specific model. LLM4HAR [ 13 ] starts from GPT-2, strips its text embedding and output-generation pathway, keeps selected decoder blocks, and adds sensor embeddings and an activity pro-jection head before fine-tuning selected components. The result is compact but is no longer a general-purpose LLM, it is a GPT-2-derived classifier specialized for a fixed configuration (six-channel IMU, four shared activities), making it hard to extend to more chan-nels, modalities, or classes, and unusable for other language or sensing tasks once its language I/O is removed. STELLA does not pursue further compression; it asks instead whether a small pre-trained LLM can remain a reusable on-device backend while the efficiency problem is solved at the sensor interface. The other on-device approach keeps the language model largely intact and attaches a sensor tokenizer. SensorLLM [ 20 ] pioneered this, using a pretrained Chronos [ 3] encoder to produce sensor embeddings, projecting them into the LLM space, and inserting channel-specific tokens. This establishes a valuable sensor-to-LLM alignment paradigm but is not built for the edge: Chronos-large 
+
+Figure 1: Overview of STELLA .
+
+alone holds roughly 710M parameters atop an 8B-parameter LLM backbone, each channel is tokenized separately so token count grows with channel count and temporal segmentation, and the LLM-side pipeline is fine-tuned through sensor-language alignment and task-aware tuning rather than used as an unchanged service. For edge inference, token count matters as much as model size: long sensor-derived sequences enlarge attention computation and the KV cache, increasing memory pressure, a problem amplified for HAR, where a window can hold hundreds to thousands of scalars across channels. STELLA targets this directly. Rather than encoding channels separately or rebuilding the LLM, it learns a hierarchical tokenizer that compresses the entire multi-channel window into a compact set of latent tokens, which are projected into the embedding space and consumed by an unchanged pretrained LLM. This keeps the LLM reusable while making HAR inference predictable and efficient on-device, shifting the burden from LLM compression to sensor tokenization. 
+
+## 3 Methodology 
+
+We propose STELLA , a multimodal architecture that bridges contin-uous sensor signals and pretrained general-purpose LLMs through a learned tokenization interface for sensor stream reasoning. The key idea is to transform a raw multi-channel sensor window X ∈ R𝐶 ×𝑇 ,comprising 𝐶 sensor channels sampled over 𝑇 timesteps, into a short sequence of latent tokens that can be directly consumed by an LLM, enabling classification via language modeling. Unlike con-ventional pipelines that rely on task-specific classifiers, STELLA 
+
+formulates sensor understanding as a conditional text generation problem. This allows the model to leverage the rich representa-tional structure of pretrained LLMs while maintaining an efficient and modular sensor encoder. As illustrated in Figure 1, STELLA 
+
+encodes X into a fixed set of sensor tokens, projects them into the LLM embedding space, fuses them with a natural-language task prompt, and scores candidate activity labels with a frozen LLM. 
+
+## 3.1 Design Overview 
+
+The design of STELLA is guided by three core principles: 
+
+• Compatibility with LLMs: Sensor representations must be mapped into the embedding space of pretrained LLMs with-out modifying their architecture. 
+
+• Efficiency for time-series data: Sensor signals are long and high-frequency; the encoder must reduce temporal resolu-tion while preserving salient patterns. Nirhoshan Sivaroopan, Albert Zomaya, and Kanchana Thilakarathna 
+
+Figure 2: STELLA -Tower. (a) Patch Embedding (b) RepMixer (c) MHSA (d) PoolToN blocks 
+
+• Multi-scale representation: Human activities exhibit patterns at different temporal scales, requiring hierarchical feature extraction. To satisfy these requirements, STELLA consists of three main components, which map directly onto the pipeline in Figure 1: (1) A sensor tokenizer that converts the raw window X into a fixed-length sequence of 𝑁 sensor tokens. (2) A projection module that aligns these sensor tokens with the LLM embedding space. (3) A pretrained causal LLM that performs prediction via next-token modeling. 
+
+## 3.2 Sensor Tokenizer 
+
+The sensor tokenizer, shown as the STELLA -Tower in Figure 2, is the central component of STELLA . It is a hierarchical encoder that progressively abstracts the raw time-series window into a compact set of semantic tokens. 
+
+3.2.1 Motivation. Raw sensor signals are: high-frequency (hun-dreds of timesteps), multi-channel (accelerometer, gyroscope, etc.), noisy and locally structured. Directly feeding such data into an LLM is infeasible due to sequence length and modality mismatch. The tokenizer addresses this by: reducing temporal resolution, increas-ing feature abstraction, and producing a small set of informative tokens. 
+
+3.2.2 Convolutional Stack - Early Feature Extraction. The tokenizer begins with a convolutional stack composed of depthwise separable convolutions. This design is chosen for efficiency and inductive bias: (i) Depthwise convolution extracts temporal patterns independently per channel, which is well-suited for sensor modalities where each channel captures distinct physical signals. (ii) Pointwise convolution 
+
+mixes information across channels, enabling cross-sensor interac-tions. The convolutional stack performs initial downsampling and maps the raw window X into a richer feature space: 
+
+H0 = 𝑓 conv_stack (X), H0 ∈ R𝑑 0 ×𝑇 0 , (1) where 𝑑 0 is the feature dimension and 𝑇 0 < 𝑇 the reduced temporal length. This stage removes high-frequency noise while preserving coarse motion dynamics, and H0 serves as the input to the first hierarchical stage. 
+
+3.2.3 Hierarchical Stages. The encoder body consists of three stages indexed by 𝑖 ∈ { 1, 2, 3}, each comprising a patch embedding layer followed by a stack of RepMixer blocks . Stage 𝑖 transforms the fea-ture map H𝑖 −1 into H𝑖 ∈ R𝑑 𝑖 ×𝑇 𝑖 , with progressively larger feature dimension 𝑑 𝑖 and shorter temporal length 𝑇 𝑖 .
+
+Patch Embedding. Each stage begins with a patch embedding layer (Figure 2(a)) that performs temporal downsampling via strided depthwise–pointwise convolution. Conceptually, it groups adja-cent timesteps into “patches” and projects them into a higher-dimensional feature space, reducing sequence length while increas-ing representational capacity: 
+
+H𝑖 = PatchEmbed 𝑖 (H𝑖 −1), 𝑖 ∈ { 1, 2, 3}. (2) 
+
+RepMixer Blocks. Following patch embedding, each stage applies multiple RepMixer blocks (Figure 2(b)). The term “RepMixer” (short for reparameterizable mixer ) refers to a convolution-based alterna-tive to self-attention that mixes information along the temporal dimension. A RepMixer block maps an input feature map x to an output x′′ through two residual sublayers: 
+
+x′ = x + DWConv (GN (x)) , (3) 
+
+x′′ = x′ + ConvFFN (GN (x′)) , (4) where GN (·) denotes group normalization, DWConv (·) a depth-wise convolution that performs temporal mixing , and ConvFFN (·) aconvolutional feed-forward network that performs channel mixing .The patch embedding together with the stacked RepMixer blocks of stage 𝑖 produce the stage output H𝑖 . We use RepMixer blocks instead of attention in these early stages for two reasons: 
+
+• Efficiency: Convolutions scale linearly with sequence length, making them suitable for long time-series and requiring less computation than attention. 
+
+• Local inductive bias: Early sensor patterns are predomi-nantly local (e.g., periodic motion). 
+
+3.2.4 Late Attention Layer. After the three convolutional stages, we apply a lightweight multi-head self-attention (MHSA) module (Figure 2(c)) to the stage-3 output H3. Because H3 has already been aggressively downsampled, this layer operates on a much shorter sequence than the raw window, making attention computationally feasible. Its role is to capture long-range dependencies, integrate STELLA: Efficient Sensor-to-LLM Translation for On-Device Human Activity Recognition 
+
+information across the entire time window, and refine global con-text. The MHSA block follows a transformer structure, mapping its input x = H3 to the attention-enhanced representation H4 = x′′ :
+
+x′ = x + SelfAttention (LayerNorm (x)) , (5) 
+
+x′′ = x′ + MLP (LayerNorm (x′)) . (6) We place attention after the convolutional stages to balance effi-ciency and expressiveness. 
+
+3.2.5 Multi-scale Token Aggregation. Sensor activities manifest at different temporal scales, so STELLA aggregates features from three levels of the hierarchy, annotated in Figure 2 as local motion patterns, activity dynamics, and global context: 
+
+• the intermediate representation H2 (stage-2 output), 
+
+• the high-level representation H3 (stage-3 output), 
+
+• the attention-enhanced representation H4.Each selected representation H𝑖 is passed through a PoolToN 
+
+module (Figure 2(d)), which smooths features with a depthwise convolution, normalizes activations, and resamples the temporal axis to a fixed number of 𝑁 tokens via linear interpolation: 
+
+Z𝑖 = PoolToN (H𝑖 ), 𝑖 ∈ { 2, 3, 4}, Z𝑖 ∈ R𝑁 ×𝑑 𝑖 . (7) Because every Z𝑖 has the same token count 𝑁 regardless of its source resolution, the three representations are concatenated along the feature dimension and fused by a learned linear projection W
+
+followed by layer normalization: 
+
+S = LayerNorm (W · ( Z2 ⊕ Z3 ⊕ Z4)) , S ∈ R𝑁 ×𝑑 . (8) This yields the fixed-length sensor-token sequence S of 𝑁 tokens, capturing both local and global temporal patterns. Crucially, 𝑁 is fixed independently of 𝐶 and 𝑇 , so downstream LLM cost does not grow with channel count or window length. 
+
+## 3.3 Projection to LLM Space 
+
+The sensor tokens S are mapped into the LLM embedding space using a two-layer MLP: 
+
+E𝑠 = 𝑓 proj (S), E𝑠 ∈ R𝑁 ×𝑑 LLM , (9) where 𝑑 LLM is the token-embedding dimension of the pretrained LLM. This projection is necessary because the sensor tokenizer operates in a feature space of dimension 𝑑 that differs from the LLM space of dimension 𝑑 LLM ; the MLP learns to align the two representations without modifying the LLM. 
+
+## 3.4 Prompt Conditioning and LLM Integration 
+
+In parallel, a textual prompt describing the task is embedded with the LLM’s own tokenizer and embedding table: 
+
+E𝑡 = Embed (Prompt ), E𝑡 ∈ R𝑇 𝑝 ×𝑑 LLM , (10) where 𝑇 𝑝 is the number of prompt tokens. The final input sequence is formed by concatenating the projected sensor embeddings and the prompt embeddings along the sequence dimension: 
+
+E = [E𝑠 ; E𝑡 ]. (11) Conditioned on E, the LLM defines a distribution over candidate label token sequences, 
+
+𝑃 (𝑦 | X, Prompt ), (12) which allows the model to interpret the sensor tokens within a natural-language context. This is the distribution that STELLA max-imizes during training and scores at inference. 
+
+## 3.5 Training Objective 
+
+We train STELLA with a standard autoregressive language-modeling objective. The target activity label is first tokenized by the LLM tokenizer into a sequence of 𝐿 tokens 𝑦 = (𝑦 1, . . . , 𝑦 𝐿 ). The model is trained to predict this sequence under the conditional distribution of Eq. (12) : each label token 𝑦 𝑡 is predicted from the fused sensor– prompt input E = [E𝑠 ; E𝑡 ] together with the label tokens that come before it, 𝑦 1, . . . , 𝑦 𝑡 −1. The objective is the average negative log-likelihood over the 𝐿 label tokens: 
+
+L = − 1
+
+𝐿 
+
+> 𝐿
+
+∑︁  
+
+> 𝑡 =1
+
+log 𝑃 (𝑦 𝑡 | E, 𝑦 1, . . . , 𝑦 𝑡 −1) . (13) The 1/𝐿 normalization makes the loss of each example independent of how many sub-tokens its label spans, so that multi-token labels (e.g., walking upstairs ) do not exert disproportionately large gra-dients compared to single-token labels (e.g., running ). In practice, the LLM is frozen, and only the sensor tokenizer and projection layers are trained. This significantly reduces training cost while leveraging pretrained knowledge. 
+
+## 3.6 Inference 
+
+At inference time, the candidate activity labels for the dataset form a closed set Y, and we cast classification as label scoring: each candidate label is evaluated under the frozen LLM and the highest-scoring one is selected, 
+
+ˆ𝑦 = arg max   
+
+> 𝑦 ∈ Y
+
+𝑠 (𝑦 | X, Prompt ), (14) where ˆ𝑦 is the predicted label and 𝑠 (·) is the score of a candidate, defined as the average per-token log-likelihood the frozen LLM assigns to its token sequence. For a candidate label 𝑦 tokenized into 
+
+𝐿 tokens (𝑦 1, . . . , 𝑦 𝐿 ), each token is conditioned on the same fused input E and on the candidate’s own preceding tokens: 
+
+𝑠 (𝑦 | X, Prompt ) = 1
+
+𝐿 
+
+> 𝐿
+
+∑︁ 
+
+> 𝑡 =1
+
+log 𝑃 (𝑦 𝑡 | E, 𝑦 1, . . . , 𝑦 𝑡 −1) . (15) Because 𝐿 varies across candidate labels, the 1/𝐿 normalization, identical to the one used in training, keeps scores comparable be-tween short and long label names. 
+
+## 4 On-device Personalization 
+
+STELLA is designed not only for generic on-device HAR, but also for personalized recognition after deployment. Different users often perform the same activity with different motion patterns due to differences in gait, speed, body posture, device placement, and execution style. A model trained across many subjects provides a strong general representation, but can still benefit from adapting to the motion characteristics of a specific user. To support this, we introduce an on-device personalization mechanism that combines lightweight subject-specific tokenizer adaptation with retrieval-augmented inference. Figure 3 summarizes the pipeline: the sensor tokenizer is the only component that is updated, while the LLM and its text tokenizer remain frozen throughout. Nirhoshan Sivaroopan, Albert Zomaya, and Kanchana Thilakarathna 
+
+Figure 3: On-device personalization in STELLA .
+
+The personalization pipeline starts from a pretrained STELLA 
+
+model obtained from population-level training. After deployment, the device collects a small amount of labelled data from the target user, for example through lightweight calibration when a user se-lects an activity on a smartwatch and performs it briefly. As shown on the left of Figure 3, these samples are split into two roles: a 
+
+training set that adapts the lightweight sensor tokenizer, and a con-text set stored in an on-device knowledge base for retrieval during inference. Updating only the sensor-side module preserves the LLM as a reusable on-device reasoning backend and avoids expensive full-model fine-tuning. 
+
+Tokenizer adaptation. Starting from the pretrained tokenizer pa-rameters, STELLA fine-tunes the sensor tokenizer on training set using the same language-modeling objective as the main training stage (Section 3.5). This encourages the personalized tokenizer to produce sensor tokens that better align the user’s motion patterns with the corresponding activity labels, while the frozen LLM con-tinues to score candidate labels exactly as in standard inference (Section 3.6). Consistent with Figure 3, gradients flow only through the tokenizer branch; the text tokenizer and LLM are never updated. 
+
+Knowledge base construction. The knowledge base is populated from the context set. For each context window, the current sensor tokenizer produces a sensor-token embedding, and the frozen LLM tokenizer converts the associated activity label into label tokens; the two are stored together, so each entry pairs a personalized sensor embedding with its label. Because the tokenizer changes during adaptation, the knowledge base is refreshed after every personalization epoch: all context samples are re-encoded with the updated tokenizer and their stored embeddings replaced. This keeps retrieval consistent with the current personalized representa-tion space rather than relying on stale embeddings from an earlier tokenizer state. 
+
+Retrieval-augmented inference. At inference, a test window is first encoded by the personalized tokenizer into a query embed-ding. STELLA then runs a cosine-similarity search against each stored context embedding in the knowledge base, and retrieves the top-𝑘 most similar context examples as user-specific evidence. Following the figure, the final LLM input prepends the retrieved context tokens Ectx to the query sensor tokens E𝑠 and the task-prompt tokens E𝑡 , extending the standard fused input of Eq. (12) to Epers = [Ectx ; E𝑠 ; E𝑡 ]. The frozen LLM then predicts the activity by scoring candidate label sequences over Epers , exactly as in the standard STELLA inference procedure (Section 3.6). This design has two advantages for on-device HAR. First, per-sonalization is lightweight: adaptation is restricted to the compact sensor tokenizer rather than the full LLM. Second, retrieval is local and privacy-preserving, since the user’s sensor data and context memory never leave the device. 
+
+## 5 Results 
+
+We evaluate STELLA on seven widely used public HAR bench-marks: HHAR [ 33 ], PAMAP2 [ 28 ], MHEALTH [ 5 ], GOTOV [ 26 ], SKODA [ 32 ], Opportunity [ 29 ] and USC-HAD [ 39 ], which span 6 to 60 sensor channels and 6 to 18 activities, covering diverse activity types such as locomotion (e.g., walking, running), daily living tasks (e.g., ironing, vacuuming), fitness exercises (e.g., cy-cling, jogging), manufacturing assembly-line tasks, and settings that capture activity variations across pace, direction, or equip-ment. To ensure direct comparability and consistency with prior peer-reviewed benchmarks (Percom, SenSys, EMNLP), we replicate dataset-specific preprocessing and evaluation protocols (train-test split) from earlier works: HHAR follows [ 11 ], PAMAP2 and Oppor-tunity (gestures) follow [ 15 ], Opportunity (locomotion) follows [ 19 ], MHEALTH follows [ 34 ], GOTOV and SKODA follow [ 2 ], and USC-HAD follows [ 17 ]. 1 Sections 5.1 and 5.2 benchmark STELLA against prior HAR methods and time-series tokenizers, Section 5.3 analyzes on-device feasibility, and Section 5.5 ablates the design. The per-sonalization step of Section 4 is applied only in Section 5.4. 
+
+## 5.1 HAR Benchmark 
+
+Table 1 reports STELLA against prior deep learning and LLM-based approaches across all eight benchmarks. STELLA achieves the best reported performance among the compared methods on every benchmark under the corresponding published protocol, with gains ranging from marginal on near-saturated benchmarks to substantial on sparse-sensor platforms. 
+
+Low-channel benchmarks. The largest gains occur on the two single-IMU datasets, where sensor evidence is most constrained. On USC-HAD, STELLA reaches 72.00% F1, +9.20 over the best prior baseline (Triplet LSTM HTL-SB) and +10.80 over the strongest prior LLM method (SensorLLM). On HHAR it reaches 71.69% F1, +11.83 over the best prior method (RAG-HAR) and +12.44 over the best contrastive baseline (Enhanced CPC). RAG-HAR, which classifies by retrieving similar labelled segments, is especially disad-vantaged here, since 6-channel representations are less distinctive 
+
+> 1per-dataset pre-processing and evaluation protocols are detailed in Appendix A
+
+STELLA: Efficient Sensor-to-LLM Translation for On-Device Human Activity Recognition 
+
+Table 1: Benchmarking STELLA with SOTAs. The reference shows from where the values were taken.                                                                                                                                              
+
+> Dataset Model Acc(%) F1 (%)
+> USC-HAD Triplet LSTM baseline [17] -53.50 DeepConvLSTM [17] -46.00 Transformer-like architecture [17] -55.00 Triplet LSTM (HTL-SB) [17] [Percom ’21] -62.80 HARGPT [16] 28.90 21.00 LLM as VA [14] 34.51 32.10 SensorLLM [20] [EMNLP ’25] 62.60 61.20 RAG-HAR [30] [Percom ’26] 57.20 58.63
+> STELLA (ours) 76.36 72.00
+> HHAR CPC [11] -59.17 GRU Classifier [11] -45.23 DeepConvLSTM [11] -52.37 SimCLR [11] -52.84 Enhanced CPC [11] [Percom ’23] -59.25 RAG-HAR [30] [Percom ’26] 58.61 59.86
+> STELLA (ours) 72.71 71.69
+> MHEALTH MC-CNN [34] 89.69 87.42 DeepConvLSTM [34] 89.24 87.17 Transformer-like [34] 87.44 85.13 METIER [34] 94.42 94.09 ADFE [34] [Percom ’22] 96.72 96.47 Triplet LSTM (HTL-SB) [17] [Percom ’21] -65.60 HARGPT [16] 24.00 22.05 LLM as VA [14] 32.78 30.11 SensorLLM [20] [EMNLP ’25] 89.00 89.40 RAG-HAR [30] [Percom ’26] 96.91 96.74
+> STELLA (ours) 97.93 97.15
+> GOTOV LSTM Learner Baseline [2] -61.10 DeepConvLSTM [2] -66.90 b-LSTM-S [2] -63.90 Att. Model [2] -70.70 Attend and Discriminate [2] -76.20 ALAE-TAE-CutMix+ [2] [Percom ’23] -79.40 RAG-HAR [30] [Percom ’26] 81.55 79.92
+> STELLA (ours) 83.15 82.60
+> SKODA LSTM Learner Baseline [2] -90.40 DeepConvLSTM [2] -91.20 b-LSTM-S [2] -92.10 Att. Model [2] -91.30 Attend and Discriminate [2] -92.80 ALAE-TAE-CutMix+ [2] [Percom ’23] -94.80 RAG-HAR [30] [Percom ’26] 96.04 95.21
+> STELLA (ours) 97.37 95.87
+> Opportunity (locomotion) DWT [19] 87.43 89.01 ResNet [19] 89.54 91.36 MaCNN [19] 88.32 90.32 SenseHAR [15] [SenSys ’19] 88.90 88.60 THAT [19] 90.35 92.12 LaxCat [19] 60.19 41.47 Uni-TS [19] [SenSys ’21] 91.58 93.33
+> STELLA (ours) 97.27 94.29
+> Opportunity (gesture) DNN [15] 67.21 58.42 CNN [15] 71.13 64.31 Conv-LSTM [15] 74.80 67.92 MA-DNN [15] 72.86 66.84 MA-CNN [15] 74.40 67.54 SenseHAR [15] [SenSys ’19] 74.22 67.48
+> STELLA (ours) 79.88 69.75
+> PAMAP2 DNN [15] 85.82 86.22 CNN [15] 90.40 90.36 Conv-LSTM [15] 94.68 94.46 MA-DNN [15] 92.16 92.04 MA-CNN [15] 95.14 94.99 SenseHAR [15] [SenSys ’19] 95.32 95.08
+> STELLA (ours) 96.48 96.52
+
+for retrieval while STELLA achieves larger metrics even with less number of channels. 
+
+Rich-sensor and near-saturated benchmarks. STELLA also leads where prior methods already perform strongly, confirming it does 
+
+Table 2: Benchmarking Tokenizer performance 
+
+HHAR MHEALTH USC-HAD 
+
+Tokenizers Acc (%) F1 (%) Acc. (%) F1 (%) Acc. (%) F1 (%) 
+
+STELLA -Tower (ours) 72.71 71.69 96.68 96.22 86.92 81.01 
+
+PatchTST [23] 64.74 61.73 94.52 94.21 78.93 74.38 Chronos [3] 62.46 60.73 92.78 92.97 79.39 75.06 Timesnet [36] 61.06 59.64 94.71 94.30 76.55 70.92 itransformer [22] 65.21 64.03 88.52 87.26 79.02 74.39 Tsmixer [7] 54.11 51.66 94.64 94.22 73.86 69.04 Timemixer [35] 59.21 58.76 94.19 93.50 80.90 75.94 
+
+not sacrifice recognition performance for efficiency. On MHEALTH it reaches 97.15% F1, the highest reported, exceeding RAG-HAR by +0.41 and ADFE by +0.68. On Skoda it reaches 95.87% F1, beating RAG-HAR by +0.66 and ALAE-TAE-CutMix+ by +1.07. On Opportu-nity it reaches 94.29% F1 (locomotion), +0.96 over the prior SenSys best Uni-TS, and 69.75% F1 (gesture), +2.27 over SenseHAR. On GOTOV it reaches 82.60% F1, +2.68 over RAG-HAR and +3.20 over ALAE-TAE-CutMix+. On PAMAP2 it sets a new SOTA at 96.52% F1, +1.44 over SenseHAR. 
+
+Comparison with LLM-based approaches. The LLM-based base-lines fall into two lines, both limited for on-device use. The API line prompts a cloud LLM: HARGPT [ 16 ] feeds the raw window directly and scales poorly as channels and sampling rate grow, while LLM as VA [ 14 ] instead passes a two-value t-SNE summary that is too compressed to capture multi-channel dynamics, both score poorly in Table 1. RAG-HAR [ 30 ] is the strongest prior method, using per-channel statistical descriptors and retrieved examples, but its prompt grows with channels and context, costing more than 6 s per prediction on a 6-channel dataset and requiring sensor data to be sent to the cloud. The fine-tuning line, represented by SensorLLM, tokenizes each channel separately with Amazon’s Chronos [ 3 ] en-coder (roughly 710M parameters) atop an 8B-parameter LLM, so both token count and model size scale unfavourably for the edge. 
+
+STELLA avoids all of these. It compresses each complete window into a fixed set of 16 latent tokens before any LLM computation, a 262.5 × reduction for MHEALTH and 187.5 × for USC-HAD over scalar-level tokenization, so inference cost is independent of win-dow length, and it keeps the LLM frozen with the full pipeline local, so sensor data need not leave the device. Inference completes in under 10 ms on a server GPU and under 50 ms on a mobile GPU (Sec-tion 5.3), versus multi-second API latency for RAG-HAR. Despite using only a frozen GPT-2 backbone, STELLA outperforms every prior LLM-based method where a direct comparison exists, exceed-ing RAG-HAR by 0.41–13.37 F1 points (largest on USC-HAD and HHAR). The key to LLM-based HAR is therefore not a larger LLM, a longer prompt, or heavier fine-tuning, but an efficient sensor-to-LLM translation layer that preserves activity-relevant information while keeping the LLM input short, private, and deployable on-device. 
+
+## 5.2 Tokenizer Performance 
+
+The central hypothesis of STELLA is that LLM-based HAR should not rely on raw numerical prompts or generic time-series repre-sentations, but instead requires a sensor tokenizer that is explicitly Nirhoshan Sivaroopan, Albert Zomaya, and Kanchana Thilakarathna 
+
+designed to translate wearable signals into a compact sequence of LLM-compatible tokens. To evaluate this hypothesis, we com-pare our STELLA -Tower tokenizer against representative SOTA time-series encoders, including PatchTST [ 23 ], Chronos [ 3 ], Times-Net [ 36 ], iTransformer [ 22 ], TSMixer [ 7 ], and TimeMixer [ 35 ] in Table 2. For a fair comparison, all tokenizers are constrained to out-put the same number of tokens, 𝑁 = 16 , and are evaluated under the same downstream LLM-based classification pipeline. Thus, the com-parison isolates the quality of the sensor-to-token translation rather than differences in LLM capacity or token budget. We perform a 5-fold held-out evaluation protocol for this experiment. The detailed implementation of the tokenizer baselines are presented in Appen-dix B. Table 2 shows that STELLA -Tower consistently outperforms all competing tokenizers across HHAR, MHEALTH, and USC-HAD. On HHAR, STELLA -Tower achieves 71.69% F1, improving over the strongest baseline by +7.66 F1 points. On MHEALTH, where most encoders already perform strongly, STELLA -Tower still achieves the best result with 96.22% F1, surpassing the next best tokenizer by +1.92 F1 points. On USC-HAD, STELLA -Tower reaches 86.92% accuracy and 81.01% F1, outperforming the strongest baseline by +5.07 F1 points. These results highlight an important distinction be-tween general-purpose time-series encoders and sensor tokenizers for LLM-based HAR. Models such as PatchTST, TimesNet, iTrans-former, TSMixer, and TimeMixer were primarily designed to model temporal dependencies in conventional time-series forecasting or classification settings. These encoders often lose fine-grained ac-tivity cues or fail to preserve the multi-scale structure needed for HAR. STELLA -Tower is better suited to this bottleneck because its architecture is explicitly designed around compact sensor-to-LLM translation. Overall, Table 2 confirms that the performance of STELLA is not only due to the downstream LLM, but also to the quality of the learned sensor tokenizer. These results validate the design choice of using a dedicated sensor tokenizer rather than directly adopting existing time-series encoders for LLM-based HAR. 
+
+## 5.3 On-Device Feasibility Analysis 
+
+We systematically characterise the computational footprint, infer-ence latency, memory requirements, and deployment constraints of 
+
+STELLA to establish its viability for real-time, on-device HAR. To assess generalisation across sensor configurations, all experiments are conducted on two datasets with contrasting characteristics: MHEALTH (21 channels, 50 Hz, 4-second windows) and USC-HAD (6 channels, 100 Hz, 5-second windows). This pairing deliberately spans the extremes of practical wearable deployments, a rich multi-placement inertial suite versus a minimal single-IMU platform. Unless stated otherwise, latency figures report the median (p50) of 200 isolated benchmark iterations preceded by 50 warm-up rounds, using CUDA events for GPU timing and high-resolution wall-clock measurements for CPU. In a streaming HAR deployment, the slid-ing stride determines how frequently a new window arrives for classification; the system must complete each inference before the next window is ready. We therefore define the inference budget as the stride duration: 1,000 ms for MHEALTH (50-sample stride at 50 Hz) and 2,500 ms for USC-HAD (250-sample stride at 100 Hz). A system is real-time feasible if inference latency < 50% of this budget, 
+
+Table 3: Computational profile of STELLA . GFLOPs are re-ported for a single forward pass through each component. A complete classification requires one LLM pass for each candidate activity label.                     
+
+> Component Params Share GFLOPs (single pass) FP32 Size
+> Sensor Encoder 12.57 M 9.1% 0.12 50.3 MB MLP Projector 1.77 M 1.3% <0.01 7.1 MB GPT-2 (frozen) 117 M 89.7% 7.42 497.8 MB
+> Total 138.78 M 100% 7.54 555.2 MB
+
+Table 4: Latency breakdown (median of 200 runs, batch = 1,FP32). Budget: inference latency as a fraction of the predic-tion stride (1,000 ms for MHEALTH; 2,500 ms for USC-HAD).                                            
+
+> DS Device Config Tokenizer (ms) Inference Latency (ms) Budget (%)
+> MH RTX 4090 GPU FP32 1.62 9.73 0.97 MH Server (x86) CPU, 16T 4.05 206.4 20.6 MH Server (x86) CPU, 4T 4.01 247.8 24.8 MH Server (x86) CPU, 1T 6.84 852.2 85.2 USC RTX 4090 GPU FP32 1.53 9.74 0.39 USC Server (x86) CPU, 16T 5.16 180.3 7.2 USC Server (x86) CPU, 4T 5.26 225.2 9.0 USC Server (x86) CPU, 1T 7.86 774.7 31.0
+
+preserving headroom for sensor I/O and application overhead. We perform a 5-fold held-out evaluation protocol for these experiments. 
+
+5.3.1 Computational Profile . Table 3 summarises the param-eter distribution and floating-point operations of STELLA across both sensor configurations. The model architecture is identical for both datasets; only the input dimension differs. STELLA comprises 138.78 M parameters, of which 117 M (89.7%) reside in the frozen GPT-2 backbone. The trainable component, sensor encoder plus MLP projector, totals 14.34 M parameters (10.3%), confining gradient computation entirely to the lightweight sensor front-end. The encoder contributes 1.6% of the per-pass GFLOPs (0.12 of 7.54), confirming that the LLM is the dominant computational component regardless of sensor configuration. Since classification scores all candidate labels, let 𝐶 = |Y| denote the number of candi-date activity labels. For MHEALTH, 𝐶 = 12 , so the total inference cost per prediction is 𝐶 × 7.42 + 0.12 ≈ 89 .2 GFLOPs, the encoder runs once, and the LLM runs once per candidate label. The encoder FLOPs differ by 50% across datasets (0.12 vs. 0.18 GFLOPs) owing to USC-HAD’s longer 500-sample windows; however, total infer-ence latency FLOPs are virtually identical (89.10 vs. 89.16 GFLOPs), because encoder computation accounts for just 0.13–0.20% of the total budget. The LLM cost of 88.98 GFLOPs is completely invariant to input channel count and window length, as it always processes the same 16-token compressed representation. Raw sensor input for MHEALTH spans 4,200 scalar values per window (200 ×21), compressed to 16 tokens, a 262.5 × reduction relative to naïve per-scalar tokenisation. USC-HAD spans 3,000 scalar values (500 ×6), compressed to the same 16 tokens, a 187.5 × reduction .
+
+5.3.2 Inference Latency . We define inference latency as the elapsed time from receiving a raw sensor window to producing a classifica-tion label, encompassing sensor encoding and all 𝐶 LLM scoring STELLA: Efficient Sensor-to-LLM Translation for On-Device Human Activity Recognition 
+
+Table 5: Effect of model compression on size, latency, and accuracy. † FP16 on x86 CPU emulates via FP32 upcasting; not representative of ARM CPUs with native FP16 arith-metic. ‡ LLM-only schemes quantize GPT-2 transformer block weights only; the embedding table and sensor encoder remain in FP32                               
+
+> Scheme Size (MB) CPU 4T p50 (ms) GPU p50 (ms) MHEALTH USC-HAD Acc. (%) F1 (%) Acc. (%) F1 (%)
+> Full Model  FP32 (baseline) 555.2 247.8 9.73 96.68 96.22 86.92 81.01 FP16 277.7 2,146 †6.30 96.68 96.22 86.60 80.92 INT8 152.3 184.3 4.14 40.13 27.08 86.74 80.75
+> LLM Only  INT8 ‡300.8 252.2 8.91 96.58 96.48 86.59 80.68 INT4 ‡263.3 237.8 6.34 96.52 96.41 85.93 78.02
+
+passes. Table 4 presents this latency alongside its encoder sub-component across all evaluated hardware configurations on the server with different cores. The central result is the near-perfect alignment of inference latency across the two sensor configura-tions. On GPU, MHEALTH and USC-HAD differ by 0.01 ms (9.73 vs. 9.74 ms) despite USC-HAD’s 2.5 × longer input window. On CPU (4 threads), USC-HAD is marginally faster than MHEALTH (225.2 vs. 247.8 ms), because the 3.5 × reduction in channel count more than compensates for the 2.5 × increase in temporal samples in the early depthwise encoder stages. This confirms that end-to-end prediction latency is governed by the LLM processing 16 fixed tokens rather than by raw sensor volume, channel count, or sampling rate. Two further observations hold across both datasets. First, the LLM dominates CPU cost: the encoder contributes just 1.6–2.3% of inference latency at 4 threads (4.01/247.8 ms for MHEALTH; 5.26/225.2 ms for USC-HAD). Second, USC-HAD’s longer 2.5-second stride substantially relaxes the real-time constraint: even single-thread CPU inference (774.7 ms, 31.0% of the 2.5-second budget) is feasible, whereas on MHEALTH single-thread inference (852.2 ms, 85.2% budget) is not. 
+
+5.3.3 Memory Requirements . Peak GPU VRAM during a full 
+
+𝐶 batched prediction is 749.9 MB on MHEALTH and 788.3 MB on USC-HAD. The 38 MB difference is attributable to the larger inter-mediate activation tensors produced by USC-HAD’s 500-sample input windows. Both values fit within the 1 GB VRAM available on entry-level mobile GPUs (Adreno 619 and above). For CPU-only deployment, a minimum of 4 GB total device RAM is required on both datasets, with the inference process consuming approximately 1.7 GB (model weights 555 MB, PyTorch runtime ≈900 MB, and inference activations ≈183–221 MB). 
+
+5.3.4 Precision and Quantisation . Table 5 evaluates two com-pression strategies: full-model compression, which quantises all layers including the GPT-2 embedding table, and LLM-only com-pression, which quantises only the transformer block weights while keeping the embedding table and sensor encoder in FP32. Full-model FP16 halves model size to 277.7 MB and delivers a 35.3% GPU speedup (6.30 ms) with no accuracy loss on either dataset. On x86 CPU, FP16 is unusable due to the absence of hardware FP16 arithmetic; ARM processors with native FP16 units are not affected. 
+
+Table 6: Classification accuracy and inference latency vs. number of sensor tokens 𝑁 .                                 
+
+> Latency (ms) MHEALTH USC-HAD
+> 𝑁 GPU p50 CPU 4T p50 Acc. (%) F1 (%) Acc. (%) F1 (%)
+> 49.5 149 95.93 95.29 86.98 80.04 89.9 164 96.13 95.68 87.18 80.90
+> 16 10.1 211 96.68 96.22 86.92 81.01
+> 32 10.7 301 96.12 95.40 87.45 81.58
+> 64 13.4 499 95.65 95.03 86.25 79.35
+
+Full-model INT8 produces the most compact checkpoint (152.3 MB) and the fastest CPU inference (184.3 ms). Its behaviour, however, is strongly dataset-dependent: accuracy is fully preserved on USC-HAD but drops to 40.13% on MHEALTH. The divergence arises from the sensitivity of NLL-based label scoring to quantisation-induced perturbations in the embedding table. On MHEALTH, where the model achieves near-perfect discrimination, inter-class NLL mar-gins are narrow; quantising the embedding table distorts token-level log-probabilities enough to corrupt the relative label ordering. On USC-HAD, where activities are harder to distinguish and NLL margins are wider, the same perturbation stays below the decision boundary and accuracy is preserved. LLM-only compression (HuggingFace) avoids embedding-table quantisation and recovers accuracy on both datasets. INT8 LLM-only reduces MHEALTH accuracy by 0.10 percentage points (96.58%) and USC-HAD by 0.33 points (86.59%). Its model size (300.8 MB) exceeds FP16 because the unquantised embedding table ( ≈154 MB) dominates the footprint. On GPU, inference latency is 8.91 ms; on CPU it is 252.2 ms, marginally slower than FP32 (247.8 ms) due to dequantisation overhead at transformer block boundaries. INT4 LLM-only yields the smallest accuracy-preserving checkpoint at 
+
+263.3 MB , 5.2% smaller than FP16 and 52.6% smaller than FP32, while matching FP16 GPU speed (6.34 ms, 34.8% faster than FP32). On CPU it is 237.8 ms, a 4.0% improvement over FP32; the modest CPU gain reflects that compute, not weight loading, is the bottleneck at this sequence length. Accuracy costs are 0.16 percentage points on MHEALTH (96.52%) and 0.99 points on USC-HAD (85.93%). For GPU deployment, INT4 LLM-only is preferable to FP16: it achieves equivalent latency (6.34 ms vs. 6.30 ms), uses less memory (263 MB vs. 278 MB), and incurs less than 0.2 percentage points accuracy loss on MHEALTH. For CPU deployment, FP32 remains the safe default; INT4 LLM-only is a viable alternative where stor-age matters, at the cost of a modest 4.0% latency improvement. Full-model INT8 is appropriate only for datasets where the model operates below ≈90% accuracy and NLL margins are correspond-ingly wide. 
+
+5.3.5 Effect of Sensor Token Count . Table 6 reports accuracy and inference latency as the number of sensor tokens 𝑁 varies from 4 to 64 for both datasets. The optimal token count is dataset-dependent and correlates with window length. On MHEALTH (200-sample windows), 𝑁 =16 is optimal; on USC-HAD (500-sample windows), 𝑁 =32 performs best, reflecting the higher information density of the longer temporal context. The compression ratios at the respective optima are comparable: 12.5 × temporal compression for MHEALTH (200 samples → 16 tokens) and 15.6 × for USC-HAD (500 samples → 32 tokens). Notably, 𝑁 =4, a 50 × compression from Nirhoshan Sivaroopan, Albert Zomaya, and Kanchana Thilakarathna 
+
+MHEALTH’s 200-sample window and a 125 × compression from USC-HAD’s 500-sample window, retains 95.93% and 86.98% accu-racy respectively, demonstrating that the encoder extracts a highly compact representation with minimal loss. On GPU, latency is nearly insensitive to 𝑁 across the 4–32 range (9.5–10.7 ms) on both datasets, with a step at 𝑁 =64 (13.4 ms) marking the onset of atten-tion quadratic scaling. On CPU, the relationship is monotone, and 
+
+𝑁 =64 reaches the real-time threshold (499 ms) on both datasets. 
+
+5.3.6 Real-Time Deployment Feasibility . Table 7 consolidates the real-time feasibility of STELLA across three deployment tiers: server-class hardware, an edge-AI platform, and a flagship smart-phone. We assess real-time operation through the duty cycle , the ratio of inference latency to the prediction stride; since this ra-tio is also the fraction of the stride budget consumed, a system is real-time feasible when its duty cycle stays below our conservative threshold of 50% . With new windows arriving every 1,000 ms for MHEALTH and 2,500 ms for USC-HAD, this corresponds to latency budgets of 500 ms and 1,250 ms, respectively. 
+
+STELLA meets this criterion on every hardware target in Table 7, typically by a wide margin. On the RTX 4090, inference completes in 9.73 ms (a duty cycle under 1% on both datasets), and even CPU-only server execution stays comfortably within budget, with the 16-and 4-core x86-64 configurations at 206 .4 ms and 247 .8 ms ( ≤ 24 .8% 
+
+of the tighter MHEALTH stride). Crucially, feasibility extends well beyond server hardware: the Jetson Xavier NX runs at 35 .2 ms under TensorRT, and on the Samsung S23 Ultra the ONNX CPU path completes in 377 .8 ms while the NNAPI GPU path reaches 
+
+41 .7 ms. Taking the S23 Ultra CPU result as a conservative mobile baseline, its duty cycle is 37 .78% for MHEALTH and 15 .11% for USC-HAD; the GPU path lowers this to 4.17% and 1.67% . Full per-device figures are listed in Table 7. Overall, STELLA is not restricted to offline or cloud-hosted infer-ence: it runs in real time on commodity mobile hardware without a server GPU, while leaving substantial headroom for sensor ac-quisition, preprocessing, OS scheduling, and application logic. This supports the central deployment claim of STELLA : by translating each sensor window into a small fixed set of latent tokens before LLM inference, the system keeps latency predictable and enables privacy-preserving on-device HAR. 
+
+Minimum deployment specification. The FP32 checkpoint size of 
+
+STELLA is approximately 555 MB, so a practical deployment should reserve at least 600 MB of storage for the model weights alone, with additional space for the runtime, tokenizer files, and application code. Based on the validated configurations in Table 7, the recom-mended minimum specification for real-time deployment is a mod-ern 4-core CPU or mobile SoC, at least 4 GB of system memory, and support for an efficient inference runtime such as ONNX Runtime, TensorRT, NNAPI, or an equivalent backend. For best mobile perfor-mance, a smartphone-class SoC with an integrated GPU/NPU and 8 GB or more RAM provides substantial headroom, as demonstrated by the Samsung S23 Ultra results. For embedded edge deployment, an 8 GB Jetson Xavier NX-class device is sufficient for low-latency accelerated inference. For CPU-only deployment, a 4-core modern processor is sufficient for real-time operation under the evaluated MHEALTH and USC-HAD strides, although accelerator-backed ex-ecution is strongly preferred when minimizing energy consumption 1 6 11 16 21 26 31 36 40 
+
+> Data availability (%)
+> 70
+> 75
+> 80
+> 85
+> 90
+> 95
+> F1 score (%)
+> Personalized Model
+> Pretrained baseline
+
+(a) Continued learning for Per-sonalization on USC-HAD XG-   
+
+> Boost
+> CNN
+> -1D
+> KNN MLP Trans
+> former
+> STELLA
+> Model
+> 0
+> 20
+> 40
+> 60
+> 80
+> 100
+> F1 score (%)  67.27
+> 57.40
+> 63.78
+> 71.04 73.07
+> 92.70
+
+(b) On-device personalization with different models 
+
+Figure 4: On-device Personalization 
+
+or supporting additional application workloads. Under these condi-tions, STELLA can run locally without cloud inference, preserving sensor-data privacy while meeting real-time HAR constraints. 
+
+Future work. INT4 LLM-only quantises transformer block weights while keeping the embedding table ( ≈154 MB) in FP32. Full INT4 compression of all layers would reduce the checkpoint to approxi-mately 69 MB and the total inference footprint to ∼144 MB, enabling deployment on severely RAM-constrained devices such as entry-level wearables. This requires calibrated quantisation (e.g., GPTQ or AWQ) applied to the embedding table to avoid the NLL-ordering col-lapse observed with uncalibrated full-model INT8, and is deferred to future work. The remainder of the on-device feasibility analysis is available in Appendix D. 
+
+## 5.4 On-device Personalization 
+
+We evaluate whether lightweight on-device personalization can improve recognition for individual users. We hold out the worst-performing subject per dataset (Subject 8 for MHEALTH, Subject 13 for USC-HAD) and split their data into 10% retrieval context, 40% fine-tuning, and 50% test, with non-overlapping windows to prevent leakage. The LLM remains frozen throughout; only the sensor tok-enizer is fine-tuned on the per-user training split, and the retrieval pool is rebuilt from context samples after each epoch. At inference, the top-𝑘 context windows (by cosine similarity in sensor-token space) are prepended to the LLM input. We report two auxiliary metrics: Retrieval F1 (majority vote over the top-𝑘 pool, equivalent to a 𝑘 -NN classifier in learned embedding space) and Retrieval Hit Rate (RHR) (fraction of test samples whose top-𝑘 pool contains at least one correct-class example). Figure 4a shows the continual personalization trajectory on USC-HAD. Starting from 70.79% F1 with no user-specific adaptation, performance rises quickly, even 5–10% of the target user’s data already surpasses the pretrained baseline, and peaks at 93.33% F1 when 39% of data is available. Table 8 reports final results at the full 40% personalization split. GPU latency grows from 9.7 ms ( 𝑘 = 0)to 49.0 ms ( 𝑘 = 9), with retrieval itself contributing less than 1 ms. The gains are substantial: on MHEALTH, LLM F1 rises from 95.56% to 100.0%; on USC-HAD, from 70.79% to 92.70% (+21.91 F1 points). On MHEALTH, Retrieval F1 degrades from 90.74% to 78.02% as 𝑘 
+
+grows, yet LLM F1 holds at 100.0% from 𝑘 =7, with RHR at 100% throughout, this confirms the LLM actively reasons over retrieved context rather than performing nearest-neighbour matching. Fig-ure 4b compares personalized STELLA against on-device trainable STELLA: Efficient Sensor-to-LLM Translation for On-Device Human Activity Recognition 
+
+Table 7: Real-time deployment feasibility of STELLA FP32 (batch = 1). Budget: inference latency as a fraction of the prediction stride (1,000 ms for MHEALTH; 2,500 ms for USC-HAD). 
+
+Tier Device Cores / Accelerator RAM Runtime Latency p50 (ms) Budget MH / USC RT? MH / USC 
+
+Server RTX 4090 (GPU) 16,384 CUDA cores 24 GB VRAM PyTorch CUDA 9.73 0.97% / 0.39% ✓/ ✓
+
+x86-64 server 16 × x86-64 134 GB PyTorch CPU 206.4 20.6% / 8.3% ✓/ ✓
+
+x86-64 server 4× x86-64 134 GB PyTorch CPU 247.8 24.8% / 9.9% ✓/ ✓
+
+Edge AI Jetson Xavier NX 384-core Volta GPU 8 GB TensorRT 35.2 3.52% / 1.4% ✓/ ✓
+
+Smartphones Samsung S23 Ultra 8-core Snap. 8 Gen 2 12 GB ONNX CPU EP 377.8 37.8% / 15.1% ✓/ ✓
+
+Samsung S23 Ultra Adreno 740 GPU 12 GB ONNX NNAPI EP 41.7 4.17% / 1.67% ✓/ ✓
+
+Table 8: Personalizing the framework to the user. k=0 case is the baseline. Ret. - Retrieval , RHR - Retrieval Hit Rate. Evaluated on the lowest-performing subject in each dataset to assess whether personalization can improve recognition under the most challenging subject-specific conditions.                                       
+
+> Latency MHEALTH USC-HAD
+> 𝑘 GPU ms LLM F1 (%) Ret. F1 (%) RHR (%) LLM F1 (%) Ret. F1 (%) RHR (%)
+> 09.7 95.56 --70.79 --319.0 98.90 90.74 100.00 91.10 76.96 93.84 529.1 99.80 90.74 100.00 92.08 78.33 98.63 738.2 100.00 80.13 100.00 92.49 78.70 98.63 949.0 100.00 78.02 100.00 92.70 75.83 99.32
+
+baselines (KNN, MLP, XGBoost, CNN-1D, Transformer), each given all 50% of available user labels. STELLA exceeds all by approximately 20% F1, confirming that the gains come from the combination of tokenizer adaptation and retrieval-augmented inference, not merely from access to more labelled data. Overall, these results demonstrate that the proposed framework enables practical on-device personalization through lightweight subject adaptation and retrieval-augmented reasoning. By com-bining continual accumulation of user-specific knowledge with efficient personalization of the sensor tokenizer, the system pro-gressively adapts to individual users while preserving real-time deployment feasibility and low computational overhead. 
+
+## 5.5 Ablation Study 
+
+We conduct a systematic ablation study across eight design axes of 
+
+STELLA , evaluated independently on MHEALTH and USC-HAD un-der identical training conditions (40 epochs, lr = 5×10 −4, batch = 16 ,
+
+𝑁 =16 tokens, seed = 42 ). Consistent reporting on two datasets with contrasting sensor configurations (21-channel multi-placement vs. 6-channel single-IMU) reveals which design choices are universally beneficial and which are dataset-dependent. Table 9 summarises all results; default configurations are shown in bold. We perform a 5-fold held-out evaluation protocol for these experiments. 
+
+5.5.1 Multi-Scale Token Aggregation (Group A) . Group A evaluates the contribution of each hierarchical representation. Full multi-scale fusion (A4: H 2+H 3+H 4) provides the strongest over-all configuration, and removing any scale consistently reduces F1 across both datasets. Compared with the next-best fused variant, A3 (H 3+H 4), full fusion improves F1 by 0.65 points on MHEALTH and 1.60 points on USC-HAD. The larger gain on USC-HAD suggests 
+
+Table 9: Ablation study across all design axes (5-fold LOSO). Bold rows denote the default configuration for each group. The remainder of the ablation study is available in Appen-dix E.                                                       
+
+> Grp ID Variant MHEALTH USC-HAD Trainable Acc. (%) F1 (%) Acc. (%) F1 (%) Params
+> AA1 Attention output only (H 4)96.27 95.79 86.08 79.34 14.11 M A2 Stage-3 only (H 3)96.22 95.57 86.40 80.17 14.11 M A3 Stage-3 +attention (H 3+H 4)96.29 95.57 86.23 79.41 14.26 M
+> A4 Full fusion H 2+H 3+H 496.68 96.22 86.92 81.01 14.34 M
+> BB1 Full attention in encoder stages 96.94 96.54 86.23 79.29 18.42 M
+> B2 RepMixer stages 96.68 96.22 86.92 81.01 14.34 M
+> CC1 Shallow depths (1,2,3)96.72 96.19 87.37 82.09 10.07 M
+> C2 Default depths (2,4,6)96.68 96.22 86.92 81.01 14.34 M
+> C3 Deep depths (3,6,9)96.51 95.91 86.04 80.26 18.60 M
+
+that the coarse-grained H 2 representation is especially useful for sparse single-IMU data, where global temporal structure carries more discriminative information. This confirms that multi-scale fusion is a universally beneficial design choice for STELLA .
+
+5.5.2 RepMixer vs. Self-Attention (Group B) . The cross-dataset comparison provides a definitive resolution of the RepMixer vs. self-attention trade-off. On MHEALTH, B1 (full attention) marginally outperforms RepMixer (B2) by 0.32 F1 points. On USC-HAD, the relationship inverts : B2 (RepMixer) outperforms B1 by 1.72 F1 points .Taken together across both datasets, RepMixer is the consistently stronger or equally competitive choice, while using 22.2% fewer tower parameters (14.34 M vs. 18.42 M). The inversion on USC-HAD is attributed to the longer 500-sample input sequences, where early-stage self-attention incurs higher quadratic cost and has less benefit over the locally periodic convolutional inductive bias suited to single-IMU signals. We retain RepMixer (B2) as the universal default. 
+
+5.5.3 Encoder Depth (Group C) . The depth ablation produces a consistent result: adding parameters beyond the default depth does not help, and the shallow encoder is competitive or superior. On MHEALTH, C1 (shallow) and C2 (default) are statistically indis-tinguishable (96.72% vs. 96.68%, within ±4.01% cross-fold standard deviation). On USC-HAD, C1 outperforms C2 by a larger margin (87.37% vs. 86.92% accuracy; 82.09% vs. 81.01% F1), suggesting that for single-IMU signals with higher activity ambiguity, the stronger regularisation provided by a shallower encoder is beneficial. The deep encoder C3 underperforms both across datasets. The practical Nirhoshan Sivaroopan, Albert Zomaya, and Kanchana Thilakarathna 
+
+implication is clear: the shallow configuration (C1, 10.07 M train-able parameters) delivers equal or better accuracy than the default (C2, 14.34 M) at a 30% parameter reduction, and should be preferred for memory-constrained deployments. 
+
+5.5.4 Summary. The cross-dataset ablation yields five universally stable design principles and two dataset-sensitive findings. Uni-versally stable : (i) full multi-scale fusion (A4) is consistently the strongest aggregation strategy, confirming the value of combining H2, H 3, and H 4 representations; (ii) RepMixer (B2) provides the most robust encoder trade-off, matching or approaching self-attention on MHEALTH while outperforming it on the harder USC-HAD benchmark with fewer parameters; (iii) increasing encoder depth beyond the default brings no accuracy benefit and often hurts, while the shallow encoder remains competitive and may be preferable for memory-constrained deployment; (iv) freezing the LLM (D1) is more reliable than full or partial fine-tuning, especially on the sparse-sensor USC-HAD dataset; and (v) the LLM-based NLL scor-ing head is essential, as replacing it with a conventional linear classifier causes substantial drops on both datasets. 
+
+Dataset-sensitive : semantic label benefit depends on sensor rich-ness, improving MHEALTH more clearly than USC-HAD; and LLM backbone scaling improves performance most reliably within the GPT family, while non-GPT backbones do not provide con-sistent gains despite similar or larger parameter counts. Together, these findings show that STELLA is strongest when the sensor tok-enizer, multi-scale fusion, frozen GPT-style language backbone, task prompting and NLL-based activity scoring are retained as a unified design. GPT-2 remains the best efficiency–performance default, while larger GPT variants can be used when additional compute and memory are available. 
+
+## 6 Discussion 6.1 Local LLM at the Edge 
+
+STELLA is motivated by the trend toward small local LLMs that serve as shared, system-level backends on mobile and edge devices for text, voice, and multimodal reasoning. By confining all HAR-specific learning to the tokenizer, STELLA lets sensing reuse this backend rather than adding a separate model: the sensor tokenizer plays the role for sensor windows that the LLM’s native tokenizer plays for text, making sensing one more modality the frozen LLM reasons over. A device already hosting a local LLM thus needs only to add this compact front-end, instead of fine-tuning or rebuilding the LLM per task. This reflects a broader direction for edge intelli-gence, attach modality-specific tokenizers to a common LLM and reuse its semantic reasoning across applications. 
+
+## 6.2 NLL Scoring vs. Free-form Generation 
+
+STELLA recognizes activities by scoring candidate labels under the LLM’s likelihood (selecting the lowest-NLL label) rather than gen-erating a label as free text, which matters for on-device use in three ways. First, generation would require a longer, more instructive prompt (enumerating candidate activities and formatting rules) whose extra tokens inflate attention and KV-cache cost, working against our goal of a compact input. Second, small on-device LLMs generate unreliably: they may emit synonyms, explanations, or labels outside the dataset, requiring post-processing and adding avoidable errors, whereas scoring restricts predictions to valid la-bels by construction. Third, scoring cost is predictable: it grows only with the (typically small) number of candidate labels, the sensor-token prefix is shared across candidates and can be batched, and personalization can further restrict scoring to the labels present in the retrieved context. NLL scoring therefore keeps the prompt short, avoids invalid outputs, and yields predictable latency. 
+
+## 6.3 Energy Optimization for On-device Use 
+
+Because STELLA ’s per-inference cost is set by the token budget rather than the raw signal, it exposes a few knobs for matching a device’s real-time and energy budget without touching the LLM. Sustained energy is governed mainly by the prediction stride, since continuous-HAR energy scales with the duty cycle; lengthening the stride lowers average power at the cost of temporal resolution. Per-inference cost is set by the token budget 𝑁 and execution precision: smaller 𝑁 and FP16/INT4 quantization both reduce latency and memory with only graceful accuracy loss. Window length and sam-pling rate, by contrast, trade accuracy against sensor-acquisition energy but barely affect LLM latency, since the model always sees 
+
+𝑁 tokens, so low-channel deployments can use longer windows or lower sampling rates to save energy while even improving accuracy. Finally, accelerator-backed execution cuts active time by roughly an order of magnitude over CPU, sharply lowering the duty cycle. A deployment therefore selects the operating point ( 𝑁 , window, stride, precision, backend) that fits its constraints, and the fixed-token interface keeps this recipe largely independent of channel count and window length. These trade-offs are quantified in our on-device feasibility analysis (Section 5.3). 
+
+## 7 Conclusion 
+
+This paper presented STELLA , an efficient sensor-to-LLM transla-tion framework for on-device human activity recognition. Rather than treating LLM-based HAR as a prompting problem or a model-compression problem, STELLA reframes it as a sensor tokenization problem: sensor time-series data should be translated into compact, activity-aware tokens before reaching the LLM. Through a light-weight hierarchical tokenizer, frozen LLM integration, and local personalization mechanism, STELLA shows that language models can be used for HAR without sacrificing edge efficiency, privacy, or reusability. The evaluation demonstrates that this design consis-tently improves recognition performance, produces stronger sensor representations than generic time-series tokenizers, and remains practical for real-time on-device deployment. Overall, STELLA pro-vides a promising step toward accurate, private, and personalized LLM-based sensing systems on future mobile and edge platforms. 
+
+## Acknowledgments 
+
+This research was partially funded by the Australian Research Coun-cil Industrial Transformation Research Hub for Future Digital Man-ufacturing (IH230100013). 
+
+## References   
+
+> [1] Alireza Abedin, Mahsa Ehsanpour, Qinfeng Shi, Hamid Rezatofighi, and Damith C Ranasinghe. 2021. Attend and discriminate: Beyond the state-of-the-art for
+
+STELLA: Efficient Sensor-to-LLM Translation for On-Device Human Activity Recognition 
+
+human activity recognition using wearable sensors. Proc of the ACM on Interactive, Mobile, Wearable and Ubiquitous Technologies (2021). [2] Nafees Ahmad and Ho-fung Leung. 2023. ALAE-TAE-CutMix+: Beyond the state-of-the-art for human activity recognition using wearable sensors. In 2023 IEEE International Conference on Pervasive Computing and Communications (PerCom) .IEEE, 222–231. [3] Abdul Fatir Ansari, Lorenzo Stella, Caner Turkmen, Xiyuan Zhang, Pedro Mercado, Huibin Shen, Oleksandr Shchur, Syama Sundar Rangapuram, Sebas-tian Pineda Arango, Shubham Kapoor, et al . 2024. Chronos: Learning the language of time series. arXiv preprint arXiv:2403.07815 (2024). [4] Marc Bachlin, Meir Plotnik, Daniel Roggen, Inbal Maidan, Jeffrey M Hausdorff, Nir Giladi, and Gerhard Troster. 2009. Wearable assistant for Parkinson’s disease patients with the freezing of gait symptom. IEEE Transactions on Information Technology in Biomedicine (2009). [5] Oresti Banos, Rafael Garcia, Juan A Holgado-Terriza, Miguel Damas, Hector Pomares, Ignacio Rojas, Alejandro Saez, and Claudia Villalonga. 2014. mHealth-Droid: a novel framework for agile development of mobile health applications. In International workshop on ambient assisted living . Springer. [6] Gabriele Civitarese, Michele Fiori, Priyankar Choudhary, and Claudio Bettini. 2025. Large language models are zero-shot recognizers for activities of daily living. ACM Transactions on Intelligent Systems and Technology 16, 4 (2025), 1–32. [7] Vijay Ekambaram, Arindam Jati, Nam Nguyen, Phanwadee Sinthong, and Jayant Kalagnanam. 2023. Tsmixer: Lightweight mlp-mixer model for multivariate time series forecasting. In Proceedings of the 29th ACM SIGKDD conference on knowledge discovery and data mining . 459–469. [8] Rene Grzeszick, Jan Marius Lenk, Fernando Moya Rueda, Gernot A Fink, Sascha Feldhorst, and Michael Ten Hompel. 2017. Deep neural network based human activity recognition for the order picking process. In Proc of the 4th international Workshop on Sensor-based Activity Recognition and Interaction .[9] Yu Guan and Thomas Plötz. 2017. Ensembles of deep lstm learners for activity recognition using wearables. Proc of the ACM on interactive, mobile, wearable and ubiquitous technologies (2017). [10] Nils Y Hammerla, Shane Halloran, and Thomas Plötz. 2016. Deep, convolu-tional, and recurrent models for human activity recognition using wearables. 
+
+arXiv:1604.08880 (2016). [11] Harish Haresamudram, Irfan Essa, and Thomas Plötz. 2023. Investigating en-hancements to contrastive predictive coding for human activity recognition. In 
+
+2023 IEEE International Conference on Pervasive Computing and Communications (PerCom) . IEEE, 232–241. [12] Alexander Hermans, Lucas Beyer, and Bastian Leibe. 2017. In defense of the triplet loss for person re-identification. arXiv:1703.07737 (2017). [13] Zhiqing Hong, Yiwei Song, Zelong Li, Anlan Yu, Shuxin Zhong, Yi Ding, Tian He, and Desheng Zhang. 2025. Llm4har: Generalizable on-device human activ-ity recognition with pretrained llms. In Proc of the 31st ACM SIGKDD conf on Knowledge Discovery and Data Mining V. 2 .[14] Aritra Hota, Soumyajit Chatterjee, and Sandip Chakraborty. 2025. Evaluating large language models as virtual annotators for time-series physical sensing data. 
+
+ACM Transactions on Intelligent Systems and Technology (2025). [15] Jeya Vikranth Jeyakumar, Liangzhen Lai, Naveen Suda, and Mani Srivastava. 2019. SenseHAR: a robust virtual activity sensor for smartphones and wearables. In Proceedings of the 17th Conference on Embedded Networked Sensor Systems .15–28. [16] Sijie Ji, Xinzhe Zheng, and Chenshu Wu. 2024. Hargpt: Are llms zero-shot human activity recognizers?. In 2024 IEEE FMSys Workshop . IEEE, 38–43. [17] Bulat Khaertdinov, Esam Ghaleb, and Stylianos Asteriadis. 2021. Deep triplet net-works with attention for sensor-based human activity recognition. In 2021 IEEE International Conference on Pervasive Computing and Communications (PerCom) .IEEE, 1–10. [18] Justin Khasentino, Anastasiya Belyaeva, Xin Liu, Zhun Yang, Nicholas A Furlotte, Chace Lee, Erik Schenck, Yojan Patel, Jian Cui, Logan Douglas Schneider, et al .2025. A personal health large language model for sleep and fitness coaching. 
+
+Nature Medicine (2025). [19] Shuheng Li, Ranak Roy Chowdhury, Jingbo Shang, Rajesh K Gupta, and Dezhi Hong. 2021. Units: Short-time fourier inspired neural networks for sensory time series classification. In Proceedings of the 19th ACM conference on embedded networked sensor systems . 234–247. [20] Zechen Li, Shohreh Deldari, Linyao Chen, Hao Xue, and Flora D Salim. 2025. Sensorllm: Aligning large language models with motion sensors for human activity recognition. In Proceedings of the 2025 Conference on Empirical Methods in Natural Language Processing . 354–379. [21] Daniyal Liaqat, Mohamed Abdalla, Pegah Abed-Esfahani, Moshe Gabel, Tatiana Son, Robert Wu, Andrea Gershon, Frank Rudzicz, and Eyal De Lara. 2019. Wear-Breathing: Real world respiratory rate monitoring using smartwatches. Proc of the ACM on Interactive, Mobile, Wearable and Ubiquitous Technologies (2019). [22] Yong Liu, Tengge Hu, Haoran Zhang, Haixu Wu, Shiyu Wang, Lintao Ma, and Mingsheng Long. 2024. itransformer: Inverted transformers are effective for time series forecasting. In International conference on learning representations ,Vol. 2024. 11116–11140. [23] Yuqi Nie, Nam H Nguyen, Phanwadee Sinthong, and Jayant Kalagnanam. 2022. A time series is worth 64 words: Long-term forecasting with transformers. arXiv preprint arXiv:2211.14730 (2022). [24] Francisco Javier Ordóñez and Daniel Roggen. 2016. Deep convolutional and lstm recurrent neural networks for multimodal wearable activity recognition. Sensors 
+
+(2016). [25] Madhuri Panwar, Dwaipayan Biswas, Harsh Bajaj, Michael Jöbges, Ruth Turk, Koushik Maharatna, and Amit Acharyya. 2019. Rehab-net: Deep learning frame-work for arm movement classification using wearable sensors for stroke rehabil-itation. IEEE Transactions on Biomedical Engineering (2019). [26] Stylianos Paraschiakos, Ricardo Cachucho, Matthijs Moed, Diana van Heemst, Simon Mooijaart, Eline P Slagboom, Arno Knobbe, and Marian Beekman. 2020. Activity recognition using wearable sensors for tracking the elderly. User Model-ing and User-Adapted Interaction (2020). [27] Kevin Post, Reo Kuchida, Mayowa Olapade, Zhigang Yin, Petteri Nurmi, and Huber Flores. 2025. Contextllm: Meaningful context reasoning from multi-sensor and multi-device data using llms. In Proc of the 26th International Workshop on Mobile Computing Systems and Applications . 13–18. [28] Attila Reiss and Didier Stricker. 2012. Introducing a new benchmarked dataset for activity monitoring. In 16th international symposium on wearable computers .IEEE. [29] Daniel Roggen, Alberto Calatroni, Mirco Rossi, Thomas Holleczek, Kilian Förster, Gerhard Tröster, Paul Lukowicz, David Bannach, Gerald Pirkl, Alois Ferscha, et al . 2010. Collecting complex activity datasets in highly rich networked sensor environments. In 2010 Seventh international conference on networked sensing systems (INSS) . IEEE, 233–240. [30] Nirhoshan Sivaroopan, Hansi Karunarathna, Chamara Madarasingha, Anura Jayasumana, and Kanchana Thilakarathna. 2025. RAG-HAR: Retrieval Aug-mented Generation-based Human Activity Recognition. arXiv preprint arXiv:2512.08984 (2025). [31] Dimitris Spathis and Fahim Kawsar. 2024. The first step is the hardest: Pitfalls of representing and tokenizing temporal data for large language models. Journal of the American Medical Informatics Association 31, 9 (2024), 2151–2158. [32] Thomas Stiefmeier, Daniel Roggen, Georg Ogris, Paul Lukowicz, and Gerhard Tröster. 2008. Wearable activity tracking in car manufacturing. IEEE Percom 
+
+(2008). [33] Allan Stisen, Henrik Blunck, Sourav Bhattacharya, Thor Siiger Prentow, Mikkel Baun Kjærgaard, Anind Dey, Tobias Sonne, and Mads Møller Jensen. 2015. Smart devices are different: Assessing and mitigatingmobile sensing het-erogeneities for activity recognition. In Proc of the 13th ACM conf on embedded networked sensor systems .[34] Sungho Suh, Vitor Fortes Rey, and Paul Lukowicz. 2022. Adversarial deep feature extraction network for user independent human activity recognition. In 2022 IEEE International Conference on Pervasive Computing and Communications (PerCom) .IEEE, 217–226. [35] Shiyu Wang, Haixu Wu, Xiaoming Shi, Tengge Hu, Huakun Luo, Lintao Ma, James Zhang, and Jun Zhou. 2024. Timemixer: Decomposable multiscale mixing for time series forecasting. In International conference on learning representations ,Vol. 2024. 38626–38652. [36] Haixu Wu, Tengge Hu, Yong Liu, Hang Zhou, Jianmin Wang, and Mingsheng Long. 2022. Timesnet: Temporal 2d-variation modeling for general time series analysis. arXiv preprint arXiv:2210.02186 (2022). [37] Yanni Yang, Pengfei Hu, Jiaxing Shen, Haiming Cheng, Zhenlin An, and Xiulong Liu. 2024. Privacy-preserving human activity sensing: A survey. High-Confidence Computing 4, 1 (2024), 100204. [38] Ming Zeng, Le T Nguyen, Bo Yu, Ole J Mengshoel, Jiang Zhu, Pang Wu, and Joy Zhang. 2014. Convolutional neural networks for human activity recognition using mobile sensors. In 6th international conf on mobile computing, applications and services . IEEE. [39] Mi Zhang and Alexander A Sawchuk. 2012. USC-HAD: A daily activity dataset for ubiquitous activity recognition using wearable sensors. In Proceedings of the 2012 ACM conference on ubiquitous computing . 1036–1043. [40] Jiachen Zhao, Fang Deng, Haibo He, and Jie Chen. 2020. Local domain adaptation for cross-domain activity recognition. IEEE Transactions on Human-Machine Systems (2020). 
+
+## A Datasets 
+
+We use publicly available and widely used HAR datasets for our experiments. Since prior HAR benchmarks commonly use dataset-specific evaluation protocols, we follow the established preprocess-ing and split settings used by the corresponding prior work for each dataset. Accordingly, results should be interpreted as within-dataset comparisons under the same protocol used by the cited Nirhoshan Sivaroopan, Albert Zomaya, and Kanchana Thilakarathna 
+
+baselines, rather than as a single unified cross-dataset split pol-icy. For all datasets, train/validation/test separation is performed before model fitting and evaluation. Normalization statistics are computed only from the training data and then applied to validation and test data. Validation and test samples are not used for training, hyperparameter selection, retrieval-memory construction, or per-sonalization. For datasets using sliding windows, we first apply the dataset split at the recording, subject, trial, or temporal-segment level specified by the protocol, and then generate windows sepa-rately within each split. This prevents overlapping windows from crossing train/validation/test boundaries. To make the split unit explicit, HHAR and MHEALTH use subject-independent LOSO eval-uation; PAMAP2 and USC-HAD use subject-independent held-out-subject evaluation; GOTOV uses subject-independent held-out-user validation and test splits; Opportunity uses trial- or recording-file-level splits depending on the task; and SKODA uses a chronolog-ical recording-level split. None of our experiments use random window-level splitting across the full set of overlapping windows. For all datasets with overlapping windows, the split is applied be-fore sliding-window segmentation, and windows are generated independently within each split. Therefore, overlapping windows do not cross train/validation/test boundaries. 
+
+## A.1 HHAR [33] 
+
+This dataset primarily contains locomotion-style activities such as walking, sitting, standing, and going up/down stairs. The dataset consists of sensor data collected from smartphones and smart-watches. Following [ 11 ], we use only wrist-worn sensor data, which consists of 6 channels. The window size is set to 2 seconds with 50% overlap. The evaluation protocol is leave-one-subject-out (LOSO). Data preparation and splits follow [ 11 ]. Since the protocol is subject-disjoint, data from the held-out subject is not used during training or validation. 
+
+## A.2 PAMAP2 [28] 
+
+The dataset originally contains 52 channels, including heart rate and full IMU sensor streams. Following [ 15 ], we retain the three IMUs located on the wrist, ankle, and chest. For each IMU, we use accelerometer, gyroscope, and magnetometer streams, resulting in 27 channels in total. We focus on 12 protocol-defined activi-ties recorded from 9 subjects. In addition to locomotion activities, PAMAP2 contains daily living activities such as ironing and vac-uum cleaning. The IMU data was sampled at 100 Hz, and we apply a sliding window of 500 samples (5 seconds) with a step size of 100 samples (1 second). Following the split in [ 15 ], subject 4 is used as the test set and the remaining subjects are used for training. Thus, the test set is subject-disjoint from the training data. 
+
+## A.3 MHEALTH [5] 
+
+The dataset was sampled at 50 Hz and contains 21 channels. In addition to locomotion activities, it includes exercise activities such as jogging and cycling. The dataset contains 12 activities in total. Following [ 34 ], we use sliding windows of 200 samples (4 seconds) with a step size of 50 samples (1 second). The evaluation protocol is leave-one-subject-out (LOSO). Data preparation and splits fol-low [ 34 ]. In each LOSO fold, data from the held-out subject is used only for testing, while the remaining subjects are used for training and validation. 
+
+## A.4 GOTOV [26] 
+
+The dataset contains 9 sensor channels collected from three body positions on 35 older adults aged over 61 while performing 16 activities. This dataset contains the same activities performed at different paces, such as slow walking, normal walking, and fast walking, as well as the same activity performed with different equipment, such as sitting on a sofa, sitting on a chair, and sitting on a couch. Six participants are excluded due to missing sensor data. Following [ 2], data from 3 users is used for testing and data from 3 users is used for validation, each consisting of two males and one female, while data from the remaining users is used for training. Windows are then created within each split using 24-sample segments with 50% overlap between consecutive windows. This protocol keeps training, validation, and test users disjoint. Data preparation and splits follow [2]. 
+
+## A.5 SKODA [32] 
+
+This dataset contains recordings of 10 assembly-line activities per-formed by car manufacturing workers, captured through 60 sensor channels positioned on the right-hand side of the body. Follow-ing [ 2], the recording is split chronologically, with the first 80% used for training, the next 10% used for validation, and the remain-ing 10% used for testing. After this split is applied to the recording, windows are created separately within each split using 24-sample segments with 50% overlap between consecutive windows. This ensures that overlapping windows do not cross train/validation/test boundaries. Data preparation and splits follow [2]. 
+
+## A.6 USC-HAD [39] 
+
+This dataset includes accelerometer and gyroscope signals, each with three degrees of freedom, resulting in six channels per time step. Data was collected from 14 subjects performing 12 basic activ-ities such as walking in different directions, running, and jumping. Following [ 17 ], the dataset is segmented into 1-second windows with 50% overlap. Data from subjects 13 and 14 is reserved for testing, while the remaining subjects are used for training. There-fore, the test set is subject-disjoint from the training data. Data preparation and splits follow [17]. 
+
+## A.7 Opportunity [29] 
+
+The dataset consists of four trials and includes measurements from a wide range of sensing modalities, such as body-worn sensors, object-mounted sensors, and ambient sensors. Following [ 15 , 19 ], we use only the five body-worn inertial measurement units placed at different body locations: the left lower arm (LLA), left upper arm (LUA), right lower arm (RLA), right upper arm (RUA), and back torso. Each inertial unit records accelerometer, gyroscope, and magnetometer signals. The dataset provides activity annotations at two levels of granularity. The high-level labels correspond to major locomotion states, including sitting, standing, walking, lying, and random movement. The low-level gesture labels describe 17 fine-grained manipulation activities, such as opening and closing doors, shelves, and drawers, as well as drinking tea. For gesture evaluation, STELLA: Efficient Sensor-to-LLM Translation for On-Device Human Activity Recognition 
+
+Table 10: Implementation details for tokenizer baselines. All variants are reimplemented and evaluated with the same frozen GPT-2 backend, the same two-layer MLP projector, and the same output token budget of 𝑁 = 16 .                              
+
+> Variant Encoder configuration STELLA-Tower Multi-scale RepMixer tower, dims (96 ,192 ,384 ),depths (2,4,6)
+> PatchTST Patch embedding + Transformer, 𝑑 =384 , 8 heads, 3 layers, patch length 16 Chronos-style Mean-scale normalization + patch Transformer, 𝑑 =
+> 384 , 8 heads, 3 layers, patch length 16 TimesNet FFT-based period detection with 3 periods and 2 Inception-style layers iTransformer Inverted channel-as-token Transformer, 𝑑 =384 , 8 heads, 3 layers, temporal pool size 64 TSMixer Alternating temporal and channel MLP mixing, 𝑑 =
+> 384 , 4 layers, temporal pool size 64 TimeMixer Multi-scale decomposable MLP mixing, 𝑑 =384 , 4 scales, 3 layers
+
+we follow the data preparation protocol in [ 15 ]. We discard samples with null activity labels, use Trials 1–3 for training, and reserve Trial 4 for testing. The dataset is resampled to 30 Hz and segmented using windows of 256 timesteps. For locomotion evaluation, we follow the data preparation protocol of [ 19 ]. Specifically, we use 20 recording files to construct the training split and the remaining four files for the test split. We retain the original sampling rate and segment the sensor streams using 5-second windows with a 1-second overlap. For both gesture and locomotion evaluation, windowing is performed after the trial or recording-file split is applied, so windows do not cross split boundaries. 
+
+## B Tokenizer Baseline Implementation Details 
+
+This section provides implementation details for the tokenizer com-parison in Section 5.2. The purpose of this experiment is to isolate the effect of the sensor tokenizer rather than changes in the down-stream LLM, token budget, or training procedure. Therefore, all tokenizer variants are evaluated inside the same STELLA pipeline. Each encoder receives the same preprocessed sensor windows, out-puts the same number of latent sensor tokens, and is followed by the same two-layer MLP projector into the LLM embedding space. The downstream LLM is GPT-2 and remains frozen for all variants. Only the sensor tokenizer and projector are trained. All tokenizers are constrained to output 𝑁 = 16 sensor tokens. We use the same language-model classification objective, optimizer, learning rate, batch size, dropout, number of epochs, and evaluation protocol across all variants. Unless otherwise stated, models are trained for 40 epochs with AdamW, learning rate 5 × 10 −4, weight decay 10 −4, batch size 16, dropout 0.1, two warm-up epochs, co-sine learning-rate decay, and early stopping with patience 6. The reported results use the same held-out evaluation protocol as the tokenizer comparison in Section 5.2. Table 10 summarizes the encoder variants used in the tokenizer comparison. The parameter count refers only to the sensor tok-enizer unless otherwise specified. The projector and frozen GPT-2 backbone are identical across variants and are therefore not used to distinguish the tokenizer baselines. 
+
+Table 11: Accuracy and latency vs. window duration. Default configurations shown in bold.                                                    
+
+> DS Window Samples Acc. (%) F1 (%) GPU p50 (ms) CPU 4T p50 (ms)
+> MH 1 s 50 94.75 94.16 7.72 221.2 MH 2 s 100 96.38 95.88 10.24 226.7 MH 4 s 200 96.68 96.22 10.31 229.7
+> MH 6 s 300 95.85 95.35 10.54 234.4 USC 1 s 100 81.68 77.29 7.86 197.9 USC 2 s 200 84.56 79.99 8.49 226.0 USC 5 s 500 86.92 81.01 8.95 205.4
+> USC 10 s 1000 89.74 83.40 16.00 226.7
+
+For Chronos, we do not compare against different released Chronos checkpoint sizes. Instead, we use a Chronos-style patch Trans-former encoder with the same hidden dimension, token budget, and downstream LLM pipeline as the other tokenizer baselines. This avoids confounding the tokenizer comparison with differences in pretrained checkpoint size or external pretraining data. Thus, the comparison should be interpreted as a controlled comparison of tokenizer architectures under a matched STELLA -style LLM classifi-cation pipeline, not as a comparison against every publicly released Chronos model variant. Since GPT-2 is frozen and shared across all variants, differences in accuracy and encoder latency mainly reflect the sensor-tokenization architecture. 
+
+## C Prompts 
+
+For reproducibility, this appendix documents the exact prompts used by STELLA across all datasets and inference settings. STELLA 
+
+uses two prompt templates: one for the standard (non-personalized) inference setting and one for the personalized setting where re-trieved context examples are prepended to the LLM input. 
+
+Standard inference prompt. In the standard setting, the sensor tokens are followed by a short instruction prompt: 
+
+Classify the activity from the sensor window. Answer: 
+
+Personalized inference prompt. In the on-device personaliza-tion setting (Section 5.4), the top-𝑘 retrieved context examples are inserted before the query sensor tokens, and the prompt is modified to reference them: 
+
+The following are labeled sensor examples. Using them as reference, classify the current sensor window. Answer: 
+
+The same template is used across all seven datasets without dataset-specific tuning, isolating performance differences from prompt engineering. 
+
+## D Extended On-device feasibility analysis D.1 Effect of Input Window Duration 
+
+Table 11 evaluates classification performance and inference latency across a range of input window durations on both datasets. For MHEALTH (50 Hz), windows span 1–6 s; for USC-HAD (100 Hz), they span 1–10 s. Two findings are of note. First, the CPU latency remains nearly constant across all window durations on both datasets: MHEALTH Nirhoshan Sivaroopan, Albert Zomaya, and Kanchana Thilakarathna 
+
+Table 12: Accuracy under reduced sensor sampling rates. Ap-proach A: constant model-input length, increasing real-time context. Approach B: constant real-time context, decreasing temporal resolution.                                                                                                      
+
+> DS App. Hz Samples Context Acc. (%) F1 (%)
+> MH A50 (base) 200 4 s 96.68 96.22 MH A25 200 8 s 96.36 95.50 MH A12.5 200 16 s 95.73 94.85 MH A6.25 200 32 s 94.58 85.31 MH B50 (base) 200 4 s 96.68 96.22 MH B25 100 4 s 96.37 95.90 MH B12.5 50 4 s 96.04 95.61 MH B6.25 25 4 s 93.99 93.00 USC A100 (base) 500 5 s 86.92 81.01 USC A50 500 10 s 90.29 83.87 USC A25 500 20 s 92.96 78.47 USC A12.5 500 40 s 90.12 50.83 USC B100 (base) 500 5 s 86.92 81.01 USC B50 250 5 s 86.66 80.74 USC B25 125 5 s 85.52 78.52 USC B12.5 62 5 s 85.31 78.26
+
+spans only 13.5 ms across a 6 × input size range (221.2 → 234.4 ms), and USC-HAD spans 28.8 ms across a 10 × range (197.9 → 226.7 ms). This confirms that temporal compression to a fixed 𝑁 =16 token sequence renders LLM inference — the dominant cost — invariant to window length. Second, the optimal window duration is dataset-dependent and inversely related to sensor richness. MHEALTH peaks at 4 s and degrades beyond: 21-channel multi-placement sensors provide suf-ficient spatial redundancy that longer windows introduce more label-mixing than useful context. USC-HAD, equipped with only 6 channels from a single IMU, continues to improve up to 10 s: the model compensates for reduced modality richness by integrating longer temporal context to resolve activity ambiguities (e.g., distin-guishing walking left from walking right requires observing more stride cycles). The practical implication is that sparse-sensor de-ployments should favour longer acquisition windows, and STELLA 
+
+accommodates this at negligible CPU latency cost. 
+
+## D.2 Robustness to Reduced Sampling Rate 
+
+Table 12 evaluates both datasets under two sampling-rate reduc-tion strategies with Butterworth anti-aliasing (order 4). Approach A 
+
+(dataset-level decimation) preserves the fixed number of model-input samples while extending the real-time context covered. Ap-proach B (window-level decimation) preserves the real-time context duration while reducing temporal resolution. The results reveal qualitatively different behaviour across datasets. For MHEALTH, Approach B is consistently superior, losing fewer than 0.35 accuracy points at 25 Hz ( ×2 downsampling) and main-taining above 96% at 12.5 Hz ( ×4). Approach A’s macro F1 collapses at 6.25 Hz (85.31%) because 32-second context windows span mul-tiple activity bouts, corrupting majority-vote labels. We conclude that STELLA operates reliably on MHEALTH-class sensors at 25 Hz or above .For USC-HAD, the picture is strikingly different. Approach A at 50 Hz ( ×2 downsampling) produces a 3.37-point accuracy improve-ment over the 100 Hz baseline (90.29% vs. 86.92%), because the fixed 500-sample window now covers 10 seconds rather than 5, providing additional temporal context that more than compensates for halved frequency resolution. Beyond 25 Hz, F1 collapses (50.83% at 12.5 Hz) as activity bouts are subsumed within windows. Approach B de-grades gracefully, losing only 1.61 accuracy points at 25 Hz and stabilising around 85.3% below that. This has a direct hardware implication: a single-IMU deployment targeting USC-HAD-class activities can reduce its sampling rate from 100 Hz to 50 Hz without accuracy loss and with measurable improvement , simply by using the longer temporal context. For MHEALTH-class multi-sensor platforms, 25 Hz is the practical lower bound for reliable operation. 
+
+## E Extended Ablation Study 
+
+This section reports the remainder of the ablation study in Sec-tion 5.5. Table 13 extends the ablation in Table 9. 
+
+## E.1 LLM Training Strategy (Group D) 
+
+The frozen LLM strategy (D1) consistently outperforms or matches all fine-tuning variants across both datasets, and this result is 
+
+strengthened on the harder USC-HAD benchmark. On MHEALTH, full fine-tuning (D2) costs 0.32 accuracy points relative to frozen. On USC-HAD, the penalty for full fine-tuning grows to 2.99 F1 points , despite expanding trainable parameters 9.7-fold (138.78 M vs. 14.34 M) and increasing per-epoch training time from 13.3 s to 18.1 s. Partial fine-tuning of the last two transformer blocks (D3) offers a mixed result: slightly above D1 on USC-HAD accuracy (87.08% vs. 86.92%) but below D1 on F1 (80.82% vs. 81.01%), and substantially below D1 on MHEALTH. The inconsistency of D3 across datasets, combined with its higher parameter count and less pronounced per-epoch speedup (9.9 s/epoch vs. 13.3 s for D1 on USC-HAD), makes it an unreliable choice. The mechanism behind frozen LLM superiority is consistent across both datasets: the pretrained GPT-2 assigns higher prior probability to semantically coherent activity-name completions than to random token sequences, and this prior regularises the classification under NLL-based scoring. Fine-tuning erodes this prior. The penalty is larger on USC-HAD because activity signals are more ambiguous with only 6 channels, making the LLM’s pretrained prior play a relatively larger role in resolving borderline predictions. 
+
+STELLA therefore maintains the LLM as a frozen reasoning engine on all platforms and datasets. 
+
+## E.2 Semantic Label Representation (Group E) 
+
+The effect of semantic label representation is dataset-dependent and proportional to sensor richness. On MHEALTH, activity-name labels (E1) outperform generic class identifiers (E2) by 0.34 accuracy points and 0.50 F1 points, confirming that the LLM’s world knowl-edge about human activities provides a meaningful discriminative signal when 21-channel sensor data offers sufficient discriminability. On USC-HAD, the gap narrows substantially: E2 is 0.27 accuracy points above E1 but 0.22 F1 points below E1, with neither variant consistently superior across folds. This suggests that when sen-sor modalities are sparse (6 channels, single IMU) and inter-class STELLA: Efficient Sensor-to-LLM Translation for On-Device Human Activity Recognition 
+
+Table 13: Ablation study across all design axes (5-fold LOSO). Bold rows denote the default configuration for each group.                                                                                                          
+
+> Grp ID Variant MHEALTH USC-HAD Trainable Acc. (%) F1 (%) Acc. (%) F1 (%) Params
+> D
+> D1 Frozen LLM (default) 96.68 96.22 86.92 81.01 14.34 M
+> D2 Full LLM fine-tuning 96.36 95.80 85.40 78.02 138.78 M D3 Partial fine-tune (last 2 layers) 95.95 95.25 87.08 80.82 28.51 M EE1 Activity-name labels (default) 96.68 96.22 86.92 81.01 14.34 M
+> E2 Generic class-ID labels 96.34 95.72 87.19 80.79 14.34 M FF1 GPT2 (default) 96.68 96.22 86.92 81.01 14.34 M (frozen -117 M)
+> F2 distill-gpt2 96.12 95.83 85.71 79.43 14.34 M (frozen - 82 M) F3 gpt2-medium 97.12 96.48 87.81 82.53 14.34 M (frozen - 345 M) F4 gpt2-large 97.97 97.28 88.10 83.81 14.34 M (frozen - 774 M) F5 facebook-opt-125m 96.72 95.93 85.98 80.16 14.34 M (frozen - 125 M) F6 Qwen2.5-0.5B 96.43 95.45 82.37 79.09 14.34 M (frozen - 494 M) F7 TinyLlama-1.1B 96.10 95.16 81.74 78.25 14.34 M (frozen - 1.1 B) GG1 GPT2 (default) 96.68 96.22 86.92 81.01 14.34 M
+> G2 linear-head 93.14 91.57 82.11 75.84 14.63 M HH1 with task prompt 96.68 96.22 86.92 81.01 14.34 M
+> H2 without prompt, sensor only 94.89 93.67 82.79 76.71 14.34 M
+
+NLL margins are narrower and less reliable, the LLM’s semantic priors offer diminishing benefit: activities such as walking left and walking right are not easily resolved by their names even with GPT-2’s full world model. The results establish that semantic label benefit scales with sensor richness, and that STELLA remains fully functional with generic class identifiers in low-modality settings. 
+
+## E.3 Robustness to LLM Backbone Choice (Group F). 
+
+Group F evaluates the robustness of STELLA to different LLM back-bones while keeping the sensor tokenizer and the 16-token repre-sentation fixed. The results show that performance is stable across a range of causal language models, with consistent gains observed when scaling within the GPT family. However, replacing GPT with other architectures (OPT, Qwen, TinyLlama) does not yield con-sistent gains despite comparable or larger parameter counts. This indicates that performance depends not only on model size but also on alignment between the tokenizer output and the LLM architec-ture. Overall, these results demonstrate that STELLA is robust to the choice of LLM backbone, while also benefiting from increased model capacity within a well-aligned family. GPT-2 provides the best efficiency–performance trade-off, while larger GPT variants offer additional accuracy when computational budget permits. 
+
+## E.4 LLM vs. Linear Classification Head (Group G) 
+
+Group G tests whether the frozen GPT-2 scoring mechanism can be replaced by a standard linear classifier. Although the linear-head variant uses a comparable number of trainable parameters to the de-fault configuration, it performs substantially worse on both datasets. Compared with the linear head, GPT-2 scoring improves F1 by 4.65 points on MHEALTH and 5.17 points on USC-HAD. This confirms that the benefit of STELLA does not come only from the sensor tokenizer: the frozen LLM provides an additional discriminative prior that improves robustness across both rich multi-sensor and sparse single-IMU settings. Therefore, STELLA retains the frozen GPT-2 scoring head as the default prediction mechanism. 
+
+## E.5 Task Prompt Conditioning (Group H) 
+
+Group H evaluates whether the task prompt provides useful condi-tioning beyond the latent sensor tokens alone. Compared with the sensor-only variant, adding the task prompt improves F1 by 2.55 points on MHEALTH and 4.30 points on USC-HAD, while increas-ing inference latency by only 1.83 ms. This shows that the prompt helps the frozen LLM interpret the sensor-token sequence in the intended HAR classification context, with a negligible latency cost. We therefore retain task-prompt conditioning as part of the default input formulation.

@@ -1,0 +1,597 @@
+Title: HiFA4: Training-Free 4-bit FlashAttention on Ascend HIF4 NPUs for LLM Inference
+
+URL Source: https://arxiv.org/pdf/2607.04302v1
+
+Published Time: Tue, 07 Jul 2026 02:41:17 GMT
+
+Number of Pages: 22
+
+Markdown Content:
+# HiFA4: Training-Free 4-bit FlashAttention on Ascend HIF4 NPUs for LLM Inference 
+
+Hui Dong ∗ Yanzhao Li Jie Gao Chunlu Li Zhiyuan Zhang Yupeng Sun Zhenyuan Chen Zhiqiang Zou 
+
+Huawei Technologies 
+
+donghui24@huawei.com 
+
+Abstract 
+
+We present HiFA4, a post-training operator-level design that executes both the QK T and P V matrix multiplications in FlashAttention as 4-bit HIF4 Cube GEMMs for LLM inference on Ascend NPUs, while maintaining online softmax state in FP16. To our knowledge, HiFA4 is the first such design evaluated on standard NLP benchmarks. We introduce two complementary mechanisms. Smooth-QK applies a calibration-static, per-channel equivalent rescaling to Q and K after RoPE, transferring quantization difficulty from K to Q. Because the target channels are determined by fixed model parameters rather than input data, the scale factors are computed once from a small offline calibration set and require no per-tile online reduction at inference (only a fusible element-wise scaling). P-Reordering ensures that the softmax normalizer is accumulated from the same quantized attention weights ˆP used in the P V GEMM, rather than a higher-precision reconstruction. We prove (Theorem 1) that the conventional inconsistent formulation introduces a systematic, coherent output-scaling error, and validate empirically on a Qwen3-8B Layer-0 MMLU trace that this error is present in 100% of 3.6 million real attention tiles with median magnitude ¯ε = −0.064. P-Reordering additionally allows the normalizer accumulation to be fused into the P V Cube GEMM. Evaluated on five LLMs, HiFA4 consistently reduces quantization-induced decision drift. On Qwen3-8B, HiFA4 recovers 37.5% of the accuracy gap introduced by direct HIF4 quantization (sample-weighted 
+
+δw narrowing from 1.12 pp to 0.70 pp, Table 2), reduces the fraction of BF16-inconsistent predictions on MMLU from 16.3% to 8.2%, and cuts accuracy regressions (samples correctly answered by BF16 but incorrectly by the quantized model) by 57% (1 ,071 → 465 on MMLU full set). On Gemma2-9B, mild smoothing keeps HiFA4 within 0.7 pp of BF16 while cutting MMLU accuracy regressions by 27% relative to direct quantization. On the three models where the applicability gate disables Smooth-QK (LLaMA3.1-8B, Mistral-7B, Phi-4B), the remaining HiFA4 components— P-Reordering together with the adopted Q-Mean auxiliary—reduce full-set MMLU accuracy regressions by 41–52% (and HellaSwag by 39–42%) with no K-smoothing, showing that this part of the design generalizes beyond models with concentrated K-outliers. A theoretical instruction-scheduling analysis projects a 35.4% critical-path latency reduction relative to BF16 by fusing the softmax normalizer into the P V Cube GEMM via P-Reordering; on-hardware validation will be reported when the target Ascend NPU becomes publicly available. 
+
+# 1 Introduction 
+
+FlashAttention [Dao et al., 2022, Dao, 2024, Shah et al., 2024, Zadouri et al., 2026] is the widely-adopted tiled attention kernel for LLM inference. Its two dominant matrix multiplications, QK T and P V , constitute the majority of attention compute in the prefill stage. Executing both as 4-bit Cube GEMMs using Ascend HIF4 would substantially improve throughput, since 4-bit operands allow the Cube units to process four times as many elements per cycle compared to BF16. The challenge is preserving accuracy: direct 4-bit quantization of attention activations causes substantial degradation in language models. Prior FP4 attention work has mainly focused on diffusion and video-generation models. SageAtten-tion3 [Zhang et al., 2025b] reports FP4 inference results on CogVideoX, HunyuanVideo, Mochi, Flux, and SD3.5, but its NLP-related experiments do not correspond to a full post-training FP4 inference evaluation. 1
+
+> arXiv:2607.04302v1 [cs.LG] 5 Jul 2026
+
+Concurrent work targets NVIDIA NVFP4 rather than Ascend HIF4 and uses different correction strategies: online scale search with mixed-precision KV caching [Gupta et al., 2026], or selective mixed precision [Sharratt, 2026]. We make two technical contributions: (1) Smooth-QK : calibration-static suppression of QK-RMSNorm-induced K-activation outliers with no per-tile online reduction (only a fusible element-wise scaling); and (2) P-Reordering : proof and elimination of a coherent output error introduced by normalizer–GEMM inconsistency, plus a Cube-path efficiency benefit. Alongside standard accuracy, we report prediction flip rate and per-sample accuracy regressions relative to BF16, which expose distributional shifts in decision boundaries that aggregate accuracy can mask. 
+
+# 2 Related Work 
+
+FlashAttention. FA1–FA4 [Dao et al., 2022, Dao, 2024, Shah et al., 2024, Zadouri et al., 2026] optimize the exact tiled attention kernel. HiFA4 addresses the numerical accuracy of its GEMMs rather than kernel scheduling or memory layout. 
+
+LLM quantization. Weight-only post-training methods (GPTQ [Frantar et al., 2023], AWQ [Lin et al., 2024]) and fine-tuning-based approaches (QLoRA [Dettmers et al., 2024]) target static model weights. SmoothQuant [Xiao et al., 2023] and QuaRot [Ashkboos et al., 2024] reduce model-level activation or weight outliers. KIVI [Liu et al., 2024] quantizes the KV cache. HiFA4 operates inside the fused FA kernel on Q, K, V, and P .
+
+Quantized attention. Zhang et al. [2025a] introduced Q-Mean compensation for sub-8-bit attention; we adopt this technique as an auxiliary component. Zhang et al. [2025b] demonstrated the first FP4 FA kernel on NVIDIA Blackwell, evaluated on image and video generation. Gupta et al. [2026] and Sharratt [2026] address NVFP4 for causal LM and long-context, respectively, on NVIDIA hardware. HiFA4 targets Ascend HIF4’s three-level hierarchical format and derives its corrections from a parameter-level root-cause analysis (Smooth-QK) and an algebraic consistency argument (P-Reordering). 
+
+# 3 Background 
+
+HIF4. The 4-bit hierarchical block-floating-point format from Luo et al. [2026] for Ascend NPUs packs 64 elements per unit with 32 bits of shared scaling metadata (averaging 4.5 bits per value). The metadata defines a three-level scaling hierarchy: a level-1 global base scale (E6M2) per 64-element group, plus level-2 (8-way) and level-3 (16-way) 1-bit micro-exponents that refine the intra-group dynamic range; each 4-bit element is a sign-magnitude S1P2 value (equivalent to E1M2, 3-bit significand). All QDQ operations follow the official specification; we use the BF16 →HIF4 conversion of Algorithm 1 in the HIF4 specification [Luo et al., 2026] without modification. We use “4-bit” to refer to the per-element compute operand width; storage accounting includes the 32-bit per-group metadata and is therefore 4.5 bits per value for HIF4. 
+
+FlashAttention tiling. Standard FlashAttention maintains a row-wise running maximum mi and normal-izer ℓi updated per tile. For each tile ( i, j ): update the running max mnew  
+
+> i
+
+= max (mi, rowmax (Sij )); rescale history Oi ← Oi exp (mi − mnew  
+
+> i
+
+), ℓi ← ℓi exp (mi − mnew  
+
+> i
+
+), mi ← mnew  
+
+> i
+
+; then compute Pij = exp (Sij − mi), accumulate Oi + = Pij Vj , ℓi + = rowsum (Pij ), and finalize Oi ← Oi/ℓ i. The vector path handles the softmax, rescaling, and normalizer; the Cube path handles the two GEMMs ( QK T and P V ). In method descriptions we write “ Pij = exp( Sij − mi)” with mi denoting the post-rescaling running maximum for the current tile. 
+
+C4V16-Aux. Our scheme (C4V16-Aux) quantizes both QK T and P V to HIF4. The online softmax state is FP16. An auxiliary Q-Mean GEMV [Zhang et al., 2025a], acknowledged as adopted from prior work, operates in FP16 at < 0.75% of QK T Cube cost. 24 Method 
+
+# 4.1 K-Activation Outliers: Origin and Structural Properties 
+
+A necessary condition for accurate 4-bit GEMM computation is that the input activations lie within a range that the quantizer’s group scale can represent with sufficient resolution. HIF4 assigns a level-1 base scale to every contiguous block of 64 elements (refined by level-2/level-3 micro-exponents): if one element in a group has a magnitude substantially larger than the rest, the base scale is dominated by that element and the remaining elements are quantized with effectively fewer useful bits, beyond what the per-element micro-exponents recover. We begin by characterizing the structure of the K-activation outliers that violate this condition in practice. In practice, a small number of channels in K can carry magnitudes an order of magnitude larger than the bulk, forcing the group base scale to accommodate the extreme value at the cost of coarser quantization for the other channels in the group. Although such sparse outliers leave aggregate accuracy largely intact, they enlarge the per-tile attention error and thereby amplify decision-level drift—the prediction flips and regressions that our metrics (Section 5) are designed to expose—which is the effect Smooth-QK targets. Understanding where this outlier originates is essential for designing a correction that is both effective and deployment-friendly. Figure 1 traces the computation path leading to the outlier at Layer 0, channel 51 of Qwen3-8B. The output of the K-projection layer is well-behaved, with magnitude approximately 1.08. However, QK-RMSNorm then divides by a small per-token RMS value and multiplies by the per-channel affine weight γK, 51 ; with 
+
+γK, 51 ≈ 34, this amplification alone pushes the channel magnitude to approximately 155, saturating HIF4’s group base scale. 
+
+Figure 1: Computation chain leading to the K-activation outlier at Layer 0, channel 51 of Qwen3-8B. The projection output is normal ( ≈1.08); the large value arises entirely within QK-RMSNorm through the combination of a small per-token RMS normalizer and the large affine weight γK, 51 ≈ 34. The key observation is that γK, 51 is a fixed model parameter , not a property of any particular input token. Figure 2 shows γK, 51 across all 36 layers: it is an isolated outlier at Layer 0, roughly 12 × larger than the layer mean (= 2 .87). All other layers carry values within normal range, which means the quantization difficulty is highly concentrated and not a generic property of the model’s arithmetic. Because γK, 51 is a fixed parameter, the resulting outlier is broadcast identically to every token and—after GQA expansion—to every attention head. Figure 3 visualizes this at the activation level: the K heatmap shows a head-invariant vertical stripe at channel 51, uniform across all 32 heads, while Q exhibits a sparse and head-varying pattern with no comparable concentration. This spatial signature is diagnostic of a parameter-level broadcast cause: if the outlier were input-dependent, its magnitude would vary across heads and tokens. The head-invariance observed here means that a single per-channel scalar ˆs51 is sufficient to suppress the outlier for the entire layer, without needing per-head or per-token corrections. Table 1 quantifies the outlier across five models. Figure 4 shows the layer-wise K profile for three representative models (Qwen3-8B, Gemma2-9B, LLaMA3.1-8B); the two bypass models Mistral-7B and Phi-4B have flat profiles with no dominant layer and are omitted. 3Figure 2: QK-RMSNorm affine weight at channel 51 for K (blue) and Q (red) across 36 layers of Qwen3-8B. Layer 0 K weight (≈ 34) is far outside the range of all other values (K layer mean = 2 .87, Q layer mean = 1 .79). 
+
+Figure 3: Q (left) and K (right) head-by-channel maximum-magnitude heatmap at Layer 0. K shows a uniform vertical stripe at channel 51 across all heads, consistent with a parameter-level broadcast cause. Q shows no comparable pattern. Table 1: Outlier diagnostic statistics across five models. ρK = max |K|/P 99( |K|): intra-K outlier severity. 
+
+TK/Q = max |K|/ max |Q|: K-to-Q dynamic-range asymmetry. Both metrics are max-layer values. Jaccard: outlier channel stability across inputs. The gate applies Smooth-QK only when K-outliers are both con-centrated ( ρK ≥ 6) and dominant over Q ( TK/Q ≥ 2); within that region TK/Q > 3 selects Strong and 2 ≤ TK/Q ≤ 3 selects Mild. All other models are bypassed. Thresholds are calibrated on these five models (Section 4.4) and validated against the per-model ablations.                                                           
+
+> Model ρKTK/Q Jaccard Gate condition Action Qwen3-8B 14.15 14.47 0.707 ρK≥6 & TK/Q >3Strong ( α= 0 .5) Gemma2-9B 8.11 2.17 0.676 ρK≥6 & 2 ≤TK/Q ≤3Mild ( α= 0 .25) LLaMA3.1-8B 4.78 2.70 0.679 ρK<6Bypass ( s= 1) Mistral-7B 3.56 1.63 0.887 ρK<6 & TK/Q <2Bypass ( s= 1) Phi-4B 3.69 1.50 0.786 ρK<6 & TK/Q <2Bypass ( s= 1)
+
+# 4.2 Smooth-QK 
+
+Applied post-RoPE: ˜qc = qc × ˆsc, ˜kc = kc ÷ ˆsc, ˆsc = |Kmax ,c |α
+
+|Qmax ,c |1−α , α ∈ { 0.5, 0.25 }. (1) In matrix form: ˜Q = Q diag ( ˆs), ˜K = K diag ( ˆs)−1, preserving ˜Q ˜KT = QK T . The exponent α controls how much difficulty is transferred from K to Q and is set by the gate (Section 4.4): the Strong branch uses α = 0 .5and the Mild branch α = 0 .25. With α = 0 .5, ˆsc = p|Kmax ,c |/|Qmax ,c |, which equalizes the transformed magnitudes |Kmax ,c |/ˆsc and |Qmax ,c | ˆsc at their common value p|Kmax ,c | | Qmax ,c | (the geometric mean of the two magnitudes), the choice that minimizes max (|˜kc|, |˜qc|). A smaller α (Mild) transfers proportionally less difficulty to Q, which is preferable when TK/Q is moderate. Equation (1) is defined per channel on the calibration statistics |Kmax ,c |, |Qmax ,c | aggregated over the calibration set (Section 4.3). The magnitudes quoted in Figure 5 are a direct visualization of one fixed attention slice (Layer 0, a single batch element and a single head, first 64 tokens) and are not the inputs to Eq. (1) : “before” is the measured max-abs of that slice’s K, and “after” is the measured max-abs of the same slice after Smooth-QK has actually been applied, not a value obtained by dividing the before-value by a scale factor. Because the channel-51 outlier magnitude varies across heads, tokens, and inputs, the value seen in this particular slice (104.5) differs from the calibration-aggregate maximum reported in Table 8 (220.8) and from the single-token forward trace in Figure 1 ( ≈155); these are three different statistics of the same 4(a) Qwen3-8B (b) Gemma2-9B 
+
+> (c) LLaMA3.1-8B
+
+Figure 4: Layer-wise K statistics (max, p99.9, p99, std) for three models. Qwen3-8B has an isolated dominant Layer-0 spike; Gemma2-9B has a moderate Layer-0 peak; LLaMA3.1-8B has no concentrated outlier layer. underlying parameter-driven outlier and are not expected to coincide. Appendix F states the exact statistic behind each reported number.  
+
+> (a) Before: K max-abs = 104 .5. (b) After: K max-abs = 2 .516.
+
+Figure 5: K activations before and after Smooth-QK for one fixed attention slice (Qwen3-8B, Layer 0, a single batch element, head 0, first 64 tokens). “After” is the measured max-abs of the slice once Smooth-QK has been applied, not a value computed from the scale factor. The channel-51 stripe is suppressed; K becomes amenable to 4-bit quantization. This per-slice max-abs is one of three distinct statistics of the same outlier used in the paper (per-slice here, calibration-aggregate in Table 8, single-token trace in Figure 1); see Appendix F. 5Figure 6: The Smooth-QK applicability gate as a two-dimensional decision plane over ρK (intra-K outlier concentration) and TK/Q (K-to-Q dominance), with all five models plotted at their calibration values. Smoothing is enabled only in the upper-right region where both ρK ≥ 6 and TK/Q ≥ 2 hold; within it, 
+
+TK/Q > 3 selects Strong ( α = 0 .5, Qwen3-8B) and 2 ≤ TK/Q ≤ 3 selects Mild ( α = 0 .25, Gemma2-9B). All other models are bypassed ( ˆs = 1). LLaMA3.1-8B (open marker) is the informative boundary case: its 
+
+TK/Q = 2 .70 exceeds Gemma2-9B’s 2 .17, yet its ρK = 4 .78 falls short of the ρK ≥ 6 threshold, so the gate correctly bypasses it—illustrating that TK/Q alone is insufficient and both coordinates are required. Jaccard stability (Appendix E) validates static calibration but is not a gate trigger: Mistral-7B has Jaccard = 0 .887 yet is bypassed because ρK = 3 .56 < 6 and TK/Q = 1 .63 < 2. Smooth-QK is layer- and channel-agnostic: the calibration procedure evaluates every layer and channel. The Qwen3-8B Layer-0 case is the clearest motivating example but not a structural assumption. 
+
+# 4.3 Calibration-Static Deployment 
+
+Since the outlier originates from fixed model parameters, ˆsc is stable across inputs (inter-sample CV < 8% for high-outlier channels). Calibration uses 1024 samples from training/auxiliary splits only. The per-channel statistics |Kmax ,c | and |Qmax ,c | in Eq. (1) are RMS-aggregated over the calibration set (Section 5.1); this aggregate is the statistic used to compute every ˆsc, and it is distinct from the per-slice max-abs values used purely for visualization in Figure 5. At inference, applying Smooth-QK requires one element-wise multiply and divide per channel per token per layer—no per-tile online reduction. 
+
+# 4.4 Adaptive Applicability Gate 
+
+Smooth-QK is beneficial only when two conditions hold simultaneously. First, K must contain sufficiently 
+
+concentrated internal outliers (high ρK ): if K is internally uniform, its values are already well represented by the HIF4 group scale and there is nothing to suppress. Second, K must dominate Q (high TK/Q ): Smooth-QK transfers quantization difficulty from K to Q, so when TK/Q is low (K and Q have similar magnitudes), the transfer merely expands Q toward HIF4 saturation without a proportionate benefit on K. The gate (Figure 6) enforces both conditions. We treat the gate as an offline diagnostic : the per-channel statistics ρK and TK/Q are computed once from the calibration set, and the resulting branch (Strong / Mild / Bypass) is fixed for deployment. We do not perform any runtime model selection. Concretely, smoothing is enabled only when both conditions hold, 
+
+ρK ≥ 6 and TK/Q ≥ 2; within that region TK/Q > 3 selects strong smoothing ( α = 0 .5) and 2 ≤ TK/Q ≤ 3selects mild smoothing ( α = 0 .25, which transfers less difficulty to Q). Any model failing either condition is bypassed ( ˆs = 1). Both conditions are necessary and neither alone suffices: TK/Q captures whether transferring difficulty from K to Q has a worthwhile target, while ρK captures whether K’s outliers are concentrated 6enough to be worth transferring. LLaMA3.1-8B illustrates why TK/Q alone is insufficient—its TK/Q = 2 .70 actually exceeds Gemma2-9B’s 2 .17, yet its low ρK = 4 .78 (K-outliers too diffuse) correctly routes it to bypass. On our five models this routes Qwen3-8B to Strong, Gemma2-9B to Mild, and LLaMA3.1-8B, Mistral-7B, and Phi-4B to Bypass. As we show in Section 5.6 and Appendix F, each of these routing decisions coincides with the empirically best configuration for that model: smoothing helps Qwen3-8B and Gemma2-9B, and is neutral or harmful on the three bypass models. The thresholds are empirical boundaries fitted to these five models; we discuss their limited statistical support in Section 7. 
+
+# 4.5 P-Reordering 
+
+In our Direct HIF4 baseline, following the common emulation path used by several FP4 attention implemen-tations, the softmax normalizer is accumulated from a higher-precision reconstruction ˜P of the quantized weights, while the P V GEMM consumes the quantized ˆP directly. This inconsistency introduces a systematic error that Theorem 1 characterizes exactly. P-Reordering replaces ˜P in the normalizer with ˆP , making both paths consistent. 
+
+Theorem 1. Let aj = exp (Sj − m) be the unnormalized softmax weight at position j, Z = P 
+
+> k
+
+ak the partition sum, and wj = aj /Z the normalized weight. Let ˆaj = aj (1 + εj ) be the HIF4-quantized value. Define 
+
+¯ε = P 
+
+> j
+
+wj εj , δj = εj − ¯ε (P 
+
+> j
+
+wj δj = 0 ), O∗ = P 
+
+> j
+
+wj vj for fixed vj , and et = P 
+
+> j
+
+wj δj (vj − O∗). Then: 
+
+Ocon − O∗ = et
+
+1 + ¯ ε (P-Reordering: denominator = P 
+
+> k
+
+ˆak) (2) 
+
+Omis − O∗ = et + ¯ ε O ∗ (mismatched: denominator = Z) (3) Scope : V is held fixed; Q/K/V quantization errors are independent and not modelled here. Proof. Mismatched: Omis =   
+
+> P
+> jˆajvj
+> Z
+
+= O∗ + P 
+
+> j
+
+wj εj vj . For the last sum, write εj = ¯ε + δj : P 
+
+> j
+
+wj εj vj =¯ε P 
+
+> j
+
+wj vj + P 
+
+> j
+
+wj δj vj = ¯εO ∗ + P 
+
+> j
+
+wj δj (vj − O∗) + O∗X
+
+> j
+
+wj δj
+
+| {z }
+
+> =0
+
+= ¯εO ∗ + et. Hence Omis − O∗ = et + ¯εO ∗.
+
+Consistent: Ocon =    
+
+> P
+> jˆajvj
+> P
+> kˆak
+
+= Z(1+¯ ε)O∗+Ze t 
+
+> Z(1+¯ ε)
+
+= O∗ + et 
+
+> 1+¯ ε
+
+.The term ¯εO ∗ scales the attention output coherently along the O∗ direction—a radial error that standard metrics such as relative L2 distance are insensitive to because it is small compared to the Q/K/V quantization noise floor. Theorem 1 isolates the P -quantization contribution under fixed V ; it is an exact local statement about the normalizer path, not a claim that this term dominates the full end-to-end error budget, which also contains independent Q/K/V noise. The end-to-end ablation in Section 6 (rows B vs. D and C vs. E) measures the realized benefit when all of Q, K, V, and P are quantized; a controlled P -only local-operator study that holds Q, K, V at BF16 is left to a future version. 
+
+Empirical validation. Figure 8 shows the distribution of ¯ε across 3.6 million tiles from Qwen3-8B Layer 0. Every tile exhibits net probability-mass loss ( ¯ε < 0). The radial error term ¯εO ∗ has a consistent sign in this trace; because the direction of O∗ varies across layers, heads, and tokens, the global cross-layer effect is assessed empirically via the D-vs-B and E-vs-C ablations (Section 6) rather than extrapolated from the theorem. 
+
+Secondary benefit. Accumulating P 
+
+> j
+
+ˆaj alongside P 
+
+> j
+
+ˆaj vj is achievable within the same Cube GEMM by appending a column of ones to V : ˆP [ ˆV | 1] = [ ˆP ˆV | ˆP 1]. This fuses the normalizer into the P V Cube GEMM, removing a separate vector-path reduction. 
+
+# 4.6 Auxiliary Q-Mean Compensation 
+
+We include the Q-Mean compensation from Zhang et al. [2025a] as an acknowledged auxiliary; it addresses Q DC-bias and is not a contribution of this paper. 7Figure 7: Theorem 1 illustrated. Omis (red) is contracted toward the origin by the P -normalizer-induced term ¯εO ∗ ( ¯ε < 0 under 4-bit). Ocon (P-Reordering, green) does not exhibit this contraction under fixed V .
+
+Figure 8: Distribution of per-tile ¯ε = P 
+
+> j
+
+ˆaj /Z − 1across 3.6 million attention tiles from Qwen3-8B run-ning MMLU at Layer 0 (direct HIF4 quantization, no Smooth-QK). 100% of tiles have ¯ε < 0 (median = −0.064), confirming the consistent negative sign of the bias identified in Theorem 1 in this measured Layer-0 Qwen3-8B trace. The end-to-end magnitude contribution across all layers is a separate question, addressed by the D-vs-B and E-vs-C ablations (Sec-tion 6) rather than by this per-tile distribution. 
+
+# 4.7 Complete Algorithm 
+
+Algorithm 1 C4V16-Aux (HiFA4) 
+
+Require: Q,K,V (FP16, post-RoPE); static ˆ s ∈ Rdk 
+
+> 1:
+
+˜Q ← Q diag(ˆ s); ˜K ← K diag(ˆ s)−1 ▷ Smooth-QK  
+
+> 2:
+
+μi ← 1
+
+> d
+
+Pdc=1 ˜Qi,c ; Qz,i,c ← ˜Qi,c − μi ▷ Q-Mean: per-token scalar mean over head-feature dim d 
+
+> 3:
+
+ˆQ, ˆK, ˆV ← HIF4( Qz , ˜K, V ) 
+
+> 4:
+
+for each tile ( i, j ) do  
+
+> 5:
+
+Sij ← ˆQi ˆKTj /√d ▷ HIF4 Cube  
+
+> 6:
+
+Sij += μi
+
+P 
+
+> c
+
+˜KTj,c ▷ FP16 GEMV (Q-Mean correction)  
+
+> 7:
+
+mnew  
+
+> i
+
+← max( mi, rowmax( Sij )) ▷ online softmax: update running max  
+
+> 8:
+
+r ← exp( mi − mnew  
+
+> i
+
+); Oi ← r · Oi; ℓi ← r · ℓi; mi ← mnew  
+
+> i
+
+▷ rescale history  
+
+> 9:
+
+Pij ← exp( Sij − mi) 
+
+> 10:
+
+ˆPij ← HIF4( Pij ) ▷ P-Reordering: quantize before normalizer accumulation  
+
+> 11:
+
+[Oi | ℓi] += ˆPij [ ˆVj | 1] ▷ HIF4 Cube, fused normalizer  
+
+> 12:
+
+end for  
+
+> 13:
+
+Oi ← Oi/ℓ i
+
+P-Reordering under online softmax. Theorem 1 holds for any fixed softmax offset m; in Algorithm 1, 
+
+mi is the running maximum that has already been updated (line 7) before ˆPij is computed (line 9). The rescaling of ℓi in line 8 applies the same factor to the accumulated normalizer as to the accumulated output 
+
+Oi, so the P-Reordering consistency property—that numerator and denominator both use the same quantized ˆP —is preserved across all tiles independently of the per-tile rescaling. 
+
+# 5 Experiments 
+
+Throughout all experiments, the BF16 baseline is the unmodified FlashAttention execution with BF16 
+
+QK T and P V GEMMs and FP16 online softmax state (labeled C16V16 in Section 5.5). In all quantized 8configurations, the surrounding model weights, prompts, scoring protocol, and non-attention computation remain unchanged; only the attention operator is replaced by the corresponding Direct HIF4 or HiFA4 variant defined in Section 4. We evaluate on Qwen3-8B [Qwen Team, 2025] (primary), Gemma2-9B [Gemma Team, 2024], LLaMA3.1-8B [Meta AI, 2024], Mistral-7B [Jiang et al., 2023], and Phi-4B [Abdin et al., 2025]. All results use the official HIF4 QDQ implementation. Calibration uses only training or auxiliary splits. Full experimental settings (shot count, prompt templates, scoring protocol, software versions, calibration provenance, and hook coverage) are documented in Appendix B. We report prediction flip rate (PFR: fraction of samples where quantized top-1 differs from BF16) and 
+
+Quant Hurts (BF16-correct samples that the quantized model answers incorrectly; equivalently, the per-sample accuracy regressions referred to in the abstract), alongside accuracy. These decision-level metrics expose degradation invisible in aggregate accuracy. 
+
+# 5.1 Calibration Aggregation (Qwen3-8B) 
+
+Table 2: Calibration aggregation strategies on Qwen3-8B. δw: sample-weighted accuracy loss relative to BF16 over the four decision benchmarks (ARC, TQA, MMLU, HellaSwag), lower is better. The δw values for BF16 and RMS are computed from the per-column figures in this table. For the Direct HIF4 row, δw is marked ( †)to indicate it is reported from the evaluation configuration defined in Section 5.6 (MMLU 14 ,042, HellaSwag 10 ,042, ARC 295, TQA 817), which uses the complete evaluation sets rather than the mixed-task calibration set shown here; the per-column figures in this row are from the same configuration but include GPQA and BBH for comparison. The δw for Mean and 99th percentile are omitted ( −) because these strategies are evaluated only for the purposes of selecting the calibration aggregator and their δw is not used downstream. Strategies are ranked primarily by PPL and per-benchmark accuracy; RMS is selected as it gives the best PPL (9.72) and the smallest δw (0.70 pp).                                                 
+
+> Strategy ARC TQA GPQA BBH Hella MMLU δwPPL BF16 .885 .704 .364 .602 .865 .714 09.73 Direct HIF4 .881 .705 .369 .570 .841 .680 1.12 †11.35 Mean .881 .716 .364 .596 .849 .699 −9.83 RMS (used) .885 .725 .369 .591 .857 .706 0.70 9.72
+> 99th percentile .888 .710 .343 .598 .859 .711 −9.78
+
+RMS aggregation achieves the best δw = 0 .70 pp and is used in all subsequent experiments. The same RMS aggregate over the 1024-sample calibration set defines the per-channel |Kmax ,c |, |Qmax ,c | used in Eq. (1) .
+
+# 5.2 Main Decision-Consistency Results (Qwen3-8B) 
+
+Table 3: Prediction flip rate and Quant Hurts (Qwen3-8B, Direct HIF4 vs. HiFA4).                      
+
+> Flip Rate Quant Hurts Dataset Direct HiFA4 Direct HiFA4 ARC-C (295) 7.46%(22) 1.69%(5) 11 4
+> TruthfulQA (817) 14.93%(122) 6.36%(52) 43 12
+> MMLU (14k) 16.26%(2283) 8.16%(1146) 1071 465
+> HellaSwag (10k) 9.02%(906) 4.75%(477) 516 233
+
+Table 3 presents the main results on Qwen3-8B. HiFA4 reduces the prediction flip rate substantially across all four benchmarks: ARC-Challenge flips drop from 7.46% to 1.69%, and MMLU flips fall from 16.26% to 8.16%. Quant Hurts—samples that BF16 answers correctly but the quantized model does not—are reduced by 57% on MMLU (1071 to 465) and 55% on HellaSwag (516 to 233). 9The sample-weighted accuracy loss relative to BF16 ( δw, Table 2) narrows from 1.12 pp under direct HIF4 quantization to 0.70 pp under HiFA4—recovering 37.5% of the quantization-induced degradation. Notably, on TruthfulQA, HiFA4 actually exceeds BF16 accuracy (.725 vs. .704), which may reflect a mild regularization/noise effect of K-outlier suppression on attention patterns (Section 4.2) rather than a guaranteed improvement over BF16. These gains are achieved without any model retraining, fine-tuning, or modifications to the surrounding inference pipeline. The only change from a standard BF16 FA execution is the substitution of the C4V16-Aux operator described in Section 4. 
+
+# 5.3 Decision Margin on Correctly-Answered Samples 
+
+Beyond whether the final prediction is correct or incorrect, the top-1/top-2 logit margin of that prediction is meaningful: a model that produces correct answers with a thin margin between the top two logits is more likely to flip under slight distribution shift than one with a large margin. We treat this margin as a robustness proxy rather than a calibrated confidence. To probe this effect, we examine the top-1 minus top-2 logit gap across samples that all three configurations (BF16, Direct HIF4, HiFA4) answer correctly, thereby controlling for correctness and isolating the effect of quantization on the decision margin.  
+
+> (a) TruthfulQA (b) HellaSwag
+
+Figure 9: Top1–Top2 logit margin distribution, restricted to samples all three configurations (BF16, Direct HIF4, HiFA4) answer correctly. The distribution is a proxy for decision-margin robustness; a shift leftward indicates reduced robustness even on correct predictions. (In-panel labels use “confidence” loosely as a synonym for this top-1/top-2 margin; we use “decision margin” in the text.) Figure 9 shows that direct HIF4 quantization (red) shifts the logit margin distribution noticeably leftward relative to BF16 (blue) on both TruthfulQA and HellaSwag. This shift occurs even for samples that all three models answer correctly, indicating that quantization narrows the decision margin in ways that are invisible to accuracy metrics but may affect robustness under slight perturbation. HiFA4 (green) recovers most of this margin: on TruthfulQA, the HiFA4 distribution nearly coincides with BF16, while on HellaSwag the recovery is partial but substantial. This result is consistent with the flip-rate improvements in Table 3: suppressing K-outliers and correcting the normalizer mismatch not only prevents more prediction changes but also widens the decision margin of the remaining correct predictions. 
+
+# 5.4 Long-Context Behavior 
+
+The attention-output relative error reported in Table 4 is the relative L2 distance ∥Oquant −OBF16 ∥2/∥OBF16 ∥2
+
+between the quantized and BF16 attention outputs, computed over the prefill stage and averaged over all query positions and all layers. Because retrieval accuracy saturates at 100% and is not discriminative, this metric is the operative signal: Direct HIF4 error grows from 51.5% at 4K to 63.1% at 40K, while HiFA4 stays near 12% across context lengths. We note two limitations of this experiment that we plan to address in the future version: (i) it is reported only on Qwen3-8B, and (ii) the needle task does not probe long-context 10 Table 4: Needle-in-a-haystack results (Qwen3-8B, max 40K tokens). Retrieval is saturated at 100% and not discriminative. The attention-output relative error ∥Oquant − OBF16 ∥2/∥OBF16 ∥2 (prefill, averaged over all query positions and all layers) reveals that Direct HIF4 accumulates error with context length; HiFA4 remains stable.                     
+
+> BF16 Direct HIF4 HiFA4 4K / 16K / 40K retrieval 100% 100% 100% 4K attn. rel. L20% 51.5% 12.5% 16K attn. rel. L20% 55.0% 12.8% 40K attn. rel. L20% 63.1% ∼12% K cache max-abs —14.0 0.87–1.75
+
+reasoning . A cross-model evaluation on RULER and a LongBench subset, together with KV-cache memory and decode-side latency, is deferred to that version. 
+
+# 5.5 Scheduling Implication of P-Reordering 
+
+HIF4 quantization reduces Cube-path cost to 25% of BF16 but shifts the critical-path bottleneck to the vector path, which now includes softmax and normalizer reduction. P-Reordering eliminates this separate normalizer reduction by fusing it into the P V Cube GEMM (Section 4.5), reducing vector-path pressure. A preliminary instruction-scheduling analysis projects a 35.4% critical-path latency reduction relative to BF16; details and the full per-stage breakdown are in Appendix J. On-hardware validation is deferred to when the target NPU becomes publicly available (Section 7). 
+
+# 5.6 Cross-Model Results 
+
+Table 5: Accuracy across five models, each evaluated under its gate-assigned configuration (Qwen3-8B Strong; Gemma2-9B Mild α = 0 .25; LLaMA3.1-8B, Mistral-7B, Phi-4B Bypass). MMLU and HellaSwag use the full 14,042- and 10,042-sample sets for all five models; ARC and TQA use the full evaluation sets. ∆ avg : simple mean of signed per-benchmark gaps from BF16; ∆ w = P 
+
+> b
+
+Nb( Acc HiFA4  
+
+> b
+
+− Acc BF16  
+
+> b
+
+)/ P 
+
+> b
+
+Nb: sample-weighted signed gap over the four benchmarks with weights Nb equal to their evaluation-set sizes ( NMMLU = 14 ,042, 
+
+NHella = 10 ,042, NTQA = 817, NARC = 295). Both are signed (negative = below BF16).                                                                         
+
+> Model (Gate) Method MMLU ARC TQA Hella ∆avg ∆w
+> Qwen3-8B (Strong) BF16 .714 .885 .704 .865 ——HiFA4 .706 .885 .725 .857 +0 .1 pp −0.7 pp Gemma2-9B (Mild) BF16 .675 .892 .422 .603 ——HiFA4 .672 .885 .453 .588 +0 .2 pp −0.7 pp LLaMA3.1-8B (Bypass) BF16 .610 .803 .438 .547 ——HiFA4 .607 .773 .426 .519 −1.8 pp −1.4 pp Mistral-7B (Bypass) BF16 .586 .800 .518 .706 ——HiFA4 .588 .790 .523 .701 −0.2 pp −0.1 pp Phi-4B (Bypass) BF16 .663 .837 .524 .726 ——HiFA4 .656 .841 .503 .720 −0.8 pp −0.7 pp
+
+Table 5 shows aggregate accuracy under each model’s gate-assigned configuration. On Qwen3-8B (Strong Smooth-QK), HiFA4 is within 0.7 pp of BF16 (∆ w = −0.7 pp), with the simple mean essentially flat (∆ avg = +0 .1 pp). On Gemma2-9B (Mild Smooth-QK, α = 0 .25), HiFA4 stays close to BF16 (∆ avg = +0 .2 pp, ∆w = −0.7 pp); relative to the Direct HIF4 baseline it improves decision consistency, reducing full-set MMLU Quant Hurts from 445 to 323 ( −27%) and recovering accuracy from 66.75% to 67.23% (BF16 67.49%), while 11 Table 6: Full-set decision metrics for the three bypass models (Direct HIF4 vs. HiFA4) on MMLU (14,042) and HellaSwag (10,042). In bypass mode Smooth-QK is disabled ( ˆs = 1), so the improvement over Direct HIF4 isolates the joint effect of P-Reordering and the Q-Mean auxiliary on models without a concentrated K-outlier. Acc = accuracy; Fl = flips vs. BF16; Hu = Quant Hurts; He = Quant Helps; ∆Hu = Quant-Hurt reduction. Across all three models HiFA4 reduces Quant Hurts by 39–52% without any K-smoothing.                                                                                                  
+
+> Model Dataset Method Acc Fl Hu He ∆Hu LLaMA3.1-8B MMLU BF16 .6098 ————Direct HIF4 .5769 2073 976 514 —HiFA4 .6070 1279 468 429 −52 .0% HellaSwag BF16 .5466 ————Direct HIF4 .4883 2539 1215 630 —HiFA4 .5190 1674 745 468 −38 .7% Mistral-7B MMLU BF16 .5857 ————Direct HIF4 .5819 1957 696 642 —HiFA4 .5875 1282 408 433 −41 .4% HellaSwag BF16 .7062 ————Direct HIF4 .6808 1213 614 359 —HiFA4 .7009 821 355 301 −42 .2% Phi-4B MMLU BF16 .6629 ————Direct HIF4 .6355 2113 943 558 —HiFA4 .6560 1246 493 397 −47 .7% HellaSwag BF16 .7260 ————Direct HIF4 .7124 1374 632 496 —HiFA4 .7196 842 369 305 −41 .6%
+
+on TruthfulQA it even exceeds BF16 (.453 vs. .422). These two models confirm that Smooth-QK is beneficial when the gate detects a concentrated K-outlier ( ρK ≥ 6). For the three bypass models (LLaMA3.1-8B, Mistral-7B, Phi-4B), the gate disables Smooth-QK, and the remaining components—P-Reordering and the Q-Mean auxiliary—still substantially reduce decision drift relative to Direct HIF4. Table 6 reports the full-set MMLU and HellaSwag metrics: Quant Hurts fall by 39–52% on every model/benchmark pair without any K-smoothing (e.g. LLaMA3.1-8B MMLU 976 → 468, 
+
+−52%; Phi-4B MMLU 943 → 493, −48%; Mistral-7B HellaSwag 614 → 355, −42%). This demonstrates that the P-Reordering + Q-Mean benefit is not specific to models with a K-dominant outlier pattern, and is the mechanism by which HiFA4 remains useful precisely where Smooth-QK does not apply. LLaMA3.1-8B is an instructive boundary case that motivates the two-dimensional gate. Its K-to-Q asymmetry is not the issue— TK/Q = 2 .70 actually exceeds that of Gemma2-9B (2 .17), which is smoothed— but its intra-K outlier severity ρK = 4 .78 falls below the ρK ≥ 6 threshold, indicating K-outliers too diffuse to benefit from difficulty transfer. Consistent with this, applying Smooth-QK at any tested strength (α ∈ [0 .05 , 0.35]) fails to improve—and on the diagnostic benchmarks slightly degrades—its decision consistency relative to the bypass configuration (Appendix F). The gate therefore routes it to bypass, where P-Reordering and Q-Mean alone deliver the largest MMLU Quant-Hurt reduction of any model ( −52%). Had the gate used TK/Q alone, LLaMA3.1-8B would have been incorrectly smoothed; this case shows that the decision is driven by the structure of the outlier ( ρK ), not merely the presence of K–Q asymmetry. 
+
+# 6 Ablation 
+
+Smooth-QK (C vs. B): MMLU flips −20%, hurts −23%. Strongest on TruthfulQA (flips 89 → 50, hurts 29 → 11), consistent with K-outlier suppression having the largest effect on semantically sensitive decisions. 
+
+P-Reordering (D vs. B): Achieves the lowest HellaSwag Quant Hurts of any single mechanism (271 vs. 301 for Smooth-QK alone), consistent with the normalizer error accumulating proportionally with the number 12 Table 7: Stepwise ablation on Qwen3-8B. Row A is Direct HIF4 without any corrections. Rows B–E include the Q-Mean auxiliary from Zhang et al. [2025a]. MMLU and HellaSwag use full evaluation sets. ARC and TruthfulQA values in row E match Table 3. Bold = best per column.                                                                
+
+> Config SQK PRe MMLU (14k) HellaSwag (10k) ARC (full) TruthfulQA (full) Flip Hurt Flip Hurt Flip Hurt Flip Hurt A. Direct HIF4 ——2283 1071 906 516 22 11 122 43 B. +Q-Mean ——1595 693 601 319 13 689 29 C. +Smooth-QK ✓—1279 536 541 301 11 550 11
+> D. +P-Reordering —✓1476 601 553 271 13 787 29 E. Both (HiFA4) ✓✓1146 465 477 233 5452 12
+
+of active sequence positions. MMLU hurts −13%. We note that this comparison isolates P-Reordering relative to the Q-Mean-only baseline (row B), not relative to an unquantized-V control; the latter is the subject of the planned P -only local-operator study discussed in Section 4.5. 
+
+Full HiFA4 (E): Outperforms either mechanism alone on every column. ARC flips drop to 5, below C (= 11) and D (= 13), confirming the two mechanisms address complementary failure modes. 
+
+# 7 Discussion 
+
+Why the coherent error is hard to detect. Standard distance metrics such as relative L2 are dominated by the independent per-dimension noise from Q, K, V quantization. The coherent term ¯εO ∗ changes relative 
+
+L2 only weakly, yet has a consistent sign ( ¯ε < 0 in the measured trace) and its aggregate effect across layers shifts logit ordering. PFR and Quant Hurts are sensitive to this accumulated effect. 
+
+Bypass models still benefit. On the three bypass models (LLaMA3.1-8B, Mistral-7B, Phi-4B), Smooth-QK is disabled, yet HiFA4 reduces full-set Quant Hurts by 39–52% (Table 6). This shows that P-Reordering and Q-Mean together address failure modes that are not specific to the concentrated-K-outlier pattern, and that the gate’s decision to bypass these models loses no decision-level accuracy. 
+
+Limitations. The most significant limitation is that all latency numbers are theoretical instruction-scheduling estimates; the target Ascend NPU is not yet publicly available, and on-hardware throughput and latency measurements will be reported when it is. The applicability thresholds ( ρK ≥ 6 and TK/Q ≥ 2 to enable smoothing; TK/Q > 3 for Strong vs. Mild) are empirical boundaries fitted to five models. With only five points, these thresholds have limited statistical support: the ρK ≥ 6 boundary falls in the gap between LLaMA3.1-8B ( ρK = 4 .78, bypassed) and Gemma2-9B (ρK = 8 .11, smoothed), and a larger model suite would be needed to locate it precisely or to confirm its functional form. We therefore present the gate as a calibrated heuristic that is consistent with our per-model ablations (Section 5.6, Appendix F), not as a universally validated criterion. Smooth-QK itself is effective only on models whose K activations carry a concentrated, parameter-induced outlier; among our five models this holds for Qwen3-8B (the QK-RMSNorm channel-51 pattern) and, more mildly, for Gemma2-9B. On models without such structure (LLaMA3.1-8B, Mistral-7B, Phi-4B) smoothing is correctly bypassed, and HiFA4’s benefit comes entirely from P-Reordering and Q-Mean. Characterizing how prevalent the concentrated-K-outlier pattern is across the broader model population is left to future work; we do not claim Smooth-QK is broadly applicable beyond models exhibiting it. The end-to-end isolation of P-Reordering relies on the row B vs. D ablation, in which Q-Mean is already active and V is quantized; a cleaner P -only local-operator ablation (Q, K, V held at BF16, varying only the normalizer denominator, reported via cosine similarity and output-norm ratio) is deferred to a future version, as is a cross-layer and cross-model characterization of ¯ ε.The long-context evaluation (Section 5.4) currently uses a retrieval task that saturates at 100% accuracy and is reported on a single model; RULER/LongBench coverage, KV-cache memory, and decode-side latency are deferred. 13 8 Conclusion 
+
+HiFA4 quantizes both QK T and P V in FlashAttention to HIF4 4-bit for LLM inference on Ascend NPUs via two mechanisms. Smooth-QK traces K-activation outliers to fixed model parameters and eliminates them with a calibration-static per-channel rescaling requiring no per-tile online reduction and only a fusible element-wise scaling. P-Reordering proves and eliminates a coherent output error arising from normalizer– GEMM inconsistency (Theorem 1), validated across 3.6 million attention tiles, and additionally fuses the normalizer into the P V Cube GEMM. On Qwen3-8B: MMLU Quant Hurts 1071 → 465, ARC flips 22 → 5, sample-weighted δw narrowed from 1.12 pp to 0.70 pp (Table 2). On Gemma2-9B (mild smoothing): MMLU Quant Hurts 445 → 323, within 0.7 pp of BF16. On the three bypass models, P-Reordering and Q-Mean alone reduce full-set MMLU Quant Hurts by 41–52% (LLaMA3.1-8B 976 → 468; Phi-4B 943 → 493; Mistral-7B 696 → 408), demonstrating that this component generalizes beyond models with concentrated K-outliers. A theoretical latency model projects a 35.4% reduction relative to BF16, to be validated on hardware when the target NPU becomes available. 
+
+# References 
+
+Marah Abdin et al. Phi-4-mini technical report. Technical report, 2025. arXiv:2503.01743. Saleh Ashkboos, Ilia Markov, Elias Frantar, Tingxuan Zhong, Xincheng Wang, Jie Ren, Torsten Hoefler, and Dan Alistarh. QuaRot: Outlier-free 4-bit inference in rotated LLMs. arXiv preprint arXiv:2404.00456 ,2024. Tri Dao. FlashAttention-2: Faster attention with better parallelism and work partitioning. In International Conference on Learning Representations , 2024. Tri Dao, Daniel Y. Fu, Stefano Ermon, Atri Rudra, and Christopher R´ e. FlashAttention: Fast and memory-efficient exact attention with IO-awareness. In Advances in Neural Information Processing Systems ,volume 35, pages 16344–16359, 2022. Tim Dettmers, Artidoro Pagnoni, Ari Fetterman, and Luke Zettlemoyer. QLoRA: Efficient finetuning of quantized LLMs. In Advances in Neural Information Processing Systems , volume 36, 2024. Elias Frantar, Saleh Ashkboos, Torsten Hoefler, and Dan Alistarh. GPTQ: Accurate post-training quantization for generative pre-trained transformers. In International Conference on Learning Representations , 2023. Gemma Team. Gemma 2: Improving open language models at a practical size. arXiv preprint arXiv:2408.00118 ,2024. Tanmaey Gupta, Pragaash Ponnusamy, Ben Athiwaratkun, Leon Song, Tri Dao, Daniel Y. Fu, et al. Search your block floating point scales! In Proceedings of Machine Learning and Systems (MLSys) , 2026. Oral. arXiv:2605.12464. Albert Q. Jiang, Alexandre Sablayrolles, Arthur Mensch, et al. Mistral 7b. arXiv preprint arXiv:2310.06825 ,2023. Ji Lin, Jiaming Tang, Haotian Tang, Shang Yang, Xingyu Dang, and Song Han. AWQ: Activation-aware weight quantization for LLM compression and acceleration. In Proceedings of Machine Learning and Systems , volume 6, 2024. Zirui Liu, Jiayi Yuan, Hongye Jin, Shaochen Zhong, Zhaozhuo Xu, Vladimir Braverman, Beidi Chen, and Xia Hu. KIVI: A tuning-free asymmetric 2bit quantization for KV cache. In International Conference on Machine Learning , 2024. Yuanyong Luo et al. HiFloat4 format for language model inference. arXiv preprint arXiv:2602.11287 , 2026. Meta AI. The Llama 3 herd of models. arXiv preprint arXiv:2407.21783 , 2024. 14 Qwen Team. Qwen3 technical report. arXiv preprint arXiv:2505.09388 , 2025. Jay Shah, Ganesh Bikshandi, Ying Zhang, Vijay Thakkar, Pradeep Ramani, and Tri Dao. FlashAttention-3: Fast and accurate attention with asynchrony and low-precision. arXiv preprint arXiv:2407.08608 , 2024. Joe Sharratt. ThriftAttention: Selective mixed precision for long-context FP4 attention. arXiv preprint arXiv:2605.23081 , 2026. Guangxuan Xiao, Ji Lin, Mickael Seznec, Hao Wu, Julien Demouth, and Song Han. SmoothQuant: Accurate and efficient post-training quantization for large language models. In International Conference on Machine Learning , pages 38087–38099, 2023. Ted Zadouri, Markus Hoehnerbach, Jay Shah, Timmy Liu, Vijay Thakkar, and Tri Dao. FlashAttention-4: Algorithm and kernel pipelining co-design for asymmetric hardware scaling. arXiv preprint arXiv:2603.05451 ,2026. Jintao Zhang, Haofeng Wei, Pengle Zhu, et al. SageAttention2: Efficient attention with thorough outlier smoothing and per-thread INT4 quantization. In International Conference on Learning Representations ,2025a. Jintao Zhang, Haofeng Wei, Pengle Zhu, et al. SageAttention3: Microscaling FP4 attention for inference and an exploration of 8-bit training. In Advances in Neural Information Processing Systems , 2025b. Spotlight. 
+
+# A Caveats on the FP4 Attention Port 
+
+The motivation experiment discussed in the introduction applies the published FP4 attention recipe of Zhang et al. [2025b] to Qwen3-8B. This is an algorithmic port, not a controlled ablation or a comparison of optimized kernels. At least four factors differ simultaneously between this port and HiFA4: 
+
+(1) Hardware and quantization format. SageAttention3 targets NVIDIA Blackwell’s NVFP4, a 16-element-group block-floating-point format with an FP8-E4M3 scale. HiFA4 targets Ascend HIF4’s three-level hierarchical format with a 64-element group, a global E6M2 base scale, two levels of 1-bit micro-exponents, and S1P2 elements. The two formats respond differently to the same activation distributions. 
+
+(2) Smoothing calibration. SageAttention3’s smoothing parameters are tuned for diffusion model activations (CogVideoX, HunyuanVideo, etc.). The port applies those parameters to Qwen3-8B, whose activations have a qualitatively different outlier structure (QK-RMSNorm-induced, parameter-level, head-invariant) not present in diffusion models. 
+
+(3) P -quantization granularity. SageAttention3 quantizes attention weights at a different granularity than HIF4’s 64-element grouping. 
+
+(4) Normalizer path. SageAttention3 accumulates the softmax normalizer from a higher-precision reconstruction of ˆP (see Section 4.5). This is the mismatch that P-Reordering is designed to correct. The degradation observed in this port reflects all four factors acting simultaneously. It demonstrates that the published recipe does not transfer directly to a language model on different hardware, not that the authors’ optimized kernel fails on its intended workloads. We present it as a portability stress test , not a comparison. 
+
+# B Experimental Settings 
+
+This appendix documents the full evaluation configuration to support reproducibility. 
+
+Scoring protocol. All benchmarks are evaluated as multiple-choice tasks scored by comparing the per-option likelihoods of the candidate continuations; we do not use free-form generation. The predicted label is the argmax over option likelihoods, and the top-1/top-2 logit margin in Figure 9 is computed on these option logits. ARC-Challenge, TruthfulQA (MC1), GPQA-Diamond, MMLU, and HellaSwag all follow this protocol. 15 Shot count and prompt template. Evaluation is zero-shot with the standard task templates; the same template string is used for BF16, Direct HIF4, and HiFA4 so that the only varying factor is the numerical precision of attention. Answer extraction is by option-likelihood ranking as above and does not depend on string parsing. 
+
+Precision and dtype. The BF16 baseline (labeled C16V16 in Table 10) is the unmodified FlashAttention execution in which both the QK T and P V GEMMs use BF16 operands with FP16 online softmax state—the exact floating-point operator baseline against which all quantized variants are compared. For the quantized configurations, only the attention QK T and P V GEMMs are computed in HIF4 (with the online softmax state, normalizer, and final normalization in FP16 as detailed in Appendix C); all other model weights and activations remain in BF16. This isolates the effect of attention quantization. 
+
+Calibration provenance and leakage. Smooth-QK calibration uses 1024 samples drawn exclusively from training or auxiliary splits, never from any evaluation split, so there is no calibration/test leakage. Scale factors are computed once offline and held fixed for all evaluation runs. 
+
+Hook coverage. All attention computation is routed through the C4V16 dispatch hook; no attention call falls back to a BF16 path. We log the number of hook invocations per evaluation to verify complete coverage. For example, on Phi-4B the hook records 321,344 calls on the full HellaSwag set and 449,344 calls on the full MMLU set, matching the expected (layers × samples × tiles) counts for those runs. Equivalent coverage logs are produced for every model/benchmark pair. 
+
+Software and hardware. Functional QDQ evaluation uses the official HIF4 reference implementation following the BF16 →HIF4 conversion of Algorithm 1 in the HIF4 specification [Luo et al., 2026] (64-element group, three-level scaling hierarchy). We will release the exact library, framework, and toolkit versions (PyTorch / transformers / Ascend toolkit) alongside the code; on-hardware timing awaits public availability of the target NPU. 
+
+Determinism. Evaluation runs are deterministic given a fixed model, fixed calibration scales, and greedy (argmax) option scoring; no sampling is used, so the reported decision-consistency counts are reproducible across runs. 
+
+# C Implementation Details 
+
+Hook insertion point. All quantization is applied inside the FlashAttention dispatch hook, after RoPE but before any GEMM. Neither the projection layers nor the RoPE rotation itself is modified. 
+
+Smooth-QK placement. Smooth-QK must be applied after RoPE so that the rotation sees the original per-head Q and K tensors. Applying it before RoPE would require commutativity with the complex exponentials in the rotation, which does not hold in general. 
+
+Quantized tensors. The following tensors are quantized to HIF4 before entering a Cube GEMM: 
+
+• Qz = ˜Q − μ (zero-mean query, post-Smooth-QK); 
+
+• ˜K = K diag(ˆ s)−1 (smoothed key); 
+
+• V (value, unchanged); 
+
+• ˆPij (per-tile softmax weights, before P V GEMM). 16 FP16 operations. The following are computed and maintained in FP16 throughout: 
+
+• Running maximum mi (online softmax); 
+
+• Softmax exponential exp( Sij − mi); 
+
+• Normalizer ℓi (accumulated from ˆP , result in FP16); 
+
+• Final normalization Oi ← Oi/ℓ i;
+
+• Q-Mean auxiliary GEMV (see below). 
+
+Q-Mean GEMV and coordinate consistency. The Q-Mean correction subtracts the per-token scalar mean of ˜Q over the head-feature (channel) dimension d: μi = 1
+
+> d
+
+Pdc=1 ˜Qi,c , which is a scalar per query token (not a mean across heads). The correction compensates by adding μi
+
+P 
+
+> c
+
+˜Kj,c to each tile’s pre-softmax scores, i.e., Sij + = μi1TTj
+
+˜Kj where 1Tj sums all key-feature channels. We use ˜K (post-Smooth-QK FP16 tensor) rather than the original K to maintain a consistent coordinate frame: since ˜Q is the quantity fed into the main QK GEMM, the Q-mean should be referenced to the same transformed space, and the correction should use the correspondingly transformed key. The ˜K tensor is available as a transient FP16 activation before HIF4 packing and requires no additional memory allocation. 
+
+GQA and batch handling. In GQA configurations (e.g. Qwen3-8B uses 32 Q heads and 8 KV heads), the scale factor ˆs is computed per key-head channel and broadcast across the corresponding Q heads. This correctly handles the head-invariant nature of the outlier (Section 4.1): a single γK,c parameter produces the same activation at every Q head after GQA expansion. Batch size and sequence length do not affect the algorithm; the per-channel ˆ s is applied element-wise to the token dimension. 
+
+# D Decision-Consistency Metric Definitions 
+
+Why not aggregate accuracy? Aggregate accuracy changes can mask opposing effects. A quantized model may corrupt some BF16-correct answers (Quant Hurts) while accidentally fixing some BF16-incorrect answers (Quant Helps). A model that hurts many samples but helps just as many would show zero accuracy change while exhibiting substantial decision drift. We use metrics that separate these effects. 
+
+Prediction Flip Rate (PFR). 
+
+PFR = 1
+
+N
+
+> N
+
+X
+
+> i=1
+
+1ˆyqi̸ = ˆ ybf16 
+
+> i
+
+ (4) PFR measures the fraction of evaluation samples for which the quantized model’s top-1 prediction differs from the BF16 model’s prediction. A BF16 model has PFR = 0 by definition. PFR is related to but not equal to accuracy change: a flip may move from a correct BF16 prediction to an incorrect one (a Hurt), or from an incorrect BF16 prediction to a different incorrect one. 
+
+Quant Hurts. 
+
+Hurts = i : ˆ ybf16  
+
+> i
+
+= yi and ˆ yqi̸ = yi (5) Quant Hurts counts only the regressions: samples the BF16 model answers correctly that the quantized model does not. We report Hurts as a count (rather than a rate) because it is bounded above by the BF16 model’s accuracy and is most interpretable as a raw count of corrupted inferences. 
+
+Relation to accuracy. Defining Helps = |{ i : ˆybf16 
+
+> i
+
+̸ = yi, ˆyqi = yi}| , the accuracy change satisfies ∆ Acc =( Helps − Hurts )/N . We emphasize Hurts over ∆ Acc because Helps often reflect quantization noise accidentally realigning a borderline wrong answer, whereas Hurts identify samples where the model has lost a reliable capability. 17 BF16 as reference. All metrics compare against the same BF16 model on identical inputs. This controls for prompt format, tokenization, and sampling—only the numerical precision of the attention computation differs. 
+
+# E Outlier Channel Stability (Jaccard) 
+
+A central assumption behind calibration-static Smooth-QK deployment is that the identity of the outlier channels—not just their magnitude—is stable across different inputs. If a channel is a dominant outlier for one prompt but not another, a static scale factor computed from calibration data would suppress the wrong channels at inference time, potentially harming accuracy. To test this assumption, we run each of our five evaluation models on eight diverse prompts spanning code generation, mathematical reasoning, factual question answering, multi-turn dialogue, and narrative text. For each model and prompt, we collect the top-N channels by maximum activation magnitude at Layer 0 (where 
+
+N = 5% of the total channel count). We then compute the pairwise Jaccard similarity between all 28 pairs of prompt-specific channel sets—where a Jaccard similarity of 1.0 would indicate the identical set of outlier channels across both prompts, and 0 would indicate no overlap. High mean off-diagonal Jaccard ( ≫ 0.5) across diverse prompts indicates that the outlier channel identity is an intrinsic model property rather than an input artifact.   
+
+> (a) Qwen3-8B (0.707) (b) Gemma2-9B (0.676)
+> (c) LLaMA3.1-8B (0.679) (d) Mistral-7B (0.887)
+
+Figure 10: Jaccard similarity of top-N outlier channels across 8 prompts. Mean off-diagonal values of 0.676–0.887 confirm that the same channels are identified regardless of input, supporting static calibration. Phi-4B Jaccard is 0.786 (Table 1). High Jaccard in Mistral-7B and Phi-4B does not trigger smoothing; 
+
+ρK < 6 in both cases routes them to bypass. 18 F Smooth-QK Scale Factor by Layer 
+
+The Smooth-QK calibration procedure computes per-layer, per-channel scale factors ˆs for every model, regardless of the gate outcome. Table 8 reports the resulting statistics for Qwen3-8B, where the correction is most pronounced. All statistics in this table are RMS-aggregated over the 1024-sample calibration set (the statistic that drives Eq. (1) ), and are therefore not directly comparable to the per-slice (single batch element, single head) max-abs values shown in Figure 5. Table 8: K outlier statistics and resulting Smooth-QK scale factor for Qwen3-8B, grouped by layer depth (calibration-set RMS aggregate). Layer 0 dominates; deeper layers have near-unity ˆs and are effectively unaffected by smoothing. Q Expand gives the resulting range of max |˜qc|/ max |qc| across channels.                     
+
+> Layer MaxAbs P99 ρKˆsQ Expand 0220.8 16.9 13.1 3.72 0.56–1.40 ×
+> 1–4 10–25 8–16 1.3–1.7 1.1–1.3 0.8–1.2 ×
+> 5–35 12–35 9–19 ∼1.8 ∼1.1 0.9–1.1 ×
+
+On the different magnitudes reported for the same outlier. Three numerical values describing the channel-51 outlier appear in the paper, and they are deliberately different measurements rather than the same quantity computed three ways. (i) Table 8 reports MaxAbs = 220 .8 at Layer 0: this is the calibration-set RMS aggregate of the per-channel maximum and is the statistic that drives Eq. (1) ; the corresponding ˆs = 3 .72 would compress it to ≈59 (= 220 .8/3.72) under that scale. (ii) Figure 5 reports max-abs = 104 .5(before) and = 2 .516 (after) for a single fixed slice (one batch element, head 0, first 64 tokens), where “after” is measured directly on the Smooth-QK-transformed K tensor. (iii) Figure 1 reports ≈155 from a single-token forward trace on a different input, illustrating the per-token amplification mechanism. These values differ because the outlier magnitude varies across heads, tokens, and inputs, and because the three measurements use different aggregation levels (single-token trace vs. single-slice max-abs vs. calibration-set RMS aggregate) and were produced by different scripts (the main inference hook for the figures, a separate calibration script for Table 8). They are therefore not expected to coincide; we annotate each figure and table with its statistic so the reader can interpret them correctly. In particular, the after-value 2 .516 in Figure 5 is the measured result of applying Smooth-QK to that slice and should not be cross-checked against 220 .8/3.72 or against the 
+
+|Kmax |/|Qmax | ratio of any other statistic, since it pertains to a different head and input. 
+
+Cross-model comparison. The concentration pattern differs substantially across architectures. 
+
+Qwen3-8B (strong gate): Layer 0 is the dominant outlier layer with ρK = 13 .1 and TK/Q = 14 .5. The scale factor at Layer 0 is 3.72, compressing K’s maximum from 220.8 to approximately 59 and expanding Q proportionally. All other layers have near-unity ˆs (≤ 1.3). This concentrated pattern is consistent with the QK-RMSNorm affine weight γK, 51 ≈ 34 being the root cause: it acts only at the layer where it is defined. 
+
+Gemma2-9B (mild gate, α = 0 .25 ): Layer 0 has ρK = 8 .1 (above the ρK ≥ 6 threshold) but 
+
+TK/Q = 2 .17. Because K does not strongly dominate Q, the gate selects mild smoothing ( α = 0 .25) rather than α = 0 .5, transferring less difficulty to Q. An α sweep on the diagnostic suite confirmed α = 0 .25 as the best of {0.05 , 0.1, 0.25 , 0.35 }; relative to Direct HIF4 it lowers full-set MMLU and HellaSwag Quant Hurts (445 → 323 and 449 → 406). The outlier is present but less extreme than in Qwen3-8B. 
+
+LLaMA3.1-8B (bypass): ρK peaks at only 4.78, below the ρK ≥ 6 smoothing threshold, and there is no single dominant outlier layer; the outlier ratio is spread more evenly across layers. Although its ρK
+
+is the highest among the bypass models, an α sweep ( α ∈ { 0.05 , 0.1, 0.2, 0.25 , 0.35 }) shows that enabling Smooth-QK does not improve, and on some diagnostic benchmarks slightly degrades, its decision consistency relative to the bypass configuration. The gate therefore routes LLaMA3.1-8B to bypass, consistent with the empirical result; this is the boundary case discussed in Section 5.6. 
+
+Mistral-7B and Phi-4B (bypass): Both models have low intra-K outlier severity ( ρK = 3 .56 and 3.69, below the ρK ≥ 6 threshold) together with TK/Q < 2. For Phi-4B, the max-layer ρK = 3 .69 occurs at Layer 30, and the max-layer TK/Q = 1 .50 is at a different layer. At Layer 0, Phi-4B actually has TK/Q = 0 .56, meaning K is smaller than Q —the reverse of the Qwen3-8B pattern. This confirms that the outlier topology 19 can differ fundamentally across architectures, and the gate correctly identifies that no smoothing should be applied. 
+
+Why the calibration procedure covers all layers. Even though only Layer 0 of Qwen3-8B has a large ˆs, the calibration procedure computes ˆsc for every layer and channel of every model. The gate is then applied independently per layer. For models in bypass mode, all ˆsc values are set to 1.0 at inference, effectively a no-op. This design ensures that if future models have outliers at deeper layers, no algorithmic change is needed: the calibration will find them and the gate will route them appropriately. 
+
+# G Cross-Model Ablation (Diagnostic Suite) 
+
+Table 9: Stepwise ablation on Gemma2-9B (diagnostic benchmarks; Mild Smooth-QK at α = 0 .25). Row A is Direct HIF4; rows B–E add the Q-Mean auxiliary. Rows C and E apply Smooth-QK; rows A, B, D do not and are α-independent. Fl = Flip count, Hu = Quant Hurt count. The full pipeline (E) is best on TQA and GPQA; on the small ARC set (295 samples) the SQK-only row C is marginally lower.                                                   
+
+> Config SQK PRe ARC (295) TQA (817) GPQA (198) Fl Hu Fl Hu Fl Hu A. Direct HIF4 ——13 799 25 49 12 B. +Q-Mean ——8487 23 35 12 C. +Smooth-QK ✓—4170 17 37 10 D. +P-Reordering —✓9578 16 37 14 E. Both (HiFA4) ✓✓10 574 11 33 8
+
+The Gemma2-9B stepwise result corroborates the Qwen3-8B findings. Relative to Direct HIF4 (row A), the full HiFA4 configuration (row E) reduces Quant Hurts on every diagnostic benchmark, with the largest effect on TruthfulQA (hurts 25 → 11, a 56% reduction), consistent with semantically sensitive decisions benefiting most. Smooth-QK (row C vs. B) and P-Reordering (row D vs. B) each contribute: Smooth-QK is strongest on ARC and TQA, while P-Reordering also lowers TQA hurts independently of smoothing. Combining them (row E) is best on TQA and GPQA; on ARC, where only 295 samples make the counts noisy, the SQK-only configuration is marginally lower, but the difference (Hu 1 vs. 5) is within run-to-run variation on a set this size. 
+
+# H Bypass-Model Full-Set Provenance 
+
+Table 6 in the main text reports the three bypass models (LLaMA3.1-8B, Mistral-7B, Phi-4B) on the full MMLU and HellaSwag sets, comparing the Direct HIF4 baseline (no corrections) against the bypass HiFA4 configuration (Smooth-QK disabled, ˆs = 1; P-Reordering and Q-Mean active). Because Smooth-QK is off, the Direct →HiFA4 improvement isolates the joint effect of P-Reordering and the Q-Mean auxiliary on models without a concentrated K-outlier. All three models show Quant-Hurt reductions of 39–52% on both datasets (LLaMA3.1-8B MMLU 976 → 468, HellaSwag 1215 → 745; Mistral-7B MMLU 696 → 408, HellaSwag 614 → 355; Phi-4B MMLU 943 → 493, HellaSwag 632 → 369). The hook-coverage logs for these runs (e.g. Phi-4B HellaSwag 321,344 calls, MMLU 449,344 calls) confirm that all attention computation was routed through the C4V16 operator (Appendix B). 
+
+# I Ablation Sub-Result Provenance 
+
+Table 7 in Section 6 reports a stepwise component ablation on Qwen3-8B. This appendix documents the evaluation setup for each row to ensure reproducibility. 20 MMLU (14,042 samples). All five configurations (A–E) were evaluated on the full MMLU dataset. Each run uses the complete standard MMLU evaluation split (14,042 questions across 57 subjects). Rows A and E match the values reported in Tables 3 and 5 for Direct HIF4 and HiFA4, respectively. 
+
+HellaSwag (10,042 samples). All five configurations were evaluated on the full HellaSwag validation set. Rows A and E match the corresponding values in Table 3. 
+
+ARC-Challenge (295 samples) and TruthfulQA (817 samples). All five configurations were evaluated on the complete ARC-Challenge and TruthfulQA evaluation sets. Row E values match Table 3 exactly. 
+
+Why Q-Mean (row B) is held fixed. The goal of the ablation is to isolate the contributions of Smooth-QK and P-Reordering, which are the two mechanisms proposed in this paper. Q-Mean is adopted from Zhang et al. [2025a] and is not a contribution of this work. Including it as a fixed component in rows B–E ensures that the incremental differences between rows reflect only our proposed mechanisms. Row A (Direct HIF4, no corrections) provides the absolute baseline. Row B (+Q-Mean only) provides the baseline after applying the inherited component, against which our mechanisms are compared. 
+
+Gemma2-9B stepwise component effect. The stepwise component effect for Gemma2-9B (diagnostic suite: ARC, TruthfulQA, GPQA) is reported in Table 9 in Appendix G. 
+
+# J Instruction-Scheduling Latency Model 
+
+This appendix reports the quantitative instruction-scheduling analysis summarized in Section 5.5. All figures are theoretical estimates derived from an Ascend NPU cycle-count model at T = 40 ,960 tokens; no on-hardware measurements are available at this time and on-hardware validation is deferred to a future version. 
+
+Figure 11: Relative critical-path latency (BF16 = 1.0), from the instruction-scheduling model described in this appendix. HIF4 quantization reduces Cube cost but shifts the bottleneck to the vector path. P-Reordering moves the normalizer accumulation into the Cube GEMM, reducing vector-path cost; the model projects a 35.4% overall reduction relative to BF16. All figures are theoretical estimates; on-hardware validation is deferred. The key mechanism is that 4-bit Cube GEMMs reduce the QK T +P V Cube cost to 25% of BF16. However, this shifts the critical-path bottleneck to the vector path (softmax, rescaling, normalizer reduction). P-Reordering fuses the normalizer accumulation into the Cube GEMM (Section 4.5), shortening the Softmax vector-path cost from 1.46 to 1.29 (normalized), resulting in a projected overall reduction from 0.73 to 0.65 (35.4% relative to BF16 = 1.0). 21 Table 10: Relative latency per stage ( T = 40 ,960 tokens; all values normalized to BF16 = 1.0). All figures are instruction-scheduling theoretical estimates from a preliminary Ascend NPU scheduling analysis; on-hardware validation is deferred (Section 7).                     
+
+> Variant QK+PV Cube Softmax Other VL Bottleneck Relative BF16 (C16V16) 1.00 0.49 0.85 Cube 1.00 Direct (C4V16) 0.25 1.46 0.75 Vector 0.73
+> HiFA4 0.25 1.29 0.75 Vector 0.65
+
+22

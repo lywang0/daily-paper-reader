@@ -1,0 +1,1050 @@
+Title: CoCoScale: Leveraging Layer-wise Scaling to Unlock the Potential of Online LLM Serving
+
+URL Source: https://arxiv.org/pdf/2607.04181v1
+
+Published Time: Tue, 07 Jul 2026 02:01:29 GMT
+
+Number of Pages: 22
+
+Markdown Content:
+# CoCoScale: Leveraging Layer-wise Scaling to Unlock the Potential of Online LLM Serving 
+
+JINGFENG WU ∗, YIYUAN HE ∗, MINXIAN XU †, and XITONG GAO, Shenzhen Institutes of Advanced Technology, Chinese Academy of Sciences, China 
+
+CHONG MA, LE CHEN, MIN SHEN, and LIN QU, Alibaba Group Inc, China 
+
+KEJIANG YE, Shenzhen Institutes of Advanced Technology, Chinese Academy of Sciences, China 
+
+CHENGZHONG XU, State Key Lab of IOTSC, University of Macau, China Online large language model (LLM) serving has become the backbone of modern AI applications, powering diverse downstream services through shared hardware clusters. However, modern serving systems frequently encounter highly dynamic workloads characterized by severe workload skewness, where a small fraction of model instances receives the vast majority of traffic. Existing instance-level scaling mechanisms are limited by coarse-grained resource adjustment: scaling up requires the cold-start of full-model replicas, incurring substantial latency, while scaling down leaves the system vulnerable to performance degradation during sudden traffic surges. The key insight of this work is that LLM serving offers a unique opportunity for fine-grained scaling. In this paper, we propose CoCoScale, a layer-wise dynamic scaling mechanism that selectively expands the parallelism of hot layers onto idle resources reclaimed from underutilized devices, enabling elastic data parallelism without altering model architectures or adding hardware overhead. Evaluations demonstrate that CoCoScale significantly reduces cold start latency by 97.9%–99.3% compared to traditional scale up. Under production traces, CoCoScale reduces average latency by 20.7%–28.1% and achieves full Service Level Objective (SLO) attainment, demonstrating superior dynamic adaptability and resource efficiency. CCS Concepts: • Computing methodologies → Computer Systems ; • Computer systems organization 
+
+→ Distributed Systems .Additional Key Words and Phrases: LLM, Inference Serving, Module Scaling, Replication, Migration 
+
+ACM Reference Format: 
+
+Jingfeng Wu, Yiyuan He, Minxian Xu, Xitong Gao, Chong Ma, Le Chen, Min Shen, Lin Qu, Kejiang Ye, and Chengzhong Xu. 2026. CoCoScale: Leveraging Layer-wise Scaling to Unlock the Potential of Online LLM Serving. ACM Trans. Arch. Code Optim. 1, 1, Article 1 (January 2026), 22 pages. https://doi.org/XXXXXX 
+
+1 Introduction 
+
+The advent of state-of-the-art LLMs, such as GPT 5.2 [ 1], Qwen 3 [ 36 ], and DeepSeek V3 [ 7 ], has reshaped user experiences and driven the rapid growth of online LLM serving. Consequently, major cloud platforms [ 3, 11 , 20 ] have emerged as the foundational infrastructure for diverse downstream applications. Despite these advancements, online serving environments contend with significant operational challenges stemming from extreme workload volatility and imbalance. Specifically, request patterns exhibit unpredictable dynamics, leading to frequent load fluctuations across instances. Further-more, there is a severe workload disparity among heterogeneous models. As demonstrated by the OpenRouter [ 22 ] leaderboard, the top 25% of model instances process 75% of the total traffic, 
+
+> ∗
+
+Both authors contributed equally to this research. 
+
+> †
+
+Minxian Xu is the corresponding author. Authors’ Contact Information: Jingfeng Wu, jf.wu2@siat.ac.cn; Yiyuan He, yy.he2@siat.ac.cn; Minxian Xu, mx.xu@siat.ac.cn; Xitong Gao, xt.gao@siat.ac.cn, Shenzhen Institutes of Advanced Technology, Chinese Academy of Sciences, Shenzhen, China; Chong Ma, machong.mc@alibaba-inc.com; Le Chen, donghuai.cl@taobao.com; Min Shen, shenmin.sm@taobao.com; Lin Qu, xide.ql@taobao.com, Alibaba Group Inc, Hangzhou, China; Kejiang Ye, kj.ye@siat.ac.cn, Shenzhen Institutes of Advanced Technology, Chinese Academy of Sciences, Shenzhen, China; Chengzhong Xu, czxu@um.edu.mo, State Key Lab of IOTSC, University of Macau, Macau SAR, China. ACM Trans. Arch. Code Optim., Vol. 1, No. 1, Article 1. Publication date: January 2026.  
+
+> arXiv:2607.04181v1 [cs.DC] 5 Jul 2026 1:2 Wu et al.
+
+creating a distinct “hot/cold skewness.” This imbalance arises from entrenched user preferences for specific models, making it difficult to alleviate through simple request migration on the provider side without violating user-model affinity. Mitigating these challenges requires robust runtime scaling mechanisms capable of dynamically reconfiguring resource allocation. However, existing instance-wise scaling strategies are funda-mentally restricted by their coarse granularity. As illustrated in Figure 1, addressing a traffic burst requires the re-allocation of full model replicas, as shown in ②. This rigid process triggers a prohib-itive cold-start period for container initialization and parameter loading, resulting in provisioning latency that significantly lags behind demand spikes and leads to temporary SLO violations [ 40 ]. Additionally, since resources can only be scaled in large and fixed units, such as entire instances, it is impossible to perfectly match the fluctuating workload. This lack of precision forces the system to over-provision resources, leaving valuable computing power locked in underutilized instances. In contrast, our proposed approach, CoCoScale, introduces layer-wise scaling to eliminate these overheads. By selectively expanding the parallelism of hot layers onto reclaimed idle resources, as depicted in states ③ and ④, our approach delivers near-instant performance boosts. This fine-grained elasticity enables the system to strictly adhere to SLOs while minimizing resource waste, bypassing the operational delays inherent in traditional methods. A B B     
+
+> ③
+> ABB
+> ④
+> burst
+> SLO
+> Timeline
+> Latency  ①
+> ②
+> cold start
+> ④
+> burst
+> SLO
+> Timeline
+> Latency  ①
+> ③
+> A
+> ①
+> high workload
+> BB
+> ②
+> ABBA
+> re-allocate devices
+> Instance-wise Layer-wise
+> replicate layers
+> reduce parallelism
+> up
+> down
+> up
+
+Fig. 1. Comparison between instance-wise and layer-wise scaling. (1) Instance-level scaling suffers from significant latency spikes due to cold starts. (2) CoCoScale enables rapid SLO recovery by selectively replicating layers onto idle resources. 
+
+To overcome these limitations, we propose layer-wise scaling, a fine-grained mechanism that operates without triggering costly full-model redeployments. The key insight is to reclaim idle resource from “cold" devices to boost the performance of “hot" instances. This achieves a dual effect: scaling up the throughput of hot instances while effectively consolidating fragmented idle resources on cold ones. In particular, we replicate selected layers of a hot instance onto underutilized devices. These replicas perform inference alongside the original layers, forming layer-wise data parallelism. This approach allows the system to dynamically adjust the parallelism degree of specific layers in response to workload fluctuations, thereby satisfying SLO requirements with precision. Crucially, by leveraging communication-computation overlapping, layer-wise scaling maintains a minimal communication footprint, ensuring that the performance gains are not eroded by synchronization overhead. Thanks to its fine-grained granularity, layer-wise scaling incurs significantly lower setup  
+
+> ACM Trans. Arch. Code Optim., Vol. 1, No. 1, Article 1. Publication date: January 2026. CoCoScale: Leveraging Layer-wise Scaling to Unlock the Potential of Online LLM Serving 1:3
+
+latency compared to instance-level scaling, making it a robust alternative when coarse-grained methods fall short. In this paper, we present CoCoScale, the layer-wise scaling mechanism and its corresponding serving framework. By replicating specific layers onto reclaimed idle resources, CoCoScale enables fine-grained elastic data parallelism that eliminates the need for full-model redeployment. We implemented a prototype of CoCoScale based on the Nano-vLLM [ 10 ] backend and conducted extensive evaluations using production-scale traces. The results demonstrate that CoCoScale achieves a 97.9%-99.3% reduction in scaling latency and ensures 100% SLO attainment. Furthermore, the system reduces average end-to-end (E2E) latency by 20.7%–28.1% over baseline methods. In summary, our primary contributions are as follows: 
+
+• We conduct a systematic characterization of workload challenges in online LLM serving, identifying the staircase lag and quantization mismatch inherent in coarse-grained scaling. 
+
+• We propose layer-wise scaling mechanism and implement a system framework that decouples performance adjustment from rigid instance boundaries to enable rapid, non-integer capacity expansion. 
+
+• Extensive evaluations validate that CoCoScale significantly enhances system efficiency while maintaining stable performance under varying workloads. The rest of the paper is organized as follows: Section 2 discusses the background and motivation of the proposed approach, and the mechanism that supports layer-wise replication is introduced in Section 3. Section 4 presents the layer-wise algorithm for scaling resources and Section 5 demonstrates the system design of CoCoScale. Performance evaluations are illustrated in Section 6. The related work are summarized in Section 7, and Section 8 concludes the paper. 
+
+2 Background and Motivation 2.1 Online LLM Serving 
+
+Online LLM serving provides a scalable infrastructure that allows users to integrate advanced intelligence into applications through simple APIs without managing underlying hardware [ 35 ]. The core of modern online serving is LLM inference, which requires providing high-concurrency and highly reliable services for users on shared hardware clusters. This presents significant challenges to the entire architecture. On one hand, the system must efficiently manage computing and storage resources to avoid workload imbalance. On the other hand, the system also needs to meet strict SLOs for different businesses while balancing high throughput and minimized end to end latency. 
+
+2.2 Workload Skewness and Variety 
+
+The workloads in online LLM serving exhibit a high degree of hot and cold skewness as well as burstiness. Since model instances with different popularity are heterogeneous, traditional sched-ulers [ 12 , 27 ] cannot direct requests from hot instances to cold ones. This situation eventually leads to severe load imbalance among the hardware devices to which these instances belong. In addition, the request patterns for the same model show a wide range of variability and are difficult to predict. From a macro perspective, instances face periodic changes in load levels, such as the tidal phenomenon. From a micro perspective, instances occasionally encounter sudden bursts of traffic, which places high demands on the elastic scaling capabilities of the system. 
+
+2.3 Limitations of Instance-wise Scaling 
+
+To address these challenges, contemporary LLM serving systems rely on elastic scaling at the instance level [ 18 , 37 , 39 ], where entire model replicas are deployed or removed across GPUs to accommodate workload changes. However, as shown in the production traces from Alibaba in  
+
+> ACM Trans. Arch. Code Optim., Vol. 1, No. 1, Article 1. Publication date: January 2026. 1:4 Wu et al.
+
+Figure 2, these coarse-grained strategies face significant hurdles [ 9 , 40 ]. A primary obstacle is the high provisioning latency caused by the inherent cold-start problem. Because initializing a new model instance involves time-consuming operations like container setup and loading massive weights, the system exhibits a pronounced temporal lag. This is visible in Figure 2, where the step-like progression of Scaling Devices fails to keep pace with sharp spikes in response time, resulting in frequent SLO violations. 13:11       
+
+> 13:41
+> 14:11
+> 14:41
+> 15:11
+> 15:41
+> 16:11
+> 16:41
+> 17:11
+> 17:41
+> 18:11
+> Timestamp (2025-03-19)
+> 0
+> 250
+> 500
+> 750
+> 1000
+> E2E Latency(s)  E2E Latency Fixed Machines Scaling Machines
+> 0
+> 20
+> 40
+> 60
+> 80
+> 100
+> Number of Machines
+> Fig. 2. Production traces highlighting the staircase pattern and temporal lag in coarse-grained scaling relative to request spikes.
+
+Beyond latency, existing methods also suffer from a lack of precision that leads to resource inefficiency. Since scaling occurs in large increments such as adding a complete GPU or model instance, the system often struggles to match SLOs exactly. This lack of granularity results in over-provisioning where added capacity exceeds actual demand. While aggressive scaling might eventually stabilize response times, the gains are negated by excessive resource consumption because current architectures cannot finely tune performance to follow the exact demand curve. The fundamental issue is the mismatch between the massive, indivisible model instance and the highly dynamic, fine-grained workload fluctuations. This mismatch suggests that breaking down the scaling unit from the entire model to its internal modular layers could provide the necessary agility and precision for modern LLM serving. These observations motivate a shift in perspective: instead of treating the entire model instance as the atomic unit of scaling, we propose to operate at the granularity of individual Transformer layers. In the following sections, we introduce layer-wise replication as a mechanism for fine-grained data parallelism, present a formal modeling framework to characterize its performance trade-offs, and describe a complete system design that realizes this vision in production environments. 
+
+3 Layer-wise Replication 
+
+Inspired by the concept of instance-level data parallelism (DP), we explore its application at a finer granularity. Specifically, we adopt layer-wise replication as a fine-grained augmentation for Transformer layers (also referred to as blocks) to implement layer-wise DP [ 17 , 41 ]. Unlike instance-level scaling, which treats the entire model as an indivisible unit, layer-wise replication selectively duplicates a subset of layers onto available devices. This section describes the replication mechanism and the optimized data transfer protocols that make it practical. 
+
+3.1 Replication Mechanism 
+
+As illustrated in Figure 3, by replicating the weights and KV caches of selected layers onto available devices, the system creates layer replicas. This enables a more precise workload distribution where  
+
+> ACM Trans. Arch. Code Optim., Vol. 1, No. 1, Article 1. Publication date: January 2026. CoCoScale: Leveraging Layer-wise Scaling to Unlock the Potential of Online LLM Serving 1:5
+
+a batch size (bs) of 15 requests is split into sub-batches of 7 and 8. These sub-batches are processed concurrently by the original layers and their replicas, with results merged after completing the parallel blocks. This approach establishes the foundation for layer-wise DP, where the resulting speedup and communication overhead are determined by the number of involved layers ( 𝑁 ) and the degree of parallelism ( 𝑃 ). replica 
+
+layer 
+
+replica 
+
+layer layer layer    
+
+> bs=15
+> bs=8
+> bs=7 bs=7 bs=7
+> bs=8 bs=8
+> bs=15
+> Fig. 3. Illustration of the replication for decoder layers. Yellow blocks represent the layers deployed on the main device, while green blocks represent replicas deployed on another device.
+
+To minimize runtime communication overhead, we treat multiple consecutive layers as a mono-lithic unit for replication. As illustrated by the gray shaded area in Figure 3, this coarse-grained strategy ensures that intermediate activations generated by replicas remain resident in local mem-ory. Consequently, cross-device transfers are confined exclusively to the segment boundaries, making the transmission overhead fixed relative to the replicated layer count 𝑁 . Given this design of mutually independent replicas, we are able to enable the static graph execution mode for these replicas, as described in Section 5.2. At the input boundary, the host device scatters the incoming batch into sub-batches according to the parallelism degree 𝑃 . Each replica independently processes its assigned sub-batch through the 𝑁 consecutive layers without any inter-device synchronization. At the output boundary, the partial results from all replicas are gathered back to the host device and concatenated along the batch dimension to reconstruct the full output tensor. This scatter-gather pattern requires exactly two communication rounds per forward pass, regardless of the number of replicated layers, which keeps the communication overhead predictable and bounded. For the KV cache, each replica maintains its own partition corresponding to the sub-batch it processes. During autoregressive decoding, new key-value entries are appended locally on each device without cross-device coherence traffic. This partitioned design avoids the synchronization overhead that would arise from maintaining a globally consistent cache. When the parallelism configuration changes (e.g., increasing 𝑃 from 2 to 4), the existing cache entries must be redistributed to match the new sub-batch assignment. This redistribution is performed as part of the configuration transition protocol, leveraging the same chunked transfer mechanism described in Section 3.2 to overlap cache migration with ongoing decoding steps. 
+
+3.2 Optimized Data Transfer 
+
+To minimize the setup latency during replica creation, it is essential to maximize the utilization of P2P network bandwidth when transferring weights and the KV Cache. As shown in Figure 4(a), in the absence of full duplex communication (e.g., NVLink), standard data transfer schemes typically employ a single source multicast approach. This sequential execution creates a significant performance bottleneck where the total transmission time grows linearly with the number of GPUs. Furthermore, the prolonged transmission of dynamic KV Cache data often overlaps with 
+
+> ACM Trans. Arch. Code Optim., Vol. 1, No. 1, Article 1. Publication date: January 2026.
+
+1:6 Wu et al. 
+
+the subsequent forward pass. This conflict forces the system to abort and resend incomplete data, resulting in unpredictable scaling delays. GPU#0 GPU#1                                                                                                                                            
+
+> GPU#2 GPU#3
+> GPU#0 GPU#1
+> GPU#2 GPU#3
+> ①
+> ③②
+> ②
+> ①
+> ③
+> ②
+> ③①
+> Multicast to GPUs
+> Time
+> ①L1
+> Weight
+> ①L2
+> Weight
+> ②L3 Weight ②L4 Weight
+> ③L5 Weight ③L6 Weight
+> ②L3
+> Weight
+> ②L4
+> Weight
+> ①L1 Weight ①L2 Weight
+> ③L5 Weight ③L6 Weight
+> ③L5
+> Weight
+> ③L6
+> Weight
+> ①L1 Weight ①L2 Weight
+> ②L3 Weight ②L4 Weight
+> L1 FWD L2 FWD L3 FWD L4 FWD L5 FWD L6 FWD
+> L1 Weight L2 Weight L3 Weight L4 Weight L5 Weight L6 Weight
+> L1 FWD L2 FWD L3 FWD L4 FWD L5 FWD L6 FWD …L3 FWD
+> Time
+> Multicast
+> L1 KV Cache
+> Multicast
+> L2 KV Cache
+> Multicast
+> L3 KV Cache
+> Next FWD
+> Resend L3 KV Cache
+> ①Part#1 L2
+> KV Cache
+> ①Part#2 L2
+> KV Cache
+> ②Part#3 L2 ②Part#4 L2
+> ③Part#5 L2 ③Part#6 L2
+> ②Part#3 L2
+> KV Cache
+> ②Part#4 L2
+> KV Cache
+> ①Part#1 L2 ①Part#2 L2
+> ③Part#5 L2 ③Part#6 L2
+> ③Part#5 L2
+> KV Cache
+> ③Part#6 L2
+> KV Cache
+> ①Part#1 L2 ①Part#2 L2
+> ②Part#3 L2 ②Part#4 L2
+> Save Time
+> L1 FWD L2 FWD L3 FWD L4 FWD L5 FWD L6 FWD …L3 FWD
+> L1 KV
+> Cache
+> L2 KV
+> Cache
+> L3 KV
+> Cache
+> L4 KV
+> Cache
+> L5 KV
+> Cache No Resend
+> Multicast L2 KV Cache
+> P2P Transmission
+
+(a) 
+
+(b)  
+
+> Save Time
+
+Fig. 4. Comparison of data transfer strategies. (a) Single-source multicast causes linear delay and “Resend” conflicts. (b) CoCoScale utilizes a Scatter-then-Exchange ring topology. Numbered arrows denote concurrent transmission phases of different chunks utilizing full-duplex bandwidth. 
+
+To maximize bandwidth utilization, we design a bidirectional chunked multicast mechanism based on a ring topology [ 6 , 23 ]. As illustrated in the weight transfer flow of Figure 4(b), we employ a Scatter-then-Exchange strategy. The source GPU first partitions the weights and scatters distinct segments to different neighbors simultaneously. These segments then circulate across the ring in both clockwise and counter-clockwise directions, leveraging the full-duplex capabilities of NVLink to significantly reduce the broadcasting latency compared to sequential unicast. For dynamic KV Cache states, we adopt a fine-grained chunked transfer strategy to ensure timing precision. As depicted by the blocks (e.g., Part#1 through Part#6) in Figure 4(b), the KV cache is par-titioned and transmitted via parallel streams. This fine granularity allows data transfer to fit strictly within the narrow inter-token intervals. By masking communication behind computation, this design effectively prevents the temporal overlap conflicts with the next forward pass, eliminating the need for costly data resending. 
+
+4 Modeling and Scaling Algorithm 
+
+The acceleration capability of layer-wise DP constitutes the core of our fine-grained scaling mech-anism. In this section, we first conduct systematic ablation studies to evaluate the sensitivity of inference performance to varying layer counts ( 𝑁 ) and parallelism degrees ( 𝑃 ). Guided by these empirical insights, we then establish a formal modeling framework that captures the speedup and communication overhead of layer-wise DP. Finally, we present a unified scaling algorithm that leverages this analytical model to determine optimal configurations in real time. 
+
+4.1 Ablation Study of Layer-wise DP 
+
+To analyze the performance characteristics and overhead of layer-wise DP, we denote the number of consecutive layers replicated as 𝑁 , and the degree of parallelism as 𝑃 , which together define a non-integer speedup ratio. For instance, in a 60-layer Qwen-32B model, a configuration of 𝑁 = 20 
+
+and 𝑃 = 2 can theoretically achieve a speedup approaching 120%, offering a significant performance boost even when full instance-level scaling is infeasible. 
+
+ACM Trans. Arch. Code Optim., Vol. 1, No. 1, Article 1. Publication date: January 2026. CoCoScale: Leveraging Layer-wise Scaling to Unlock the Potential of Online LLM Serving 1:7 
+
+To explore the marginal benefits of 𝑁 and 𝑃 , we conducted ablation studies under various Requests Per Second (RPS) on four NVIDIA H20 GPUs using the Qwen-32B model. We investigated the impact of varying 𝑁 while maintaining a constant 𝑃 . We used vLLM [ 14 ] as the baseline and evaluated performance on the Alpaca dataset [ 28 ] (with a fixed input length of 1k tokens and output length of 64 tokens), adopting end-to-end latency as the primary performance metric. 5.0 7.5 10.0 12.5 15.0 17.5 20.0 22.5 25.0 
+
+Request Per Second 
+
+> 15
+> 20
+> 25
+> 30
+> Latency (s)
+> Baseline
+> N=10, P=2
+> N=20, P=2
+> N=30, P=2
+> N=40, P=2
+
+(a) End-to-end Latency with varying 𝑁 (P=2) 5.0 7.5 10.0 12.5 15.0 17.5 20.0 22.5 25.0 
+
+Request Per Second  
+
+> 15
+> 20
+> 25
+> 30
+> Latency (s)
+> Baseline
+> N=10, P=4
+> N=20, P=4
+> N=30, P=4
+> N=40, P=4
+
+(b) End-to-end Latency with varying 𝑁 (P=4) Fig. 5. Performance analysis of different number of continuous replicas and parallelism under varying request rates. 
+
+Effect of Layer Count 𝑁 . With parallelism fixed at 𝑃 = 2, as 𝑁 increases from 10 to 40, the minimum improvement rises from 4.3% to 12.4%, and the maximum improvement from 15.4% to 38.7%. Similarly, at 𝑃 = 4, the minimum improvement increases from 11.3% to 32.7%, while the maximum grows from 33.51% to 51.2%. This indicates that at a fixed parallelism level, increasing 
+
+𝑁 to cover more Transformer layers significantly reduces computational latency. However, as 𝑁 
+
+continues to grow, the gap between performance curves narrows, exhibiting a phenomenon of diminishing marginal returns. This suggests that the residual components, specifically those that cannot be parallelized or require redundant computation, gradually emerge as bottlenecks, limiting further performance gains. 
+
+Effect of Parallelism 𝑃 . Increasing 𝑃 enhances the system’s throughput under high concurrency but introduces substantial cross-device communication overhead. For example, with 𝑁 = 20 , the theoretical maximum speedups for 𝑃 = 2 and 𝑃 = 4 are 33% and 100%, respectively. However, empirical results show maximum gains of only 29.3% and 40.4%. This discrepancy highlights that as 𝑃 increases, the latency overhead from device synchronization and data exchange constitutes a growing proportion of total execution time, thereby diluting the benefits of fine-grained data parallelism. To visualize the joint effect of 𝑁 and 𝑃 , Figure 6 presents 3D surface plots of end-to-end latency under two representative load levels. At low concurrency (RPS=5), the latency surface is relatively flat: moderate values of 𝑁 and 𝑃 already bring the system close to its performance ceiling, and further increases yield marginal gains. In contrast, at high concurrency (RPS=25), the surface exhibits a pronounced valley where larger 𝑁 and moderate 𝑃 jointly reduce latency. Beyond this valley, however, increasing 𝑃 further provides diminishing returns as communication overhead grows. Notably, the optimal operating region shifts with load intensity, underscoring the need for an adaptive strategy that continuously adjusts both 𝑁 and 𝑃 in response to workload dynamics. These empirical observations validate the effectiveness of layer-wise parallelism, serving as the cornerstone for our proposed scaling mechanism. Furthermore, compared to model-level parallelism, layer-wise parallelism introduces the number of layers as a new dimension. This flexibility offers a 
+
+> ACM Trans. Arch. Code Optim., Vol. 1, No. 1, Article 1. Publication date: January 2026.
+
+1:8 Wu et al. 10 
+
+> 15
+> 20
+> 25
+> 30
+> 35
+> 40
+> 45
+> 50
+> Number of Layers
+> 1
+> 2
+> 3
+> 4
+> Parallelism
+> 14
+> 16
+> 18
+> 20
+> 22
+> 24
+> Latency (s)
+> 14
+> 16
+> 18
+> 20
+> 22
+> 24
+
+(a) Low-concurrency (RPS=5) 10  
+
+> 15
+> 20
+> 25
+> 30
+> 35
+> 40
+> 45
+> 50
+> Number of Layers
+> 1
+> 2
+> 3
+> 4
+> Parallelism
+> 20
+> 22
+> 24
+> 26
+> 28
+> 30
+> Latency (s)
+> 20
+> 22
+> 24
+> 26
+> 28
+> 30
+
+(b) High-concurrency (RPS=25) Fig. 6. 3D surface plots of end-to-end latency as a function of layer count 𝑁 and parallelism 𝑃 under two representative load levels. 
+
+broader configuration space, liberating the system from rigid integer-level parallelism constraints. However, this increased flexibility also introduces complexity in decision-making. Consequently, we next introduce a formal model to analyze the speedup ratios and communication overheads across these diverse granularity configurations. 
+
+4.2 Cost and Speedup Modeling 
+
+To systematically generalize the empirical findings from our ablation studies and provide a rigor-ous basis for system optimization, this subsection establishes a formal modeling framework. We structure the analysis by decomposing the total latency into computation and communication components, followed by deriving the speedup ratio based on an adaptation of Amdahl’s Law. While the classical formulation defines speedup as 𝑆 (𝑎, 𝑝 ) = 1 
+
+> (1−𝑎 )+ 𝑎 𝑝
+
+(where 𝑎 represents the parallelizable fraction and 𝑝 denotes the speedup factor), our model extends this framework to quantify the specific trade-offs between the replicated layer count ( 𝑁 ) and parallelism degree ( 𝑃 ) in LLM serving. 
+
+Assumptions and Symbol Definitions. To establish a formal framework, we define 𝐿 as the total number of layers in the model. A replica configuration is characterized by 𝑁 , the number of consecutive layers selected for replication, and 𝑃 , the degree of parallelism applied to these layers. Let 𝑑 ℎ𝑖𝑑𝑑𝑒𝑛 denote the hidden dimension, 𝑏𝑠 the batch size, and 𝐵 the interconnect bandwidth. We assume a homogeneous cluster environment where compute capacity 𝑡 𝑐𝑜𝑚𝑝 per layer and bandwidth 𝐵 are uniform across all devices. Additionally, we assume that sub batches are equally distributed among all replicas. 
+
+Cost Modeling. The deployment of a configuration (𝑁 , 𝑃 ) is physically constrained by the memory capacity and floating-point throughput of each participating device. It is important to clarify that a configuration of parallelism 𝑃 implies the cluster utilizes 𝑃 devices in total (1 host plus 𝑃 − 1 replicas) to process the 𝑁 layers. For modern LLMs employing SwiGLU structures (e.g., Qwen), the per-device resource consumption is modeled as follows. The value of 𝑙 varies between inference phases, corresponding to the prompt length during the prefill stage and a single token (𝑙 = 1) during the decoding stage [ 13 , 24 ]. Let 𝜅 denote the parameter storage coefficient (typically 2 
+
+ACM Trans. Arch. Code Optim., Vol. 1, No. 1, Article 1. Publication date: January 2026. CoCoScale: Leveraging Layer-wise Scaling to Unlock the Potential of Online LLM Serving 1:9 
+
+bytes for FP16). The memory cost 𝐶 𝑚𝑒𝑚 and computational load 𝐶 𝑐𝑜𝑚𝑝 required for a single device are approximated as: 
+
+𝐶 𝑚𝑒𝑚 (𝑁 , 𝑃 ) ≈ 𝑁 · 𝜅 · ( 12 𝑑 2 
+
+> ℎ𝑖𝑑𝑑𝑒𝑛
+
++ 𝑏𝑠 𝑃 · 𝑙 · 𝑑 ℎ𝑖𝑑𝑑𝑒𝑛 ), (1) 
+
+𝐶 𝑐𝑜𝑚𝑝 (𝑁 , 𝑃 ) ≈ 𝑁 𝑃 · 24 · 𝑏𝑠 · 𝑙 · 𝑑 2 
+
+> ℎ𝑖𝑑𝑑𝑒𝑛
+
+. (2) This formulation reflects the mechanics of layer-wise replication: while the static weight memory per device remains constant (each replica holds a full copy), the dynamic activation memory and computational load are amortized by the total parallelism degree 𝑃 .
+
+Speedup Modeling. Based on the resource overhead, we quantify the trade-offs between the replicated layer count 𝑁 and parallelism 𝑃 . Let 𝐿 be the total number of layers and 𝑡 𝑐𝑜𝑚𝑝 the computation time per layer. The total inference latency is defined as the sum of the computation cost 𝑊 (𝑁 , 𝑃 ) and the communication overhead 𝑇 (𝑃 ):Latency (𝑁 , 𝑃 ) = 𝑊 (𝑁 , 𝑃 ) + 𝑇 (𝑃 ). (3) First, we explicitly model the computation overhead 𝑊 (𝑁 , 𝑃 ). The 𝐿 − 𝑁 layers execute sequen-tially on the main device, while the 𝑁 replicated layers are accelerated by parallelism 𝑃 . Thus, the accumulated computation load is: 
+
+𝑊 (𝑁 , 𝑃 ) = (𝐿 − 𝑁 ) · 𝑡 𝑐𝑜𝑚𝑝 + 𝑁 · 𝑡 𝑐𝑜𝑚𝑝 
+
+𝑃 . (4) Next, we analyze the communication overhead 𝑇 (𝑃 ). A key advantage of CoCoScale is that 
+
+𝑇 (𝑃 ) remains decoupled from the number of layers 𝑁 , as communication occurs exclusively at the boundaries. We model the communication cost based on bandwidth 𝐵 . Let 𝑙 denote the sequence length, 𝑑 ℎ𝑖𝑑𝑑𝑒𝑛 the hidden dimension, and 𝑏𝑠 the batch size. The latency is approximated as: 
+
+𝑇 (𝑃 ) ≈ 2 · 𝑏𝑠 /𝑃 · ( 𝑃 − 1) · 𝑙 · 𝑑 ℎ𝑖𝑑𝑑𝑒𝑛 
+
+𝐵 . (5) Here, the term 𝑏𝑠 /𝑃 · ( 𝑃 − 1) denotes the fraction of the batch data offloaded in a scatter-gather operation, and the factor of 2 accounts for the bidirectional data transfer. Although these phase-dependent variations also influence the per-layer computation time 𝑡 𝑐𝑜𝑚𝑝 , they do not affect the relative speedup ratio calculation within a single token generation step. Finally, to provide an intuitive metric for performance gains, we define the speedup ratio 𝑆 (𝑁 , 𝑃 )
+
+as the sequential latency divided by the latency under the scaling strategy: 
+
+𝑆 (𝑁 , 𝑃 ) = 𝐿 · 𝑡 𝑐𝑜𝑚𝑝 
+
+(𝐿 − 𝑁 )𝑡 𝑐𝑜𝑚𝑝 + 𝑁 𝑃 𝑡 𝑐𝑜𝑚𝑝 + 𝑇 (𝑃 ) . (6) By introducing the replicated fraction 𝛼 (𝑁 ) = 𝑁 /𝐿 and the relative communication cost ratio 
+
+𝛽 (𝑃 ) = 𝑇 (𝑃 )/( 𝐿 · 𝑡 𝑐𝑜𝑚𝑝 ), the formulation can be simplified to reveal the governing dynamics: 
+
+𝑆 (𝑁 , 𝑃 ) = 11 − 𝛼 (𝑁 ) + 𝛼 (𝑁 ) 
+
+> 𝑃
+
++ 𝛽 (𝑃 ) . (7) This model mathematically validates our design intuition: the speedup is positively correlated with the replicated fraction 𝛼 (𝑁 ) and parallelism 𝑃 , yet remains strictly bounded by the fixed communication penalty 𝛽 (𝑃 ). Crucially, this model confirms that the “diminishing returns” observed in Section 4.1 arise as 𝛼 (𝑁 ) → 1, where the fixed communication cost 𝛽 (𝑃 ) starts to dominate the execution time. As an analytical approximation fitted from empirical observations, the model does not aim for cycle-accurate latency prediction. Rather, its value lies in preserving the relative ordering of candidate configurations: the predicted speedup trends are consistent with the distributions  
+
+> ACM Trans. Arch. Code Optim., Vol. 1, No. 1, Article 1. Publication date: January 2026. 1:10 Wu et al.
+
+observed in the ablation studies. This monotonicity property is sufficient for the scaling algorithm in Section 4.4, where the controller ranks configurations rather than predicting absolute latencies. 
+
+Generalization to Heterogeneous Environments. The simplified model above assumes a homogeneous cluster and perfectly divisible workloads. However, practical deployments often face two sources of heterogeneity: hardware variability (mixed GPU generations [ 15 ]) and discrete workload quantization (batch sizes not perfectly divisible by parallelism). To handle these scenarios, we generalize the framework using a configuration vector v ∈ Z𝐿 , where the scalar 𝑣 (𝑙 ) denotes the parallelism degree for the 𝑙 -th layer. This vector representation captures per-layer heterogeneity and serves as the formal state descriptor for the scaling algorithm presented in Section 4.4. We define D (𝑙 ) as the set of devices assigned to execute layer 𝑙 , with cardinality |D (𝑙 ) | = 𝑣 (𝑙 ) .When 𝑏𝑠 is not a multiple of 𝑣 (𝑙 ) , the load distribution becomes uneven: the device with the heaviest load processes ⌈𝑏𝑠 /𝑣 (𝑙 ) ⌉ tokens, while others process ⌊𝑏𝑠 /𝑣 (𝑙 ) ⌋. This quantization error introduces a “straggler effect” that is amplified when combined with hardware heterogeneity. Let 𝑡 (𝑘 ) 
+
+> 𝑐𝑜𝑚𝑝
+
+denote the computation time for device 𝑑 𝑘 to process a full batch of size 𝑏𝑠 for a single layer. The generalized computation overhead is the summation of the bottleneck latency across all layers: 
+
+𝑊 (v) =
+
+> 𝐿
+
+∑︁ 
+
+> 𝑙 =1
+
+max    
+
+> 𝑘 ∈ D (𝑙 )
+
+
+
+𝑡 (𝑘 ) 
+
+> 𝑐𝑜𝑚𝑝
+
+· ⌈𝑏𝑠 /𝑣 (𝑙 ) ⌉
+
+𝑏𝑠 
+
+
+
+. (8) For communication, the transmission rate is bottlenecked by the link with the minimum band-width, 𝐵 𝑚𝑖𝑛 = min 𝑘 𝐵 (𝑘 ) . Communication occurs at the indices 𝑙 where the parallelism degree changes (i.e., 𝑣 (𝑙 ) ≠ 𝑣 (𝑙 +1) ). The generalized communication cost accounts for the maximum transfer volume required at each transition: 
+
+𝑇 (v) ≈ ∑︁  
+
+> 𝑙 ∈Transitions
+
+2 · ⌈𝑏𝑠 · 𝑣 (𝑙 ) −1   
+
+> 𝑣 (𝑙 )
+
+⌉ · 𝑑 ℎ𝑖𝑑𝑑𝑒𝑛 
+
+𝐵 𝑚𝑖𝑛 
+
+. (9) The generalized speedup ratio is thus: 
+
+𝑆 (v) =
+
+Í𝐿 𝑙 =1 𝑡 (ℎ𝑜𝑠𝑡 )
+
+> 𝑐𝑜𝑚𝑝
+
+𝑊 (v) + 𝑇 (v) . (10) This unified model allows CoCoScale to detect subtle performance degradations caused by integer quantization artifacts (e.g., when 𝑏𝑠 = 1 and 𝑣 (𝑙 ) > 1, speedup is impossible as ⌈1/𝑃 ⌉ = 1) and hardware variance, ensuring that the selected strategy v is physically optimal rather than just theoretically ideal. 
+
+4.3 Initialization Phase 
+
+To maximize cluster-wide throughput from the outset, CoCoScale must first solve a static global placement problem: given a set of model instances I competing for cluster resources and a pool of underutilized devices, determine the optimal initial layer-wise replication configuration for each instance. We formulate this allocation challenge as a variant of the Multi-Knapsack Problem (MKP), where instances function as utility-generating items and cold devices serve as capacity-constrained knapsacks. Since MKP is NP-hard and exact solutions are impractical for online service bootstrap, CoCoScale employs a Priority-based Greedy Heuristic (Algorithm 1). The initialization phase proceeds through three sequential steps: 
+
+Cold Resource Harvesting. The Monitor component periodically profiles cluster-wide resource utilization via the NVML interface and identifies underutilized devices suitable for repurposing. We define Load (𝑑 ) as the GPU compute utilization of device 𝑑 , and introduce a configurable safety threshold 𝜏 𝑖𝑑𝑙𝑒 (empirically set to 70%). Devices are classified as “low-load” candidates and admitted  
+
+> ACM Trans. Arch. Code Optim., Vol. 1, No. 1, Article 1. Publication date: January 2026. CoCoScale: Leveraging Layer-wise Scaling to Unlock the Potential of Online LLM Serving 1:11
+
+Algorithm 1 Initialization: Global Placement  
+
+> 1:
+
+Input: Instances I, Devices D, Current Load L𝑐𝑢𝑟𝑟 , Speedup Model M. 
+
+> 2:
+
+Output: Placement Plan P. 
+
+> 3:
+
+D𝑝𝑜𝑜𝑙 ← { 𝑑 ∈ D | Load (𝑑 ) < 𝜏 𝑖𝑑𝑙𝑒 } 
+
+> 4:
+
+for each instance 𝐼 𝑘 ∈ I do  
+
+> 5:
+
+Priority 𝑘 ← L 𝑐𝑢𝑟𝑟,𝑘 − Capacity (𝐼 𝑘 ) 
+
+> 6:
+
+end for  
+
+> 7:
+
+I𝑠𝑜𝑟𝑡𝑒𝑑 ← Sort (I , descending by Priority ) 
+
+> 8:
+
+P ← ∅  
+
+> 9:
+
+for each 𝐼 𝑘 ∈ I 𝑠𝑜𝑟𝑡𝑒𝑑 do  
+
+> 10:
+
+C𝑓 𝑒𝑎𝑠 ← ∅  
+
+> 11:
+
+for each candidate (𝑁 , 𝑃 ) with 1 ≤ 𝑁 ≤ 𝐿 , 2 ≤ 𝑃 ≤ 𝑃 𝑚𝑎𝑥 do  
+
+> 12:
+
+𝐶 𝑟𝑒𝑞 ← 𝐶 𝑚𝑒𝑚 (𝑁 , 𝑃 ) // per-device memory from Eq. (1)  
+
+> 13:
+
+D𝑐𝑎𝑛𝑑 ← { 𝑑 ∈ D 𝑝𝑜𝑜𝑙 | 𝑑. free_mem ≥ 𝐶 𝑟𝑒𝑞 } 
+
+> 14:
+
+if |D 𝑐𝑎𝑛𝑑 | ≥ 𝑃 − 1 then  
+
+> 15:
+
+Select any D𝑠𝑢𝑏 ⊆ D 𝑐𝑎𝑛𝑑 with |D 𝑠𝑢𝑏 | = 𝑃 − 1 
+
+> 16:
+
+C𝑓 𝑒𝑎𝑠 ← C 𝑓 𝑒𝑎𝑠 ∪ {( 𝑁 , 𝑃, D𝑠𝑢𝑏 )}  
+
+> 17:
+
+end if  
+
+> 18:
+
+end for  
+
+> 19:
+
+if C𝑓 𝑒𝑎𝑠 ≠ ∅ then  
+
+> 20:
+
+(𝑁 ∗, 𝑃 ∗, D∗ 
+
+> 𝑠𝑢𝑏
+
+) ← argmax (𝑁 ,𝑃, D𝑠𝑢𝑏 ) ∈ C 𝑓 𝑒𝑎𝑠 𝑆 (𝑁 , 𝑃 ) 
+
+> 21:
+
+P ← P ∪ {( 𝐼 𝑘 , 𝑁 ∗, 𝑃 ∗, D∗ 
+
+> 𝑠𝑢𝑏
+
+)}  
+
+> 22:
+
+D𝑝𝑜𝑜𝑙 ← D 𝑝𝑜𝑜𝑙 \ D ∗ 
+
+> 𝑠𝑢𝑏
+> 23:
+
+end if  
+
+> 24:
+
+end for  
+
+> 25:
+
+return P
+
+to the dynamic pool D𝑝𝑜𝑜𝑙 only if Load (𝑑 ) < 𝜏 𝑖𝑑𝑙𝑒 . This filtering mechanism serves as a primary safety valve, ensuring that resource borrowing remains a non-intrusive supplement rather than disrupting existing workloads. 
+
+Instance Prioritization. Given the finite capacity of D𝑝𝑜𝑜𝑙 , prioritizing critical bottlenecks is essential. We define Capacity (𝐼 𝑘 ) as the maximum request throughput (RPS) that instance 𝐼 𝑘 can sustain under its current configuration while adhering to the SLO bound. This value is derived from the speedup model in Section 4.2: for a configuration (𝑁 , 𝑃 ), the speedup ratio 𝑆 (𝑁 , 𝑃 ) in Equation (7) determines the latency reduction relative to the sequential baseline. By combining this with the SLO constraint and an empirical latency–load relationship (obtained via offline profiling), we compute the maximum sustainable load for each instance. The priority score is: Priority 𝑘 = L𝑐𝑢𝑟𝑟,𝑘 − Capacity (𝐼 𝑘 ) (11) which quantifies the capacity gap —the excess load beyond the instance’s current serving capability. Sorting instances by descending priority transforms the allocation problem into a sequential decision process, ensuring that instances facing the most acute risk of SLO violation are addressed first. 
+
+Greedy Allocation and Search Space Tractability. For each high-priority instance, the algorithm searches for the configuration (𝑁 ∗, 𝑃 ∗) that maximizes the speedup ratio 𝑆 (𝑁 , 𝑃 ) subject to the physical memory limits of candidate devices. A natural concern is that Line 14 of Algorithm 1 appears to require searching all subsets D𝑠𝑢𝑏 ⊆ D 𝑝𝑜𝑜𝑙 , which would incur exponential complexity  
+
+> ACM Trans. Arch. Code Optim., Vol. 1, No. 1, Article 1. Publication date: January 2026. 1:12 Wu et al.
+
+in |D 𝑝𝑜𝑜𝑙 |. However, under the homogeneous cluster assumption in Section 4.2, the speedup 𝑆 (𝑁 , 𝑃 )
+
+depends only on the tuple (𝑁 , 𝑃 ), not on the specific identity of replica devices. Consequently, the search decomposes into two tractable stages: (1) Configuration enumeration. The algorithm enumerates all (𝑁 , 𝑃 ) pairs where 1 ≤ 𝑁 ≤ 𝐿 and 
+
+2 ≤ 𝑃 ≤ 𝑃 𝑚𝑎𝑥 . This space contains at most 𝐿 × 𝑃 𝑚𝑎𝑥 candidates—for example, only 256 entries for the Qwen-32B model with 𝐿 = 64 and 𝑃 𝑚𝑎𝑥 = 4—identical in size to the search space analyzed in Section 4.4. (2) Device feasibility check. For each candidate, the per-device memory requirement is given by 𝐶 𝑚𝑒𝑚 (𝑁 , 𝑃 ) in Equation (1) . The configuration is feasible if D𝑝𝑜𝑜𝑙 contains at least 𝑃 − 1
+
+devices each satisfying 𝑑. free_mem ≥ 𝐶 𝑚𝑒𝑚 (𝑁 , 𝑃 ). The device selection is then deterministic: any qualifying subset of size 𝑃 − 1 suffices, and CoCoScale greedily selects devices with the largest idle memory to minimize fragmentation. This two-step procedure reduces the complexity from exponential in |D 𝑝𝑜𝑜𝑙 | to 𝑂  |I| · 𝐿 · 𝑃 𝑚𝑎𝑥 ·|D 𝑝𝑜𝑜𝑙 |. Evaluating each candidate requires only constant-time arithmetic (computing 𝐶 𝑚𝑒𝑚 and 
+
+𝑆 ) plus a linear scan of D𝑝𝑜𝑜𝑙 , making the per-instance decision latency negligible compared to the service bootstrap interval. The algorithm iteratively assigns the best feasible configuration to each instance, removes the allocated devices from D𝑝𝑜𝑜𝑙 , and proceeds to the next instance in the sorted order. Although this greedy strategy does not guarantee a global mathematical optimum, it efficiently approximates the optimal solution and is computationally practical for online serving. In summary, the initialization phase transforms idle cluster resources into scalable replica sets, boosting global system performance while establishing a robust foundation for the dynamic scaling phase described in Section 4.4. 
+
+4.4 Scaling Algorithm 
+
+To strictly enforce SLOs while minimizing reconfiguration overhead, we propose a unified layer-wise scaling algorithm (Algorithm 2). Unlike traditional strategies that decouple scale-up and scale-down logic, CoCoScale unifies these operations by treating any significant latency deviation as a trigger for state transition. The Controller continuously monitors the normalized latency deviation |𝐼 .𝑙𝑎𝑡𝑒𝑛𝑐𝑦 − 𝑆𝐿𝑂 |/ 𝑆𝐿𝑂 . When this deviation exceeds a tolerance threshold 𝛿 , the system initiates a search for the “nearest” valid configuration. This approach ensures that whether the system is under-performing (requiring scale-up) or over-provisioned (requiring scale-down), the adjustment target is always to return to the SLO compliance boundary with the minimal necessary operational cost. Using the configuration vector v defined in Section 4.2, we can precisely quantify the “distance” between configurations and preserve layer-specific state information. While the tuple (𝑁 , 𝑃 ) used in the simplified model summarizes the resource count, it is merely a subset of the information contained in v (e.g., a configuration v = [1, 1, 𝑃, . . . , 𝑃 
+
+| {z }
+
+> 𝑁
+
+, . . . , 1]⊤ corresponds to specific layers being replicated). We define the transition cost between the current state v𝑐𝑢𝑟𝑟 and a target state v𝑛𝑒𝑤 
+
+using the L1 norm distance: Dist (v𝑐𝑢𝑟𝑟 , v𝑛𝑒𝑤 ) = ∥v𝑛𝑒𝑤 − v𝑐𝑢𝑟𝑟 ∥1. This metric linearly maps to the data migration overhead, ensuring that the scheduler distinguishes between low-cost adjustments (e.g., extending replication to adjacent layers) and high-cost global reconfigurations. The scaling process begins by calculating a target speedup ratio 𝛼 𝑟𝑒𝑞 based on the instance’s current speedup and its latency deviation. The system then filters the search space for all candidate vectors v𝑐𝑎𝑛𝑑 that satisfy the theoretical speedup requirement 𝑆 (v𝑐𝑎𝑛𝑑 ) ≥ 𝛼 𝑟𝑒𝑞 . Crucially, instead of selecting the candidate with the absolute lowest cost, the algorithm sorts candidates by their transition distance Dist (v𝑐𝑢𝑟𝑟 , v𝑐𝑎𝑛𝑑 ) in ascending order. This optimization strategy prioritizes  
+
+> ACM Trans. Arch. Code Optim., Vol. 1, No. 1, Article 1. Publication date: January 2026. CoCoScale: Leveraging Layer-wise Scaling to Unlock the Potential of Online LLM Serving 1:13
+
+Algorithm 2 Unified Layer-wise Scaling  
+
+> 1:
+
+Input: Instances I, Cold Devices D𝑐𝑜𝑙𝑑 , 𝑆𝐿𝑂 ,Tolerance 𝛿 . 
+
+> 2:
+
+while True do  
+
+> 3:
+
+I𝑠𝑐𝑎𝑙𝑒 ← { 𝐼 ∈ I | | 𝐼 .𝑙𝑎𝑡𝑒𝑛𝑐𝑦 − 𝑆𝐿𝑂 |/ 𝑆𝐿𝑂 > 𝛿 } 
+
+> 4:
+
+for 𝐼 𝑘 ∈ I 𝑠𝑐𝑎𝑙𝑒 do  
+
+> 5:
+
+𝑆 𝑐𝑢𝑟𝑟 ← 𝑆 (𝐼 𝑘 .𝑁 , 𝐼 𝑘 .𝑃 ) 
+
+> 6:
+
+𝛼 𝑟𝑒𝑞 ← 𝑆 𝑐𝑢𝑟𝑟 · ( 𝐼 𝑘 .𝑙𝑎𝑡𝑒𝑛𝑐𝑦 /𝑆𝐿𝑂 ) 
+
+> 7:
+
+C𝑐𝑎𝑛𝑑 ← {( 𝑁 , 𝑃 ) | 𝑆 (𝑁 , 𝑃 ) ≥ 𝛼 𝑟𝑒𝑞 } 
+
+> 8:
+
+Sort C𝑐𝑎𝑛𝑑 by Dist (( 𝐼 𝑘 .𝑁 , 𝐼 𝑘 .𝑃 ), (𝑁 , 𝑃 ))  
+
+> 9:
+
+𝑢𝑝𝑑𝑎𝑡𝑒𝑑 ← False  
+
+> 10:
+
+for (𝑁 ∗, 𝑃 ∗) ∈ C 𝑐𝑎𝑛𝑑 do  
+
+> 11:
+
+Δ𝑟𝑒𝑠 ← Cost (𝑁 ∗, 𝑃 ∗) − Cost (𝐼 𝑘 .𝑁 , 𝐼 𝑘 .𝑃 ) 
+
+> 12:
+
+if Δ𝑟𝑒𝑠 ≤ 0 or D𝑐𝑜𝑙𝑑 .𝑐𝑎𝑝𝑎𝑐𝑖𝑡𝑦 ≥ Δ𝑟𝑒𝑠 then  
+
+> 13:
+
+UpdateResource (D 𝑐𝑜𝑙𝑑 , −Δ𝑟𝑒𝑠 ) 
+
+> 14:
+
+𝐼 𝑘 .config ← ( 𝑁 ∗, 𝑃 ∗) 
+
+> 15:
+
+𝑢𝑝𝑑𝑎𝑡𝑒𝑑 ← True ; break  
+
+> 16:
+
+end if  
+
+> 17:
+
+end for  
+
+> 18:
+
+if 𝐼 𝑘 .𝑙𝑎𝑡𝑒𝑛𝑐𝑦 > 𝑆𝐿𝑂 and not 𝑢𝑝𝑑𝑎𝑡𝑒𝑑 then  
+
+> 19:
+
+TriggerInstanceScale (𝐼 𝑘 ) 
+
+> 20:
+
+end if  
+
+> 21:
+
+end for  
+
+> 22:
+
+Wait for next interval  
+
+> 23:
+
+end while 
+
+stability, guiding the system to select the configuration that meets the SLO while introducing the least perturbation to the running inference service. Finally, the feasibility of the optimal candidate is verified against the available resources in the cluster. We calculate the resource differential Δ𝑟𝑒𝑠 between the new and current vectors. This unifies the execution logic: if Δ𝑟𝑒𝑠 ≤ 0 (Scale Down), the transition is automatically approved, and surplus resources are returned to the cold device set D𝑐𝑜𝑙𝑑 ; if Δ𝑟𝑒𝑠 > 0 (Scale Up), the transition is executed only if D𝑐𝑜𝑙𝑑 has sufficient capacity to absorb the increment. As a concrete example, consider an instance currently running with v𝑐𝑢𝑟𝑟 corresponding to 𝑁 = 10 , 𝑃 = 2 that experiences a latency spike of 1.3 × the SLO. The controller computes 𝛼 𝑟𝑒𝑞 and identifies 𝑁 = 20 , 𝑃 = 2 as the nearest candidate satisfying 𝑆 ≥ 𝛼 𝑟𝑒𝑞 . Since extending replication to 10 adjacent layers requires no additional devices (only memory copies), Δ𝑟𝑒𝑠 = 0 and the transition executes immediately. By strictly adhering to this distance-aware, unified scaling paradigm, CoCoScale effectively eliminates the “staircase” provisioning lag, ensuring robust service delivery under volatile workloads. A natural concern with configuration search is its computational tractability. For a model with 
+
+𝐿 layers and a maximum parallelism degree 𝑃 𝑚𝑎𝑥 , the full configuration space contains 𝐿 × 𝑃 𝑚𝑎𝑥 
+
+candidates. In practice, this space remains small: for the Qwen-32B model ( 𝐿 = 64 ) with 𝑃 𝑚𝑎𝑥 = 4,only 256 entries exist. Since evaluating each candidate requires only constant-time arithmetic (computing 𝑆 (𝑁 , 𝑃 ) and Dist ), the per-instance decision latency is negligible compared to the monitoring interval. More importantly, the distance-aware sorting causes the algorithm to terminate early once the first feasible candidate is found, further reducing the effective search in the common case where nearby configurations suffice.  
+
+> ACM Trans. Arch. Code Optim., Vol. 1, No. 1, Article 1. Publication date: January 2026. 1:14 Wu et al.
+
+The algorithm converges to a stable configuration when the monitored latency falls within the tolerance band [𝑆𝐿𝑂 · ( 1 − 𝛿 ), 𝑆𝐿𝑂 · ( 1 + 𝛿 )] . Because candidates are sorted by transition distance, consecutive scaling decisions produce monotonically smaller adjustments, which prevents oscillation between distant states. 
+
+5 System Design 
+
+To overcome the rigidity of instance-level scaling, we design a hot-pluggable serving framework tailored for CoCoScale. As illustrated in Figure 7, CoCoScale is compatible with mainstream backend engines [ 2, 16 , 32 ]. It augments the backend via three core components that form a closed-loop control system: the Monitor profiles resource availability and detects SLO violations, the Controller 
+
+executes feedback-driven scaling strategies using the analytical model from Section 4.2, and the 
+
+Scheduler orchestrates intra-instance request distribution. Together, these components enable continuous monitoring, adaptive decision-making, and seamless resource reallocation. Scheduler 
+
+Backend ...... 
+
+A B CA B C
+
+Controller 
+
+metrics 
+
+scaling 
+
+feedback 
+
+Monitor 
+
+distribute 
+
+R1 
+
+R2 
+
+R3 
+
+R4 
+
+Requests 
+
+R5 
+
+R6 
+
+R7 
+
+R8 
+
+update 
+
+> Fig. 7. The system overview of CoCoScale, illustrating the closed-loop interaction between the Monitor, Controller, and Scheduler for fine-grained resource scavenging.
+
+5.1 System Architecture 
+
+Metrics Monitor. The Monitor extends observation capabilities through two key functions. For resource profiling, it periodically collects hardware metrics (e.g., GPU and memory utilization) via the NVML interface and identifies “cold” devices suitable for repurposing based on predefined utilization thresholds. For performance tracking, the Monitor acquires instance-level metrics, including per-request end-to-end latency and throughput, directly from the backend engine. It evaluates SLO compliance by comparing observed statistics against the target latency bound and flags instances whose normalized deviation exceeds the tolerance threshold 𝛿 as candidates for scaling. These aggregated metrics are forwarded to the Controller at each monitoring cycle. 
+
+Request Scheduler. The Scheduler extends the backend’s native dispatching logic to support fine-grained workload distribution [ 26 ]. When an instance operates under a layer-wise DP con-figuration, the Scheduler partitions incoming request batches into sub-batches according to the active parallelism degree 𝑃 and dispatches them to the host device and its replicas. By dynamically balancing traffic between the original layers on “hot” instances and their replicas on “cold” devices,  
+
+> ACM Trans. Arch. Code Optim., Vol. 1, No. 1, Article 1. Publication date: January 2026. CoCoScale: Leveraging Layer-wise Scaling to Unlock the Potential of Online LLM Serving 1:15
+
+the Scheduler ensures that throughput gains are achieved with minimal synchronization latency, maintaining global cluster load balancing without disrupting the inference critical path. 
+
+Auto-Scaling Controller. The Controller serves as the central decision engine, leveraging the analytical framework derived in Section 4.2. By analyzing aggregated metrics from the Monitor, it determines the optimal {𝑁 , 𝑃 } configurations driven by detected SLO violations and resource vacancy. The Controller evaluates candidate configurations using the speedup model 𝑆 (𝑁 , 𝑃 ) and selects the nearest feasible target according to the distance-aware algorithm described in Section 4.4. Upon decision finalization, it updates the Scheduler’s routing topology and enforces threshold-based safeguards to mitigate performance interference on target devices. 
+
+5.2 Compatibility Discussion 
+
+A practical layer-wise scaling system must be compatible with diverse deployment environments and coexist with the performance optimizations employed by modern inference engines. In this subsection, we discuss four aspects: backend compatibility, parallelism compatibility, multi-tenant interference isolation, and CUDA Graph execution support. 
+
+Backend Compatibility. CoCoScale is designed as a backend-agnostic middleware layer that can be integrated with a variety of LLM serving engines. The layer-wise replication mechanism operates at the model execution level by intercepting the forward pass at configurable layer boundaries, which is a common abstraction across all Transformer-based serving frameworks. Our current prototype is built on Nano-vLLM [ 10 ], but the architecture imposes no engine-specific dependencies. The Monitor communicates with the backend through a standardized metrics interface (latency and throughput counters), and the Scheduler interacts via a request routing API that is orthogonal to the engine’s internal scheduling logic. This decoupled design allows CoCoScale to be ported to other backends such as vLLM [ 14 ], SGLang [ 42 ], or TensorRT-LLM with minimal adaptation, primarily requiring the implementation of a thin adapter layer for metrics collection and batch routing. 
+
+Parallelism Compatibility. CoCoScale adopts layer-wise replication as its core parallelism strategy, and this choice is compatible with the operational constraints of dynamic scaling. In terms of com-munication efficiency, Tensor Parallelism (TP) requires strictly synchronized AllReduce operations within every layer, inducing heavy overhead that creates bottlenecks on PCIe-based interconnects. In contrast, our strategy restricts data transfer exclusively to the segment boundaries of replicated layers, significantly reducing the frequency of synchronization and making it suitable for scale-out scenarios where bandwidth may be limited. Additionally, implementing dynamic weight resharding for TP at runtime incurs prohibitive engineering complexity. Pipeline Parallelism (PP) is primarily designed to improve throughput via micro-batching but inevitably introduces “bubble” latency, which counteracts our goal of minimizing real-time inference delay. Our layer-replication method offers a favorable trade-off by simplifying the control plane to a manageable memory copy opera-tion while delivering predictable speedups. Furthermore, layer-wise replication is compositionally compatible with existing static parallelism configurations: an instance already using intra-node TP can additionally employ layer-wise replication across nodes for dynamic capacity expansion, as the two mechanisms operate on orthogonal axes. 
+
+Interference Isolation. To evaluate the isolation capabilities of CoCoScale in multi-tenant envi-ronments, we conducted stress tests focusing on the interference caused by scaling operations on co-located workloads. We measured the performance impact on adjacent active instances while simultaneously triggering scaling events (weight migration and KV-cache transfer) on neighboring devices within the same node. Experimental data indicates that during dynamic migration, the  
+
+> ACM Trans. Arch. Code Optim., Vol. 1, No. 1, Article 1. Publication date: January 2026. 1:16 Wu et al.
+
+throughput fluctuation of adjacent active instances is suppressed to less than 3%. We also verified that the outputs produced by CoCoScale instances remain bit-wise consistent with the baseline, ensuring strict correctness guarantees. A critical observation concerns the management of “Cold Instances,” which are replicas that are provisioned but currently idle. While these instances occupy GPU memory (making immediate release difficult without process termination), their impact on the performance of active tasks is negligible. Since cold instances do not compete for computation cycles (SMs), the scaling process primarily utilizes P2P bandwidth. Our ring-based flow control effectively limits this bandwidth usage, ensuring that state migration does not disturb the inference stability of neighboring high-priority services. 
+
+CUDA Graph Execution Compatibility. To strictly enforce low-latency objectives during the decoding phase, CoCoScale is designed to be fully compatible with CUDA Graphs. While dynamic scaling typically conflicts with the static nature of computation graphs (which require fixed tensor shapes and execution paths), our layer-wise replication strategy circumvents this limitation by treating each replica as an independent, static execution unit. In contrast to TP, which requires complex communication group updates during scaling, our replicas execute a fixed set of continuous layers. This allows us to capture the forward pass of each replica into a CUDA Graph at initialization. During inference, the runtime controller simply routes different sub-batches to these pre-captured graphs. To handle the variable sequence lengths in the KV-cache without breaking the graph, we employ a pre-allocation strategy with pointer arithmetic, ensuring that the tensor memory addresses remain constant across iterations. Graph re-capture is only triggered when the scaling algorithm alters the configuration vector 
+
+v (i.e., changing the number of replicated layers 𝑁 or parallelism 𝑃 ). To minimize the overhead of these transition events, we implement a persistent memory pool mechanism. When a new graph configuration is required, the system reuses the existing allocated memory buffers instead of triggering expensive device memory reallocation. The resulting re-capture overhead is evaluated in Section 6.3. Consequently, CoCoScale enjoys the kernel-launch-free performance of static graphs while maintaining the elasticity of dynamic scheduling. 
+
+6 Perforamnce Evaluations 6.1 Experimental Setup 
+
+Testbed. Our experiments are conducted on a cluster with 4 NVIDIA H20 GPUs. CoCoScale is built on Nano-vLLM [ 10 ] and utilizes NVLink for rapid layer-wise weight and KV cache migration [ 24 ]. 
+
+Workload Traces. We evaluate CoCoScale on two production request traces that differ in intensity and burstiness: (1) Alibaba Trace: A 60-minute production trace from Alibaba’s online serving platform with moderate burstiness (average RPS: 1.62 , peak RPS: 11 ). (2) Azure Trace [ 21 ]: A longer 130-minute trace with higher load intensity and more severe burstiness (average RPS: 7.09 , peak RPS: 23 ), representing a more challenging production scenario. Both traces exhibit pronounced temporal variability, consistent with prior characterizations [ 30 ]. To preserve privacy while retaining long-context behavior, we use prompts from LongBench [4]. 
+
+Multi-Instance Configuration. We deploy 4 concurrent model instances competing for 4 GPUs under skewed workload distributions. Processing identical traces simultaneously creates contention where underutilized (cold) instances relinquish resources to overloaded (hot) instances. 
+
+Baselines. We compare CoCoScale against two state-of-the-art baselines: (1) vLLM (Static) [ 14 ], which provisions resources based on average load and assigns each engine a fixed 1-GPU allocation; and (2) Alibaba Autoscaler , a utilization-threshold policy that samples resource usage every 1 s ,scales out when utilization exceeds 80% , and scales in when utilization drops below 30% (no cooling 
+
+> ACM Trans. Arch. Code Optim., Vol. 1, No. 1, Article 1. Publication date: January 2026.
+
+CoCoScale: Leveraging Layer-wise Scaling to Unlock the Potential of Online LLM Serving 1:17 
+
+period), and these values are widely used as scaling thresholds in realistic production systems. This baseline employs a warm pool strategy where scaled-in instances are retained rather than terminated, mitigating cold-start overhead (up to 241s, as shown in Figure 9b). 
+
+Table 1. Performance comparison across Alibaba (60min, average RPS is 1.62, SLO=30s) and Azure (130min, average RPS is 7.09, SLO=27s) traces. 
+
+Alibaba Trace Azure Trace Model Method Avg (s) P99 (s) SLO Met Avg (s) P99 (s) SLO Met 
+
+Qwen3-8B vLLM (Static) 39 .7 50 .1 0.7% 34 .2 40 .7 1.1% 
+
+Alibaba 30 .7 35 .3 40 .6% 32 .2 37 .2 0.8% 
+
+CoCoScale 22.1 28.2 100% 17.5 23.5 100% 
+
+Qwen3-14B vLLM (Static) 39 .5 49 .6 0.8% 33 .5 41 .1 1.3% 
+
+Alibaba 30 .3 35 .2 48 .3% 31 .9 37 .1 2.4% 
+
+CoCoScale 21.9 27.9 100% 18.1 24.1 100% 
+
+Qwen3-32B vLLM (Static) 39 .3 48 .3 1.0% 29 .4 36 .0 21 .1% 
+
+Alibaba 27 .5 32 .1 90 .7% 31 .2 36 .4 2.4% 
+
+CoCoScale 21.8 27.6 100% 17.0 23.6 100% 
+
+6.2 Main Results and Analysis 0 20 40 60    
+
+> Time (minutes)
+> 10
+> 20
+> 30
+> 40
+> 50
+> E2E latency (seconds)
+> Alibaba CoCoScale vLLM SLO=30.0s
+
+(a) Qwen3-8B (Alibaba) 0 20 40 60     
+
+> Time (minutes)
+> 10
+> 20
+> 30
+> 40
+> 50
+> E2E latency (seconds)
+> Alibaba CoCoScale vLLM SLO=30.0s
+
+(b) Qwen3-14B (Alibaba) 0 20 40 60     
+
+> Time (minutes)
+> 10
+> 20
+> 30
+> 40
+> 50
+> E2E latency (seconds)
+> Alibaba CoCoScale vLLM SLO=30.0s
+
+(c) Qwen3-32B (Alibaba) 0 20 40 60    
+
+> Time (minutes)
+> 10
+> 20
+> 30
+> 40
+> E2E latency (seconds)
+> Alibaba CoCoScale vLLM SLO=27.0s
+
+(d) Qwen3-8B (Azure) 0 20 40 60     
+
+> Time (minutes)
+> 10
+> 20
+> 30
+> 40
+> E2E latency (seconds)
+> Alibaba CoCoScale vLLM SLO=27.0s
+
+(e) Qwen3-14B (Azure) 0 20 40 60     
+
+> Time (minutes)
+> 10
+> 20
+> 30
+> 40
+> E2E latency (seconds)
+> Alibaba CoCoScale vLLM SLO=27.0s
+
+(f) Qwen3-32B (Azure) 
+
+Fig. 8. Temporal latency comparison across production traces. Top (a–c): Alibaba trace (60 min, moderate load). Bottom (d–f): Azure trace (130 min, 4.4 × higher load). CoCoScale maintains stable latency through adaptive layer-wise scaling, while baselines exhibit latency spikes during demand surges due to resource contention (vLLM Static) and reconfiguration delays (Alibaba Autoscaler). 
+
+Latency Performance. As shown in Table 1 and Figure 8, CoCoScale consistently outperforms both baselines while maintaining temporal stability across both traces. Under the moderate Alibaba trace (SLO=30 s), CoCoScale maintains low latency (green lines in Figures 8a–c) throughout the 60-minute window, whereas vLLM (Static) (blue) and Alibaba autoscaler (red) exhibit significant spikes exceeding the SLO threshold during demand surges. Similarly, under the intensive Azure trace (4.4 ×
+
+higher load, SLO=27 s), CoCoScale demonstrates robust stability (Figures 8d–f), while baselines 
+
+ACM Trans. Arch. Code Optim., Vol. 1, No. 1, Article 1. Publication date: January 2026. 1:18 Wu et al. 
+
+suffer prolonged high latency due to resource contention (vLLM Static) and reconfiguration delays (Alibaba autoscaler). Quantitatively, CoCoScale achieves 20.7%–28.1% lower average latency than Alibaba autoscaler (P99 latency < 28.3 s ) on the Alibaba trace, and 43.3%–45.7% reduction on the Azure trace. 
+
+Per-Model Analysis. Examining the results across model sizes reveals that CoCoScale provides consistent improvements regardless of model complexity. For Qwen3-8B, the smallest model, CoCoScale reduces the average latency from 30.7 s (Alibaba autoscaler) to 22.1 s on the Alibaba trace, a 28.0% improvement. The relatively lower computational demand of Qwen3-8B means that layer-wise replication can cover a larger fraction of the model’s layers within the available memory budget, yielding a higher effective speedup ratio. For Qwen3-14B, we observe similar gains (27.7% reduction), with the P99 latency dropping to 27.9 s. The Qwen3-32B model is the most demanding in terms of both computation and memory. Despite this, CoCoScale achieves a 20.7% reduction in average latency on the Alibaba trace and an even more pronounced 45.5% reduction on the Azure trace. This is because under high concurrency, the larger batch sizes make the parallelism gains from layer-wise DP more effective, as the communication overhead ( 𝛽 (𝑃 ) in our model) is amortized over a larger number of tokens. 
+
+Trace Comparison. The performance gap between CoCoScale and the baselines widens sig-nificantly under the Azure trace. This trace exhibits a 4.4 × higher average RPS and more severe burstiness, with peak loads reaching 23 RPS compared to 11 RPS in the Alibaba trace. Under such conditions, the Alibaba autoscaler’s SLO attainment drops from 40.6%–90.7% to a mere 0.8%–2.4%, because its utilization-threshold scaling policy cannot react quickly enough to absorb the sudden load spikes. The cold-start latency of provisioning new instances (74–241 s as shown in Figure 9b) far exceeds the duration of individual burst events. In contrast, CoCoScale completes layer-wise scaling in 1–2 seconds, allowing it to preemptively expand capacity before the burst saturates the existing resources. This advantage is most visible in Figures 8d–f, where the green line (CoCoScale) remains consistently below the SLO threshold even during the most intense burst periods around the 40–60 minute marks. 
+
+SLO Attainment. These latency improvements translate directly into 100% SLO attainment 
+
+for CoCoScale across all models and both traces (Table 1). In stark contrast, the Alibaba autoscaler achieves only 40.6%–90.7% on the moderate Alibaba trace, and catastrophically drops to merely 
+
+0.8%–2.4% under the high-intensity Azure trace. vLLM (Static) performs worst with only 0.7%– 21.1% attainment, rendering it unsuitable for production scenarios with strict latency requirements. The full SLO compliance of CoCoScale is a direct consequence of the fine-grained elasticity: by adjusting capacity in fractional increments (e.g., replicating 10 additional layers rather than a full instance), the system can precisely match the target speedup ratio without over-provisioning, maintaining tight adherence to the SLO boundary throughout the entire serving period. 
+
+6.3 Overhead Analysis 
+
+To validate system agility, we evaluate the setup overhead of CoCoScale’s layer-wise scaling compared to traditional full-instance scaling. 
+
+CoCoScale Scaling Agility. As shown in Figure 9a, CoCoScale achieves sub-second to second-level response times. For the Qwen3-32B model, the P50 scaling latency is 1.52s , which is nearly invariant to model size. This is enabled by our ring-multicast protocol, which migrates only essential layers and KV caches, avoiding full engine re-initialization. 
+
+Bottlenecks in Traditional Scaling. In contrast, Figure 9b highlights the prohibitive costs of full-instance scaling. A Qwen3-32B instance requires up to 241.1s to become operational, with over 80% of the time spent on model loading and CUDA graph capturing. Compared to this baseline,  
+
+> ACM Trans. Arch. Code Optim., Vol. 1, No. 1, Article 1. Publication date: January 2026. CoCoScale: Leveraging Layer-wise Scaling to Unlock the Potential of Online LLM Serving 1:19
+
+0 1 2 3 4 5 6 7 8 9
+
+Time (s) 
+
+0.0 
+
+0.2 
+
+0.4 
+
+0.6 
+
+0.8 
+
+1.0 
+
+> Cumulative Probability
+> 32B
+> 14B
+> 8B
+> 32B P50 (1.52s)
+> 32B P99 (6.57s)
+> 14B P50 (1.04s)
+> 14B P99 (5.17s)
+> 8B P50 (1.44s)
+> 8B P99 (5.37s)
+
+(a) CDF of CoCoScale scale-up latency. P50 stays stable (1.04 s to 1.52 s) across model sizes with consistently low tail latency. Qwen 8B Qwen 14B Qwen 32B 
+
+0
+
+50 
+
+100 
+
+150 
+
+200 
+
+250 
+
+> Time (seconds)
+> 74.4s
+> TP1
+> 142.2s
+> TP1
+> 241.1s
+> TP1
+> 106.2s
+> TP2
+> 139.1s
+> TP2
+> 215.9s
+> TP2
+> 111.7s
+> TP4
+> 136.9s
+> TP4
+> 209.8s
+> TP4
+> Model Loading
+> Capture Graph
+> Init Engine
+> Others
+
+(b) Startup breakdown of vLLM. End-to-end delay (74 s to 241 s) is dominated by model loading and engine initialization. Fig. 9. Scaling overhead comparison. (a) CoCoScale agility. (b) Traditional scaling bottlenecks. 
+
+CoCoScale reduces the scaling latency by 97.9%–99.3% , enabling the system to react effectively to rapid production workload fluctuations. 
+
+Sensitivity to Interconnect. While our current evaluation utilizes NVLink for high-speed layer migration (PCIe 5.0 equivalent bandwidth), we acknowledge that CoCoScale’s performance may vary under slower interconnects (e.g., PCIe 4.0 or Ethernet). The layer-wise migration latency would increase proportionally with reduced bandwidth, potentially affecting the agility demonstrated in Figure 9a. We leave the comprehensive sensitivity analysis of migration overhead under diverse network topologies to future work. 
+
+7 Related Work 
+
+Instance-level Scaling and Cold Start. Conventional scaling strategies incur significant cold-start latencies due to full-model loading. ServerlessLLM [ 9 ] accelerates checkpoint loading through locality-aware scheduling, and BlitzScale [ 40 ] reduces startup time by pre-warming containers and overlapping initialization stages. HydraServe [ 19 ] further improves cold-start performance by sharing model weights across co-located instances. Yu et al. [ 38 ] address the serverless inference cold-start problem through GPU-efficient model swapping, enabling low-latency instance tran-sitions. Despite these optimizations, all approaches remain restricted to coarse-grained instance boundaries, where the fundamental unit of scaling is a complete model replica. This granularity mismatch prevents them from responding to sub-second traffic bursts without significant over-provisioning. CoCoScale diverges from this paradigm by introducing layer-wise scaling, which decouples capacity expansion from model loading to achieve near-instantaneous responsiveness. 
+
+Resource Pooling and Multiplexing. Systems like Aegaeon [ 34 ] and MuxServe [ 8 ] improve utiliza-tion through model swapping or live migration but incur prohibitive reconfiguration overheads during sudden load shifts. These approaches typically require moving heavy model states, which blocks inference during critical bursts. Llumnix [ 27 ] introduces live migration of inference contexts across GPUs to improve load balancing but still operates at the instance level with significant migration overhead for large models. In contrast, CoCoScale treats cold resources as a hot-pluggable  
+
+> ACM Trans. Arch. Code Optim., Vol. 1, No. 1, Article 1. Publication date: January 2026. 1:20 Wu et al.
+
+pool, allowing hot instances to seamlessly borrow compute cycles without displacing resident models or triggering heavy state migration. 
+
+Parallelism Granularity and Serving. Existing frameworks often rely on static parallelism config-urations [ 5 , 17 , 33 ] or phase disaggregation [ 23 , 43 ] that require complex global synchronization to adjust at runtime. Similarly, changing Tensor [ 25 ] or Pipeline Parallelism [ 29 ] degrees necessitates expensive reshuffling of weights and KV caches. Recent work such as FlexPipe [ 18 ] explores adap-tive pipeline configurations but remains constrained by the pipeline bubble problem. Wei et al. [ 31 ]propose interleaved parallelism to dynamically balance latency and throughput in distributed inference, but their approach operates at the parallelism configuration level rather than the layer level. CoCoScale introduces layer-wise DP to enable flexible, continuous capacity adjustments that precisely align with dynamic demand curves without rigid architectural constraints. 
+
+Disaggregated Inference and KV Cache Management. A growing body of work advocates dis-aggregating the prefill and decode phases of LLM inference onto separate hardware to improve resource efficiency. Splitwise [ 23 ] and DistServe [ 43 ] partition inference requests such that compute-intensive prefill runs on high-throughput accelerators while memory-bound decode runs on capacity-optimized devices. Complementing this direction, efficient KV cache management has emerged as a critical concern. Mooncake [ 24 ] proposes a KV-cache-centric disaggregated architec-ture that decouples cache storage from computation, while vLLM [ 14 ] introduces paged attention to reduce memory fragmentation. While CoCoScale currently operates within a non-disaggregated setting, its layer-wise replication mechanism is orthogonal to these techniques: the fine-grained cache partitioning used in our scatter-gather protocol shares design principles with paged attention, and extending layer-wise scaling to disaggregated clusters is a promising direction for future work. 
+
+8 Conclusion 
+
+We propose CoCoScale to overcome the latency and inefficiency of coarse-grained scaling by introducing fine-grained elasticity through layer-wise data parallelism. The core insight is that the layered structure of Transformer models provides a natural decomposition point for scaling: by selectively replicating subsets of layers onto idle resources, CoCoScale achieves non-integer capacity expansion without full-model redeployment. We developed an analytical model that captures the interplay between the replicated layer count 𝑁 , parallelism degree 𝑃 , and communication overhead, enabling the system to determine cost-effective configurations in real time. Built on this foundation, a unified scaling algorithm dynamically adjusts configurations to maintain SLO compliance with minimal reconfiguration cost. Evaluations on production traces from Alibaba and Azure demonstrate that CoCoScale reduces scale-up latency by 97.9%–99.3% compared to traditional instance-level scaling. Under both moderate and high-intensity workloads, CoCoScale achieves 100% SLO attainment while reducing average end-to-end latency by 20.7% to 28.1%. These results confirm that decoupling capacity adjustment from rigid instance boundaries enables precise resource alignment with dynamic demand. 
+
+References      
+
+> [1] 2025. GPT-5.2. https://openai.com/index/introducing-gpt-5-2/. Accessed: Dec. 20, 2025. [2] 2025. Ollama - Get up and running with large language models. https://ollama.com/. Accessed: Apr. 23, 2025. [3] Alibaba. 2026. Alibaba Cloud. Online. https://www.alibabacloud.com Alibaba Cloud free service product catalog and introduction page. Accessed: 2026-01-23. [4] Yushi Bai, Shangqing Tu, Jiajie Zhang, Hao Peng, Xiaozhi Wang, Xin Lv, Shulin Cao, Jiazheng Xu, Lei Hou, Yuxiao Dong, Jie Tang, and Juanzi Li. 2024. LongBench v2: Towards Deeper Understanding and Reasoning on Realistic Long-context Multitasks. arXiv preprint arXiv:2412.15204 (2024). ACM Trans. Arch. Code Optim., Vol. 1, No. 1, Article 1. Publication date: January 2026.
+
+CoCoScale: Leveraging Layer-wise Scaling to Unlock the Potential of Online LLM Serving 1:21 
+
+[5] Seungbeom Choi, Sunho Lee, Yeonjae Kim, Jongse Park, Youngjin Kwon, and Jaehyuk Huh. 2022. Serving heterogeneous machine learning models on Multi-GPU servers with Spatio-Temporal sharing. In 2022 USENIX Annual Technical Conference (USENIX ATC 22) . 199–216. [6] Jeffrey Dean and Sanjay Ghemawat. 2008. MapReduce: simplified data processing on large clusters. Commun. ACM 51, 1 (2008), 107–113. [7] DeepSeek-AI, Aixin Liu, Bei Feng, Bing Xue, and Bing-Li Wang et al. 2024. DeepSeek-V3 Technical Report. ArXiv 
+
+abs/2412.19437 (2024). [8] Jiangfei Duan, Runyu Lu, Haojie Duanmu, Xiuhong Li, Xingcheng Zhang, Dahua Lin, Ion Stoica, and Hao Zhang. 2024. MuxServe: Flexible Multiplexing for Efficient Multiple LLM Serving. arXiv preprint arXiv:2404.02015 (2024). [9] Yao Fu, Leyang Xue, Yeqi Huang, Andrei-Octavian Brabete, Dmitrii Ustiugov, Yuvraj Patel, and Luo Mai. 2024. ServerlessLLM: Low-Latency Serverless Inference for Large Language Models. In 18th USENIX Symposium on Operating Systems Design and Implementation (OSDI 24) . 135–153. [10] GeeeekExplorer. 2025. Nano-vLLM: A Lightweight vLLM Implementation Built from Scratch. https://github.com/ GeeeekExplorer/nano-vllm. GitHub repository. [11] Google Cloud. 2024. Vertex AI. https://cloud.google.com/vertex-ai. Accessed: 2024-05-20. [12] Yiyuan He, Minxian Xu, Jingfeng Wu, Wanyi Zheng, Kejiang Ye, and Chengzhong Xu. 2024. UELLM: A Unified and Efficient Approach for Large Language Model Inference Serving. In Service-Oriented Computing: 22nd International Conference, ICSOC 2024, Tunis, Tunisia, December 3–6, 2024, Proceedings, Part I (Tunis, Tunisia). Springer-Verlag, Berlin, Heidelberg, 218–235. doi:10.1007/978-981-96-0805-8_16 [13] Cunchen Hu, Heyang Huang, Liangliang Xu, Xusheng Chen, Jiang Xu, Shuang Chen, Hao Feng, Chenxi Wang, Sa Wang, Yungang Bao, Ninghui Sun, and Yizhou Shan. 2024. Inference without Interference: Disaggregate LLM Inference for Mixed Downstream Workloads. arXiv:2401.11181 [cs.DC] [14] Woosuk Kwon, Zhuohan Li, Siyuan Zhuang, Ying Sheng, and Lianmin et al. Zheng. 2023. Efficient Memory Management for Large Language Model Serving with PagedAttention. In Proceedings of the 29th Symposium on Operating Systems Principles (Koblenz, Germany) (SOSP ’23) . Association for Computing Machinery, New York, NY, USA, 611–626. doi:10.1145/3600006.3613165 [15] Hao Lan, Ziang Zhou, Qi Zhu, Wei Yan, Qinfen Hao, Xiaochun Ye, Yong Liu, and Ninghui Sun. 2026. Heterogeneous Confidential Computing System for Large Language Models: A Survey. ACM Trans. Archit. Code Optim. 23, 1, Article 4 (March 2026), 26 pages. doi:10.1145/3779307 [16] Benjamin Lefaudeux, Francisco Massa, Diana Liskovich, Wenhan Xiong, Vittorio Caggiano, Sean Naren, Min Xu, Jieru Hu, Marta Tintore, Susan Zhang, Patrick Labatut, Daniel Haziza, Luca Wehrstedt, Jeremy Reizenstein, and Grigory Sizov. 2022. xFormers: A modular and hackable Transformer modelling library. https://github.com/facebookresearch/ xformers. [17] Zhuohan Li, Lianmin Zheng, Yinmin Zhong, Vincent Liu, Ying Sheng, Xin Jin, and Yanping Huang et al. 2023. AlpaServe: Statistical Multiplexing with Model Parallelism for Deep Learning Serving. In 17th USENIX Symposium on Operating Systems Design and Implementation (OSDI 23) . USENIX Association, Boston, MA, 663–679. [18] Yanying Lin, Shijie Peng, Chengzhi Lu, Chengzhong Xu, and Kejiang Ye. 2025. FlexPipe: Adapting Dynamic LLM Serving Through Inflight Pipeline Refactoring in Fragmented Serverless Clusters. arXiv preprint arXiv:2510.11938 
+
+(2025). [19] Chiheng Lou, Sheng Qi, Chao Jin, Dapeng Nie, Haoran Yang, Yu Ding, Xuanzhe Liu, and Xin Jin. 2025. HydraServe: Minimizing Cold Start Latency for Serverless LLM Serving in Public Clouds. arXiv preprint arXiv:2502.15524 (2025). [20] Microsoft. 2024. Azure Machine Learning. https://azure.microsoft.com/en-us/products/machine-learning. Accessed: 2024-05-20. [21] Microsoft Azure. 2024. Microsoft Azure Public Dataset. https://github.com/Azure/AzurePublicDataset. Accessed: 2026-01-27. [22] OpenRouter. 2024. OpenRouter: A unified interface for LLMs. https://openrouter.ai/. Accessed: 2024-05-20. [23] Pratyush Patel, Esha Choukse, Chaojie Zhang, Inigo Goiri, Aashaka Shah, Saeed Maleki, and Ricardo Bianchini. 2023. Splitwise: Efficient Generative LLM Inference Using Phase Splitting. 2024 ACM/IEEE 51st Annual International Symposium on Computer Architecture (ISCA) (2023), 118–132. [24] Ruoyu Qin, Zheming Li, Weiran He, Mingxing Zhang, Yongwei Wu, Weimin Zheng, and Xinran Xu. 2024. Mooncake: A KVCache-centric Disaggregated Architecture for LLM Serving. arXiv:2407.00079 [cs.DC] [25] Mohammad Shoeybi, Mostofa Patwary, Raul Puri, Patrick LeGresley, Jared Casper, and Bryan Catanzaro. 2019. Megatron-LM: Training Multi-billion Parameter Language Models Using Model Parallelism. arXiv preprint arXiv:1909.08053 
+
+(2019). [26] Sudipta Saha Shubha, Haiying Shen, and Anand Iyer. 2024. USHER: Holistic Interference Avoidance for Resource Optimized ML Inference. In 18th USENIX Symposium on Operating Systems Design and Implementation (OSDI 24) .USENIX Association, Santa Clara, CA, 947–964. ACM Trans. Arch. Code Optim., Vol. 1, No. 1, Article 1. Publication date: January 2026. 1:22 Wu et al. 
+
+[27] Biao Sun, Ziming Huang, Hanyu Zhao, Wencong Xiao, Xinyi Zhang, Yong Li, and Wei Lin. 2024. Llumnix: Dy-namic Scheduling for Large Language Model Serving. In 18th USENIX Symposium on Operating Systems Design and Implementation (OSDI 24) . USENIX Association, Santa Clara, CA, 173–191. [28] Rohan Taori, Ishaan Gulrajani, Tianyi Zhang, Yann Dubois, Xuechen Li, Carlos Guestrin, and Percy Liang et al. 2023. Stanford Alpaca: An Instruction-following LLaMA Model. https://github.com/tatsu-lab/stanford_alpaca. GitHub repository, Accessed: 2025-05-04. [29] Xinyi Wan, Penghui Qi, Guangxing Huang, Min Lin, and Jialin Li. 2025. Pipeoffload: Improving scalability of pipeline parallelism with memory optimization. arXiv preprint arXiv:2503.01328 (2025). [30] Yuxin Wang, Yuhan Chen, Zeyu Li, Xueze Kang, Yuchu Fang, Yeju Zhou, Yang Zheng, Zhenheng Tang, Xin He, Rui Guo, Xin Wang, Qiang Wang, Amelie Chi Zhou, and Xiaowen Chu. 2025. BurstGPT: A Real-world Workload Dataset to Optimize LLM Serving Systems. arXiv:2401.17644 [cs.DC] https://arxiv.org/abs/2401.17644 [31] Jinhui Wei, Shenggan Cheng, Wei Zhu, Jiazhi Jiang, Dan Huang, Zhiguang Chen, Jiangsu Du, and Yutong Lu. 2026. Dynamic Latency-Throughput Balancing in Distributed Large Model Inference with Interleaved Parallelism. ACM Trans. Archit. Code Optim. 23, 1, Article 27 (March 2026), 26 pages. doi:10.1145/3797040 [32] Thomas Wolf, Lysandre Debut, Victor Sanh, Julien Chaumond, Clement Delangue, Anthony Moi, Pierric Cistac, Tim Rault, Rémi Louf, Morgan Funtowicz, Joe Davison, Sam Shleifer, Patrick von Platen, Clara Ma, Yacine Jernite, Julien Plu, Canwen Xu, Teven Le Scao, Sylvain Gugger, Mariama Drame, Quentin Lhoest, and Alexander M. Rush. 2020. Transformers: State-of-the-Art Natural Language Processing. In Proceedings of the 2020 Conference on Empirical Methods in Natural Language Processing: System Demonstrations . Association for Computational Linguistics, Online, 38–45. https://www.aclweb.org/anthology/2020.emnlp-demos.6 [33] Bingya Wu, Shengyu Liu, Yinmin Zhong, Peng Sun, Xuanzhe Liu, and Xin Jin. 2024. LoongServe: Efficiently Serving Long-Context Large Language Models with Elastic Sequence Parallelism. Proceedings of the ACM SIGOPS 30th Symposium on Operating Systems Principles (2024). [34] Yuxing Xiang, Xue Li, Kun Qian, Yufan Yang, Diwen Zhu, Wenyuan Yu, Ennan Zhai, Xuanzhe Liu, Xin Jin, and Jingren Zhou. 2025. Aegaeon: Effective GPU pooling for concurrent LLM serving on the market. In Proceedings of the ACM SIGOPS 31st Symposium on Operating Systems Principles . 1030–1045. [35] Minxian Xu, Jingfeng Wu, Shengye Song, Satish Narayana Srirama, Bahman Javad, Rajiv Ranjan, Devki Nandan Jha, Sa Wang, Wenhong Tian, Huanle Xu, Li Li, Zizhao Mo, Shuo Ren, Thomas Kunz, Petar Kochovski, Vlado Stankovski, Kejiang Ye, Chengzhong Xu, and Rajkumar Buyya. 2026. Cloud-native and Distributed Systems for Efficient and Scalable Large Language Models – A Research Agenda. arXiv:2604.17227 [cs.DC] https://arxiv.org/abs/2604.17227 [36] An Yang, Anfeng Li, Baosong Yang, Beichen Zhang, Binyuan Hui, Bo Zheng, Bowen Yu, Chang Gao, Chengen Huang, Chenxu Lv, et al. 2025. Qwen3 technical report. arXiv preprint arXiv:2505.09388 (2025). [37] Yanan Yang, Laiping Zhao, Yiming Li, Huanyu Zhang, Jie Li, Mingyang Zhao, Xingzhen Chen, and Keqiu Li. 2022. Infless: a native serverless system for low-latency, high-throughput inference. In Proceedings of the 27th ACM International Conference on Architectural Support for Programming Languages and Operating Systems . 768–781. [38] Minchen Yu, Ao Wang, Bohui Wu, Yuxuan Liu, Dong Chen, Haoxuan Yu, Wei Wang, Ruichuan Chen, Dapeng Nie, Haoran Yang, and Yu Ding. 2026. Enabling Low-Latency, GPU-Efficient Serverless Inference with Model Swapping. 
+
+ACM Trans. Archit. Code Optim. (April 2026). doi:10.1145/3800690 [39] Shaoxun Zeng, Minhui Xie, Shiwei Gao, Youmin Chen, and Youyou Lu. 2025. Medusa: Accelerating serverless LLM inference with materialization. In Proceedings of the 30th ACM International Conference on Architectural Support for Programming Languages and Operating Systems, Volume 1 . 653–668. [40] Dingyan Zhang, Haotian Wang, Yang Liu, Xingda Wei, Yizhou Shan, Rong Chen, and Haibo Chen. 2025. BLITZSCALE: fast and live large model autoscaling with O(1) host caching. In Proceedings of the 19th USENIX Conference on Operating Systems Design and Implementation (Boston, MA, USA) (OSDI ’25) . USENIX Association, USA, Article 16, 19 pages. [41] Lianmin Zheng, Zhuohan Li, Hao Zhang, Yonghao Zhuang, Zhifeng Chen, and Yanping Huang et al. 2022. Alpa: Automating Inter and Intra-Operator Parallelism for Distributed Deep Learning. In 16th USENIX Symposium on Operating Systems Design and Implementation (OSDI 22) . USENIX Association, Carlsbad, CA, 559–578. [42] Lianmin Zheng, Liangsheng Yin, Zhiqiang Xie, Chuyue Sun, Jeff Huang, Cody H Yu, Shiyi Cao, Christos Kozyrakis, Ion Stoica, Joseph E Gonzalez, et al . 2024. Sglang: Efficient execution of structured language model programs. Advances in neural information processing systems 37, 62557–62583. [43] Yinmin Zhong, Shengyu Liu, Junda Chen, Jianbo Hu, Yibo Zhu, and Xuanzhe Liu et al. 2024. DistServe: Disaggregating Prefill and Decoding for Goodput-optimized Large Language Model Serving. In 18th USENIX Symposium on Operating Systems Design and Implementation (OSDI 24) . USENIX Association, Santa Clara, CA, 193–210. ACM Trans. Arch. Code Optim., Vol. 1, No. 1, Article 1. Publication date: January 2026.
