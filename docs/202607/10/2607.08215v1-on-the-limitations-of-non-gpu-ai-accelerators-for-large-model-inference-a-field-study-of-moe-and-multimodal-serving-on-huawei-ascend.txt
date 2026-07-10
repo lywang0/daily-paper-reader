@@ -1,0 +1,355 @@
+Title: On the Limitations of Non-GPU AI Accelerators for Large-Model Inference: A Field Study of MoE and Multimodal Serving on Huawei Ascend
+
+URL Source: https://arxiv.org/pdf/2607.08215v1
+
+Published Time: Fri, 10 Jul 2026 00:36:15 GMT
+
+Number of Pages: 14
+
+Markdown Content:
+# On the Limitations of Non-GPU AI Accelerators for Large-Model Inference: A Field Study of MoE and Multimodal Serving on Huawei Ascend 
+
+A Preprint 
+
+Zheng Yu ∗
+
+School of Data Science The Chinese University of Hong Kong, Shenzhen Shenzhen, Guangdong, China July 10, 2026 
+
+# Abstract 
+
+Non-GPU AI accelerators are increasingly adopted as alternatives to general-purpose GPUs for large-model inference, motivated by supply, cost, and availability considerations. Yet the practical cost of migrating a demanding workload from the mature CUDA ecosystem to such an accelerator is poorly documented. We report a field study of deploying two concrete, demanding inference workloads on a 16-device Huawei Ascend 910 system using the CANN software stack and the vLLM-Ascend inference engine. The first is an LLM-as-a-judge value-alignment and safety evaluation pipeline: a weight-quantized (W8A8) Mixture-of-Experts (MoE) judge model, DeepSeek-V4-Flash ( ∼300 GB), scores the responses of twenty frontier LLMs (e.g., GPT-5.1, Gemini 3 Pro, Claude Haiku 4.5, DeepSeek-V3.2, Qwen3-Max, GLM-4.6) at a scale of tens of thousands of prompts each. The second is a multimodal medical vision–language benchmarking workload: DeepSeek-V4-Flash-Vision ( ∼540 GB in bf16 ), a frozen MoE language decoder fused with a Qwen3.5 vision tower through a trained merg-er/bridge, evaluated on the MMMU and MMMU-Pro benchmarks. Bringing both workloads to a serviceable state required twelve source-level patches to the vendor inference plugin, the deliberate disabling of several throughput features to preserve numerical correctness, and operational scaffolding to absorb recurring low-level device faults. We organize our observations into eight classes of platform-level limitation — software-stack maturity and operator/feature-coverage gaps, fragile multi-axis parallelism, kernel-level (aicore/vector-core) numerical faults, immature graph compilation, unstable advanced features, perfor-mance and scalability ceilings, weak operational observability, and ecosystem fragmentation — and, for each, give the symptom, evidence, and likely root cause. We quantify the in-tegration effort, the observed concurrency behavior, and the end-to-end benchmark quality that confirms both workloads were served correctly, and we distill a set of general, vendor-agnostic strategies for adopting alternative accelerators. Our aim is a reproducible reference for teams evaluating or operating this class of accelerator. 
+
+Keywords AI accelerators · NPU · large language models · inference serving · mixture-of-experts · vLLM ·
+
+Huawei Ascend · machine learning systems 
+
+> ∗
+
+Correspondence: zheng.yu3@mail.mcgill.ca .arXiv:2607.08215v1 [cs.DC] 9 Jul 2026 On the Limitations of Non-GPU AI Accelerators for Large-Model Inference: A Field Study of MoE and Multimodal Serving on Huawei Ascend A Preprint 
+
+# Contents 
+
+1 Introduction 32 Related Work 33 Background 4
+
+3.1 Ascend DaVinci, CANN, HCCL, and torch_npu . . . . . . . . . . . . . . . . . . . . . . . . . 43.2 vLLM-Ascend as a vendor plugin . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 43.3 Contrast with the CUDA ecosystem . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 4
+
+4 Deployment Setup and Methodology 4
+
+4.1 Case study A: an LLM-as-a-judge value-alignment service . . . . . . . . . . . . . . . . . . . . 44.2 Case study B: a multimodal medical vision–language model . . . . . . . . . . . . . . . . . . . 5
+
+5 Limitations 6
+
+5.1 Software-stack maturity and operator/feature coverage gaps . . . . . . . . . . . . . . . . . . . 65.2 Fragile multi-axis parallelism . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 75.3 Kernel-level numerical and stability faults . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 85.4 Immature graph compilation . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 95.5 Advanced-feature gaps . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 95.6 Performance and scalability ceilings . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 95.7 Operational reliability and observability . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 10 5.8 Ecosystem fragmentation and portability tax . . . . . . . . . . . . . . . . . . . . . . . . . . . 11 
+
+6 Discussion 11 
+
+6.1 Threats to validity . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 11 
+
+7 Recommendations and General Strategies 12 
+
+7.1 Tactics for this stack . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 12 7.2 General strategies for adopting alternative accelerators . . . . . . . . . . . . . . . . . . . . . . 12 
+
+8 Conclusion 13 
+
+2On the Limitations of Non-GPU AI Accelerators for Large-Model Inference: A Field Study of MoE and Multimodal Serving on Huawei Ascend A Preprint 
+
+# 1 Introduction 
+
+The CUDA ecosystem’s dominance in large-model inference has made alternative accelerators attractive wherever GPU supply, cost, or procurement constraints apply. Huawei’s Ascend line, together with the Compute Architecture for Neural Networks (CANN) software stack [9], is among the most mature such alternatives; its DaVinci-architecture NPUs [15, 16] target the same transformer [23] inference workloads that GPUs serve, and open-source engines such as vLLM [11] now have a vendor-maintained Ascend port [24]. On paper, a 16-card Ascend 910 system offers ample memory and interconnect to host frontier-scale MoE models [5, 10] and multimodal models [25, 18]. In practice, migrating a non-trivial workload from a GPU/CUDA baseline to this stack is far from a recom-pile. Over two independent deployments — an LLM-as-a-judge value-alignment evaluation service and a multimodal medical vision–language benchmarking pipeline (both detailed in Section 4) — we accumulated a substantial list of failures, workarounds, and hard limits that were not specific to our models but were instead properties of the accelerator, its compiler and operator library, and the vendor inference plugin. These observations are difficult to find in vendor documentation and costly to rediscover, which motivates this field study. 
+
+Contributions. 
+
+• A structured catalog of eight classes of platform-level limitation (Section 5) observed while deploying large MoE and multimodal inference on Ascend 910 via vLLM-Ascend, each presented as symptom 
+
+→ evidence → root cause .
+
+• Platform-level evidence — device fault codes, kernel exception strings, engine log excerpts — and quantitative characterizations of integration effort, concurrency behavior, and end-to-end benchmark quality (Figures 1–3). 
+
+• A set of general, vendor-agnostic strategies (Section 7) for adopting alternative accelerators, spanning correctness assurance, capacity planning, fault tolerance, and ecosystem engagement. 
+
+Scope and non-goals. This is a qualitative field study with supporting operational and benchmark mea-surements. Our focus is the hardware/software platform , not the two applications: we describe the workloads and report end-to-end quality only insofar as they establish that the deployments were real and correctly served, and we do not claim our patches are canonical fixes. The limitations we catalog are properties of the accelerator, its compiler and operator library, and the vendor inference plugin, and we expect them to generalize beyond the specific models we ran. 
+
+# 2 Related Work 
+
+Inference serving systems. High-throughput LLM serving has been advanced by iteration-level schedul-ing and selective batching in Orca [27], and by paged key–value memory management and continuous batch-ing in vLLM [11]. Efficient attention kernels such as FlashAttention [3] and FlashAttention-2 [2] underpin the throughput of these systems. Our study concerns what happens when such a serving stack is ported to a non-GPU accelerator. 
+
+Parallelism for large models. Scaling inference beyond a single device relies on tensor parallelism [22], pipeline parallelism [8], and expert/sharded parallelism [12]. We use these decompositions directly; several of our limitations (Section 5.2) arise precisely at their interactions on the target stack. 
+
+Mixture-of-experts. Sparsely-activated MoE layers [21, 6] enable large parameter counts at fixed com-pute and are used by recent open models [10, 5, 4]. MoE routing and expert parallelism are among the least-covered paths in the vendor plugin. 
+
+Speculative decoding. Draft-and-verify decoding [13] and its learned-head variants [1, 14] accelerate autoregressive generation. On the target stack the multi-token-prediction variant was the least stable feature we tried (Section 5.5). 
+
+Quantization. Post-training quantization methods including SmoothQuant [26], GPTQ [7], and AWQ [17] reduce the memory and bandwidth cost of inference; our MoE workload is served in a W8A8 configuration. 3On the Limitations of Non-GPU AI Accelerators for Large-Model Inference: A Field Study of MoE and Multimodal Serving on Huawei Ascend A Preprint 
+
+Vision–language models. Contrastive pretraining [20] and visual instruction tuning [18, 25] produce the vision-tower + LLM decoder design used by our multimodal workload, whose fusion path stresses the plugin’s multimodal support. 
+
+Accelerator architectures. The DaVinci architecture [15] and the Ascend NPU [16] provide the cube/vector compute model targeted here; PyTorch [19] is the framework integrated via a device backend. To our knowledge, few public field studies document the systems-level limitations of serving frontier-scale MoE and multimodal models on this class of accelerator. 
+
+# 3 Background 
+
+3.1 Ascend DaVinci, CANN, HCCL, and torch_npu 
+
+Ascend NPUs implement Huawei’s DaVinci architecture [15], whose compute core (“aicore”) combines a matrix/ cube unit for dense tensor contractions with a vector unit for elementwise and reduction operations, plus a memory-transfer engine (MTE) that moves data across the on-device memory hierarchy [16]. Software access is mediated by CANN [9], which provides the runtime (ACL), the operator library, a graph compiler, and the collective-communication library HCCL (the analogue of NCCL). PyTorch integration is provided by torch_npu , a device backend that maps ATen operators [19] onto CANN kernels. 
+
+3.2 vLLM-Ascend as a vendor plugin 
+
+vLLM [11] implements high-throughput LLM serving via paged attention and continuous batching. On Ascend, serving is provided by vLLM-Ascend , a platform plugin that registers an “ascend” backend and supplies NPU-specific model implementations, attention kernels, quantization paths, and a graph-capture integration. Crucially, it is a separate, fast-moving codebase that reimplements or overrides substantial portions of upstream vLLM; feature parity with the CUDA path is partial and version-dependent. 
+
+3.3 Contrast with the CUDA ecosystem 
+
+Two structural differences drive most of what follows. First, graph capture on Ascend uses ACL Graph rather than CUDA Graph, and there is no TorchInductor-style just-in-time kernel compiler in the inference path — kernels come from the operator library or are compiled ahead of time, so uncovered shapes/operators fall back to eager execution. Second, the operator and feature coverage of the vendor stack trails the CUDA reference implementation, so advanced parallelism, fused kernels, and speculative decoding are newer, more fragile, and more frequently gated behind experimental flags. 
+
+# 4 Deployment Setup and Methodology 
+
+All experience reported here is from a single node with 16 Ascend 910 accelerators running the CANN toolkit inside the vendor-provided vLLM-Ascend container (engine version in the 0.13 series). We deployed two workloads, summarized in Table 1 and described in detail below. Both are built on the DeepSeek-V4-Flash family, whose decoder combines an MoE feed-forward stack with a DeepSeek Sparse Attention (DSA) path, a heterogeneous-computing multi-head (MHC) representation, and a Multi-Token-Prediction (MTP) draft head; these are exactly the components whose Ascend support proved least mature. 
+
+4.1 Case study A: an LLM-as-a-judge value-alignment service 
+
+The first workload is an offline batch-inference pipeline that uses a large language model as an evaluator (“LLM-as-a-judge”). The judge, DeepSeek-V4-Flash-w8a8-mtp, is served through an OpenAI-compatible endpoint and scores the responses of twenty contemporary LLMs — including GPT-5.1, Gemini 3 Pro, Claude Haiku 4.5, DeepSeek-V3.2, Qwen3-Max, GLM-4.6, Kimi-K2, Doubao, ERNIE, Hunyuan, Mistral-Large, Llama-4-Scout, and others — on questions that probe value-alignment and safety. For each (question, response) pair the judge applies a weighted rubric (per-question criteria plus general deduction items) and emits a structured JSON verdict with a final score. The campaign spans tens of thousands of prompts per model, which makes sustained throughput and reliability , rather than latency, the binding constraint; this workload is the source of the concurrency and reliability findings in Sections 5.6–5.7. 4On the Limitations of Non-GPU AI Accelerators for Large-Model Inference: A Field Study of MoE and Multimodal Serving on Huawei Ascend A Preprint 
+
+Table 1: The two inference workloads. Both share the DeepSeek-V4-Flash decoder family; they differ in quantization, modality, and parallel layout.                                        
+
+> Workload A: value-alignment judge Workload B: multimodal VLM
+> Task LLM-as-a-judge value/safety scoring Vision–language benchmarking (MMMU, MMMU-Pro) Model DeepSeek-V4-Flash-w8a8-mtp DeepSeek-V4-Flash-Vision (Qwen3.5 vi-sion tower + MoE decoder) Precision / size W8A8 quantized, ∼300 GB bf16 ,∼540 GB Parallelism TP =8×DP =2, expert parallel TP =8×PP =2, expert parallel Graph mode Full-decode ACL graph capture enforce-eager (no capture) Advanced features MTP speculative decoding (1 token) —Batching max-num-seqs =128 max-num-seqs =8
+> Input image Qwen3.5 vision tower Merger Residual-MLP bridge
+> Text prompt
+> Token em-bedding (scatter at
+> ⟨image ⟩)
+> DeepSeek-V4-Flash decoder MoE / DSA / MHC / MTP
+> Text output
+
+Figure 1: Data flow of the multimodal Workload B. A frozen Qwen3.5 vision tower and a frozen DeepSeek-V4-Flash MoE decoder are joined by a trained merger and residual-MLP bridge (shaded). Visual features are scattered into the decoder’s token-embedding sequence at image-placeholder positions. The decoder’s MoE, DSA (sparse attention), MHC (heterogeneous-computing heads), and MTP (draft head) blocks are precisely the paths whose Ascend support was least mature (Section 5). 
+
+4.2 Case study B: a multimodal medical vision–language model 
+
+The second workload serves DeepSeek-V4-Flash-Vision, a multimodal model that fuses a frozen Qwen3.5 vision tower and a frozen DeepSeek-V4-Flash MoE decoder through a trained merger and a residual-MLP bridge (Figure 1). Image patches are encoded by the vision tower, projected by the merger, adapted by the bridge, and scattered into the decoder’s token embedding at the image-placeholder positions; the decoder then generates text autoregressively. Because the bf16 weights are large (Figure 3) and an attention head-grouping factor caps tensor parallelism at eight, the single replica must be split with an additional pipeline-parallel stage (TP = 8 × PP = 2), which exercises pipeline-parallel code paths that the text-only reference deployment never used. We validated the deployment on the MMMU and MMMU-Pro benchmarks (Figure 2): under a forced-direct-answer ( prefill ) protocol the fully instruction-tuned checkpoint reaches 48 .0% on MMMU-Pro and 57 .8% on MMMU (validation), matching or exceeding the native-framework reference and confirming that the port is numerically correct end-to-end. 
+
+Methodology. Our evidence is observational, gathered while bringing the two workloads into production service rather than in a controlled benchmark. Concretely, we draw on (i) the set of source patches required to initialize and correct the plugin, (ii) engine and device logs captured during startup and sustained serving, (iii) coarse operational measurements (request concurrency versus throughput and queue depth, cold-start time, per-card memory), and (iv) end-to-end benchmark scores used solely to confirm correct operation. We foreground platform-level artifacts — vendor/stack component names, environment variables, device fault codes, and generic exception strings — because these are the properties that transfer across deployments. The two workloads exercise the harder corners of the stack — expert-parallel MoE routing, the DSA sparse-attention path, and (for Workload B) a multimodal input pipeline combined with pipeline parallelism — and, as we show next, essentially every one of those corners required intervention. Figure 3 shows the per-card memory budget for the multimodal workload, which explains why the tensor-parallel cap forces a second parallel axis (Section 5.2). 5On the Limitations of Non-GPU AI Accelerators for Large-Model Inference: A Field Study of MoE and Multimodal Serving on Huawei Ascend A Preprint 
+
+MMMU-Pro (direct) MMMU (val) 
+
+0
+
+20 
+
+40 
+
+60 
+
+> 36 .99
+> 49 .22 48 .03
+> 57 .78
+
+44 .68 
+
+51 .67   
+
+> Accuracy (%)
+> golden (natural decode) prefill (forced direct) native-framework reference
+
+Figure 2: End-to-end quality of the multimodal Workload B (fully instruction-tuned checkpoint) on MMMU-Pro ( standard_4/direct , 1730 items) and MMMU validation (900 items), served on Ascend via vLLM-Ascend. Under the forced-direct ( prefill ) protocol the port matches or exceeds the native-framework reference (orange ticks), confirming numerical correctness end-to-end. The golden/prefill gap reflects a model behavior (a reasoning-oriented model truncated by a 4-token answer budget), not an accelerator defect. 
+
+0 16 32 48 64 
+
+Ascend 910 card Per-card memory (GB)    
+
+> LM decoder shard Vision tower KV cache + activations Reserved / headroom
+
+Figure 3: Per-card memory footprint for the ∼540 GB bf16 multimodal workload split across 16 Ascend 910 devices (TP = 8 × PP = 2). Each card holds roughly a 34 GB decoder shard plus a ∼2 GB replicated vision tower, with the remainder of the ∼59 GB working budget (0.92 of 64 GB) going to KV cache and activations. The large weight footprint leaves little headroom, which interacts with the tensor-parallel cap discussed in Section 5.2. 
+
+# 5 Limitations 
+
+We group our observations into eight categories, each presented as symptom , evidence , and root cause . Table 2 summarizes the categories and the mitigations discussed in Section 7. 
+
+5.1 Software-stack maturity and operator/feature coverage gaps Symptom. Bringing either workload up required a sequence of source-level patches to the vendor inference plugin before it would even initialize, let alone produce correct output. In total, twelve distinct patches were applied programmatically to the installed plugin package at startup. 
+
+Evidence. Figure 4 breaks the twelve patches down by plugin source file. They spanned loader, worker, and attention code and addressed independent defects, including: a pipeline-parallel guard for a per-layer attention “sink” weight (a direct dictionary lookup that raised KeyError on ranks that did not own the layer); the memory-profiling dummy run taking an inconsistent embedding path for hash-routed MoE; the sparse-attention key/value state and Hadamard transform being gated on a text-only model_type and therefore never allocated for the multimodal config (so the first real prefill — not startup — crashed with an out-of-bounds index); the multimodal embedding merge running on every pipeline-parallel rank rather than only the first; and a persistent pipeline intermediate-tensor buffer sized from a decode-shaped dummy run and thus too small for a later prefill. Several defects were latent because the reference text deployment runs with a single pipeline stage, so the PP >1 code paths had never been exercised. 6On the Limitations of Non-GPU AI Accelerators for Large-Model Inference: A Field Study of MoE and Multimodal Serving on Huawei Ascend A Preprint 
+
+Table 2: Summary of observed limitation classes and mitigations.                           
+
+> §Limitation class Practical mitigation
+> 5.1 Stack maturity /operator &feature coverage Patch the plugin at startup; keep a versioned patch set 5.2 Fragile multi-axis parallelism (PP >1, SP, MC2) Disable SP/fused-MC2; correctness-first config; accept TP =8cap 5.3 Kernel numerical /stability faults (aicore, MTE) Watchdog + auto-restart; reduce concurrency; avoid fragile ops 5.4 Immature graph compilation Prefer enforce-eager ; limit full-decode capture sizes 5.5 Advanced-feature gaps (speculative de-coding) Disable MTP when unstable; trade throughput for reliability 5.6 Performance / scalability ceilings Tune concurrency to a “sweet spot”; budget slow startup 5.7 Operational reliability / observability External health checks; log scraping for device faults 5.8 Ecosystem fragmentation / portability tax Pin versions; document env-var matrix; patch-on-startup
+
+0 1 2 3 4 5 6 7 8
+
+model_runner_v1.py 
+
+deepseek_v4.py 
+
+dsa_v1.py 
+
+models/__init__.py 
+
+> 7
+> 3
+> 1
+> 1
+
+Number of source-level patches 
+
+Figure 4: The twelve startup patches applied to the vendor inference plugin, grouped by source file. The worker runtime ( model_runner_v1.py ) and the model definition ( deepseek_v4.py ) absorb most of the changes, reflecting the pipeline-parallel, multimodal, and MoE/sparse-attention paths that fell outside the plugin’s tested envelope. 
+
+Root cause. The vendor plugin is a young, fast-moving reimplementation whose tested configurations are a subset of what upstream vLLM supports. Feature combinations that are routine on CUDA (pipeline parallelism × multimodal × MoE with a sparse-attention variant) fall outside the tested envelope, and coverage gaps surface as hard crashes rather than graceful fallbacks. 
+
+5.2 Fragile multi-axis parallelism Symptom. Splitting a single replica across 16 devices is constrained and fragile. Two throughput-oriented parallel features had to be disabled to obtain correct results, and the tensor-parallel degree is hard-capped. We use the standard tensor/pipeline/expert-parallel decomposition of [22, 8, 12]. 
+
+Evidence. 
+
+• TP cap. An attention head-grouping factor of 8 caps tensor parallelism at TP = 8 . To use all 16 devices for one replica a second axis is mandatory — pipeline parallelism ( PP = 2 ) for the bf16 
+
+multimodal model (Figure 3), or data parallelism ( DP = 2 ) for the quantized LLM. 
+
+• Sequence parallelism / FlashComm. Enabling sequence parallelism (via the FlashComm path) shards hidden states by the TP degree, but the multimodal forward injects image embeddings through full-size inputs_embeds ; the sharded and full-size tensors then disagree ( expanded size (N) must match existing size (N/tp) ). We disabled it (Listing 1). 7On the Limitations of Non-GPU AI Accelerators for Large-Model Inference: A Field Study of MoE and Multimodal Serving on Huawei Ascend A Preprint 
+
+• Fused MC2 expert routing. The fused MoE communication kernel reads token ids from the forward context, which are absent during the multimodal memory-profiling dummy run, so it had to be disabled as well. 
+
+• Pipeline parallelism correctness. Beyond the crashes in §5.1, a heterogeneous-computing head dimension carried on the hidden-state and residual streams between layers was being collapsed on 
+
+every rank and re-expanded on the next, making the per-head states identical mid-network and silently corrupting output. The fix forwards the full multi-head stream across the pipeline boundary and collapses it only on the last stage — a defect that only manifests with PP > 1 .  
+
+> # Fused MC2 expert routing needs the forward-context token ids, which are # None during multimodal memory profiling (inputs_embeds-only dummy run).
+> export VLLM_ASCEND_ENABLE_FUSED_MC2=0 # FlashComm1 turns on sequence parallelism. SP shards hidden_states by # tp_size, but the multimodal forward injects image embeddings via full-size # inputs_embeds, so the sharded context and full hidden_states disagree.
+> export VLLM_ASCEND_ENABLE_FLASHCOMM1=0
+
+Listing 1: Correctness-over-throughput parallel toggles for the multimodal path. 
+
+Root cause. Parallelism features are implemented and validated largely for the single-modality, single-pipeline-stage case. Their interaction with multimodal input injection, hash-routed MoE, and the sparse-attention variant is thin, so each additional parallel axis multiplies the number of untested code paths. The safe posture is to minimize parallel features and prefer correctness over the associated throughput gains. 
+
+5.3 Kernel-level numerical and stability faults Symptom. Under sustained load the service intermittently aborted with low-level device execution faults — both “aicore” and “vector core” exceptions — that killed the worker process and required a restart. 
+
+Evidence. The faults surfaced as CANN inner errors with runtime result codes 507015 (aicore) and 507035 
+
+(vector core), and an extended message pointing at an MTE address violation (“ The DDR address of the MTE instruction is out of range ”). Representative sanitized excerpts are shown in Listings 2 and 3. 
+
+> RuntimeError: npuSynchronizeDevice: NPU function error: AclrtSynchronizeDeviceWithTimeout, error code is 507035 [Error]: The vector core execution is abnormal. EZ9999: Inner Error! there is an exception of aivec error, core id is 21, error code = 0x800000 errorStr: The DDR address of the MTE instruction is out of range. Kernel task happen error, retCode=0x31, [vector core exception]. wait event to be complete failed, runtime result = 507035
+
+Listing 2: Vector-core execution fault (runtime result 507035). 
+
+> RuntimeError: npuSynchronizeDevice: NPU function error: AclrtSynchronizeDeviceWithTimeout, error code is 507015 [Error]: The aicore execution is abnormal. EZ9999: Inner Error! there is an exception of fftsplus aivector error, core id is 9, error code = 0x800000 errorStr: The DDR address of the MTE instruction is out of range. Kernel task happen error, retCode=0x26, [aicore exception]. wait for compute device to finish failed, runtime result = 507015
+
+Listing 3: Aicore execution fault (runtime result 507015). 
+
+Root cause. These are kernel-internal memory-addressing faults raised by the device, not application-level exceptions. Because they originate inside compiled operators and are reported only as opaque codes and 8On the Limitations of Non-GPU AI Accelerators for Large-Model Inference: A Field Study of MoE and Multimodal Serving on Huawei Ascend A Preprint 
+
+register dumps, they are essentially undebuggable from the serving layer. Their intermittency (tied to load and specific shapes) points to edge cases in the operator library rather than a deterministic bug we could isolate. Operationally they must be treated as expected faults to be detected and recovered from (§5.7). 
+
+5.4 Immature graph compilation Symptom. The high-performance graph-execution path is either unavailable or carries explicit stability warnings, so we frequently fell back to eager execution. 
+
+Evidence. On the multimodal model we ran with enforce-eager (no graph capture) to avoid capture-time failures. On the quantized LLM we used the full-decode ACL-graph mode, for which the engine emits an explicit experimental-stage warning that capturing too many batch sizes can cause out-of-memory errors or inference hangs (Listing 4). The engine also logs that TorchInductor is not supported on this platform, so only ACL Graph mode is available and there is no JIT kernel fusion in the decode path. 
+
+> WARNING platform.py] FULL_DECODE_ONLY compilation enabled on NPU. use_inductor not supported - using only ACL Graph mode WARNING platform.py] * WARNING: You have enabled the *full graph* feature. * This is an early experimental stage and may involve various unknown issues. * A known problem is that capturing too many batch sizes can lead to OOM * (Out of Memory) errors or inference hangs. If you encounter such issues, * consider reducing gpu_memory_utilization or manually specifying a smaller * batch size for graph capture.
+
+Listing 4: Full-graph capture carries an explicit experimental/OOM/hang warning. 
+
+Root cause. Graph capture and kernel compilation are less mature than their CUDA counterparts. With-out an Inductor-equivalent JIT, uncovered shapes and operators fall back to eager mode, and the experimen-tal full-decode capture trades stability for throughput. The practical consequence is a hard choice between the robust-but-slow eager path and the fast-but-fragile capture path. 
+
+5.5 Advanced-feature gaps Symptom. Advanced inference features that are stable on CUDA are newer and less reliable here, and enabling them can destabilize serving. 
+
+Evidence. We configured Multi-Token Prediction (MTP) speculative decoding [13, 1, 14] with a single speculative token on the quantized LLM. In this stack the feature is deprecation-warned and renamed across versions, and speculative quantization settings are silently overridden by the platform. Combined with the kernel faults of §5.3, the safest configuration disabled speculative decoding entirely, trading its throughput benefit for reliability. 
+
+Root cause. Speculative decoding requires tight coordination between a draft path, the main model, and the scheduler; on a stack where each piece is itself young, the composed feature is the least stable of all. Feature availability also churns between plugin versions, so a working recipe is version-locked. 
+
+5.6 Performance and scalability ceilings Symptom. Effective throughput saturates at a surprisingly low request concurrency, and time-to-first-serve is long. 
+
+Evidence. For the quantized-LLM service we found a concurrency “sweet spot” of about four in-flight request streams. Below it the device was underutilized; at that level the engine reported a near-zero waiting queue; at six or more the queue saturated (dozens of requests waiting), parse/timeout failures rose, and 
+
+aggregate throughput fell rather than rose. Figure 5 shows this non-monotonic behavior: aggregate through-put peaks near a concurrency of four and then collapses as the waiting queue explodes, while per-stream throughput (Figure 6) degrades steadily under oversubscription. Separately, cold-start took several minutes due to operator compilation and weight/KV-cache quantization before the first request could be served. 9On the Limitations of Non-GPU AI Accelerators for Large-Model Inference: A Field Study of MoE and Multimodal Serving on Huawei Ascend A Preprint 
+
+1 2 4 6
+
+0
+
+1,000 
+
+2,000 
+
+3,000 
+
+Request concurrency (in-flight streams) 
+
+> Aggregate throughput (req/h)
+> Aggregate throughput
+
+0
+
+20 
+
+40 
+
+60 
+
+> Waiting queue depth
+> Waiting queue
+
+Figure 5: Aggregate serving throughput (left axis, solid) and steady-state waiting queue depth (right axis, dashed) versus request concurrency for the quantized-LLM service. Throughput is non-monotonic: it peaks near a concurrency of four and then collapses as the queue saturates beyond the “sweet spot”. 1 2 4 6
+
+0
+
+500 
+
+1,000 900 900 
+
+> 700
+> 180
+
+Request concurrency (in-flight streams) Per-stream throughput (req/h) Figure 6: Per-stream throughput versus concurrency. Each additional stream past the sweet spot receives a smaller share; at a concurrency of six, per-stream throughput has dropped roughly five-fold, indicating that oversubscription degrades rather than improves service. 
+
+Root cause. The low concurrency ceiling reflects operator-library and scheduler behavior that does not extract as much batch-level parallelism as the CUDA path for these models, so oversubscription degrades instead of helping. The slow startup reflects ahead-of-time operator compilation and quantization work that the CUDA path either avoids or amortizes differently. Both are stack properties, not tuning mistakes, and must be planned around (fixed modest concurrency; long readiness timeouts). 
+
+5.7 Operational reliability and observability Symptom. Long-running services do not stay up on their own, and when they fail the diagnostics are cryptic. 
+
+Evidence. We ran the serving process under an external watchdog that health-checks the OpenAI-compatible endpoint every 30 seconds and automatically restarts the engine on failure — without it, the kernel faults of §5.3 would have caused unbounded outages. We also observed the engine repeatedly logging that no shared-memory broadcast block was available for 60 seconds at a time (Listing 5), a symptom of a process hanging or doing long compilation/quantization work, with no finer-grained signal as to which. Combined with the opaque device fault dumps, root-causing incidents from logs alone was rarely possible. 
+
+> INFO shm_broadcast.py] No available shared memory broadcast block found in 60 seconds. This typically happens when some processes are hanging or doing some time-consuming work (e.g. compilation,
+
+10 On the Limitations of Non-GPU AI Accelerators for Large-Model Inference: A Field Study of MoE and Multimodal Serving on Huawei Ascend A Preprint 
+
+> weight/kv cache quantization).
+
+Listing 5: Repeated shared-memory broadcast stall, indicating a hang or long-running compilation/quantization step. 
+
+Root cause. The stack surfaces failures as low-level device or IPC messages rather than actionable, layered diagnostics, and it lacks the mature resiliency features one expects from a production serving path. Reliability therefore has to be supplied externally (watchdogs, restart policies, log scraping for known fault signatures). 
+
+5.8 Ecosystem fragmentation and portability tax Symptom. Getting and keeping a working deployment depends on a matrix of vendor forks, environment variables, and startup patches that must be rediscovered and pinned. 
+
+Evidence. Behavior is governed by numerous vendor-specific environment variables (for example a family of VLLM_ASCEND_ENABLE_* feature toggles, plus ACL_OP_INIT_MODE , HCCL_BUFFSIZE , and NPU allocator knobs), and by model-/engine-specific source patches applied at container startup. Correct operation depends on a specific engine version, a specific patch set, and a specific env-var configuration; changing any one can silently alter correctness or stability. 
+
+Root cause. Because the vendor path is a fork/plugin that trails and diverges from upstream, portability from a CUDA deployment is not free: it incurs a recurring “tax” of re-patching, re-tuning, and re-validating on every version bump. The small community and thin public documentation make this tax higher than for the mainstream ecosystem. 
+
+# 6 Discussion 
+
+The eight categories share a small number of cross-cutting root causes. First , an immature compiler and operator library is upstream of the kernel faults (§5.3), the graph-compilation limits (§5.4), and the low concurrency ceiling and slow startup (§5.6). Second , thin coverage of feature combinations — as opposed to individual features — explains the parallelism fragility (§5.2) and most of the startup patches (§5.1): each feature may work in isolation, but their cross-product is untested. Third , missing production-grade reliability and observability (§5.7) turns the inevitable faults into outages unless external scaffolding is added. Fourth ,ecosystem fragmentation (§5.8) amplifies all of the above by making every fix version-specific and hard to share. A recurring and dangerous pattern is that startup can look healthy while inference is broken: memory profiling and warmup exercise different code paths than real requests, so several defects only appeared on the first real prefill or under sustained load. Teams should therefore validate with realistic traffic, not just a successful launch. We stress that none of this means the platform is unusable — both workloads were ultimately served correctly. It means the total cost of ownership is dominated by engineering effort (patching, tuning, operating) rather than by acquiring the hardware, and that budgeting for that effort is the single most important planning decision. 
+
+6.1 Threats to validity 
+
+Our study is observational and has clear limits. It covers a single vendor (Huawei Ascend), a single engine line (vLLM-Ascend 0.13.x), and a single node of 16 devices; other accelerators, engine versions, or cluster scales may behave differently, and several defects we hit are likely to be fixed in later releases. The workloads are two specific architectures (a W8A8 MoE LLM and an MoE-decoder VLM) that deliberately stress the hardest paths, so the incidence of problems is not representative of simpler dense models. Our performance measurements are coarse operational observations rather than controlled benchmarks, and absolute numbers depend on request mix and generation lengths; we therefore report them only to illustrate qualitative behavior (e.g., the existence of a concurrency sweet spot) rather than as precise figures. The benchmark scores in Figure 2 are likewise used only to establish correct operation, not as a model-quality claim. We believe the 
+
+classes of limitation and the cross-cutting root causes generalize even where specific codes or counts do not. 11 On the Limitations of Non-GPU AI Accelerators for Large-Model Inference: A Field Study of MoE and Multimodal Serving on Huawei Ascend A Preprint 
+
+# 7 Recommendations and General Strategies 
+
+We separate concrete tactics for the specific stack from general strategies that apply to adopting any alter-native accelerator. 
+
+7.1 Tactics for this stack 
+
+1. Adopt a correctness-first configuration. Disable fragile throughput features by default (se-quence parallelism/FlashComm, fused MoE communication, speculative decoding) and re-enable them only after workload-specific validation. Prefer enforce-eager unless graph capture is proven stable for your shapes. 2. Minimize parallel axes. Respect the tensor-parallel cap and add only the one extra axis (PP or DP) you actually need; every extra parallel feature multiplies untested code paths. 3. Wrap the service in a watchdog. Assume kernel faults will occur; health-check the endpoint and auto-restart. Scrape logs for known fault signatures (e.g., runtime results 507015 /507035 , MTE out-of-range) to drive alerting. 4. Tune to a concurrency sweet spot. Measure the point where the waiting queue stays near zero (Figure 5) and fix concurrency there rather than oversubscribing. 5. Pin everything and keep a patch set. Lock the engine/plugin version, keep source patches idem-potent and applied at startup, and document the full environment-variable matrix so the deployment is reproducible across restarts and hosts. 
+
+7.2 General strategies for adopting alternative accelerators 
+
+These strategies are vendor-agnostic and, in our experience, are what actually bound the cost and risk of a migration. 1. Differential testing against a reference. Treat a trusted implementation (e.g., the CUDA or CPU path, or the model’s native framework) as a correctness oracle and diff intermediate tensors and final outputs layer by layer. Many of our hardest bugs were silent numerical corruptions, not crashes; only differential comparison catches these. 2. Continuous integration on the target stack. Run the real prefill/decode paths (not just startup) on target hardware in CI for every engine/plugin bump, so coverage gaps and regressions are caught before production. 3. A thin portability layer. Isolate engine- and vendor-specific configuration (env vars, flags, patches) behind a small abstraction so the rest of the serving system is portable and the “portability tax” is paid in one place. 4. Canary and shadow deployment. Roll out new versions/patch sets to a canary that mirrors production traffic, and shadow real requests to detect quality or stability regressions before full rollout. 5. A feature-flag compatibility matrix. Maintain an explicit, tested matrix of which feature combinations (parallelism × modality × MoE × quantization × graph mode) are known-good on each version, and default to the smallest working set. 6. Capacity planning around measured limits. Size fleets from the measured concurrency sweet spot and cold-start time (Figures 5–6) rather than from theoretical peak FLOPs or memory. 7. Fault-tolerant serving by default. Assume device faults; combine health-checked auto-restart, request retries/idempotency, and fault-signature alerting so that isolated kernel faults degrade grace-fully instead of causing outages. 8. Kernel-level fallback policies. Prefer the most robust execution mode (eager) as a safe default and adopt graph capture or fused kernels selectively, with automatic fallback when capture fails. 9. Upstream and collaborate. Contribute fixes and reproducers back to the vendor plugin and engage the community; on a thin ecosystem, shared fixes reduce everyone’s recurring cost and shorten the divergence from upstream. 12 On the Limitations of Non-GPU AI Accelerators for Large-Model Inference: A Field Study of MoE and Multimodal Serving on Huawei Ascend A Preprint 
+
+Asks for the ecosystem. Graceful fallbacks (or clear errors) instead of hard crashes for uncovered feature combinations; layered, actionable diagnostics that map device faults to the offending operator/layer; broader testing of feature cross-products (parallelism × multimodal × MoE × sparse attention); and tighter, better-documented version/feature compatibility matrices would each remove a large share of the cost documented here. 
+
+# 8 Conclusion 
+
+We reported a field study of deploying a large W8A8 MoE language model and a large multimodal vision– language model for inference on a 16-card Huawei Ascend 910 system using CANN and vLLM-Ascend. Both were eventually served correctly, but only after twelve source patches, the deliberate disabling of several performance features to preserve correctness, and external operational scaffolding to absorb recurring low-level device faults. The limitations we encountered — stack and operator/feature-coverage immaturity, fragile multi-axis parallelism, kernel-level aicore/vector-core faults, immature graph compilation, unstable advanced features, low performance/scalability ceilings, weak reliability/observability, and ecosystem fragmentation — are platform properties rather than workload quirks. For teams considering this class of accelerator, the hardware is capable, but the engineering cost of reaching and maintaining correctness is the dominant consideration and should be planned for explicitly. The general strategies in Section 7 — differential testing, CI on the target stack, portability layers, canary/shadow rollout, capacity planning around measured limits, and fault-tolerant serving — are, in our experience, what make that cost manageable. 
+
+# References 
+
+[1] Tianle Cai, Yuhong Li, Zhengyang Geng, Hongwu Peng, Jason D. Lee, Deming Chen, and Tri Dao. Medusa: Simple LLM inference acceleration framework with multiple decoding heads. arXiv preprint arXiv:2401.10774 , 2024. [2] Tri Dao. FlashAttention-2: Faster attention with better parallelism and work partitioning. In Interna-tional Conference on Learning Representations (ICLR) , 2024. arXiv:2307.08691. [3] Tri Dao, Daniel Y. Fu, Stefano Ermon, Atri Rudra, and Christopher Ré. FlashAttention: Fast and memory-efficient exact attention with IO-awareness. In Advances in Neural Information Processing Systems (NeurIPS) , 2022. [4] DeepSeek-AI. DeepSeek-V2: A strong, economical, and efficient mixture-of-experts language model. 
+
+arXiv preprint arXiv:2405.04434 , 2024. [5] DeepSeek-AI. DeepSeek-V3 technical report. arXiv preprint arXiv:2412.19437 , 2024. [6] William Fedus, Barret Zoph, and Noam Shazeer. Switch Transformers: Scaling to trillion parameter models with simple and efficient sparsity. Journal of Machine Learning Research , 23(120):1–39, 2022. [7] Elias Frantar, Saleh Ashkboos, Torsten Hoefler, and Dan Alistarh. GPTQ: Accurate post-training quantization for generative pre-trained transformers. In International Conference on Learning Repre-sentations (ICLR) , 2023. arXiv:2210.17323. [8] Yanping Huang, Youlong Cheng, Ankur Bapna, Orhan Firat, Dehao Chen, Mia Xu Chen, HyoukJoong Lee, Jiquan Ngiam, Quoc V. Le, Yonghui Wu, and Zhifeng Chen. GPipe: Efficient training of giant neural networks using pipeline parallelism. In Advances in Neural Information Processing Systems (NeurIPS) , 2019. [9] Huawei Technologies Co., Ltd. CANN: Compute architecture for neural networks — documentation. 
+
+https://www.hiascend.com/en/software/cann , 2024. Accessed 2026. [10] Albert Q. Jiang, Alexandre Sablayrolles, Antoine Roux, Arthur Mensch, Blanche Savary, Chris Bamford, et al. Mixtral of experts. arXiv preprint arXiv:2401.04088 , 2024. [11] Woosuk Kwon, Zhuohan Li, Siyuan Zhuang, Ying Sheng, Lianmin Zheng, Cody Hao Yu, Joseph E. Gonzalez, Hao Zhang, and Ion Stoica. Efficient memory management for large language model serving with PagedAttention. In Proceedings of the 29th Symposium on Operating Systems Principles (SOSP) ,pages 611–626, 2023. doi: 10.1145/3600006.3613165. [12] Dmitry Lepikhin, HyoukJoong Lee, Yuanzhong Xu, Dehao Chen, Orhan Firat, Yanping Huang, Maxim Krikun, Noam Shazeer, and Zhifeng Chen. GShard: Scaling giant models with conditional computa-tion and automatic sharding. In International Conference on Learning Representations (ICLR) , 2021. arXiv:2006.16668. 13 On the Limitations of Non-GPU AI Accelerators for Large-Model Inference: A Field Study of MoE and Multimodal Serving on Huawei Ascend A Preprint 
+
+[13] Yaniv Leviathan, Matan Kalman, and Yossi Matias. Fast inference from transformers via speculative decoding. In Proceedings of the 40th International Conference on Machine Learning (ICML) , 2023. arXiv:2211.17192. [14] Yuhui Li, Fangyun Wei, Chao Zhang, and Hongyang Zhang. EAGLE: Speculative sampling requires rethinking feature uncertainty. arXiv preprint arXiv:2401.15077 , 2024. [15] Heng Liao, Jiajin Tu, Jing Xia, and Xiping Zhou. DaVinci: A scalable architecture for neural network computing. In IEEE Hot Chips 31 Symposium (HCS) . IEEE, 2019. [16] Heng Liao, Jiajin Tu, Jing Xia, Hu Liu, Xiping Zhou, Honghui Yuan, and Yuxing Hu. Ascend: A scalable and unified architecture for ubiquitous deep neural network computing — industry track paper. In 2021 IEEE International Symposium on High-Performance Computer Architecture (HPCA) , pages 789–801, 2021. doi: 10.1109/HPCA51647.2021.00071. [17] Ji Lin, Jiaming Tang, Haotian Tang, Shang Yang, Wei-Ming Chen, Wei-Chen Wang, Guangxuan Xiao, Xingyu Dang, Chuang Gan, and Song Han. AWQ: Activation-aware weight quantization for LLM compression and acceleration. In Proceedings of Machine Learning and Systems (MLSys) , 2024. arXiv:2306.00978. [18] Haotian Liu, Chunyuan Li, Qingyang Wu, and Yong Jae Lee. Visual instruction tuning. In Advances in Neural Information Processing Systems (NeurIPS) , 2023. arXiv:2304.08485. [19] Adam Paszke, Sam Gross, Francisco Massa, Adam Lerer, James Bradbury, Gregory Chanan, Trevor Killeen, Zeming Lin, Natalia Gimelshein, Luca Antiga, et al. PyTorch: An imperative style, high-performance deep learning library. In Advances in Neural Information Processing Systems (NeurIPS) ,2019. arXiv:1912.01703. [20] Alec Radford, Jong Wook Kim, Chris Hallacy, Aditya Ramesh, Gabriel Goh, Sandhini Agarwal, Girish Sastry, Amanda Askell, Pamela Mishkin, Jack Clark, Gretchen Krueger, and Ilya Sutskever. Learning transferable visual models from natural language supervision. In Proceedings of the 38th International Conference on Machine Learning (ICML) , 2021. arXiv:2103.00020. [21] Noam Shazeer, Azalia Mirhoseini, Krzysztof Maziarz, Andy Davis, Quoc Le, Geoffrey Hinton, and Jeff Dean. Outrageously large neural networks: The sparsely-gated mixture-of-experts layer. In International Conference on Learning Representations (ICLR) , 2017. arXiv:1701.06538. [22] Mohammad Shoeybi, Mostofa Patwary, Raul Puri, Patrick LeGresley, Jared Casper, and Bryan Catan-zaro. Megatron-LM: Training multi-billion parameter language models using model parallelism. arXiv preprint arXiv:1909.08053 , 2019. [23] Ashish Vaswani, Noam Shazeer, Niki Parmar, Jakob Uszkoreit, Llion Jones, Aidan N. Gomez, Łukasz Kaiser, and Illia Polosukhin. Attention is all you need. In Advances in Neural Information Processing Systems (NeurIPS) , 2017. [24] vLLM Project. vLLM Ascend plugin (vllm-ascend) documentation. https://vllm-ascend. readthedocs.io/ , 2024. Accessed 2026. [25] Peng Wang, Shuai Bai, Sinan Tan, Shijie Wang, Zhihao Fan, Jinze Bai, et al. Qwen2-VL: Enhancing vision-language model’s perception of the world at any resolution. arXiv preprint arXiv:2409.12191 ,2024. [26] Guangxuan Xiao, Ji Lin, Mickael Seznec, Hao Wu, Julien Demouth, and Song Han. SmoothQuant: Accurate and efficient post-training quantization for large language models. In Proceedings of the 40th International Conference on Machine Learning (ICML) , 2023. arXiv:2211.10438. [27] Gyeong-In Yu, Joo Seong Jeong, Geon-Woo Kim, Soojeong Kim, and Byung-Gon Chun. Orca: Adistributed serving system for Transformer-based generative models. In 16th USENIX Symposium on Operating Systems Design and Implementation (OSDI 22) , pages 521–538, Carlsbad, CA, 2022. USENIX Association. 14

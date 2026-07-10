@@ -6,40 +6,35 @@
 </div>
 
 ## 每次日报
-- 最新运行日期：2026-07-09
-- 运行时间：2026-07-09 21:49:10 UTC
+- 最新运行日期：2026-07-10
+- 运行时间：2026-07-10 21:01:05 UTC
 - 运行状态：成功
-- 本次总论文数：6
-- 精读区：4
+- 本次总论文数：5
+- 精读区：3
 - 速读区：2
 
 ### 今日简报（AI）
-1) 今日精选2篇高分精读，聚焦LLM推理优化：CPU约束下自适应推测解码框架与移动端NPU效率瓶颈剖析。  
-2) 最值得关注：AdaptiveSD的多策略编排可大幅提升CPU受限场景解码速度；NPU论文揭示了当前移动端隐藏的计算与访存瓶颈。  
-3) 建议优先精读这两篇9分论文，重点关注其部署优化方案，后续可针对自身硬件环境复现评估。
-- 详情：[/202607/09/README](/202607/09/README)
+今日精读9分论文《Rethinking Small VLM Quantization》与《Towards Efficient LLM Serving》，聚焦小模型量化与KV缓存系统优化。最值得关注的是硬件感知的组件级量化方法和系统级KV缓存架构。下一步可深入研读这两篇的部署案例与优化策略，并关注速读的剪枝与昇腾推理瓶颈分析。
+- 详情：[/202607/10/README](/202607/10/README)
 
 ### 精读区论文标签
-1. [AdaptiveSD A Stability-Aware, Runtime-Adaptive Speculative Decoding Framework with Multi-Policy Orchestration for CPU-Constrained LLM Inference](/202607/09/2607.03876v1-adaptivesd-a-stability-aware-runtime-adaptive-speculative-decoding-framework-with-multi-policy-orchestration-for-cpu-constrained-llm-inference)  
+1. [Rethinking Small VLM Quantization: From Component-Wise Analysis to Hardware-Aware Edge Deployment](/202607/10/2607.08029v1-rethinking-small-vlm-quantization-from-component-wise-analysis-to-hardware-aware-edge-deployment)  
    标签：评分：9.0/10、query:edge-llm
-   evidence：CPU资源受限下运行时自适应推测解码
-2. [Is Your NPU Ready for LLMs? Dissecting the Hidden Efficiency Bottlenecks in Mobile LLM Inference](/202607/09/2607.05475v1-is-your-npu-ready-for-llms-dissecting-the-hidden-efficiency-bottlenecks-in-mobile-llm-inference)  
+   evidence：硬件感知的视觉语言模型量化边缘部署
+2. [Towards Efficient Large Language Model Serving: A Survey on System-Aware KV Cache Optimization](/202607/10/2607.08057v1-towards-efficient-large-language-model-serving-a-survey-on-system-aware-kv-cache-optimization)  
    标签：评分：9.0/10、query:edge-llm
-   evidence：移动端LLM推理在NPU上的瓶颈
-3. [Voltron: Enabling Elastic Multi-Device Execution of LLM Inference for Empowered Edge Intelligence](/202607/09/2607.07046v1-voltron-enabling-elastic-multi-device-execution-of-llm-inference-for-empowered-edge-intelligence)  
+   evidence：LLM服务中系统感知KV缓存优化的综述
+3. [MORES: Mobile Reasoning-as-a-Service via Distributed LLM Inference-Time Scaling](/202607/10/2607.08116v1-mores-mobile-reasoning-as-a-service-via-distributed-llm-inference-time-scaling)  
    标签：评分：9.0/10、query:edge-llm
-   evidence：边缘LLM推理的弹性多设备执行
-4. [Energy-Efficient GPU DVFS for Fine-Tuning of SLMs on Resource-constrained Embedded Devices](/202607/09/2607.05933v1-energy-efficient-gpu-dvfs-for-fine-tuning-of-slms-on-resource-constrained-embedded-devices)  
-   标签：评分：8.0/10、query:edge-llm
-   evidence：嵌入式设备上基于GPU DVFS的能效优化小语言模型微调
+   evidence：面向移动设备的分布式LLM推理时缩放方法
 
 ### 速读区论文标签
-1. [The Key to Going Linear: Analysis-Driven Transformer Linearization](/202607/09/2607.07706v1-the-key-to-going-linear-analysis-driven-transformer-linearization)  
+1. [Structured Pruning of Large Language Models via Power Transformation and Sign-Preserving Score Aggregation with Adaptive Feature Retention](/202607/10/2607.08027v1-structured-pruning-of-large-language-models-via-power-transformation-and-sign-preserving-score-aggregation-with-adaptive-feature-retention)  
    标签：评分：7.0/10、query:edge-llm
-   evidence：transformer线性化以实现高效推理
-2. [TriRoute: Unified Learned Routing for Joint Adaptive Attention, Experts, and KV-Cache Allocation](/202607/09/2607.06601v1-triroute-unified-learned-routing-for-joint-adaptive-attention-experts-and-kv-cache-allocation)  
+   evidence：结构化剪枝降低模型大小，可提升边缘设备资源效率
+2. [On the Limitations of Non-GPU AI Accelerators for Large-Model Inference: A Field Study of MoE and Multimodal Serving on Huawei Ascend](/202607/10/2607.08215v1-on-the-limitations-of-non-gpu-ai-accelerators-for-large-model-inference-a-field-study-of-moe-and-multimodal-serving-on-huawei-ascend)  
    标签：评分：6.0/10、query:edge-llm
-   evidence：联合优化注意力、专家和KV缓存分配以实现高效LLM推断
+   evidence：在非GPU加速器（华为昇腾）上部署LLM的实地研究，揭示了迁移工作负载的工程成本和限制
 
 
 <div class="dpr-home-promo-card">
