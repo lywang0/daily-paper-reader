@@ -6,38 +6,38 @@
 </div>
 
 ## 每次日报
-- 最新运行日期：2026-07-16
-- 运行时间：2026-07-16 20:39:52 UTC
+- 最新运行日期：2026-07-17
+- 运行时间：2026-07-17 21:14:04 UTC
 - 运行状态：成功
 - 本次总论文数：6
 - 精读区：3
 - 速读区：3
 
 ### 今日简报（AI）
-今日日报聚焦两篇高分研究：边缘端异构执行与云边协同推理，以及三篇KV缓存压缩论文。最值得关注的是《HeteroMosaic》与《Efficient and Privacy Aware Edge Cloud Collaborative Inference》，前者挖掘边缘异构机会实现能效LLM推理，后者兼顾效率与隐私。建议普通读者优先精读这两篇，把握边缘推理前沿思路。
-- 详情：[/202607/16/README](/202607/16/README)
+今日共处理6篇边缘端LLM推理论文，精读重点聚焦能效优化。最值得关注的是《HeteroMosaic》的异构执行策略与《PolyQ》的端到端量化框架，两者均实现边缘LLM高效推理。建议后续深入探索异构计算与量化技术的协同设计方向。
+- 详情：[/202607/17/README](/202607/17/README)
 
 ### 精读区论文标签
-1. [HeteroMosaic: Exposing and Exploiting Heterogeneous Execution Opportunities for Energy-Efficient Edge LLM Inference](/202607/16/2607.12839v2-heteromosaic-exposing-and-exploiting-heterogeneous-execution-opportunities-for-energy-efficient-edge-llm-inference)  
+1. [HeteroMosaic: Exposing and Exploiting Heterogeneous Execution Opportunities for Energy-Efficient Edge LLM Inference](/202607/17/2607.12839v3-heteromosaic-exposing-and-exploiting-heterogeneous-execution-opportunities-for-energy-efficient-edge-llm-inference)  
+   标签：评分：10.0/10、query:edge-llm
+   evidence：利用CPU、iGPU、NPU的边端LLM推理异构调度框架
+2. [PolyQ: Codesigning End-to-End Quantization Framework for Scalable Edge CPU LLM Inference](/202607/17/2607.14618v1-polyq-codesigning-end-to-end-quantization-framework-for-scalable-edge-cpu-llm-inference)  
    标签：评分：9.0/10、query:edge-llm
-   evidence：面向边缘LLM推理的异构调度框架，利用iGPU和NPU
-2. [Efficient and Privacy Aware Edge Cloud Collaborative Inference for Large Language Models](/202607/16/2607.13093v1-efficient-and-privacy-aware-edge-cloud-collaborative-inference-for-large-language-models)  
+   evidence：边缘CPU LLM推理的软硬协同设计
+3. [SmartRAG: Native Graph-Based RAG for Mobile Device](/202607/17/2607.14661v1-smartrag-native-graph-based-rag-for-mobile-device)  
    标签：评分：9.0/10、query:edge-llm
-   evidence：隐私感知的边缘-云协同LLM推理
-3. [CIMERA: Compute-in-Interconnect and Memory with Reconfigurable Precision for LLM Inference](/202607/16/2607.13649v1-cimera-compute-in-interconnect-and-memory-with-reconfigurable-precision-for-llm-inference)  
-   标签：评分：9.0/10、query:edge-llm
-   evidence：面向LLM推理的可重构精度加速器
+   evidence：面向移动端的设备上LLM框架
 
 ### 速读区论文标签
-1. [MemDecay: Region-Aware KV Cache Eviction for Efficient LLM Agent Inference](/202607/16/2607.10582v1-memdecay-region-aware-kv-cache-eviction-for-efficient-llm-agent-inference)  
-   标签：评分：6.0/10、query:edge-llm
-   evidence：面向LLM智能体推理的区域感知KV缓存淘汰
-2. [A JoLT for the KV Cache: Near-Lossless KV Cache Compression via Joint Tucker and JL-Residual Allocation for LLMs](/202607/16/2607.12550v1-a-jolt-for-the-kv-cache-near-lossless-kv-cache-compression-via-joint-tucker-and-jl-residual-allocation-for-llms)  
-   标签：评分：6.0/10、query:edge-llm
-   evidence：用于高效LLM推理的KV缓存压缩
-3. [Adaptive Filtering of the KV Cache: Diagnosing and Correcting Structural-Role Bias in LLM Inference](/202607/16/2607.13205v1-adaptive-filtering-of-the-kv-cache-diagnosing-and-correcting-structural-role-bias-in-llm-inference)  
-   标签：评分：6.0/10、query:edge-llm
-   evidence：面向LLM服务的KV缓存优化，解决内存受限推理
+1. [Benchmarking Edge Inference Strategies for Deep Learning Models in Industrial Machine Vision](/202607/17/2607.11356v1-benchmarking-edge-inference-strategies-for-deep-learning-models-in-industrial-machine-vision)  
+   标签：评分：7.0/10、query:edge-llm
+   evidence：在边缘设备上基准测试ONNX、OpenVINO、TensorRT等推理策略
+2. [Realizable N:M Sparse Transformer Inference via Search-Kernel Co-Design](/202607/17/2607.12505v2-realizable-nm-sparse-transformer-inference-via-search-kernel-co-design)  
+   标签：评分：7.0/10、query:edge-llm
+   evidence：面向N:M稀疏Transformer推理的软硬件协同设计
+3. [ExaGEMM: Exploration Framework for CPU-Driven ML Inference via Associative In-Register Computing for Low-Bit GEMM](/202607/17/2607.14622v1-exagemm-exploration-framework-for-cpu-driven-ml-inference-via-associative-in-register-computing-for-low-bit-gemm)  
+   标签：评分：7.0/10、query:edge-llm
+   evidence：面向CPU低比特GEMM的软硬协同设计，实现高效推理
 
 
 <div class="dpr-home-promo-card">
