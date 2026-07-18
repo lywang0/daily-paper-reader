@@ -6,38 +6,29 @@
 </div>
 
 ## 每次日报
-- 最新运行日期：2026-07-17
-- 运行时间：2026-07-17 21:14:04 UTC
+- 最新运行日期：2026-07-18
+- 运行时间：2026-07-18 21:20:25 UTC
 - 运行状态：成功
-- 本次总论文数：6
-- 精读区：3
-- 速读区：3
+- 本次总论文数：3
+- 精读区：2
+- 速读区：1
 
 ### 今日简报（AI）
-今日共处理6篇边缘端LLM推理论文，精读重点聚焦能效优化。最值得关注的是《HeteroMosaic》的异构执行策略与《PolyQ》的端到端量化框架，两者均实现边缘LLM高效推理。建议后续深入探索异构计算与量化技术的协同设计方向。
-- 详情：[/202607/17/README](/202607/17/README)
+今日精读两篇8分论文：无注意力机制标记缩减高效化视觉语言模型，非线性IMC增强FPGA加速ML推理；速读6分长上下文稀疏注意力优化。值得关注轻量级Token缩减与非传统硬件加速方向，建议学习如何平衡模型效率与精度以适配边缘部署。
+- 详情：[/202607/18/README](/202607/18/README)
 
 ### 精读区论文标签
-1. [HeteroMosaic: Exposing and Exploiting Heterogeneous Execution Opportunities for Energy-Efficient Edge LLM Inference](/202607/17/2607.12839v3-heteromosaic-exposing-and-exploiting-heterogeneous-execution-opportunities-for-energy-efficient-edge-llm-inference)  
-   标签：评分：10.0/10、query:edge-llm
-   evidence：利用CPU、iGPU、NPU的边端LLM推理异构调度框架
-2. [PolyQ: Codesigning End-to-End Quantization Framework for Scalable Edge CPU LLM Inference](/202607/17/2607.14618v1-polyq-codesigning-end-to-end-quantization-framework-for-scalable-edge-cpu-llm-inference)  
-   标签：评分：9.0/10、query:edge-llm
-   evidence：边缘CPU LLM推理的软硬协同设计
-3. [SmartRAG: Native Graph-Based RAG for Mobile Device](/202607/17/2607.14661v1-smartrag-native-graph-based-rag-for-mobile-device)  
-   标签：评分：9.0/10、query:edge-llm
-   evidence：面向移动端的设备上LLM框架
+1. [Attention-Free and Lightweight Token Reduction for Efficient Vision-Language Models](/202607/18/2607.13500v1-attention-free-and-lightweight-token-reduction-for-efficient-vision-language-models)  
+   标签：评分：8.0/10、query:edge-llm
+   evidence：边缘设备上视觉语言模型的令牌减少实现高效推理
+2. [NIFA: Nonlinear IMC enhanced FPGA for efficient ML inference](/202607/18/2607.15123v1-nifa-nonlinear-imc-enhanced-fpga-for-efficient-ml-inference)  
+   标签：评分：8.0/10、query:edge-llm
+   evidence：非线性存内计算增强FPGA实现高效ML推理
 
 ### 速读区论文标签
-1. [Benchmarking Edge Inference Strategies for Deep Learning Models in Industrial Machine Vision](/202607/17/2607.11356v1-benchmarking-edge-inference-strategies-for-deep-learning-models-in-industrial-machine-vision)  
-   标签：评分：7.0/10、query:edge-llm
-   evidence：在边缘设备上基准测试ONNX、OpenVINO、TensorRT等推理策略
-2. [Realizable N:M Sparse Transformer Inference via Search-Kernel Co-Design](/202607/17/2607.12505v2-realizable-nm-sparse-transformer-inference-via-search-kernel-co-design)  
-   标签：评分：7.0/10、query:edge-llm
-   evidence：面向N:M稀疏Transformer推理的软硬件协同设计
-3. [ExaGEMM: Exploration Framework for CPU-Driven ML Inference via Associative In-Register Computing for Low-Bit GEMM](/202607/17/2607.14622v1-exagemm-exploration-framework-for-cpu-driven-ml-inference-via-associative-in-register-computing-for-low-bit-gemm)  
-   标签：评分：7.0/10、query:edge-llm
-   evidence：面向CPU低比特GEMM的软硬协同设计，实现高效推理
+1. [LiteTopK: Exploiting the Curse of Dimensionality for a Fused Indexer-TopK Kernel in Long-Context Sparse Attention](/202607/18/2607.11976v1-litetopk-exploiting-the-curse-of-dimensionality-for-a-fused-indexer-topk-kernel-in-long-context-sparse-attention)  
+   标签：评分：6.0/10、query:edge-llm
+   evidence：面向LLM稀疏注意力高效的融合索引TopK核
 
 
 <div class="dpr-home-promo-card">
