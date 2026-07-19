@@ -6,29 +6,29 @@
 </div>
 
 ## 每次日报
-- 最新运行日期：2026-07-18
-- 运行时间：2026-07-18 21:20:25 UTC
+- 最新运行日期：2026-07-19
+- 运行时间：2026-07-19 21:15:12 UTC
 - 运行状态：成功
-- 本次总论文数：3
-- 精读区：2
-- 速读区：1
+- 本次总论文数：2
+- 精读区：0
+- 速读区：2
 
 ### 今日简报（AI）
-今日精读两篇8分论文：无注意力机制标记缩减高效化视觉语言模型，非线性IMC增强FPGA加速ML推理；速读6分长上下文稀疏注意力优化。值得关注轻量级Token缩减与非传统硬件加速方向，建议学习如何平衡模型效率与精度以适配边缘部署。
-- 详情：[/202607/18/README](/202607/18/README)
+今日速读两篇论文，分别聚焦大模型并行推理加速与微控制器神经网络调度优化。  
+第一篇通过渐进式树草稿机制提升推测解码效率，第二篇将推理管道作为操作系统对象实现优先级调度和恒定内存流式处理。  
+建议普通读者重点关注推测解码对LLM推理速度的潜在提升，以及嵌入式AI中资源受限场景的调度策略。
+- 详情：[/202607/19/README](/202607/19/README)
 
 ### 精读区论文标签
-1. [Attention-Free and Lightweight Token Reduction for Efficient Vision-Language Models](/202607/18/2607.13500v1-attention-free-and-lightweight-token-reduction-for-efficient-vision-language-models)  
-   标签：评分：8.0/10、query:edge-llm
-   evidence：边缘设备上视觉语言模型的令牌减少实现高效推理
-2. [NIFA: Nonlinear IMC enhanced FPGA for efficient ML inference](/202607/18/2607.15123v1-nifa-nonlinear-imc-enhanced-fpga-for-efficient-ml-inference)  
-   标签：评分：8.0/10、query:edge-llm
-   evidence：非线性存内计算增强FPGA实现高效ML推理
+- 本次无精读推荐。
 
 ### 速读区论文标签
-1. [LiteTopK: Exploiting the Curse of Dimensionality for a Fused Indexer-TopK Kernel in Long-Context Sparse Attention](/202607/18/2607.11976v1-litetopk-exploiting-the-curse-of-dimensionality-for-a-fused-indexer-topk-kernel-in-long-context-sparse-attention)  
+1. [Unlocking Parallelism in Autoregressive Language Models via Speculative Decoding with Progressive Tree Drafting](/202607/19/2607.10661v1-unlocking-parallelism-in-autoregressive-language-models-via-speculative-decoding-with-progressive-tree-drafting)  
    标签：评分：6.0/10、query:edge-llm
-   evidence：面向LLM稀疏注意力高效的融合索引TopK核
+   evidence：通过并行推测实现LLM推理的硬件感知加速
+2. [Inference Pipelines as Operating-System Objects: Priority Scheduling and Constant-Footprint Streaming for Microcontroller Neural Inference](/202607/19/2607.12614v1-inference-pipelines-as-operating-system-objects-priority-scheduling-and-constant-footprint-streaming-for-microcontroller-neural-inference)  
+   标签：评分：6.0/10、query:edge-llm
+   evidence：微控制器上神经网络推理运行时，具有优先级调度和恒定占用
 
 
 <div class="dpr-home-promo-card">
