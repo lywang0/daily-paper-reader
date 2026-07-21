@@ -6,52 +6,62 @@
 </div>
 
 ## 每次日报
-- 最新运行日期：2026-07-20
-- 运行时间：2026-07-20 21:29:16 UTC
+- 最新运行日期：2026-07-21
+- 运行时间：2026-07-21 21:40:17 UTC
 - 运行状态：成功
-- 本次总论文数：10
-- 精读区：5
-- 速读区：5
+- 本次总论文数：14
+- 精读区：6
+- 速读区：8
 
 ### 今日简报（AI）
-今日日报聚焦大模型推理优化，精读两篇：边缘-云协同推理（9.0分）与MLIR编译方法（9.0分）。  
-最值得关注的是高效隐私感知的端云协同推理及MLIR编译优化，两者均达顶级评价。  
-建议普通读者重点关注这些方法在实际部署中的应用，尤其是隐私敏感或编译效率提升场景。
-- 详情：[/202607/20/README](/202607/20/README)
+今日聚焦3D内存异构加速器与细粒度DVFS，共分析14篇LLM相关论文；最值得关注的是ThAME利用3D内存实现MoE模型高效加速，以及面向LLM服务的NPU空间DVFS节能技术；建议优先阅读精读高分论文，并关注SelectInfer的端侧选择性神经元加载方法。
+- 详情：[/202607/21/README](/202607/21/README)
 
 ### 精读区论文标签
-1. [Efficient and Privacy Aware Edge Cloud Collaborative Inference for Large Language Models](/202607/20/2607.13093v2-efficient-and-privacy-aware-edge-cloud-collaborative-inference-for-large-language-models)  
+1. [ThAME: 3D Memory-Enabled Heterogeneous Accelerator for LLM Mixture of Experts](/202607/21/2607.17074v1-thame-3d-memory-enabled-heterogeneous-accelerator-for-llm-mixture-of-experts)  
+   标签：评分：10.0/10、query:edge-llm
+   evidence：基于FeFET内存的3D异构多芯片架构用于MoE大模型推理
+2. [Enabling Spatially Fine-Grained DVFS in Neural Processing Units for Energy-Efficient LLM Serving](/202607/21/2607.16473v1-enabling-spatially-fine-grained-dvfs-in-neural-processing-units-for-energy-efficient-llm-serving)  
    标签：评分：9.0/10、query:edge-llm
-   evidence：边缘云协作LLM推理框架，在设备端处理输入并保护隐私
-2. [An MLIR-Based Compilation Method for Large Language Models](/202607/20/2607.15865v1-an-mlir-based-compilation-method-for-large-language-models)  
+   evidence：NPU上空间细粒度DVFS实现能效LLM服务
+3. [EdgeCoInfer: Hierarchical Collaborative Inference for On-Device Multimodal Large Models](/202607/21/2607.17143v1-edgecoinfer-hierarchical-collaborative-inference-for-on-device-multimodal-large-models)  
    标签：评分：9.0/10、query:edge-llm
-   evidence：基于MLIR的LLM硬件部署编译方法
-3. [LiteTopK: Exploiting the Curse of Dimensionality for a Fused Indexer-TopK Kernel in Long-Context Sparse Attention](/202607/20/2607.11976v1-litetopk-exploiting-the-curse-of-dimensionality-for-a-fused-indexer-topk-kernel-in-long-context-sparse-attention)  
+   evidence：边缘端设备上多模态LLM推理的协同框架
+4. [LMEdge: QoS-Aware LLM Inference Orchestration on Edge Clusters](/202607/21/2607.17175v1-lmedge-qos-aware-llm-inference-orchestration-on-edge-clusters)  
+   标签：评分：9.0/10、query:edge-llm
+   evidence：边缘集群上基于QoS的LLM推理编排
+5. [Transition-Aware Backend Dispatch for Edge LLM Inference](/202607/21/2607.17415v1-transition-aware-backend-dispatch-for-edge-llm-inference)  
+   标签：评分：9.0/10、query:edge-llm
+   evidence：边缘LLM推理的过渡感知后端调度，硬件感知调度
+6. [On Hardware-Aware Design and Optimization of Edge Intelligence](/202607/21/2607.16297v1-on-hardware-aware-design-and-optimization-of-edge-intelligence)  
    标签：评分：8.0/10、query:edge-llm
-   evidence：针对LLM推理中稀疏注意力操作的高效GPU内核融合优化
-4. [PFAdapter: Hierarchical LoRA Decomposition for Personalized Federated MLLMs](/202607/20/2607.12111v1-pfadapter-hierarchical-lora-decomposition-for-personalized-federated-mllms)  
-   标签：评分：8.0/10、query:edge-llm
-   evidence：面向边缘设备的多模态大模型个性化联邦微调
-5. [A JoLT for the KV Cache: Near-Lossless KV Cache Compression via Joint Tucker and JL-Residual Allocation for LLMs](/202607/20/2607.12550v2-a-jolt-for-the-kv-cache-near-lossless-kv-cache-compression-via-joint-tucker-and-jl-residual-allocation-for-llms)  
-   标签：评分：8.0/10、query:edge-llm
-   evidence：通过张量方法压缩KV缓存以加速LLM推理
+   evidence：边缘智能硬件感知设计与优化综述，涵盖模型压缩和神经架构搜索
 
 ### 速读区论文标签
-1. [Full-Pipeline Inference Optimization for MiMo-V2.5 Series: Pushing Hybrid SWA Efficiency to the Limit](/202607/20/2607.13095v1-full-pipeline-inference-optimization-for-mimo-v25-series-pushing-hybrid-swa-efficiency-to-the-limit)  
+1. [SelectInfer: Selective Neuron Loading and Computation for On-Device LLMs](/202607/21/2607.18081v1-selectinfer-selective-neuron-loading-and-computation-for-on-device-llms)  
+   标签：评分：8.0/10、query:edge-llm
+   evidence：面向边缘设备的神经元级LLM推理优化框架
+2. [SmartRAG: Native Graph-Based RAG for Mobile Device](/202607/21/2607.14661v2-smartrag-native-graph-based-rag-for-mobile-device)  
    标签：评分：7.0/10、query:edge-llm
-   evidence：面向LLM服务的全管道推理优化
-2. [D-cut: Adaptive Verification Depth Pruning for Batched Speculative Decoding](/202607/20/2607.14647v1-d-cut-adaptive-verification-depth-pruning-for-batched-speculative-decoding)  
+   evidence：面向移动端设备的片上大语言模型服务框架
+3. [Roomie: Interference-Aware Colocation for Efficient Model Serving](/202607/21/2607.16784v1-roomie-interference-aware-colocation-for-efficient-model-serving)  
    标签：评分：7.0/10、query:edge-llm
-   evidence：批处理推测解码中的自适应验证深度剪枝，服务于LLM serving
-3. [CODA: Algorithm-Hardware Co-design for Edge Video Diffusion via NMP-Enabled Compute-Cache Operator Disaggregation](/202607/20/2607.14908v1-coda-algorithm-hardware-co-design-for-edge-video-diffusion-via-nmp-enabled-compute-cache-operator-disaggregation)  
+   evidence：干扰感知的模型服务共置调度，适用于边缘和云
+4. [MXSens: Sensitivity-Aware Mixed-Precision Quantization for Efficient LLM Inference](/202607/21/2607.17733v1-mxsens-sensitivity-aware-mixed-precision-quantization-for-efficient-llm-inference)  
+   标签：评分：7.0/10、query:edge-llm
+   evidence：敏感度感知的混合精度量化实现高效LLM推理
+5. [ExpertPlex: A High-Goodput Disaggregated Serving System for MoE LLMs with Adaptive Persistent Kernels](/202607/21/2607.18002v1-expertplex-a-high-goodput-disaggregated-serving-system-for-moe-llms-with-adaptive-persistent-kernels)  
+   标签：评分：7.0/10、query:edge-llm
+   evidence：MoE大模型服务系统，采用预填充-解码分离设计
+6. [Empowering On-Device Model Adaptation with an Edge AI Inference Accelerator](/202607/21/2607.18101v1-empowering-on-device-model-adaptation-with-an-edge-ai-inference-accelerator)  
+   标签：评分：7.0/10、query:edge-llm
+   evidence：利用边缘AI加速器(Hailo-8L)的异构流水线进行设备上模型适应，支持高效推理
+7. [Auto-Scaling Heterogeneous Neural Processing Units for Energy and Cost-Efficient LLM Serving](/202607/21/2607.16488v1-auto-scaling-heterogeneous-neural-processing-units-for-energy-and-cost-efficient-llm-serving)  
    标签：评分：6.0/10、query:edge-llm
-   evidence：面向边缘视频扩散的算法-硬件协同设计
-4. [VarRate: Training-Free Variable-Rate KV Cache Compression for Long-Context LLMs](/202607/20/2607.15498v1-varrate-training-free-variable-rate-kv-cache-compression-for-long-context-llms)  
+   evidence：异构NPU自动缩放用于LLM服务，解决LLM推理的异构计算问题
+8. [C$^2$KV: Compressed and Composable KV Cache Reuse for Efficient LLM Inference](/202607/21/2607.17715v1-c2kv-compressed-and-composable-kv-cache-reuse-for-efficient-llm-inference)  
    标签：评分：6.0/10、query:edge-llm
-   evidence：面向长上下文LLM推理的无训练KV缓存压缩
-5. [PagedWeight: Efficient MoE LLM Serving with Dynamic Quality-Aware Weight Quantization](/202607/20/2607.16184v1-pagedweight-efficient-moe-llm-serving-with-dynamic-quality-aware-weight-quantization)  
-   标签：评分：6.0/10、query:edge-llm
-   evidence：高效的MoE LLM服务与动态权重量化
+   evidence：KV缓存重用与压缩实现高效LLM推理
 
 
 <div class="dpr-home-promo-card">
