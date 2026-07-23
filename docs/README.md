@@ -6,32 +6,34 @@
 </div>
 
 ## 每次日报
-- 最新运行日期：2026-07-22
-- 运行时间：2026-07-22 20:03:35 UTC
+- 最新运行日期：2026-07-23
+- 运行时间：2026-07-23 20:31:15 UTC
 - 运行状态：成功
 - 本次总论文数：4
 - 精读区：1
 - 速读区：3
 
 ### 今日简报（AI）
-今日聚焦LLM推理优化，涵盖KV缓存鲁棒管理、GPU近光速通信、视觉Token剪枝及自适应路由。最值得研读精读文章《Robust KV Cache Management...》（8.0分）解决输出长度不确定性下的缓存管理，同时《Every Microsecond Matters》（7.0分）展示GPU集体通信延迟极限优化。建议先精读KV缓存管理论文，再速览通信延迟研究以提升推理系统理解。
-- 详情：[/202607/22/README](/202607/22/README)
+1) 今日精读苹果M5神经加速器上的顶级LLM推理方案，并速读扩散模型精确缓存、小大模型协同推理及多模态加速三篇论文。  
+2) 最值得关注的是《BaseRT》中针对Apple M5芯片的高效推理设计（9.0分），以及《PyroDash》提出的token级成本协作思路。  
+3) 建议优先精读BaseRT论文理解M5加速原理，再浏览PyroDash获取低成本推理灵感。
+- 详情：[/202607/23/README](/202607/23/README)
 
 ### 精读区论文标签
-1. [Robust KV Cache Management for LLM Serving under Output Token Length Uncertainty](/202607/22/2607.16892v1-robust-kv-cache-management-for-llm-serving-under-output-token-length-uncertainty)  
-   标签：评分：8.0/10、query:edge-llm
-   evidence：面向LLM服务的鲁棒KV缓存管理
+1. [BaseRT: Advancing Best-in-Class LLM Inference with Apple M5 Neural Accelerators](/202607/23/2607.19438v1-basert-advancing-best-in-class-llm-inference-with-apple-m5-neural-accelerators)  
+   标签：评分：9.0/10、query:edge-llm
+   evidence：利用Apple M5神经加速器进行硬件感知的LLM推理
 
 ### 速读区论文标签
-1. [Every Microsecond Matters: Achieving Near Speed-of-Light Latency in GPU Collectives](/202607/22/2607.16100v1-every-microsecond-matters-achieving-near-speed-of-light-latency-in-gpu-collectives)  
-   标签：评分：7.0/10、query:edge-llm
-   evidence：面向LLM服务的低延迟GPU集体通信优化
-2. [CRISP: Pre-LLM Yet Text-Driven Visual Token Pruning for Efficient LVLM Inference](/202607/22/2607.16326v1-crisp-pre-llm-yet-text-driven-visual-token-pruning-for-efficient-lvlm-inference)  
+1. [LaCache: Exact Caching and Precision-Adaptive Inference for Diffusion Large Language Models](/202607/23/2607.16339v2-lacache-exact-caching-and-precision-adaptive-inference-for-diffusion-large-language-models)  
    标签：评分：6.0/10、query:edge-llm
-   evidence：预LLM的文本驱动视觉标记剪枝提升LVLM推理效率，可迁移至边缘LLM
-3. [VDAR-Router: Adaptive LLMs Routing via Verbalized Query Difficulty Analysis Retrieval](/202607/22/2607.18098v1-vdar-router-adaptive-llms-routing-via-verbalized-query-difficulty-analysis-retrieval)  
+   evidence：面向扩散LLM的无训练加速框架，利用缓存和混合精度
+2. [PyroDash: Cost-Efficient Token-Level Small-Large Language Model Collaborative Inference](/202607/23/2607.20327v1-pyrodash-cost-efficient-token-level-small-large-language-model-collaborative-inference)  
    标签：评分：6.0/10、query:edge-llm
-   evidence：用于成本-性能折衷的LLM路由框架
+   evidence：令牌级小-大模型协同推理降低开销，适用于边缘
+3. [Look Less, Think Faster: Joint Token-Compute Adaptation for Multimodal LLMs](/202607/23/2607.20357v1-look-less-think-faster-joint-token-compute-adaptation-for-multimodal-llms)  
+   标签：评分：6.0/10、query:edge-llm
+   evidence：LLM推理成本优化，自适应令牌和计算剪枝
 
 
 <div class="dpr-home-promo-card">

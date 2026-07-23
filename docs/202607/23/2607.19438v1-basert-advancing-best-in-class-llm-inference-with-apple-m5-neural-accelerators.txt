@@ -1,0 +1,164 @@
+Title: BaseRT: Advancing Best-in-Class LLM Inference with Apple M5 Neural Accelerators
+
+URL Source: https://arxiv.org/pdf/2607.19438v1
+
+Published Time: Thu, 23 Jul 2026 00:03:30 GMT
+
+Number of Pages: 8
+
+Markdown Content:
+# BaseRT: Advancing Best-in-Class LLM Inference with Apple M5 Neural Accelerators 
+
+## Fabian Waschkowski ∗ Prabod Rathnayaka Lukas Wesemann 
+
+## Base Compute, Melbourne, Australia 
+
+Abstract 
+
+Apple’s M5 generation introduces a redesigned GPU architecture in which every core carries a dedicated Neural Accelerator: on-die matrix units exposed through the Metal 4 tensor API. We show that BaseRT, our native Metal inference runtime for large language models on Apple Silicon, exploits these units to push inference throughput on Apple hardware substantially beyond both llama.cpp and MLX. Building on BaseRT’s framework-free design, we add a family of hand-written Metal 4 tensor-core kernels (including dense and mixture-of-experts GEMM and flash-attention prefill kernels) that route the compute-bound matrix multiplications of inference through the M5 Neural Accelerators while leaving the memory-bound decode path on our existing specialised kernels. On an Apple M5 Pro, across fifteen model configurations spanning the Qwen3, Qwen3.5/3.6, Llama 3.2, and Gemma 4 families from sub-1B to 35B parameters, BaseRT delivers up to 6 .4× higher prompt-processing throughput than llama.cpp and 3 .9× higher than MLX, with the largest margins on the mixture-of-experts models where matrix multiplication dominates, while maintaining its lead on decode of up to 1 .75 × over llama.cpp and 1 .33 ×
+
+over MLX. These results establish a new performance ceiling for on-device LLM inference and show that the M5’s tensor cores are the decisive lever for prompt processing on Apple Silicon. BaseRT is publicly available at https://github.com/basecompute/baseRT .
+
+# 1 Introduction 
+
+The case for on-device inference, i.e. running large language models locally on consumer and professional hardware rather than in the cloud, has grown steadily stronger. Global inference compute is projected to overtake training compute for the first time in 2027, and AI inference is expected to account for 40% of global data-center compute by 2030 [ 1], placing increasing pressure on the economics of cloud-only serving. Four independent drivers push inference toward local devices. Privacy and data residency : prompts processed in the cloud are subject to multi-tenancy and cross-border routing risk, which Gartner projects will cause over 40% of AI-related data breaches by 2027 [ 2, 3]. Local inference keeps data within controlled, air-gapped environments. Latency : on-device inference avoids network, queueing, and scheduling overhead, enabling sub-100 ms interactive responses for real-time robotic [ 4] and agentic workloads [ 5 , 6]. Connectivity : local execution removes the hard dependency on external network and shared cloud infrastructure whose failures repeatedly render AI systems unavailable [ 7, 8 ]. Token costs : local inference converts linear per-token pricing into a fixed hardware cost with marginal cost approaching zero at scale [ 9]. The appetite for cost-efficient open models is already visible, as roughly a third of all tokens on OpenRouter now go to open-weight models [ 10 ]. Among edge platforms, Apple Silicon stands out for its combination of high memory bandwidth, large unified memory capacity, and a mature GPU compute stack [ 11 ]. Its unified memory architecture removed the traditional CPU–GPU memory segregation, giving the GPU direct high-bandwidth access to full system memory and making it practical to run quantised models locally at interactive speeds [ 12 ]. In prior work we introduced BaseRT [ 13 ], an LLM inference runtime built directly on Apple’s Metal GPU API with no 
+
+> ∗Correspondence: fabian@basecompute.co
+
+1arXiv:2607.19438v1 [cs.AR] 21 Jul 2026 128 256 512 1024 2048       
+
+> 0
+> 0.5
+> 1
+> 1.5
+> ·10 4
+> Prompt length (tokens)
+> Prefill throughput (tok/s)
+> Gemma-4-E2B (Q8)
+> 128 256 512 1024 2048
+> 0
+> 1,000
+> 2,000
+> 3,000
+> Prompt length (tokens)
+> Prefill throughput (tok/s)
+> Qwen3.6-35B-A3B (Q4)
+> BaseRT MLX llama.cpp
+
+Figure 1: BaseRT delivers best-in-class prompt-processing (prefill) throughput on Apple M5 Pro by utilising the chip’s per-core GPU Neural Accelerators. Left: Gemma-4-E2B (8-bit), where BaseRT leads llama.cpp by up to 6 .4× and MLX by up to 2 .1× as the prompt grows to 2048 tokens. Right: Qwen3.6-35B-A3B (4-bit), a mixture-of-experts model, where BaseRT leads both baselines at every prompt length. intermediate framework, which through chip-specific kernel fusion, unified-memory-aware data layout, and low-overhead dispatch achieved the highest reported inference throughput on Apple Silicon, ahead of both the widely deployed llama.cpp [14] and Apple’s purpose-built MLX [15] framework. The arrival of the Apple M5 architecture changes the optimisation landscape. Where earlier M-series GPUs executed matrix multiplication (matmul) on general-purpose SIMD units, the M5 introduces a redesigned GPU in which every core carries a dedicated Neural Accelerator: an on-die matrix engine, analogous to the tensor cores of discrete GPUs, purpose-built for the dense matmuls at the heart of transformer inference [ 16 ]. Apple exposes these units to third-party developers through the Metal 4 tensor API and its Metal Performance Primitives cooperative-tensor operations [ 17 –19 ]. Driving these units requires kernels written directly against the new tensor API, and a runtime’s performance on the compute-bound phases of inference depends on how well the accelerators are utilised. This paper shows that BaseRT’s framework-free architecture is well suited to exploiting this new hardware. We extend BaseRT with a family of hand-written Metal 4 tensor-core kernels for the compute-bound matmuls of inference: dense and mixture-of-experts (MoE) GEMM, fused expert projections, and the QK ⊤ and PV products of prefill attention. These kernels route that work through the M5 Neural Accelerators, while leaving the memory-bandwidth-bound decode path on our existing specialised kernels where the tensor units offer no benefit. The result is a sharp widening of BaseRT’s lead over both baselines, concentrated exactly where the workload is compute-bound: prompt processing and MoE inference (Figure 1). 
+
+## 1.1 Contributions 
+
+Our contributions are as follows: 
+
+• A family of hand-written Metal 4 cooperative-tensor kernels that drive the Apple M5’s per-core GPU Neural Accelerators, covering dense GEMM, MoE expert GEMM, fused expert projections, and prefill attention. 
+
+• A workload-aware dispatch strategy that applies the tensor-core path only to the compute-bound phases of inference, preserving BaseRT’s existing low-overhead kernels for memory-bound decode, with a clean fallback to the SIMD path on pre-M5 hardware. 
+
+• A comprehensive evaluation on the Apple M5 Pro across fifteen model configurations, establishing new state-of-the-art throughput on Apple Silicon and quantifying where the tensor cores matter: up to 6 .4×
+
+prefill throughput over llama.cpp, with decode gains bounded by memory bandwidth. 22 Background: The M5 GPU and Metal 4 Tensor Operations 
+
+## 2.1 From SIMD Matmul to Neural Accelerators 
+
+Every Apple M-series GPU from the M1 onward supports simdgroup matrix , a set of Metal intrinsics that cooperatively compute small fixed-size matrix products across the 32 lanes of a SIMD group. This is the mechanism on which BaseRT’s tiled GEMM and FlashAttention kernels were originally built. It runs on the GPU’s general-purpose arithmetic units: matrix multiplication competes with every other instruction for the same execution ports. The M5 breaks this coupling. Its redesigned GPU places a dedicated Neural Accelerator inside each GPU core: a hardware matrix-multiply-accumulate engine that is the Apple Silicon analogue of a discrete GPU’s tensor core, delivering a large step-change in peak GPU compute for AI workloads relative to the M4 [ 16 ]. Crucially, the M5 continues to advertise the MTLGPUFamily.apple9 feature set, so the accelerators are not reached by querying a capability flag. They are reached only through a new programming interface. 
+
+## 2.2 The Metal 4 Tensor API 
+
+The new interface is Metal 4, which introduces a first-class tensor resource for multidimensional data, whose storage may live in device or threadgroup memory, and, through the Metal Performance Primitives (MPP) library, a set of mpp::tensor ops primitives, most importantly a matmul2d , issued collectively at simdgroup or threadgroup scope to drive the Neural Accelerators [ 17 –19 ]. A kernel declares tensor views over its operands, requests a destination cooperative tensor, i.e. a tensor whose elements are partitioned across the thread-local storage of the participating threads, and accumulates a sequence of tile products into it. Operands may stream directly from device memory or be staged in threadgroup memory. The cooperative-tensor accumulator remains resident across the reduction loop. Notably, threadgroup-memory staging is not necessary for peak GEMM on Apple Silicon: kernels are fastest reading operands straight from device memory and letting the cache hierarchy work [ 18 ]. This is a materially different kernel structure from the simdgroup matrix model, and code must be compiled against the Metal 4 language revision ( -std=metal4.0 ) to use it [ 20 ]. Because BaseRT hand-writes and owns every GPU kernel it dispatches, adopting this new path is a self-contained addition to its shader library. 
+
+## 2.3 Utilising Tensor Cores 
+
+LLM inference has two phases with opposite performance characteristics. Prefill (prompt processing) multiplies the prompt’s activation matrix, one row per token, by the layers’ weight matrices: because all tokens are processed together, arithmetic intensity grows with sequence length, making prefill compute-bound and dominated by these GEMMs and by the QK ⊤ and PV attention products, whose cost scales with context. This is precisely the regime in which a dedicated matmul engine pays off. Decode generates one token at a time: each step multiplies a single activation vector against the weights ( M = 1 GEMV), streaming the entire weight set from memory for a handful of arithmetic operations per byte. Decode is memory-bandwidth-bound, and the M5’s unified memory bandwidth, not its matmul throughput, is the binding constraint. A tensor core cannot accelerate a phase that is waiting on memory. This asymmetry, which we confirm empirically in Section 4, is the organising principle of BaseRT’s M5 design. 
+
+# 3 Tensor-Core Kernels in BaseRT 
+
+BaseRT is a C++ inference runtime that targets Metal directly, with no dependency on MLX, PyTorch, CoreML, or any intermediate array framework. Its design (data-driven architecture descriptors, a zero-allocation decode loop, an extensive library of hand-written and fused Metal shaders, and low-overhead command dispatch) is described in prior work [ 13 ]. We add the Metal 4 tensor path as a new family of kernels alongside the existing SIMD kernels, selected at dispatch time. 33.1 A Tensor-Core Kernel Family for Inference 
+
+We implement cooperative-tensor kernels for the matmul-dominated operators of inference. Each threadgroup owns an output tile and, for each step along the contraction dimension, feeds operand tiles into an MPP 
+
+matmul2d that accumulates into a register-resident cooperative tensor. The family covers: 
+
+• Dense GEMM for the attention and feed-forward projection weights, in 4-bit and 8-bit quantisation, reading the same packed-quant weight layout as BaseRT’s SIMD GEMM so no reconversion is required. 
+
+• MoE expert GEMM , a kernel that computes each active expert’s projection over its routed tokens. 
+
+• Fused MoE gate/up projection , which computes the gate and up projections and applies the SiLU activation on the tensor-core accumulators in a single dispatch, removing a global memory round-trip per expert. 
+
+• Prefill attention , a flash-attention kernel that routes both the QK ⊤ score product and the PV output product through matmul2d while keeping an exact online softmax (running row maximum, numerically stabilised) between them, so attention output is numerically equivalent to the SIMD FlashAttention path. 
+
+## 3.2 Workload-Aware Dispatch 
+
+The per-chip configuration of BaseRT detects the M5 family at load time. The tensor path is selected for prefill GEMM, MoE expert GEMM, and prefill attention (the compute-bound operators), while decode continues to use BaseRT’s specialised GEMV and decode-attention kernels, which are bounded by memory bandwidth and gain nothing from a matmul engine. Dispatch additionally checks shape constraints, falling back to the SIMD kernel whenever they are not met. On any pre-M5 chip, the entire tensor path is bypassed and behaviour is unchanged from the SIMD kernels. The result is a single runtime that transparently exploits the Neural Accelerators of the M5 architecture where they matter and preserves BaseRT’s established performance everywhere else. 
+
+# 4 Evaluation 
+
+## 4.1 Experimental Setup 
+
+Hardware. All measurements are taken on an Apple M5 Pro with 48 GB of unified memory, running macOS (Darwin 25.4). 
+
+Models. We benchmark fifteen model configurations across four distinct model families: Qwen3, the newer Qwen3.5/3.6 family (newly supported as of BaseRT v0.1.6), Llama 3.2, and Gemma 4, from sub-1B to 35B parameters. The set spans dense models together with four mixture-of-experts models, namely Gemma-4-26B-A4B, Qwen3-30B-A3B, Qwen3.5-35B-A3B, and Qwen3.6-35B-A3B. Ten configurations use 4-bit quantisation, with 8-bit variants for five of the smaller models (Qwen3-0.6B, Llama-3.2-1B, Llama-3.2-3B, Gemma-4-E2B, and Qwen3.5-2B). 
+
+Baselines. We compare against llama.cpp (build b9960) using its Metal backend with default settings, and mlx-lm 0.31.3 (MLX 0.32.0) with default generation settings. BaseRT (v0.1.6) loads the same checkpoints converted to its native base weight format at matched quantisation. All three engines run on the same M5 Pro device. 
+
+Metrics. We report prompt-processing throughput (pp, tokens/s) at prompt lengths of 128, 256, 512, 1024, and 2048 tokens, and token-generation throughput (tg128, tokens/s) over 128 generated tokens. Each data point is the average of five repetitions. 44.2 Decode Throughput 
+
+Table 1 reports decode throughput (tg128). Against llama.cpp, BaseRT is faster on all fifteen configurations, by 1 .02–1 .75 ×. The advantage is largest on the smaller dense models, where BaseRT’s low-overhead dispatch is a larger fraction of a short per-token budget, and on the 35B-A3B mixture-of-experts models (1 .53–1 .75 ×), where llama.cpp’s measured MoE decode throughput is comparatively low. Against MLX the picture is tighter: BaseRT leads on thirteen of fifteen configurations (1 .02–1 .33 ×) but trails narrowly on the two large models Gemma-4-26B-A4B and Qwen3.6-27B (0 .98 ×). This is expected, as decode is memory-bandwidth-bound, and the M5’s Neural Accelerators do not raise the memory ceiling. Here BaseRT and MLX both operate close to what the hardware’s bandwidth allows, and the tensor cores confer no decode advantage. The decode gains that remain come from BaseRT’s dispatch and kernel-fusion work, not from the M5 tensor path. Table 1: Decode throughput (tg128, tok/s) on Apple M5 Pro for BaseRT, llama.cpp, and mlx-lm, grouped into 4-bit and 8-bit blocks. Bold indicates the fastest runtime.                                                                                  
+
+> vs. llama.cpp vs. mlx-lm Model BaseRT llama.cpp Ratio mlx-lm Ratio 4-bit (Q4) Qwen3-0.6B 530.8 386.1 1.37 ×398.1 1.33 ×
+> Llama-3.2-1B 342.1 267.1 1.28 ×298.0 1.15 ×
+> Qwen3.5-2B 219.6 147.1 1.49 ×208.7 1.05 ×
+> Llama-3.2-3B 137.0 120.0 1.14 ×131.0 1.05 ×
+> Gemma-4-E2B 149.8 103.3 1.45 ×146.9 1.02 ×
+> Gemma-4-26B-A4B 85.0 83.3 1.02 ×87.0 0.98 ×
+> Qwen3-30B-A3B 105.1 96.7 1.09 ×97.7 1.08 ×
+> Qwen3.5-35B-A3B 110.6 72.5 1.53 ×104.8 1.06 ×
+> Qwen3.6-35B-A3B 110.7 63.1 1.75 ×101.9 1.09 ×
+> Qwen3.6-27B 18.1 15.4 1.18 ×18.4 0.98 ×
+> 8-bit (Q8) Qwen3-0.6B 365.6 285.3 1.28 ×295.5 1.24 ×
+> Llama-3.2-1B 204.4 182.8 1.12 ×181.0 1.13 ×
+> Qwen3.5-2B 132.4 110.6 1.20 ×125.9 1.05 ×
+> Llama-3.2-3B 79.6 75.5 1.05 ×75.4 1.06 ×
+> Gemma-4-E2B 95.9 72.7 1.32 ×91.7 1.05 ×
+
+## 4.3 Prefill Throughput 
+
+The tensor cores transform prompt processing. Tables 2 and 3 report prefill throughput against llama.cpp and MLX respectively. Against llama.cpp, BaseRT is faster on every configuration at every prompt length, and the margins are large and grow with context: on the dense Gemma-4-E2B the ratio rises from 2 .8×
+
+at pp128 to 6 .3× at pp2048 (6 .4× at 8-bit), and on the MoE Qwen3-30B-A3B from 1 .9× to 2 .2×. Even on the models where llama.cpp is most competitive (Qwen3-0.6B, Qwen3.5-2B), BaseRT leads by 10–96%. Against MLX, the stronger prefill baseline on Apple Silicon, BaseRT leads on all but three of seventy-five measured points, the exceptions confined to the two smaller Llama models at long context (Llama-3.2-1B and Llama-3.2-3B at pp1024–2048), where MLX edges ahead by ≤ 3%. Everywhere else BaseRT is ahead, by up to 3 .9× (Qwen3-30B-A3B at pp128). Two patterns stand out. First, the widest single margins appear on the mixture-of-experts models: MoE inference is matmul-heavy per active parameter, and BaseRT’s tensor-core expert GEMM and fused gate/up kernels route this work onto the M5’s Neural Accelerators. Across the four MoE models, BaseRT leads llama.cpp by 29–120% and MLX by 15–288% over the sweep, with the largest gaps on Gemma-4-26B-A4B and Qwen3-30B-A3B. Second, the advantage generally widens with prompt length against llama.cpp, whose prefill does not scale as well with the growing GEMM, while against MLX it is largest at short prompts and narrows toward long context. BaseRT’s lead holds across families and model sizes, from a 0.6B dense model to the 35B mixture-of-experts models. 5Table 2: Prefill throughput (tok/s) on Apple M5 Pro, BaseRT vs. llama.cpp, at prompt lengths 128–2048, grouped into 4-bit and 8-bit blocks. Bold indicates the faster runtime at each prompt length. 
+
+pp128 pp256 pp512 pp1024 pp2048 Model BaseRT ll.cpp BaseRT ll.cpp BaseRT ll.cpp BaseRT ll.cpp BaseRT ll.cpp 4-bit (Q4) Qwen3-0.6B 11,873 10,559 17,575 13,741 20,706 15,509 21,213 13,344 20,105 10,464 Llama-3.2-1B 8,936 6,859 11,032 9,137 12,134 9,740 12,084 9,490 12,451 8,362 Qwen3.5-2B 4,594 3,908 5,860 4,837 6,682 5,297 6,914 5,252 7,270 5,166 Llama-3.2-3B 3,663 2,831 4,321 3,457 4,383 3,665 4,407 3,305 4,134 3,091 Gemma-4-E2B 5,780 2,093 8,678 2,608 13,444 2,742 15,363 2,694 16,677 2,656 Gemma-4-26B-A4B 2,246 1,185 2,599 1,587 3,307 1,788 3,427 1,709 3,381 1,618 Qwen3-30B-A3B 2,478 1,280 3,199 1,726 3,701 2,086 3,907 1,964 3,834 1,740 Qwen3.5-35B-A3B 1,501 1,065 1,974 1,440 2,517 1,702 2,800 1,653 3,102 1,632 Qwen3.6-35B-A3B 1,361 1,042 1,831 1,424 2,342 1,698 2,736 1,640 2,788 1,628 Qwen3.6-27B 440 358 476 383 494 392 498 390 497 385 8-bit (Q8) Qwen3-0.6B 11,191 9,695 16,926 13,076 20,354 14,818 21,198 12,921 20,078 10,235 Llama-3.2-1B 8,434 6,739 11,392 8,640 12,040 9,663 11,118 9,123 12,434 8,317 Qwen3.5-2B 4,403 3,987 5,795 4,868 6,691 5,445 6,982 5,400 7,268 5,320 Llama-3.2-3B 3,480 2,738 4,237 3,363 4,349 3,553 4,431 3,367 4,389 3,069 Gemma-4-E2B 4,991 1,992 7,825 2,524 12,380 2,631 14,661 2,600 16,264 2,547 
+
+Table 3: Prefill throughput (tok/s) on Apple M5 Pro, BaseRT vs. mlx-lm, at prompt lengths 128–2048, grouped into 4-bit and 8-bit blocks. Bold indicates the faster runtime at each prompt length. 
+
+pp128 pp256 pp512 pp1024 pp2048 Model BaseRT mlx BaseRT mlx BaseRT mlx BaseRT mlx BaseRT mlx 4-bit (Q4) Qwen3-0.6B 11,873 4,600 17,575 5,699 20,706 12,807 21,213 13,732 20,105 16,198 Llama-3.2-1B 8,936 3,987 11,032 8,431 12,134 9,971 12,084 11,490 12,451 12,661 
+
+Qwen3.5-2B 4,594 2,328 5,860 4,346 6,682 5,752 6,914 6,644 7,270 7,003 Llama-3.2-3B 3,663 2,531 4,321 3,031 4,383 3,914 4,407 4,270 4,134 4,238 
+
+Gemma-4-E2B 5,780 2,634 8,678 5,217 13,444 9,203 15,363 11,645 16,677 13,187 Gemma-4-26B-A4B 2,246 806 2,599 1,322 3,307 1,783 3,427 2,247 3,381 2,419 Qwen3-30B-A3B 2,478 639 3,199 1,090 3,701 1,548 3,907 2,267 3,834 2,676 Qwen3.5-35B-A3B 1,501 602 1,974 1,112 2,517 1,509 2,800 2,044 3,102 2,427 Qwen3.6-35B-A3B 1,361 596 1,831 1,122 2,342 1,472 2,736 1,988 2,788 2,426 Qwen3.6-27B 440 305 476 379 494 442 498 475 497 486 8-bit (Q8) Qwen3-0.6B 11,191 5,134 16,926 7,080 20,354 13,146 21,198 17,463 20,078 16,037 Llama-3.2-1B 8,434 4,059 11,392 7,874 12,040 8,872 11,118 11,376 12,434 12,101 Qwen3.5-2B 4,403 2,140 5,795 3,909 6,691 5,168 6,982 6,228 7,268 6,734 Llama-3.2-3B 3,480 2,035 4,237 2,640 4,349 3,482 4,431 3,971 4,389 4,145 Gemma-4-E2B 4,991 2,398 7,825 4,788 12,380 8,274 14,661 10,752 16,264 12,355 
+
+64.4 Discussion of Results 
+
+Sections 4.2 and 4.3 present consistent results. Decode is memory-bandwidth-bound: on the M5 Pro all three engines cluster near the bandwidth ceiling on the larger models, BaseRT’s remaining decode advantage comes from dispatch and fusion rather than the tensor cores, and MLX occasionally edges ahead. Prefill is compute-bound, and here the M5’s Neural Accelerators are decisive: by routing prompt GEMM, MoE expert GEMM, and prefill attention through the Metal 4 tensor path, BaseRT converts the M5’s matmul throughput into the highest prompt-processing throughput measured on this hardware, with the largest gains on the matmul-heavy mixture-of-experts models. Because time-to-first-token is dominated by prefill, these gains translate directly into lower interactive latency for long-prompt and agentic workloads, exactly the use cases that motivate on-device inference. 
+
+# 5 Discussion 
+
+## 5.1 Limitations 
+
+The tensor-core kernels apply to the compute-bound phases of inference. They do not raise the decode throughput ceiling set by memory bandwidth. Realising the prefill gains requires M5-family hardware and a Metal 4 toolchain. On earlier chips BaseRT falls back to its SIMD kernels with unchanged behaviour. As in prior work, BaseRT targets single-device, single-user inference: it does not implement continuous batching, multi-request parallel decoding, or tensor parallelism, and it targets Metal exclusively. The evaluation is conducted on a single M5 Pro device. The behaviour on the M5 base and Max tiers, which differ in core count and memory bandwidth, is left for future measurement. 
+
+## 5.2 Future Work 
+
+Decode remains memory-bound, but speculative decoding turns part of the decode workload into a batched verification step whose matmuls are compute-bound and therefore amenable to the tensor-core path. Combining speculative decoding with the M5 Neural Accelerators is a promising direction for raising decode throughput indirectly. The prefill advantage also invites revisiting the balance between prefill and decode in scheduling long-context and multimodal workloads. 
+
+# 6 Conclusion 
+
+We presented an extension of BaseRT that targets the Apple M5’s per-core GPU Neural Accelerators through the Metal 4 tensor API. By adding hand-written cooperative-tensor kernels for dense and mixture-of-experts GEMM, fused expert projections, and prefill attention, and by applying them only to the compute-bound phases of inference, BaseRT turns the M5’s Neural Accelerators into best-in-class inference throughput on this hardware. On the Apple M5 Pro, this yields up to 6 .4× higher prefill throughput than llama.cpp and 3.9× higher than MLX, alongside decode gains bounded, as expected, by memory bandwidth. These results push the performance ceiling of on-device LLM inference on Apple Silicon markedly higher and demonstrate that exploiting the M5’s tensor cores translates into substantial, measurable throughput gains for on-device inference. BaseRT is available at https://github.com/basecompute/baseRT .
+
+# References 
+
+[1] Chhavi Arora, Marc Sorel, Pankaj Sachdeva, et al. The next big shifts in AI workloads and hyperscaler strategies. McKinsey & Company, December 2025. URL https://www.mckinsey.com/industries/te chnology-media-and-telecommunications/our-insights/the-next-big-shifts-in-ai-workloa ds-and-hyperscaler-strategies . Accessed: April 2026. [2] Joerg Fritsch and Gartner, Inc. Gartner predicts 40% of AI data breaches will arise from cross-border GenAI misuse by 2027. Gartner Newsroom, February 2025. URL https://www.gartner.com/en/new 
+
+7sroom/press-releases/2025-02-17-gartner-predicts-forty-percent-of-ai-data-breaches-w ill-arise-from-cross-border-genai-misuse-by-2027 . Accessed: April 2026. [3] National Institute of Standards and Technology. Artificial intelligence risk management framework: Generative artificial intelligence profile. Technical Report NIST AI 600-1, U.S. Department of Commerce, July 2024. URL https://nvlpubs.nist.gov/nistpubs/ai/NIST.AI.600-1.pdf .[4] Xuan Huang et al. DaDu-Corki: Algorithm-Architecture Co-Design for Embodied AI-powered Robotic Manipulation. In Proceedings of the 52nd Annual International Symposium on Computer Architecture (ISCA) , 2025. URL https://arxiv.org/abs/2407.04292 .[5] Tula Masterman et al. Agentic Artificial Intelligence: Architectures, Taxonomies, and Evaluation of Large Language Model Agents. arXiv preprint arXiv:2601.12560 , 2026. URL https://arxiv.org/abs/ 2601.12560 .[6] SiYoung Jang and Roberto Morabito. Edge-First Language Model Inference: Models, Metrics, and Tradeoffs. In 45th IEEE International Conference on Distributed Computing Systems (ICDCS) , 2025. URL https://arxiv.org/abs/2505.16508 .[7] Anthropic. Anthropic Status Page: Incident History. https://status.anthropic.com , 2026. Accessed: April 2026. Documented 167 incidents between October 2025 and April 2026. [8] OpenAI. OpenAI Status Page: Incident History. https://status.openai.com , 2026. Accessed: April 2026. [9] McKinsey & Company. The New Economics of Enterprise Technology in an AI World. https: //www.mckinsey.com/capabilities/tech-and-ai/our-insights/ , May 2025. [10] Mozilla Foundation. State of Open Source AI 2026. Technical report, Mozilla Foundation, 2026. URL 
+
+https://stateofopensource.ai/state-of-open-source-ai-2026.pdf . Accessed: July 2026. [11] Afsara Benazir and Felix Xiaozhu Lin. Profiling Large Language Model Inference on Apple Silicon: A Quantization Perspective. arXiv preprint arXiv:2508.08531 , 2025. [12] Nestor Maslej et al. Artificial Intelligence Index Report 2025. Technical report, Stanford Institute for Human-Centered Artificial Intelligence (HAI), 2025. arXiv:2504.07139. [13] Prabod Rathnayaka, Fabian Waschkowski, and Lukas Wesemann. BaseRT: Best-in-Class LLM Inference on Apple Silicon via Native Metal. arXiv preprint arXiv:2607.00501 , 2026. URL https://arxiv.org/ abs/2607.00501 .[14] Georgi Gerganov et al. llama.cpp: LLM inference in C/C++. https://github.com/ggml-org/llama .cpp , 2023. [15] Awni Hannun, Jagrit Digani, Angelos Katharopoulos, and Ronan Collobert. MLX: Efficient and flexible machine learning on Apple silicon. https://github.com/ml-explore/mlx , 2023. [16] Apple. Apple unleashes M5, the next big leap in AI performance for Apple silicon. Apple Newsroom, October 2025. URL https://www.apple.com/newsroom/2025/10/apple-unleashes-m5-the-next-b ig-leap-in-ai-performance-for-apple-silicon/ . Accessed: July 2026. [17] Apple. Metal 4. Apple Developer Documentation, 2025. URL https://developer.apple.com/docume ntation/metal/metal-4 . Accessed: July 2026. [18] Apple. Metal Performance Primitives (MPP) Programming Guide. Apple Inc., Version 1, March 2026. Accessed: July 2026. [19] Apple. Discover Metal 4 tensors and Metal performance primitives. Apple Worldwide Developers Conference (WWDC), 2025. URL https://developer.apple.com/videos/play/wwdc2025/ .[20] Apple. Metal Shading Language Specification. Apple Inc., Version 4.1, 2026. Accessed: July 2026. 8
