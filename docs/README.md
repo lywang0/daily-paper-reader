@@ -6,34 +6,41 @@
 </div>
 
 ## 每次日报
-- 最新运行日期：2026-07-23
-- 运行时间：2026-07-23 20:31:15 UTC
+- 最新运行日期：2026-07-24
+- 运行时间：2026-07-24 21:43:43 UTC
 - 运行状态：成功
-- 本次总论文数：4
-- 精读区：1
+- 本次总论文数：7
+- 精读区：4
 - 速读区：3
 
 ### 今日简报（AI）
-1) 今日精读苹果M5神经加速器上的顶级LLM推理方案，并速读扩散模型精确缓存、小大模型协同推理及多模态加速三篇论文。  
-2) 最值得关注的是《BaseRT》中针对Apple M5芯片的高效推理设计（9.0分），以及《PyroDash》提出的token级成本协作思路。  
-3) 建议优先精读BaseRT论文理解M5加速原理，再浏览PyroDash获取低成本推理灵感。
-- 详情：[/202607/23/README](/202607/23/README)
+日报今日共收录7篇论文，精读4篇，重点关注混合精度通信与MoE服务系统。最值得看的是《Task-Oriented Communication with Hybrid-Precision Models》和《ExpertPlex》两篇9分论文，分别面向任务驱动通信与高吞吐MoE推理。建议优先精读这两篇，速读可关注BRIM稀疏推理加速器。
+- 详情：[/202607/24/README](/202607/24/README)
 
 ### 精读区论文标签
-1. [BaseRT: Advancing Best-in-Class LLM Inference with Apple M5 Neural Accelerators](/202607/23/2607.19438v1-basert-advancing-best-in-class-llm-inference-with-apple-m5-neural-accelerators)  
+1. [Task-Oriented Communication with Hybrid-Precision Models](/202607/24/2607.16766v1-task-oriented-communication-with-hybrid-precision-models)  
    标签：评分：9.0/10、query:edge-llm
-   evidence：利用Apple M5神经加速器进行硬件感知的LLM推理
+   evidence：边缘推理，混合精度模型，直接针对边缘设备资源高效LLM推理
+2. [ExpertPlex: A High-Goodput Disaggregated Serving System for MoE LLMs with Adaptive Persistent Kernels](/202607/24/2607.18002v2-expertplex-a-high-goodput-disaggregated-serving-system-for-moe-llms-with-adaptive-persistent-kernels)  
+   标签：评分：9.0/10、query:edge-llm
+   evidence：面向MoE LLM的高吞吐分离式服务系统，采用自适应持久化内核
+3. [Beyond Independent Optimization: Compression, MoE Routing, and Quantization Interactions in Multimodal Edge Intelligence](/202607/24/2607.20981v1-beyond-independent-optimization-compression-moe-routing-and-quantization-interactions-in-multimodal-edge-intelligence)  
+   标签：评分：9.0/10、query:edge-llm
+   evidence：聚焦边缘部署、硬件感知基准测试、压缩、量化、MoE等多模态大模型优化
+4. [Adaptive Depth Sparse Framework: Similarity-Driven Resource Allocation for Pre-Trained LLMs](/202607/24/2607.21291v1-adaptive-depth-sparse-framework-similarity-driven-resource-allocation-for-pre-trained-llms)  
+   标签：评分：8.0/10、query:edge-llm
+   evidence：自适应深度稀疏实现资源高效的LLM推理
 
 ### 速读区论文标签
-1. [LaCache: Exact Caching and Precision-Adaptive Inference for Diffusion Large Language Models](/202607/23/2607.16339v2-lacache-exact-caching-and-precision-adaptive-inference-for-diffusion-large-language-models)  
+1. [BRIM: Workload-Balanced Dual-Sided Bit-Serial Sparse Inference Accelerator](/202607/24/2607.19431v1-brim-workload-balanced-dual-sided-bit-serial-sparse-inference-accelerator)  
+   标签：评分：7.0/10、query:edge-llm
+   evidence：硬件软件协同设计的双端位串行稀疏加速器
+2. [PolySim: Deterministic Polynomial Surrogates for Cross-Modal Retrieval on CiM](/202607/24/2607.20358v1-polysim-deterministic-polynomial-surrogates-for-cross-modal-retrieval-on-cim)  
    标签：评分：6.0/10、query:edge-llm
-   evidence：面向扩散LLM的无训练加速框架，利用缓存和混合精度
-2. [PyroDash: Cost-Efficient Token-Level Small-Large Language Model Collaborative Inference](/202607/23/2607.20327v1-pyrodash-cost-efficient-token-level-small-large-language-model-collaborative-inference)  
+   evidence：边缘设备上的存内计算硬件加速，与硬件感知加速相关
+3. [Profiling Lightweight Large Language Models](/202607/24/2607.20806v1-profiling-lightweight-large-language-models)  
    标签：评分：6.0/10、query:edge-llm
-   evidence：令牌级小-大模型协同推理降低开销，适用于边缘
-3. [Look Less, Think Faster: Joint Token-Compute Adaptation for Multimodal LLMs](/202607/23/2607.20357v1-look-less-think-faster-joint-token-compute-adaptation-for-multimodal-llms)  
-   标签：评分：6.0/10、query:edge-llm
-   evidence：LLM推理成本优化，自适应令牌和计算剪枝
+   evidence：面向边缘轻量LLM推理的精度感知分析框架，同时测量能耗、时间、内存和精度
 
 
 <div class="dpr-home-promo-card">
