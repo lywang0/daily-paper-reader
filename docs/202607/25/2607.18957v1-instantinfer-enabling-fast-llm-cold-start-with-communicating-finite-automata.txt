@@ -1,0 +1,882 @@
+Title: InstantInfer: Enabling Fast LLM Cold Start with Communicating Finite Automata
+
+URL Source: https://arxiv.org/pdf/2607.18957v1
+
+Published Time: Wed, 22 Jul 2026 00:51:07 GMT
+
+Number of Pages: 15
+
+Markdown Content:
+# InstantInfer: Enabling Fast LLM Cold Start with Communicating Finite Automata 
+
+## Yitao Yuan *
+
+Peking University ScitiX AI 
+
+## Yongchao He †
+
+ScitiX AI 
+
+## Shaoke Fang 
+
+Peking University 
+
+## Wenfei Wu †
+
+Peking University 
+
+## Abstract 
+
+Cold starts in large language model (LLM) inference services significantly affect user experience, yet they remain ineffi-cient due to sequential initialization and a massive number of fine-grained I/O requests issued by complex software compo-nents. Although refactoring the program can yield advantages such as concurrent execution and I/O merging, this approach is error-prone and carries correctness risks when dealing with massive, heterogeneous components. We propose the Com-municating Finite Automata (CFA) abstraction to systemat-ically analyze cross-component optimization opportunities, and design a programming framework to enable CFA-based component program refactoring. This framework preserves the original sequential program structure while enabling safe concurrent component execution. We prove the correctness of the program refactoring. We apply the CFA abstraction and framework to refactor process tree creation, tensor loading, and model switching in vLLM, forming a new cold-start sys-tem named InstantInfer. Extensive experiments demonstrate that InstantInfer substantially accelerates LLM cold starts (achieving up to 7.2× speedup) and exhibits robustness across diverse GPUs, workloads, and scales. 
+
+## 1 Introduction 
+
+Large language model (LLM) inference has become a critical service primitive for various applications [ 4 , 10 , 27 , 29 , 30 ]. Serving these interactive applications at scale requires ex-pensive GPU resources [ 9], while providers must support diverse models and bursty user demand. To improve GPU utilization, inference service providers share GPU clusters across many models, keep only a subset active, and activate other models on demand, as in typical serverless or elastic serving scenarios [ 9, 19 , 43 ]. This on-demand activation in-troduces LLM cold start: before serving requests, the system must load the model from disk to the GPU and establish a ready state for inference. Existing works [ 9, 19 , 42 , 43 ] and our measurements show that cold-start latency dominates the time to first token (TTFT): the startup time is around 50s for <10B models, around 160s for ~70B models, and around 300s for >400B models, accounting for 99.6%–99.9% of the total TTFT. Although warm starts can be enabled by pre-placing models in memory, cold starts remain necessary during bursty access to massive long-tail models or unpredictable crash 
+
+> *This work was done during an internship at ScitiX AI.
+> †Corresponding authors.
+
+recovery, still degrading user experience (§2.1). The entire cold-start process runs in multiple stages, with each stage initializing massive, heterogeneous, and possibly hierarchical components. Existing works on LLM cold starts mostly accelerate a particular stage of initialization, such as model loading [ 3, 9 , 19 , 21 , 33 , 38 , 40 ] or serving-readiness optimization [ 20 , 42 ], usually through techniques such as caching [ 33 , 43 , 45 ] and state reuse [ 42 , 45 ]. In this work, we do not optimize a single stage or technique in isolation, but focus on the dependency structure of the initialization process itself and use a unified abstraction to reveal latent optimiza-tion opportunities through cross-component refactoring. Having observed two significant overheads during LLM cold start, we reveal opportunities to perform cross-component optimization to accelerate overall performance. First, for ease of programming and debugging, numerous components are typically executed sequentially along the program control flow, which forces unnecessary sequential dependencies and waiting. Second, component operations originate from high-level algorithms, but their granularity (e.g., tensor size) mis-matches the efficient operational granularity of the underlying hardware (e.g., I/O sizes), leading to high overhead or low hardware utilization (§2.2). Our intuition is to refactor the startup program to exploit two opportunities: overlapping execution times across com-ponents and merging fine-grained I/O requests to improve hardware throughput, and ultimately reduce the overall ini-tialization time. However, the LLM startup program exhibits a complex structure, which poses significant challenges for program refactoring. The cold start spans multiple stages, including process initialization, model initialization, and opti-mization; across these stages, there are numerous and hetero-geneous components, organized in a hierarchy or sequence (e.g., process tree and model tensors). Directly rewriting the existing code of components is not only tedious and labor-intensive, but worse yet, it inherently risks concurrency haz-ards. To enable low-effort, correct, and safe refactoring of cold-start programs, we overcome three challenges. First, existing program components are viewed as “mono-lithic” entities, discouraging fine-grained internal state anal-ysis. The program’s control flow runs the monolithic com-ponents sequentially, so directly launching them in parallel could lead to race conditions and hazards. We propose a
+
+Communicating Finite Automata (CFA) abstraction to sys-tematically explore the optimization opportunities. Within a         
+
+> 1arXiv:2607.18957v1 [cs.DC] 21 Jul 2026 2019 2020 2021 2022 2023 2024 2025
+> Release Date
+> 0
+> 100
+> 200
+> 300
+> Startup Latency (s)
+> GPT-2 GPT-J-6B OPT-13B
+> Llama-2-7B
+> Llama-2-70B
+> GLM-4-9B
+> Qwen2-72B
+> Llama-3.1-405B
+> DeepSeek-R1
+> Qwen3-30B-A3B
+> Qwen3-235B-A22B
+
+Figure 1. Startup latency vs model size. The circle area is proportional to the model parameter count. component, execution progress is described by monotonic state transitions; across components, logical dependencies are described by component-state dependencies. The CFA ab-straction enables direct application of the two optimizations: independent state transitions across components can safely run concurrently, and many fine-grained FAs/state transitions can be merged into a coarser FA/transition to better match the hardware data operation granularity (§3.1). Second, an appropriate programming framework is needed to reduce the development effort of program refactoring. Com-ponents exist across multiple stages and levels in the current startup program; modifying the heterogeneous components is tedious and error-prone, and managing all components’ FAs in a single space would lead to state explosion. We pro-pose a CFA-based programming framework with unified declarative interfaces for all components. The programming framework inserts statements into the component program to declare state transitions and state dependencies, requiring minimal changes to the original program. The runtime per-forms dependency checking and blocks or wakes components accordingly. The framework also supports managing related FAs in an isolated namespace, avoiding excessive inter-FA messaging (§3.2). Third, the program refactoring must guarantee correctness. Overlapping component executions introduce concurrency, which could lead to race conditions and hazards on shared data or states. We provide a rigorous proof that sequen-tial monolithic component execution is equivalent to CFA-refactored execution under the declared state dependencies. We also analyze data safety in each case where we use CFA to refactor the LLM startup program (§3.3). We instantiate the CFA abstraction and programming frame-work in three representative cold-start cases (§4 and §5): process-tree materialization, tensor loading, and model switch-ing (cold start with replacement). The related implementation has been integrated into vLLM, forming a new LLM cold-start system InstantInfer. We run extensive experiments and show that InstantInfer achieves up to 7.2 × lower cold-start TTFT, up to 32.3 × faster model loading, and up to 11.8 ×
+
+lower service stall during model switching across diverse hardware and models (§6). In summary, this paper makes the following contributions: 
+
+• We identify cross-component optimization opportunities in LLM cold start, including overlapping component execu-tion and merging fine-grained I/O operations. 
+
+• We propose the CFA abstraction to describe cold-start com-ponents as monotonic state transitions with explicit state dependencies, enabling systematic program refactoring. 
+
+• We design a CFA-based programming framework and im-plement InstantInfer in vLLM to refactor process-tree ma-terialization, tensor loading, and model switching. 
+
+• We evaluate InstantInfer across diverse hardware and mod-els, demonstrating its effectiveness in accelerating LLM cold start. 
+
+## 2 Background 
+
+2.1 Problems in LLM Cold Start 
+
+Cold start is highly prevalent in practical deployments. (i) LLM inference providers may maintain numerous models and load specific models on demand in response to user re-quests for GPU resource efficiency [ 7 , 36 , 41 ]. (ii) When a sudden burst of requests for a specific model exceeds the capacity of active instances, cold starts are needed to launch new instances for elastic scaling [ 9 , 19 , 43 ]. (iii) For LLM service developers, updating model weights or modifying deployment configurations, such as adjusting parallelism, in-evitably requires reloading the entire model [ 15 , 44 ]. (iv) When unpredictable disasters or system failures crash active LLM instances, the system must restart instances via cold start to recover the service [9, 19]. Although some existing works demonstrate that large mod-els can be prepared in host memory to enable faster loading to GPU [ 39 ], models cannot always be kept ready in memory under all circumstances [ 9 , 12 , 43 ]: host memory may be insufficient, and predictive in-memory caching cannot always guarantee cache hits, which may waste host memory. We measured the startup time of several popular models and show the results in Figure 1 1. The startup time is around 50s for <10B models, and around 160s and 300s for ~70B and >400B models, respectively. The typical time to first token (TTFT) for a request of length 1000 when the model is ready ranges from 0.08–0.81s. Cold start accounts for the overwhelming majority (99.6%–99.9%) of total latency. This pattern has also been observed in other studies [9, 42]. 
+
+2.2 Problem Analysis Startup Phases and Components. Taking widely adopted LLM inference serving frameworks, vLLM [ 15 ] and SGLang [ 44 ], as examples, we break down the cold-start time in detail. The entire cold-start process can be broadly divided into three stages: Process Init , Model Init , and Optimize . For Qwen3-
+
+> 1Llama-3.1-405B has a larger storage footprint and longer loading time than DeepSeek-R1 because the former uses 16-bit weights and the latter 8-bit.
+> 2
+
+30B-A3B, vLLM spends 26/58/23 s in the three stages, while SGLang spends 27/58/56 s, respectively. Specifically, in the Process Init stage, the system primarily imports Python pack-ages, initializes the underlying device environment (such as a CUDA context), and sets up inter-process communication (IPC). In the Model Init stage, the system handles the heav-iest data transfer tasks, which involve sequentially reading massive model tensors from disk storage to host memory, and subsequently copying them to GPU memory. Finally, in the Optimize stage, the system completes the initialization and allocation of the KV cache, captures execution graphs (such as prefill and decode compute graphs), and compiles the underlying operators, making the model fully ready to process incoming inference requests. We observe significant similarities in the first two stages, which motivate us to adopt a unified methodology to optimize them together. Specifically, both stages internally initialize multiple identical “structures”: multiple “processes” in Pro-cess Init and multiple “tensors” in Model Init. We abstract these identical execution entities as “ components ”. Within the same stage, these components internally undergo the same or highly similar workflows and state transitions. 2 In the first two stages, there are two kinds of overhead. 
+
+• The forced sequential execution among components leads to unnecessary serial waiting . The materialization of processes in Process Init and tensors in Model Init are exe-cuted strictly sequentially, following the program’s control flow. Viewing components as “monolithic” entities and ex-ecuting them sequentially is highly developer-friendly, as it naturally avoids concurrency risks and facilitates debugging. However, it fails to fully exploit the concurrent processing capabilities of modern servers, and such serialized execution causes the overall latency to accumulate in proportion to the number of components. 
+
+• The granularity of components mismatches the effi-cient operational granularity of the underlying hardware. 
+
+In Model Init, the system loads tensors from disk to memory and to the GPU one by one, while the underlying storage system prefers block-wise I/O. The core objects in high-level LLM inference algorithms are tensors; the loading programs naturally conform to this algorithmic semantics, which is of-ten not aligned with hardware-friendly access patterns. Tensor sizes are irregular and determined by the model structure, and are often poorly aligned with the preferred I/O granularity of storage devices and interconnects; under tensor parallelism, the dominant parallelization strategy in multi-GPU deploy-ments [ 35 ], tensors are partitioned across devices, making transfers less contiguous and more fragmented. The under-utilization of hardware bandwidth constitutes a significant bottleneck during cold start.  
+
+> 2The Optimize stage also has room for improvement [ 42 ], which is orthogo-nal and complementary to our method, and can be integrated with our method in the system (Appendix A).
+
+2.3 Goal and Challenges Goal and Intuition. Our goal is to refactor the LLM cold-start program to accelerate the overall cold-start process. Based on the overhead analysis, our optimization intuition is twofold: increasing system concurrency to overlap component exe-cution times, and merging fine-grained operations to fully exploit hardware bandwidth. According to the analysis in §1, directly applying these two ideas faces three challenges. 
+
+Challenge 1: Lack of abstraction for refining internal com-ponent logic. The large number and heterogeneity of compo-nents prevent direct program modification. We introduce the CFA abstraction to describe component state transitions and dependencies, thereby revealing optimization opportunities for concurrent execution and I/O merging (§3.1). 
+
+Challenge 2: Lack of programming interfaces for applying the CFA model. Components’ diverse implementations make it difficult to rewrite them individually into CFA, and their scale also challenges the scalability of the CFA system. We propose a CFA-based programming framework to refactor the original program, which preserves the original program structure as much as possible, enables concurrent execution, and enables isolated CFA state space management (§3.2). 
+
+Challenge 3: Program correctness risks introduced by concurrent execution. Substantially refactoring a sequential program into concurrent execution inherently carries a risk of data hazards or even program crashes caused by incorrect execution orders. We provide a rigorous proof demonstrating that concurrent execution based on the CFA model is equiv-alent to monolithic sequential execution, and analyze data safety in each CFA-refined case (§3.3). 
+
+## 3 The CFA Abstraction 
+
+We use the CFA abstraction to guide the analysis of cross-component optimization and program refactoring, and to prove the correctness of the refactoring. 
+
+3.1 System Model Automata. We formalize the LLM cold-start process as a 
+
+Communicating Finite Automata (CFA) system that converges to terminal states. Each physical or logical component in-volved in the cold start (such as processes, data chunks, etc.) is defined as a finite automaton (FA) 𝑐 . A component 𝑐 is associated with a monotonic state variable 𝑆 (𝑐 ), whose value ranges over a finite and ordered state space S𝑐 = {𝑠 𝑐, 0, 𝑠 𝑐, 1, . . . , 𝑠 𝑐,𝑚 𝑐 }. The specific states of the components are defined by the application semantics, but their state transitions through-out the lifecycle must be “monotonic” and “irreversible”. At runtime, each state transition represents the execution of a code block. 
+
+Dependency. A dependency between components is uni-formly expressed as a state-dependency relation, denoted as (𝑐 𝑖 , 𝑠 𝑖 ) → ( 𝑐 𝑗 , 𝑠 𝑗 ). Note that the actual meaning of this dependency is: the “state transition” of component 𝑐 𝑗 from                                                 
+
+> 31waiters = {} #dict[tuple[component, state], list[handle]]
+> 2while True:
+> 3event =recv_event()
+> 4key =(event.component, event. state)
+> 5if event.kind == "set_state":
+> 6handles =waiters.get(key, [])
+> 7for hin handles:
+> 8wakeup(h)
+> 9waiters[key] =[]
+> 10 else: #wait_state
+> 11 if key not in waiters:
+> 12 waiters[key] =[event. handle]
+> 13 elif len(waiters[key]) >0:
+> 14 waiters[key].append(event. handle)
+> 15 else:
+> 16 wakeup(event.handle)
+
+Figure 2. Core event loop of a channel .state 𝑠 𝑗 to state 𝑠 𝑗 +1 depends on component 𝑐 𝑖 having already reached state 𝑠 𝑖 . In other words, only when 𝑐 𝑖 successfully arrives at state 𝑠 𝑖 can it trigger the specific operations of com-ponent 𝑐 𝑗 from state 𝑠 𝑗 to 𝑠 𝑗 +1. Because the state transition of each component is monotonic in cold start, for the sake of conciseness, we simplify the state transition as the starting state (𝑐 𝑗 , 𝑠 𝑗 ).
+
+Runtime Workflow. In a valid cold start, all components’ states and transitions form a directed acyclic graph (DAG) .Each component runs the code block of a transition, and publishes the new state on completion; for a dependency, the dependent component waits for the prerequisite condi-tion to be met and proceeds to the next transition; when one component publishes a new state, it may satisfy prerequisite conditions for other components and trigger their transitions (execution). 
+
+Opportunities from CFA Abstraction. The CFA abstraction can guide the safe refactoring of LLM cold-start programs tar-geting the overhead reported in §2.1. First, the execution pro-cesses within FAs are described as state transitions at a finer time granularity. State transitions with no cross-FA dependen-cies can safely run concurrently. Therefore, the corresponding independent program parts can be refactored, effectively over-lapping the execution time of components. Second, multiple related FAs can be safely merged and sim-plified, reducing state transitions while maintaining the same semantics from the start to the end state. Specifically, assum-ing multiple FAs 𝐴 𝑖 each contain an independent state transi-tion 𝑎 (𝑖 ) 
+
+> 1
+
+→ 𝑎 (𝑖 ) 
+
+> 2
+
+, we can logically merge them into a single FA with one state transition (𝑎 (1) 
+
+> 1
+
+, 𝑎 (2) 
+
+> 1
+
+, . . . ) → ( 𝑎 (1) 
+
+> 2
+
+, 𝑎 (2) 
+
+> 2
+
+, . . . ).In the program, if the original fine-grained state transitions trigger excessive fragmented I/O requests that mismatch the hardware’s ideal I/O granularity, we can safely merge and                       
+
+> 1def process_A(channel): #Component A
+> 2A_init1()
+> 3channel.set_state("A", "A1")
+> 4A_init2()
+> 5channel.set_state("A", "A2")
+> 6def process_B(channel): #Component B
+> 7B_init1()
+> 8channel.set_state("B", "B1")
+> 9channel.wait_state("A", "A1")
+> 10 B_init2()
+> 11 channel.set_state("B", "B2")
+
+Figure 3. Process/Thread Examples of CFA Programming reorganize these state transitions and their associated I/O op-erations using FA merging. This can align the refactored I/O granularity with hardware characteristics, thereby achieving higher bandwidth saturation. 
+
+3.2 Programming Framework and Runtime 
+
+We provide a programming framework to refactor the LLM cold-start program with the CFA abstraction. Components in the program run at different levels (e.g., processes, mod-els, tensors); it is not necessary to manage all FAs together. The CFA framework enables users to specify a set of re-lated FAs in a single namespace, abstracted as a channel .Each channel independently maintains the state space of all components within it, providing a lightweight interaction and synchronization scope; different channels isolate their state management for heterogeneous components. Developers customize the cold-start program to enable the CFA abstraction. Developers can explicitly express state transitions by inserting the channel.set_state() prim-itive directly into the components’ existing initialization code. Once a component completes a substantial portion of its work-ing logic, calling this primitive publishes the newly reached monotonic state to the channel , which then wakes all com-ponents waiting on that state. The channel.wait_state() primitive is inserted into the program’s execution flow to declare explicit component dependencies. When the current component reaches this code position, it either blocks until the required state of the other component becomes available or continues immediately if that state has already been published. In implementation, the channel runs continuously in the background as a daemon process (or daemon thread) re-sponsible for handling all set_state and wait_state 
+
+events. Figure 2 illustrates its internal workflow. This dae-mon process/thread maintains, for each published state key (component , state ), a queue of blocked waiters stored in a dictionary (line 1). Upon receiving a set_state event (lines 6–9), it looks up the corresponding queue in the dictio-nary (line 6), wakes all blocked waiters (lines 7–8), and then marks that state as already published by resetting the entry to the empty list (line 9). Upon receiving a wait_state event            
+
+> 4WCF
+> F/C/W: Frontend/Core/Workers Processes
+> WCF
+> vLLM Startup
+> : Execute : Dependency Original Init Independent Init Dependent Init Wait
+> Processes
+> 13
+> 13
+> 1
+> 1
+> 1
+> 1
+> 3
+> 23
+> 2
+> 1Start 2Constructed 3Ready
+> InstantInfer Startup
+
+Figure 4. Process-tree materialization in conventional engines and under CFA-guided execution. (lines 11–16), it either creates (line 12) or appends (line 14) to the corresponding queue, or resumes the waiter immediately if the required state has already been published (line 16). 
+
+An Example. The CFA programming framework can be ap-plied to concurrent processes, threads, and coroutines. In the example shown in Figure 3 (coroutine example in Figure 16 in Appendix B), we consider two components, 𝐴 and 𝐵 , with states {𝐴 1, 𝐴 2} and {𝐵 1, 𝐵 2}, and a dependency (𝐴, 𝐴 1) → (𝐵, 𝐵 1); in the cases of synchronous processes/threads and asynchronous coroutines, developers can use identical inter-faces to achieve concurrent execution and safe synchroniza-tion on dependencies, and keep most of the original code unchanged. 
+
+3.3 Correctness Analysis 
+
+We formulate the CFA-refined program and the original pro-gram as DAGs, and prove that both programs terminate and converge to the same final states. The definition and theorems are listed below, with the proofs in §8. 
+
+Definition 1 (DAG CFA) . If all internal state transitions and cross-component state dependencies of a CFA form a DAG, we define it as a DAG CFA. 
+
+Definition 2 (Chain CFA) . Traditional monolithic sequential component execution, whose execution order is strictly gov-erned by the program’s control flow, can be abstracted into a special DAG CFA, termed a Chain CFA. 
+
+Theorem 1. A DAG CFA is guaranteed to terminate. 
+
+Theorem 2. If the internal state transition sequence of each FA in a DAG CFA is identical to that in a Chain CFA, then when both CFAs terminate, the final states of all FAs will be exactly the same. 
+
+## 4 CFA for LLM Cold Start 
+
+We apply the CFA abstraction and programming framework to three key procedures of LLM cold start. 
+
+4.1 Process-Tree Materialization 
+
+Modern LLM inference systems organize their processes in a three-level hierarchy with one frontend process, one core process, and a set of worker processes, where each worker is bound to one GPU. The traditional initialization procedure strictly follows a serial execution protocol: a parent process must complete its own initialization entirely before spawning and configuring its child processes. This level-by-level pro-gression makes the cold-start time proportional to the depth of the process tree. We observe that these processes share similar execution logic and monotonic progress during cold start, and therefore abstract them into a CFA. 
+
+CFA Model. We define the frontend, core, and workers in the system as FAs in the same channel, where an FA maintains the states of {Start, Constructed, Ready} (❶, ❷, and 
+
+❸ in Figure 4). The transition from Start to Constructed 
+
+usually involves importing packages, establishing IPC con-nections, and initializing devices (like CUDA contexts). In the traditional serial startup logic, the dependency be-tween a parent process and a child process is coarse-grained: the parent must first reach Ready , and the child is launched as Start , i.e., (parent , Ready ) → ( child , Start ).Refining each component lifecycle into three states ex-poses an intermediate dependency boundary: a child can complete the independent stage of local setup (from Start 
+
+to Constructed ) before the parent is Ready , and blocks only at the final parent-dependent stage, i.e., (parent , Ready )→ ( child , Constructed ).
+
+Runtime Workflow. Figure 4 (left) shows the workflow of the traditional monolithic sequential process initialization. The overall time is the sum of the times of Frontend, Core, and (the maximum of) Workers. The CFA-refined workflow is as follows: first, the sys-tem concurrently creates all processes. Each process indepen-dently performs initialization operations, such as importing packages and allocating local memory; upon completion, each process independently enters the Constructed state. The Frontend process then advances to the Ready state and waits for completion signals from other processes. Mean-while, after the Core process evolves to Constructed on its own, it suspends and waits for the Frontend process to reach the Ready state; only when this condition is met can the Core process obtain the necessary context and enter the parent-dependent stage. Similarly, after the Workers complete the independent ini-tialization and enter the Constructed state, they wait for the Core process to reach the Ready state to complete their parent-dependent stage. 
+
+Time Reduction. In the traditional vLLM sequential initial-ization workflow, let 𝑇 1, 𝑇 2, and 𝑇 3 denote the initialization time of the Frontend, Core, and Workers, respectively. The total initialization time is therefore 𝑇 vLLM = Í3 
+
+> 𝑖 =1
+
+𝑇 𝑖 .With InstantInfer refinement, each process initialization is                   
+
+> 5H2D Transfer Allgather
+> Dependency Execute
+> Time
+> Chunk
+> 1
+> Disk I/O
+> 24
+> 1InDisk 2InMem 3InGPU 4Gathered
+> 124
+> 123
+> 3
+> 5Destroyed GPU 0
+> 12Constructed Loaded
+> 5
+> 4
+> Tensor Copy
+> 4
+> 4
+> 1
+> 1
+> 1
+> 1
+> 1
+> 2
+> 2
+> 2
+> 2
+> 2
+> 12
+> 5553
+
+Figure 5. CFA-guided model loading. decomposed into an independent stage and a parent-dependent stage, so that 𝑇 𝑖 = 𝑇 𝐼 𝑖 + 𝑇 𝐷 𝑖 , where 𝑇 𝐷  
+
+> 1
+
+= 0 because the fron-tend has no parent-dependent stage. The total initialization time becomes the maximum time over all root-to-leaf paths:                   
+
+> 𝑇 CFA =max 𝑖 {𝑇 𝐼 𝑖 +Í3
+> 𝑗 =𝑖 𝑇 𝐷 𝑗 } ≤ max 𝑖 {𝑇 𝐼 𝑖 } + Í3
+> 𝑖 =1𝑇 𝐷 𝑖 <𝑇 vLLM .
+
+The first inequality holds because the independent stage is overlapped across processes, while the parent-dependent stage remains ordered along the parent–child chain. The sec-ond strict inequality holds as long as at least two processes have nonzero independent work, which is the common case in practice. Therefore, the refined initialization time is strictly smaller than the original serial initialization time. 
+
+Correctness and Safety. By theorems in §3.3, the CFA-refined program terminates with the same final states as the original program. If a child state depends on a parent state, for example, when the child must wait for the parent to prepare an IPC address before establishing the connection, the parent state needs to be initialized during the transition 
+
+Constructed → Ready , and the child state can be al-located before Constructed but must be initialized after 
+
+Constructed .
+
+4.2 Tensor Materialization 
+
+In the traditional LLM cold start, the system materializes tensors from the model file one by one, sequentially read-ing them from disk to host memory, and then copying them from host memory to GPU memory. We observe that the mas-sive tensors share highly similar movement patterns, so we naturally abstract them as a CFA. 
+
+Naïve CFA Model. We first propose a naïve CFA model to refine the workflow. On a single distributed worker node (rank), we define all model tensors (including sharded sub-sets) as FAs, and refactor the sequential loading workflow. In the naïve CFA model, each tensor component has three mono-tonically increasing states: { InDisk , InMem , InGPU }. Since the tensors are logically independent of each other, theoretically, there is no need to enforce strict CFA state dependencies among them. However, allowing all tensors to perform I/O operations concurrently without restriction can easily cause underlying bus congestion, paradoxically preventing I/O bandwidth saturation. To limit the contention, we explicitly set state dependencies 
+
+(𝑇 𝑖 , InMem ) → ( 𝑇 𝑖 +1, InDisk ) on the disk-to-memory data path to enforce sequential tensor copying along this path; similarly, on the memory-to-GPU path, we set a comparable dependency (𝑇 𝑖 , InGPU ) → ( 𝑇 𝑖 +1, InMem ).At runtime, this forms a two-stage pipeline for the disk-memory-GPU data paths. Each pipeline stage loads only one tensor at a time, while the two stages enable efficient concur-rency and temporal overlap. 
+
+Refined CFA Model. Although the naïve model introduces a pipeline, performing multiple independent I/O calls for each fine-grained tensor on both paths separately incurs excessive system overhead, which is non-negligible for large models. To further optimize the loading process, we must aggregate operations. However, logically consecutive tensors in the al-gorithm description are not necessarily adjacent in the actual disk storage files, making it impossible to merge the I/O oper-ations for adjacent tensors directly. To this end, we introduce a novel execution component into the system: the data chunk ( chunk ). We divide the entire physical model file on disk into multiple chunks of equal length (the last chunk may be partial), and precompute the mapping associations between chunks and individual log-ical tensors. If a tensor’s content falls within the range of a certain chunk , the system associates the tensor with that 
+
+chunk . One tensor may span and be associated with one or multiple chunks , and conversely, one chunk may be associated with one or multiple tensors. We represent this as-sociation using tensor.chunks and chunk.tensors ,and the system precomputes this mapping in advance. The states of the chunk component are { InDisk , InMem ,
+
+InGPU , Destroyed } ( ❶, ❷, ❸, and ❺ in Figure 5); mean-while, in the refined CFA model, we redefine each tensor component to have two states: { Alloc , Loaded } ( ① and ②
+
+in Figure 5). The cross-component dependencies are designed for effi-cient data flow (Figure 5). (i) Among the chunk s, we set de-pendencies (𝐶 𝑖 , InMem ) → ( 𝐶 𝑖 +1, InDisk ) and (𝐶 𝑖 , InGPU )→ ( 𝐶 𝑖 +1, InMem ). These dependencies form a two-stage pipeline with temporal overlap (similar to the naïve model). 
+
+(ii) Between a chunk and its associated tensors, we establish the dependency (𝐶 𝑖 , InGPU ) → ( 𝑇 𝑗 , Alloc ). This means that when a required chunk is ready in the GPU memory, it can trigger the associated tensor to transition from Alloc 
+
+to Loaded , performing efficient data copying and assem-bly within the GPU to make the tensor ready for use. (iii) 
+
+Between a tensor and its associated chunk s, we set the de-pendency (𝑇 𝑖 , Loaded ) → ( 𝐶 𝑗 , InGPU ). These dependen-cies mean that once all tensors associated with a chunk have reached Loaded , the chunk can transition from InGPU to 
+
+Destroyed , releasing GPU memory. 
+
+Optimization of Distributed Loading. To further improve hardware utilization, we introduce an optimization mecha-nism for the multi-path concurrent loading of chunk s. If the system is configured with multiple ranks (e.g., multiple GPUs), we load each chunk cooperatively across multiple            
+
+> 6Free GPU Mem
+> Dependency
+> Execute
+> Time
+> Model
+> Serve
+> 1Active 2GMemFreed 3Destroyed
+> 12Start EnvReady
+> 3
+> 1
+> Alloc GPU Mem & GPU-dependent work Serve Initialize Environment
+> Destory Other Resources
+> 12
+> 23
+> 3Active
+
+Figure 6. CFA-guided runtime model switching. paths: each chunk is divided into multiple equal-length “seg-ments” according to the number of ranks. Within each rank, the assigned segment is loaded following the aforementioned pipeline process. Once these segments become locally ready in their respective GPUs, the system per-forms an additional AllGather collective communication operation, after which the corresponding chunk transitions to an additional state, Gathered , which triggers the chunk-to-tensor data copy. By stitching these segments together via cross-device transmission, each rank ultimately acquires the complete chunk data. This optimization fully utilizes data-transfer channels be-tween ranks and disk for concurrent reads, and then uses the peer-to-peer network among ranks to assemble the complete data. 
+
+Correctness and Safety. By theorems in §3.3, the CFA-refined program converges to the same state as the original program. For data safety, each logical tensor is assigned val-ues after its own allocation and its associated chunks’ readi-ness, which guarantees the tensor values are valid. 
+
+4.3 Runtime Model Switching 
+
+In traditional dynamic multi-model serving systems, model switching is typically treated as an indivisible serial phase transition: the system first shuts down and unloads the current old model, reclaims its associated GPU memory and system resources, and then loads and initializes the new model from scratch. This purely serial approach inevitably introduces substantial service disruption time. We observe that the new model’s initialization contains an early GPU-independent stage and a later GPU-dependent stage, while the old model’s teardown first releases GPU resources and only then reclaims CPU- and host-memory-side resources. We capture this over-lap opportunity by abstracting the old and new models uni-formly as CFAs, as illustrated in Figure 6. 
+
+CFA Model. In the CFA model for model switching, the old model ( 𝑀 1) and the new model ( 𝑀 2) are treated as two concurrently executing core components. We define the life-cycle states of the old model as: { Active , GMemFreed ,
+
+Destroyed } ( ❶, ❷, and ❸ in Figure 6); and the lifecycle states of the new model as: { Start , EnvReady , Active }(①, ②, and ③ in Figure 6). Because the old and new models compete for mutually exclusive resources like GPU memory, we explicitly establish a cross-component state dependency between them: (𝑀 1, GMemFreed ) → ( 𝑀 2, EnvReady ). This dependency means that the new model can trigger the state transition from EnvReady to Active only after the old model has fully released its GPU memory, thereby safely proceeding with GPU-memory allocation operations. 
+
+Workflow with an Optimization. Running the two mod-els with the CFA refinement above achieves safe concurrent model switching by overlapping execution (Figure 6). We also provide an optimization to further reduce the “new model waiting time”. The main idea is to make the two states ( 𝑀 1,
+
+GMemFreed ) and ( 𝑀 2, EnvReady ) as close as possible, so that the new model does not block for a long time waiting for GPU memory to be released. Let 𝑇 be the new model launch time ( 𝑀 2, Start ), 𝑡 1 the new model’s environment initialization time ( 𝑀 2, Start )
+
+→ (𝑀 2, EnvReady ), and 𝑡 2 the old model’s GPU-memory release time ( 𝑀 1, Active ) → (𝑀 1, GMemFreed ). Using historical measurements or offline profiling, we obtain 𝑡 ′ 
+
+> 1
+
+and 
+
+𝑡 ′ 
+
+> 2
+
+as predictions for 𝑡 1 and 𝑡 2. Thus, we set the old model’s shutdown time to be max {𝑇 + 𝑡 ′ 
+
+> 1
+
+− 𝑡 ′
+
+> 2
+
+,𝑇 } (Figure 6). This schedule minimizes the time the new model waits for GPU memory to be ready. 
+
+## 5 Implementation 
+
+We integrate InstantInfer with vLLM [ 15 ] by replacing block-ing initialization routines with the CFA programming ab-straction, which modifies ~3000 lines of Python code while preserving the execution semantics of the underlying system. To support the chunk-level I/O pattern efficiently, we further develop a lightweight C++ extension module of ~2700 lines for fast chunk I/O across GDS-backed storage (via cuFile ), legacy storage (via libaio ), and in-memory storage such as tmpfs (via cudaMemcpyAsync ). These changes demon-strate that CFA can be incrementally adopted in practice with-out intrusive system redesign. During tensor materialization, the AllGather operation is executed over communication groups, which are created by 
+
+torch.distributed.new_group() with the NCCL backend. For example, on four GPUs, users may specify two disjoint two-GPU groups instead of the full set. By default, we use the world group containing all GPUs. 
+
+## 6 Evaluation 
+
+This section addresses five key questions: (1) How does In-stantInfer affect end-to-end cold-start latency across diverse configurations? (§6.2) (2) How does cold-start latency scale with the number of instances for InstantInfer? (§6.3) (3) How does InstantInfer impact model switching latency? (§6.4) (4) What is the performance contribution of each InstantInfer mechanism? (§6.5) (5) What is the hardware utilization and 
+
+> 7
+
+vLLM SGLang SLLM InstantInfer 0 50 100    
+
+> Qwen3-
+> 30B-A3B
+> 0.00
+> 0.25
+> 0.50
+> 0.75
+> 1.00
+> 0150 300
+> Llama-
+> 3.1-70B
+> 0150 300
+> Qwen3-
+> 235B-A22B
+> 0150 300
+> DeepSeek-
+> R1
+
+CDF of TTFT (s) (a) [H20] Single request. 0 30 60     
+
+> Llama-
+> 3.1-8B
+> 0.00
+> 0.25
+> 0.50
+> 0.75
+> 1.00
+> 060 120
+> Qwen3-
+> 30B-A3B
+> 060 120
+> Qwen3-
+> 32B
+> 0150 300
+> Llama-
+> 3.1-70B
+
+CDF of TTFT (s) (b) [L40] Single request. 0 60 120    
+
+> Qwen3-
+> 30B-A3B
+> 0.00
+> 0.25
+> 0.50
+> 0.75
+> 1.00
+> 0200 400
+> Llama-
+> 3.1-70B
+> 0150 300
+> Qwen3-
+> 235B-A22B
+> 0150 300
+> DeepSeek-
+> R1
+
+CDF of TTFT (s) (c) [H20] 32-request burst. 
+
+Figure 7. Cold-start TTFT CDFs under different hardware and request settings. resource overhead of InstantInfer? (§6.6) 
+
+6.1 Evaluation Settings Testbed. We evaluate InstantInfer on two representative GPU clusters, each comprising 8 NVIDIA GPUs, to capture both high-end and more commonly deployed configurations. The first testbed uses NVLink-connected H20 (141 GB) GPUs with 50 GB/s networked storage (GPFS [ 2]), representing a high-bandwidth, tightly coupled environment. The second employs PCIe-connected L40 (48 GB) GPUs with 20 GB/s networked storage, reflecting a more bandwidth-constrained and cost-efficient deployment. Each node is equipped with 2 TB of host memory and an Intel® Xeon® Platinum 8468 CPU (192 logical cores). Unless otherwise specified, we load models from storage rather than memory to reflect realistic cold-start scenarios in production. 
+
+Baselines. We compare InstantInfer against three representa-tive open-source inference frameworks: vLLM (0.13.0) [ 15 ], SGLang (0.5.9) [ 44 ], and ServerlessLLM (abbreviated as SLLM in figures; version 0.8.0) [ 9]. vLLM and SGLang are among the most widely deployed LLM serving systems, rep-resenting state-of-the-art performance in conventional (non-serverless) settings. In contrast, ServerlessLLM is specifically designed for serverless environments and incorporates opti-mizations for cold-start latency. All baselines rely on Safeten-sors [ 8 ] as the de facto standard weight format, while Server-lessLLM further requires converting model weights into a proprietary format for each parallelism configuration before execution. We also prepare and enable the torch compile cache [ 34 ] for all systems, which is the default and recom-mended configuration for these systems. To isolate model loading performance, we further com-pare against standalone loaders integrated into existing sys-tems, including Safetensors (0.7.0), Run:ai Model Streamer (0.15.6) [ 3], and fastsafetensors (0.2.2) [ 38 ]. We also include ServerlessLLM as a point of comparison due to its state-of-the-art, albeit proprietary, loading pipeline. 
+
+Models. We select parallelism conservatively to match prac-tical serving constraints following vLLM’s guidance [ 35 ], balancing memory footprint and parallel efficiency. For dense models, we choose the minimum tensor parallelism (TP) de-gree required to fit the model weights while preserving KV-cache capacity on the target GPUs, since larger TP increases cross-GPU communication with limited benefit once memory feasibility is satisfied. For MoE models, we additionally use expert parallelism (EP) to shard experts and reduce expert-side load imbalance. Under this policy, we consider four models on the H20 testbed: (1) Qwen3-30B-A3B [ 37 ] with TP=1; (2) Llama-3.1-70B [ 25 ] with TP=2; (3) Qwen3-235B-A22B [ 37 ] with TP=4 and EP=4; and (4) DeepSeek-R1 [ 11 ]with TP=8 and EP=8. On the L40 testbed, we evaluate four additional configura-tions that better match the reduced GPU-memory capacity: (1) Llama-3.1-8B [ 25 ] with TP=1; (2) Qwen3-30B-A3B [ 37 ]with TP=2 and EP=2; (3) Qwen3-32B [ 37 ] with TP=4; and (4) Llama-3.1-70B [25] with TP=8. 
+
+Workload. Following standard practices in prior work [ 9,15 ], we construct realistic workloads using the ShareGPT [ 1]dataset, which contains ChatGPT conversation histories. We filter the dataset to include only requests with prompt lengths up to 32K tokens, ensuring compatibility with the context limits of all evaluated models. 
+
+Metrics. Our primary end-to-end metric is time to first token (TTFT), which captures user-perceived latency in serverless LLM serving. TTFT includes engine startup latency, queuing delay, and prefilling latency, with engine startup typically dominating the critical path in cold-start scenarios. To better understand performance bottlenecks, we addition-ally report fine-grained metrics in our ablation study, includ-ing engine startup time, model loading time, and hardware utilization. 
+
+6.2 End-to-End Cold-Start Latency Single-request cold start. We first evaluate the end-to-end cold-start TTFT for a single request, representing the base-line startup efficiency. For each measurement, we generate a request from the dataset and immediately launch a fresh engine instance to process it, repeating this procedure across             
+
+> 8030 60 90
+> Qwen3-
+> 30B-A3B
+> 10 −1
+> 10 0
+> 10 1
+> 10 2
+> 030 60 90
+> Llama-
+> 3.1-70B
+> 030 60 90
+> Qwen3-
+> 235B-A22B
+> 030 60 90
+> DeepSeek-
+> R1
+> TTFT (s)
+
+Request arrival time (s)  
+
+> Resident Cold-start
+
+Figure 8. [H20] TTFT for the same requests on cold-start and resident engines. 1 2 4 8
+
+Number of instances    
+
+> 0
+> 50
+> 100
+> 150
+> Startup time (s)  vLLM SGLang SLLM InstantInfer
+
+Figure 9. [H20, Qwen3-30B-A3B] Multi-instance startup time with in-memory caching. multiple trials to capture the latency distribution. As shown in Figure 7a, InstantInfer achieves the lowest cold-start TTFT across all evaluated models. Compared to ServerlessLLM, the state-of-the-art serverless inference system, InstantInfer achieves a 2.7 ×–2.9 × speedup in single-request TTFT, owing to faster process and tensor materialization via CFA. Fur-thermore, InstantInfer achieves a 3.2 ×–7.2 × speedup over standard inference engines like vLLM and SGLang, where SGLang exhibits higher latency than vLLM due to its longer compilation and graph capture overhead. On the L40 testbed, InstantInfer maintains a significant performance advantage. As shown in Figure 7b, InstantInfer achieves a 1.8 ×–2.6 × speedup in single-request cold start over ServerlessLLM. When compared to standard inference en-gines, InstantInfer achieves a 2.1 ×–3.7 × speedup over vLLM and SGLang. 
+
+Burst cold start. In modern serving environments, cold starts are frequently triggered by sudden traffic spikes. To evaluate this scenario, we extend our methodology by launching a fresh engine instance while dispatching a concurrent burst of sampled requests, repeating this procedure across multi-ple trials to capture the latency distribution. Figure 7c shows the TTFT distribution for a burst size of 32, while additional results for burst sizes of 16 and 64 are provided in Appen-dix C. Under these conditions, InstantInfer maintains its per-formance advantage, achieving a 1.8 ×–2.5 × TTFT speedup over ServerlessLLM and a 2.6 ×–4.9 × speedup over vLLM and SGLang. Compared with the single-request setting, the relative improvement is slightly smaller because a larger burst Qwen3-   
+
+> 30B-A3B
+> Llama-
+> 3.1-70B
+> Qwen3-
+> 235B-A22B
+> DeepSeek-
+> R1
+> 0
+> 100
+> 200
+> 300
+> 400
+> Stall time (s)
+> vLLM SGLang SLLM InstantInfer
+
+Figure 10. [H20] Service stall time during model switching. Qwen3-
+
+> 30B-A3B
+> Llama-
+> 3.1-70B
+> Qwen3-
+> 235B-A22B
+> DeepSeek-
+> R1
+> 0.00
+> 0.25
+> 0.50
+> 0.75
+> 1.00
+> Normalized time
+> vLLM
+> + Process CFA
+> + Tensor CFA
+> + Switching CFA
+
+Figure 11. [H20] Startup time improvement from each de-sign. increases the post-startup portion of TTFT, especially request scheduling and prefill queuing overheads. Across the evalu-ated settings, increasing the burst size by one raises the TTFT by approximately 0.27 s on average. These results show that InstantInfer can still bring the model online quickly enough to absorb substantial traffic bursts. 
+
+Impact of cold starts on steady-state latency. To verify that InstantInfer’s rapid initialization does not degrade steady-state performance, we replay a sequence of requests sampled from the dataset at fixed 10-second intervals in two settings: a cold-start setting, where a InstantInfer engine is launched upon the arrival of the first request, and a resident setting with an already-running vLLM engine. As shown in Figure 8, requests arriving during the initial cold-start phase experience higher latency as the system materializes. However, once the engine is fully initialized and the pending queue is cleared, InstantInfer’s request latency rapidly converges to match that of the resident vLLM engine. This confirms that InstantInfer accelerates startup without introducing any runtime overhead during continuous inference. 
+
+6.3 Concurrent Cold-Start Scalability 
+
+When a severe request burst overwhelms a single instance, the serving platform must scale out by concurrently launch-ing multiple instances to maintain quality of service (QoS). We evaluate this scalability using Qwen3-30B-A3B, whose relatively small memory footprint allows the most concurrent instances to be created on a single node, measuring the con-current startup time for 1, 2, 4, and 8 instances. When multiple instances are launched concurrently, loading the model once        
+
+> 9Safetensors fastsafetensors Run:ai SLLM InstantInfer 0
+> 40
+> 80
+> 120
+> 160
+> H20
+> Llama-
+> 3.1-8B
+> Qwen3-
+> 30B-A3B
+> Qwen3-
+> 32B
+> Llama-
+> 3.1-70B
+> 0
+> 50
+> 100
+> 150
+> 200
+> L40
+> Loading time (s) (a) Load from storage. 0
+> 20
+> 40
+> 60
+> 80
+> H20
+> Llama-
+> 3.1-8B
+> Qwen3-
+> 30B-A3B
+> Qwen3-
+> 32B
+> Llama-
+> 3.1-70B
+> 0
+> 8
+> 16
+> 24
+> 32
+> L40
+> Loading time (s) (b) Load from memory.
+
+Figure 12. [H20 and L40] Model loading time comparison across disk and memory. into host memory and then copying it to each GPU is substan-tially more efficient than issuing repeated storage reads for each instance. We therefore enable in-memory model caching, as all evaluated frameworks support this mechanism: Server-lessLLM loads the model into its custom caching layer, vLLM and SGLang load it into the page cache, and InstantInfer loads it into a tmpfs-based cache. As shown in Figure 9, the relative performance ranking among all frameworks remains consistent with the single-instance scenario, and InstantInfer achieves the lowest startup time at all concurrency levels. For a single instance, InstantIn-fer achieves a 2.6 ×–4.3 × speedup over the baselines. As the number of concurrent instances scales to 8, InstantInfer main-tains superior efficiency, achieving a 1.6 ×–2.3 × speedup over the baselines. Latency grows with the number of instances, mainly during the process-tree materialization phase, where package imports and CUDA context setup account for most of the increase because concurrent processes contend for I/O, memory allocation, and other system and hardware resources. 
+
+6.4 Model Switching Latency 
+
+Dynamic multi-model serving demands low-latency model switching. Figure 10 quantifies the service stall time—the duration during which no requests can be served—during a model switch. We evaluate switching between models of sim-ilar sizes and with the same parallel configurations: Qwen3-32B → Qwen3-30B-A3B, Qwen2.5-72B → Llama-3.1-70B, DeepSeek-V2.5 → Qwen3-235B-A22B, and DeepSeek-V3 
+
+→ DeepSeek-R1. Each group is labeled by the target model in the figure. For the baselines, this stall encompasses sequen-tially shutting down the outgoing model and cold-starting the incoming one. InstantInfer reduces this disruption by over-lapping the incoming model’s initialization with the outgoing model’s active serving and shutdown, and by accelerating the cold-start path. It reduces service stall time and achieves a 3.9 ×–5.0 × speedup over ServerlessLLM and a 4.6 ×–11.8 ×
+
+speedup over vLLM and SGLang. 
+
+6.5 Ablation Study Latency reduction by design component. We isolate the performance gains attributed to each core InstantInfer mecha-nism in Figure 11. The tensor materialization speedup yields the most substantial gain, achieving a 2.4 ×–3.7 × speedup over the baseline startup time, as model loading dominates the over-all startup latency. Building on this foundation, the speedup of process-tree materialization delivers an additional 1.2 ×–1.5 ×
+
+speedup over the optimized baseline. Finally, multi-model overlapping removes implicit barriers, contributing a further 1.6 ×–2.1 × speedup. Altogether, these compounding mecha-nisms achieve a 5.0 ×–7.8 × overall speedup compared to the unoptimized baseline. 
+
+Latency reduction of model loading. Figure 12 specifically isolates the tensor materialization stage. When loading from storage with 50 GB/s bandwidth on the H20 testbed, In-stantInfer significantly outperforms all alternatives: InstantIn-fer achieves a 10.4 ×–32.3 × speedup over the default Safeten-sors library, 3.3 ×–9.0 × over fastsafetensors, 4.8 ×–7.0 × over Run:ai, and 1.8 ×–6.5 × over ServerlessLLM. This perfor-mance stems from the highly overlapped chunk I/O pipeline constructed through CFA, which fully saturates hardware bandwidth. When loading from memory on the H20 testbed, InstantIn-fer remains highly efficient, achieving a 1.9 ×–10.1 × speedup over Safetensors and a 1.1 ×–1.4 × speedup over Serverless-LLM. Compared to loading from storage, Safetensors benefits the most from in-memory loading (4.5 ×–7.1 × speedup) due to its mmap-based zero-copy pipeline. In contrast, fastsafeten-sors and Run:ai gain little (1.1 × and 1.2 × on average, respec-tively), as they are optimized for block storage I/O and incur extra copies and memory allocations that negate the memory bandwidth advantage. ServerlessLLM’s loading pipeline also adapts well, achieving a 2.9 ×–6.3 × speedup through its direct cudaMemcpy-based pipeline. InstantInfer sees a more modest gain (1.4 ×–1.8 ×) because it already gains the highest storage bandwidth when loading from storage, leaving less headroom    
+
+> 10 015 30 45
+
+Time (s) 
+
+> Qwen3-
+> 30B-A3B
+> Llama-
+> 3.1-70B
+> Qwen3-
+> 235B-A22B
+> DeepSeek-
+> R1
+> Import pkg (F)
+> Import pkg (C)
+> Init device (W)
+> Inspect model (F)
+> Import pkg (W)
+> Create comm (W)
+
+Figure 13. [H20] Breakdown of Frontend/Core/Worker process creation. 0 2 4
+
+Time (s) 
+
+> 0
+> 20
+> 40
+> Throughput (GB/s)
+> GPU 0
+> GPU 3
+> GPU 1
+> Storage
+> GPU 2
+
+Figure 14. [H20, Qwen3-235B-A22B] GPU/storage throughput. 0 1   
+
+> 0
+> 8
+> 16
+> 24
+> 32
+> CPU (cores)
+> Qwen3-
+> 30B-A3B
+> 01
+> Llama-
+> 3.1-70B
+> 01
+> Qwen3-
+> 235B-A22B
+> 01
+> DeepSeek-
+> R1
+
+Time (s) 
+
+> vLLM InstantInfer
+
+Figure 15. [H20] CPU overhead in model load-ing. for in-memory loading to exploit. 
+
+Process-tree materialization time breakdown. To under-stand structural bottlenecks, Figure 13 breaks down the most time-consuming initialization steps. Operations like import-ing packages, initializing communication groups, and inspect-ing the model information dominate the critical path. The time for workers to import packages and create communica-tion groups increases with the number of worker processes (which equals the GPU count): the former due to contention for memory and I/O resources among workers, and the latter because more connections and communication buffers need to be created. By using the CFA, InstantInfer parallelizes these highly synchronous operations, thereby reducing the latency of the critical path. On the L40 testbed, InstantInfer achieves 5.7 ×–8.5 × speedup over Safetensors, 2.2 ×–8.4 × over fastsafetensors, 1.1 ×–1.3 ×
+
+over Run:ai, and 1.0 ×–3.1 × over ServerlessLLM. This con-firms that InstantInfer adapts robustly to PCIe-bound envi-ronments. The narrower gap between InstantInfer and Run:ai in this setting is attributable to the fact that both systems re-quire inter-GPU communication to forward a subset of weight shards, and the limited PCIe bandwidth becomes the bottle-neck for such transfers. ServerlessLLM does not require such communication, but its transfer overlap is less efficient than InstantInfer’s, thus it performs slightly worse. When loading from memory on the L40 testbed, InstantIn-fer achieves 1.3 ×–2.9 ×, 1.7 ×–4.6 ×, and 1.6 ×–2.3 × speedups over Safetensors, fastsafetensors, and Run:ai, respectively. ServerlessLLM outperforms InstantInfer in this setting be-cause its loading pipeline does not require GPU peer-to-peer communication. InstantInfer, however, still retains two practi-cal advantages: it is compatible with existing model formats and requires less storage space because ServerlessLLM needs multiple copies of weights for different parallelism config-urations; moreover, the model-loading logic of InstantInfer is decoupled from the engine itself and can therefore be in-tegrated into other inference engines, such as SGLang, with little engine-specific modification. 
+
+6.6 Hardware Utilization and Overhead 
+
+We focus on hardware bandwidth utilization to understand why InstantInfer achieves high loading performance, and on CPU and memory overhead to evaluate whether this design remains friendly to resource-constrained platforms. 
+
+Hardware bandwidth utilization. Model loading dominates engine startup time—e.g., starting a vLLM engine for Qwen3-235B-A22B takes 236s, of which 162s (68.6%) is spent on loading—so hardware I/O bandwidth utilization directly gov-erns overall cold-start performance. As depicted in Figure 14, during the initialization of Qwen3-235B-A22B, InstantInfer achieves an average storage goodput of nearly 80% of the theoretical link speed, effectively converting model material-ization into a pure hardware-bound transfer with little room for further improvement without faster hardware. 
+
+CPU Overhead. As shown in Figure 15, InstantInfer uti-lizes approximately 2.5–3.5 CPU cores per GPU during the intensive model loading stage, compared to roughly 1 core per GPU for vLLM. This overhead stems from InstantInfer’s CFA-driven multi-stage I/O pipeline, whose overlapped trans-fers require additional CPU resources for coordination and progress management. Given that modern inference servers typically feature hundreds of logical cores (e.g., 192 cores in our testbed) that remain largely idle during engine startup, this modest CPU usage is a highly cost-effective trade-off to aggressively drive high-throughput I/O. Furthermore, on platforms with lower-end CPUs, the underlying storage band-width is typically also lower; in such scenarios, InstantInfer naturally scales down its CPU footprint, requiring fewer cores to fully saturate the available hardware. 
+
+Memory Footprint. InstantInfer allocates temporary I/O buffers on both CPU and GPU, sized according to tensor di-mensions, storage types, and GPU count to maximize through-put without triggering out-of-memory errors. For instance, loading Qwen3-30B-A3B on a single H20 GPU requires a 4 GB CPU buffer and a 4 GB GPU buffer. For DeepSeek-R1 across eight H20 GPUs, it uses a 4 GB CPU buffer per node and a 512 MB GPU buffer per GPU. Importantly, all allocated 
+
+> 11
+
+buffers are immediately freed once loading completes, ensur-ing they do not consume space needed for the Key-Value (KV) cache and consequently impose zero memory or performance overhead during steady-state inference. 
+
+## 7 Related Work 
+
+Cold-start reduction. Recent surveys summarize the rapidly evolving LLM serving landscape from algorithms to sys-tems [ 16 , 26 ]. Within this space, recent systems reduce cold starts through faster loading, checkpoint locality, pipelining, caching, or state reuse, including ServerlessLLM [ 9], Hy-draServe [ 21 ], 𝜆 Scale [ 40 ], PipeBoost [ 19 ], BlitzScale [ 43 ], Tangram [ 45 ], Medusa [ 42 ], and Foundry [ 20 ], as well as loading-oriented systems such as InstaInfer, fastsafetensors, and Run:ai Model Streamer [ 3, 33 , 38 ]. In contrast, InstantIn-fer provides a unifying CFA abstraction that restructures de-pendencies across startup, loading, and switching. 
+
+Multi-model serving and switching. Multi-model serving and fast switching are studied in Prism [ 41 ], MuxServe [ 7 ], Aegaeon [ 36 ], Torpor [ 39 ], Tangram [ 45 ], and WarmServe [ 22 ], as well as adapter-serving systems [ 6 , 14 , 17 , 18 , 28 , 31 , 32 ]. These works optimize sharing, placement, or switching poli-cies, whereas InstantInfer models switching as overlapping state progress under explicit resource constraints. 
+
+Elasticity and scale-out. Fast elastic serving depends on burst handling, resource fragmentation, and cross-cluster sched-uling. Recent systems address these issues with network-assisted scale-out, cooperative execution, heterogeneous pro-visioning, and geo-distributed placement [ 5 , 13 , 19 , 23 , 24 ,40 , 43 ]. The mechanisms are complementary to InstantInfer: by shortening startup and switching on the critical path, In-stantInfer can improve the effectiveness of higher-level elastic policies. 
+
+## 8 Correctness of Program Refactoring 
+
+We make the following assumption in the correctness proof. If an FA is executing a transition from state 𝑠 𝑖 to 𝑠 𝑖 +1, it will successfully reach state 𝑠 𝑖 +1 within a finite amount of time. 
+
+Definition 1 (DAG CFA) . If all internal state transitions and cross-component state dependencies of a CFA form a DAG, we define it as a DAG CFA. 
+
+Definition 2 (Chain CFA) . Traditional monolithic sequential component execution, whose execution order is strictly gov-erned by the program’s control flow, can be abstracted into a special DAG CFA, termed a Chain CFA. 
+
+The construction is as follows: If the program’s control flow dictates that component 𝑐 𝑖 must execute strictly before component 𝑐 𝑗 , we explicitly construct a directed dependency edge from the final state of 𝑐 𝑖 to the initial state of 𝑐 𝑗 . Because such a strict linear control flow will never introduce any cyclic dependencies, the dependency structure of the constructed Chain CFA is inherently acyclic, making it a DAG CFA as well. 
+
+Theorem 1. A DAG CFA is guaranteed to terminate. Proof. (1) If there are incomplete transitions in the DAG, there must exist at least one node (state) 𝑠 with an in-degree of 
+
+0 and an out-degree greater than 0 (denoted as “in=0 ∧out>0”). An in-degree of 0 indicates that all prerequisites for this state are fully satisfied. According to the execution semantics, the FA to which this state belongs is actively executing its transi-tion to the next state. (2) By the assumption, after a finite amount of time, the FA will successfully execute to the next state. Once this transition is finished, we remove all directed edges originating from 
+
+𝑠 (including both internal FA state transitions and cross-FA dependencies) from the DAG. (3) The resulting graph after removing the node’s outgoing edges remains a DAG. Therefore, we can repeatedly exe-cute steps 1 and 2. Because the total number of edges in the system is finite, eventually, there will be no nodes left with in=0 ∧out>0. Since the DAG is acyclic, all remaining nodes have both an in-degree and out-degree of 0, meaning there are no executable steps (state transitions) left. Thus, the system successfully converges and terminates. 
+
+□
+
+Theorem 2. If the internal state transition sequence of each FA in a DAG CFA is identical to that in a Chain CFA, then when both CFAs terminate, the final states of all FAs will be exactly the same. Proof. (1) We first prove that when any DAG CFA (including a Chain CFA) terminates, every FA must be exactly at its final defined state. Suppose there is an FA that is not at its final state; then its current state must have a path to advance, meaning its out-degree in the DAG is not 0. This implies that uneliminated directed edges still exist in the DAG, meaning the DAG must still contain a node with in=0 ∧out>0, allowing execution to continue. This directly contradicts the premise that the system has reached a terminated state. (2) In both CFAs, the partial order of states for each FA is identical. With (1), the final states of all FAs in both the DAG CFA and the Chain CFA are guaranteed to be identical when they terminate. 
+
+□
+
+## 9 Conclusion 
+
+We propose a CFA abstraction and framework to refactor the LLM cold-start program. CFA safely enables the concur-rent execution of heterogeneous components and the merging of fine-grained data operations. The framework preserves sequential program structure. We refine process-tree material-ization, tensor loading, and model switching in vLLM cold start, forming the system InstantInfer. Experiments demon-strate that InstantInfer effectively accelerates LLM cold start and is robust across diverse GPUs, workloads, and scales. 
+
+> 12
+
+## References 
+
+[1] 2023. ShareGPT Datasets. https://huggingface.co/datasets/Ryok oAI/ShareGPT52K .[2] 2026. IBM Storage Scale. https://www.ibm.com/docs/storage-scale .[3] 2026. Run:ai Model Streamer. https://github.com/run-ai/runai-model-streamer .[4] Anthropic. 2026. Claude Code. https://claude.com/product/claude-code .[5] Jiabin Chen, Fei Xu, Yikun Gu, Li Chen, Fangming Liu, and Zhi Zhou. 2024. HarmonyBatch: Batching multi-SLO DNN Inference with Heterogeneous Serverless Functions. In 2024 IEEE/ACM 32nd International Symposium on Quality of Service (IWQoS) . 1–10. doi: 
+
+10.1109/IWQoS61813.2024.10682915 
+
+[6] Lequn Chen, Zihao Ye, Yongji Wu, Danyang Zhuo, Luis Ceze, and Arvind Krishnamurthy. 2024. Punica: Multi-Tenant LoRA Serving. In 
+
+Proceedings of Machine Learning and Systems , P. Gibbons, G. Pekhi-menko, and C. De Sa (Eds.), Vol. 6. 1–13. https://proceedings.mlsy s.org/paper_files/paper/2024/file/054de805fcceb78a201f5e9d 53c85908-Paper-Conference.pdf 
+
+[7] Jiangfei Duan, Runyu Lu, Haojie Duanmu, Xiuhong Li, Xingcheng Zhang, Dahua Lin, Ion Stoica, and Hao Zhang. 2024. MuxServe: Flexible Spatial-Temporal Multiplexing for Multiple LLM Serving. arXiv:2404.02015 [cs.DC] https://arxiv.org/abs/2404.02015 
+
+[8] Hugging Face. 2023. Safetensors. https://github.com/huggingface /safetensors .[9] Yao Fu, Leyang Xue, Yeqi Huang, Andrei-Octavian Brabete, Dmitrii Ustiugov, Yuvraj Patel, and Luo Mai. 2024. ServerlessLLM: Low-Latency Serverless Inference for Large Language Models. In 18th USENIX Symposium on Operating Systems Design and Implementation (OSDI 24) . USENIX Association, Santa Clara, CA, 135–153. https: //www.usenix.org/conference/osdi24/presentation/fu 
+
+[10] GitHub. 2026. GitHub Copilot. https://github.com/features/copilot .[11] Daya Guo, Dejian Yang, Haowei Zhang, Junxiao Song, Peiyi Wang, Qihao Zhu, Runxin Xu, Ruoyu Zhang, Shirong Ma, Xiao Bi, Xiaokang Zhang, Xingkai Yu, Yu Wu, Z. F. Wu, Zhibin Gou, Zhihong Shao, Zhuoshu Li, Ziyi Gao, Aixin Liu, Bing Xue, Bingxuan Wang, Bochao Wu, Bei Feng, Chengda Lu, Chenggang Zhao, Chengqi Deng, Chong Ruan, Damai Dai, Deli Chen, Dongjie Ji, Erhang Li, Fangyun Lin, Fucong Dai, Fuli Luo, Guangbo Hao, Guanting Chen, Guowei Li, H. Zhang, Hanwei Xu, Honghui Ding, Huazuo Gao, Hui Qu, Hui Li, Jianzhong Guo, Jiashi Li, Jingchang Chen, Jingyang Yuan, Jinhao Tu, Junjie Qiu, Junlong Li, J. L. Cai, Jiaqi Ni, Jian Liang, Jin Chen, Kai Dong, Kai Hu, Kaichao You, Kaige Gao, Kang Guan, Kexin Huang, Kuai Yu, Lean Wang, Lecong Zhang, Liang Zhao, Litong Wang, Liyue Zhang, Lei Xu, Leyi Xia, Mingchuan Zhang, Minghua Zhang, Minghui Tang, Mingxu Zhou, Meng Li, Miaojun Wang, Mingming Li, Ning Tian, Panpan Huang, Peng Zhang, Qiancheng Wang, Qinyu Chen, Qiushi Du, Ruiqi Ge, Ruisong Zhang, Ruizhe Pan, Runji Wang, R. J. Chen, R. L. Jin, Ruyi Chen, Shanghao Lu, Shangyan Zhou, Shanhuang Chen, Shengfeng Ye, Shiyu Wang, Shuiping Yu, Shunfeng Zhou, Shuting Pan, S. S. Li, Shuang Zhou, Shaoqing Wu, Tao Yun, Tian Pei, Tianyu Sun, T. Wang, Wangding Zeng, Wen Liu, Wenfeng Liang, Wenjun Gao, Wenqin Yu, Wentao Zhang, W. L. Xiao, Wei An, Xiaodong Liu, Xiaohan Wang, Xiaokang Chen, Xiaotao Nie, Xin Cheng, Xin Liu, Xin Xie, Xingchao Liu, Xinyu Yang, Xinyuan Li, Xuecheng Su, Xuheng Lin, X. Q. Li, Xiangyue Jin, Xiaojin Shen, Xiaosha Chen, Xiaowen Sun, Xiaoxiang Wang, Xinnan Song, Xinyi Zhou, Xianzu Wang, Xinxia Shan, Y. K. Li, Y. Q. Wang, Y. X. Wei, Yang Zhang, Yanhong Xu, Yao Li, Yao Zhao, Yaofeng Sun, Yaohui Wang, Yi Yu, Yichao Zhang, Yifan Shi, Yiliang Xiong, Ying He, Yishi Piao, Yisong Wang, Yixuan Tan, Yiyang Ma, Yiyuan Liu, Yongqiang Guo, Yuan Ou, Yuduan Wang, Yue Gong, Yuheng Zou, Yujia He, Yunfan Xiong, Yuxiang Luo, Yuxiang You, Yuxuan Liu, Yuyang Zhou, Y. X. Zhu, Yanping Huang, Yaohui Li, Yi Zheng, Yuchen Zhu, Yunxian Ma, Ying Tang, Yukun Zha, Yuting Yan, Z. Z. Ren, Zehui Ren, Zhangli Sha, Zhe Fu, Zhean Xu, Zhenda Xie, Zhengyan Zhang, Zhewen Hao, Zhicheng Ma, Zhigang Yan, Zhiyu Wu, Zihui Gu, Zijia Zhu, Zijun Liu, Zilin Li, Ziwei Xie, Ziyang Song, Zizheng Pan, Zhen Huang, Zhipeng Xu, Zhongyu Zhang, and Zhen Zhang. 2025. DeepSeek-R1 incentivizes reasoning in LLMs through reinforcement learning. Nature 645, 8081 (Sept. 2025), 633–638. doi: 
+
+10.1038/s41586-025-09422-z 
+
+[12] Zicong Hong, Jian Lin, Song Guo, Sifu Luo, Wuhui Chen, Roger Wattenhofer, and Yue Yu. 2024. Optimus: Warming Serverless ML Inference via Inter-Function Model Transformation. In Proceedings of the Nineteenth European Conference on Computer Systems (Athens, Greece) (EuroSys ’24) . Association for Computing Machinery, New York, NY, USA, 1039–1053. doi: 10.1145/3627703.3629567 
+
+[13] Junhao Hu, Jiang Xu, Zhixia Liu, Yulong He, Yuetao Chen, Hao Xu, Jiang Liu, Jie Meng, Baoquan Zhang, Shining Wan, Gengyuan Dan, Zhiyu Dong, Zhihao Ren, Changhong Liu, Tao Xie, Dayun Lin, Qin Zhang, Yue Yu, Hao Feng, Xusheng Chen, and Yizhou Shan. 2025. DeepServe: Serverless Large Language Model Serving at Scale. arXiv:2501.14417 [cs.DC] https://arxiv.org/abs/2501.14417 
+
+[14] Nikoleta Iliakopoulou, Jovan Stojkovic, Chloe Alverti, Tianyin Xu, Hubertus Franke, and Josep Torrellas. 2025. Chameleon: Adaptive Caching and Scheduling for Many-Adapter LLM Inference Environ-ments. In Proceedings of the 58th IEEE/ACM International Sympo-sium on Microarchitecture (MICRO 2025) . ACM, 217–231. doi: 
+
+10.1145/3725843.3756083 
+
+[15] Woosuk Kwon, Zhuohan Li, Siyuan Zhuang, Ying Sheng, Lianmin Zheng, Cody Hao Yu, Joseph Gonzalez, Hao Zhang, and Ion Stoica. 2023. Efficient memory management for large language model serving with pagedattention. In Proceedings of the 29th Symposium on Operat-ing Systems Principles . 611–626. https://doi.org/10.1145/3600006. 3613165 
+
+[16] Baolin Li, Yankai Jiang, Vijay Gadepally, and Devesh Tiwari. 2024. LLM Inference Serving: Survey of Recent Advances and Opportunities. arXiv:2407.12391 [cs.DC] https://arxiv.org/abs/2407.12391 
+
+[17] Suyi Li, Hanfeng Lu, Tianyuan Wu, Minchen Yu, Qizhen Weng, Xusheng Chen, Yizhou Shan, Binhang Yuan, and Wei Wang. 2024. CaraServe: CPU-Assisted and Rank-Aware LoRA Serving for Genera-tive LLM Inference. arXiv:2401.11240 [cs.DC] https://arxiv.org/ab s/2401.11240 
+
+[18] Suyi Li, Hanfeng Lu, Tianyuan Wu, Minchen Yu, Qizhen Weng, Xusheng Chen, Yizhou Shan, Binhang Yuan, and Wei Wang. 2025. TOPPINGS: CPU-assisted, rank-aware adapter serving for LLM in-ference. In Proceedings of the 2025 USENIX Conference on Usenix Annual Technical Conference (Boston, MA, USA) (USENIX ATC ’25) . USENIX Association, USA, Article 37, 17 pages. https: //dl.acm.org/doi/10.5555/3768039.3768076 
+
+[19] Chongpeng Liu, Xiaojian Liao, Hancheng Liu, Limin Xiao, and Jianxin Li. 2025. PipeBoost: Resilient Pipelined Architecture for Fast Serverless LLM Scaling. arXiv:2503.17707 [cs.DC] https: //arxiv.org/abs/2503.17707 
+
+[20] Xueshen Liu, Yongji Wu, Yuncheng Yao, Danyang Zhuo, Ion Sto-ica, and Z. Morley Mao. 2026. Foundry: Template-Based CUDA Graph Context Materialization for Fast LLM Serving Cold Start. arXiv:2604.06664 [cs.DC] https://arxiv.org/abs/2604.06664 
+
+[21] Chiheng Lou, Sheng Qi, Chao Jin, Dapeng Nie, Haoran Yang, Yu Ding, Xuanzhe Liu, and Xin Jin. 2025. HydraServe: Minimizing Cold Start Latency for Serverless LLM Serving in Public Clouds. arXiv:2502.15524 [cs.DC] https://arxiv.org/abs/2502.15524 
+
+[22] Chiheng Lou, Sheng Qi, Rui Kang, Yong Zhang, Chen Sun, Pengcheng Wang, Bingyang Liu, Xuanzhe Liu, and Xin Jin. 2025. WarmServe: Enabling One-for-Many GPU Prewarming for Multi-LLM Serving. arXiv:2512.09472 [cs.DC] https://arxiv.org/abs/2512.09472 
+
+[23] Cunchi Lv, Xiao Shi, Zhengyu Lei, Jinyue Huang, Wenting Tan, Xiao-
+
+> 13
+
+hui Zheng, and Xiaofang Zhao. 2025. Dilu: Enabling GPU Resourcing-on-Demand for Serverless DL Serving via Introspective Elasticity. In Proceedings of the 30th ACM International Conference on Ar-chitectural Support for Programming Languages and Operating Sys-tems, Volume 1 (Rotterdam, Netherlands) (ASPLOS ’25) . Associa-tion for Computing Machinery, New York, NY, USA, 311–325. doi: 
+
+10.1145/3669940.3707251 
+
+[24] Ziming Mao, Tian Xia, Zhanghao Wu, Wei-Lin Chiang, Tyler Griggs, Romil Bhardwaj, Zongheng Yang, Scott Shenker, and Ion Stoica. 2025. SkyServe: Serving AI Models across Regions and Clouds with Spot Instances. In Proceedings of the Twentieth European Con-ference on Computer Systems (EuroSys’25) . ACM, 159–175. doi: 
+
+10.1145/3689031.3717459 
+
+[25] Meta. 2024. Introducing Llama 3.1: Our most capable models to date. 
+
+https://ai.meta.com/blog/meta-llama-3-1 
+
+[26] Xupeng Miao, Gabriele Oliaro, Zhihao Zhang, Xinhao Cheng, Hongyi Jin, Tianqi Chen, and Zhihao Jia. 2025. Towards Efficient Generative Large Language Model Serving: A Survey from Algorithms to Systems. 
+
+Comput. Surveys 58, 1 (Sept. 2025), 1–37. doi: 10.1145/3754448 
+
+[27] Microsoft. 2026. Microsoft 365 Copilot. https://www.microsoft.co m/en-us/microsoft-365/copilot .[28] Yinan Ni, Xiao Yang, Yuqi Tang, Zhimin Qiu, Chen Wang, and Tingzhou Yuan. 2025. Predictive-LoRA: A Proactive and Fragmentation-Aware Serverless Inference System for LLMs. arXiv:2512.20210 [cs.DC] https://arxiv.org/abs/2512.20210 
+
+[29] OpenAI. 2026. OpenAI Codex. https://openai.com/codex/ .[30] OpenClaw. 2026. OpenClaw. https://openclaw.ai/ .[31] Ying Sheng, Shiyi Cao, Dacheng Li, Coleman Hooper, Nicholas Lee, Shuo Yang, Christopher Chou, Banghua Zhu, Lianmin Zheng, Kurt Keutzer, Joseph E. Gonzalez, and Ion Stoica. 2024. S-LoRA: Serving Thousands of Concurrent LoRA Adapters. arXiv:2311.03285 [cs.LG] 
+
+https://arxiv.org/abs/2311.03285 
+
+[32] Yifan Sui, Hao Wang, Hanfei Yu, Yitao Hu, Jianxun Li, and Hao Wang. 2025. ServerlessLoRA: Minimizing Latency and Cost in Serverless Inference for LoRA-Based LLMs. arXiv:2505.14468 [cs.LG] https: //arxiv.org/abs/2505.14468 
+
+[33] Yifan Sui, Hanfei Yu, Yitao Hu, Jianxun Li, and Hao Wang. 2024. Pre-Warming is Not Enough: Accelerating Serverless Inference With Opportunistic Pre-Loading. In Proceedings of the 2024 ACM Sympo-sium on Cloud Computing (Redmond, WA, USA) (SoCC ’24) . Associa-tion for Computing Machinery, New York, NY, USA, 178–195. doi: 
+
+10.1145/3698038.3698509 
+
+[34] PyTorch Team. 2026. Compile Time Caching in torch.compile. 
+
+https://docs.pytorch.org/tutorials/recipes/torch_compile_cachi ng_tutorial.html .[35] vLLM Team. 2026. Parallelism and Scaling of vLLM. https://docs.v llm.ai/en/latest/serving/parallelism_scaling/ .[36] Yuxing Xiang, Xue Li, Kun Qian, Yufan Yang, Diwen Zhu, Wenyuan Yu, Ennan Zhai, Xuanzhe Liu, Xin Jin, and Jingren Zhou. 2025. Ae-gaeon: Effective GPU Pooling for Concurrent LLM Serving on the Market. In Proceedings of the ACM SIGOPS 31st Symposium on Oper-ating Systems Principles (Lotte Hotel World, Seoul, Republic of Korea) 
+
+(SOSP ’25) . Association for Computing Machinery, New York, NY, USA, 1030–1045. doi: 10.1145/3731569.3764815 
+
+[37] An Yang, Anfeng Li, Baosong Yang, Beichen Zhang, Binyuan Hui, Bo Zheng, Bowen Yu, Chang Gao, Chengen Huang, Chenxu Lv, Chu-jie Zheng, Dayiheng Liu, Fan Zhou, Fei Huang, Feng Hu, Hao Ge, Haoran Wei, Huan Lin, Jialong Tang, Jian Yang, Jianhong Tu, Jianwei Zhang, Jianxin Yang, Jiaxi Yang, Jing Zhou, Jingren Zhou, Junyang Lin, Kai Dang, Keqin Bao, Kexin Yang, Le Yu, Lianghao Deng, Mei Li, Mingfeng Xue, Mingze Li, Pei Zhang, Peng Wang, Qin Zhu, Rui Men, Ruize Gao, Shixuan Liu, Shuang Luo, Tianhao Li, Tianyi Tang, Wen-biao Yin, Xingzhang Ren, Xinyu Wang, Xinyu Zhang, Xuancheng Ren, Yang Fan, Yang Su, Yichang Zhang, Yinger Zhang, Yu Wan, Yuqiong Liu, Zekun Wang, Zeyu Cui, Zhenru Zhang, Zhipeng Zhou, and Zihan Qiu. 2025. Qwen3 Technical Report. arXiv:2505.09388 [cs.CL] 
+
+https://arxiv.org/abs/2505.09388 
+
+[38] Takeshi Yoshimura, Tatsuhiro Chiba, Manish Sethi, Daniel Waddington, and Swaminathan Sundararaman. 2025. Speeding up Model Loading with fastsafetensors. arXiv:2505.23072 [cs.DC] https://arxiv.org/ab s/2505.23072 
+
+[39] Minchen Yu, Ao Wang, Dong Chen, Haoxuan Yu, Xiaonan Luo, Zhuo-hao Li, Wei Wang, Ruichuan Chen, Dapeng Nie, Haoran Yang, and Yu Ding. 2025. Torpor: GPU-Enabled Serverless Computing for Low-Latency, Resource-Efficient Inference. arXiv:2306.03622 [cs.DC] 
+
+https://arxiv.org/abs/2306.03622 
+
+[40] Minchen Yu, Rui Yang, Chaobo Jia, Zhaoyuan Su, Sheng Yao, Tingfeng Lan, Yuchen Yang, Zirui Wang, Yue Cheng, Wei Wang, Ao Wang, and Ruichuan Chen. 2026. 𝜆 Scale: Enabling Fast Scaling for Serverless Large Language Model Inference. arXiv:2502.09922 [cs.DC] https: //arxiv.org/abs/2502.09922 
+
+[41] Shan Yu, Jiarong Xing, Yifan Qiao, Mingyuan Ma, Yangmin Li, Yang Wang, Shuo Yang, Zhiqiang Xie, Shiyi Cao, Ke Bao, Ion Stoica, Harry Xu, and Ying Sheng. 2025. Prism: Unleashing GPU Sharing for Cost-Efficient Multi-LLM Serving. arXiv:2505.04021 [cs.DC] https: //arxiv.org/abs/2505.04021 
+
+[42] Shaoxun Zeng, Minhui Xie, Shiwei Gao, Youmin Chen, and Youyou Lu. 2025. Medusa: Accelerating Serverless LLM Inference with Mate-rialization. In Proceedings of the 30th ACM International Conference on Architectural Support for Programming Languages and Operating Systems, Volume 1 (Rotterdam, Netherlands) (ASPLOS ’25) . Associa-tion for Computing Machinery, New York, NY, USA, 653–668. doi: 
+
+10.1145/3669940.3707285 
+
+[43] Dingyan Zhang, Haotian Wang, Yang Liu, Xingda Wei, Yizhou Shan, Rong Chen, and Haibo Chen. 2025. BlitzScale: Fast and Live Large Model Autoscaling with O (1) Host Caching. In 19th USENIX Sym-posium on Operating Systems Design and Implementation (OSDI 25) .275–293. https://www.usenix.org/conference/osdi25/presentati on/zhang-dingyan 
+
+[44] Lianmin Zheng, Liangsheng Yin, Zhiqiang Xie, Chuyue Sun, Jeff Huang, Cody Hao Yu, Shiyi Cao, Christos Kozyrakis, Ion Stoica, Joseph E. Gonzalez, Clark Barrett, and Ying Sheng. 2024. SGLang: Ef-ficient Execution of Structured Language Model Programs. In Advances in Neural Information Processing Systems , A. Globerson, L. Mackey, D. Belgrave, A. Fan, U. Paquet, J. Tomczak, and C. Zhang (Eds.), Vol. 37. Curran Associates, Inc., 62557–62583. doi: 10.52202/ 079017-2000 
+
+[45] Wenbin Zhu, Zhaoyan Shen, Zili Shao, Hongjun Dai, and Feng Chen. 2025. Tangram: Accelerating Serverless LLM Loading through GPU Memory Reuse and Affinity. arXiv:2512.01357 [cs.DC] https://arxiv. org/abs/2512.01357 
+
+> 14
+
+vLLM SGLang SLLM InstantInfer 0 50 100 
+
+> Qwen3-
+> 30B-A3B
+
+0.00 
+
+0.25 
+
+0.50 
+
+0.75 
+
+1.00    
+
+> 0150 300
+> Llama-
+> 3.1-70B
+> 0150 300
+> Qwen3-
+> 235B-A22B
+> 0150 300
+> DeepSeek-
+> R1
+
+CDF of TTFT (s) Figure 17. [H20] Cold-start TTFT under a request burst (con-currency=16). ServerlessLLM does not support DeepSeek-R1 because it is integrated with an older engine. vLLM SGLang SLLM InstantInfer 0 60 120 
+
+> Qwen3-
+> 30B-A3B
+
+0.00 
+
+0.25 
+
+0.50 
+
+0.75 
+
+1.00    
+
+> 0200 400
+> Llama-
+> 3.1-70B
+> 0200 400
+> Qwen3-
+> 235B-A22B
+> 0200 400
+> DeepSeek-
+> R1
+
+CDF of TTFT (s) 
+
+Figure 18. [H20] Cold-start TTFT under a request burst (con-currency=64). ServerlessLLM does not support DeepSeek-R1 because it is integrated with an older engine.                              
+
+> 1async def coro_A(channel): #Component A
+> 2await A_init1()
+> 3channel.set_state("A", "A1")
+> 4await A_init2()
+> 5channel.set_state("A", "A2")
+> 67async def coro_B(channel): #Component B
+> 8await B_init1()
+> 9channel.set_state("B", "B1")
+> 10 await channel.wait_state_async("A", "A1")
+> 11 await B_init2()
+> 12 channel.set_state("B", "B2")
+
+Figure 16. Coroutine Example of CFA Programming 
+
+## A Composability 
+
+InstantInfer’s CFA abstraction is composable with comple-mentary optimizations that target other components of cold-start latency. For example, InstantInfer does not currently optimize the Optimize stage discussed in §2.2 (e.g., com-pilation and CUDA graph capture). Medusa [ 42 ] addresses precisely this stage by serializing captured CUDA graphs and restoring them on subsequent cold starts, thereby eliminat-ing the expensive graph capture overhead. Such orthogonal techniques can be directly incorporated into InstantInfer to further reduce end-to-end cold-start latency. Similarly, HydraServe [ 21 ] distributes model weights across multiple instances in a pipeline-parallel fashion so that serv-ing can begin before any single instance holds the full model, and then gradually transitions to data parallelism by loading the complete weights on each instance to improve throughput. This mechanism can also be incorporated into InstantInfer, and the higher loading bandwidth provided by InstantInfer can further shorten the service startup time of pipeline paral-lelism. 
+
+## B Coroutine Example of CFA Programming 
+
+Figure 16 shows a coroutine example of CFA programming, whose logic is similar to that of process- and thread-based execution. 
+
+## C Additional Burst Cold-Start Results 
+
+Burst cold-start TTFT. Beyond the burst size of 32 shown in the main text, InstantInfer also maintains clear advantages at burst sizes of 16 (Figure 17) and 64 (Figure 18). At a burst size of 16, InstantInfer achieves a 3.0 ×–3.6 × speedup over vLLM, a 4.1 ×–5.3 × speedup over SGLang, and a 2.2 ×–2.7 × speedup over ServerlessLLM. At a burst size of 64, InstantInfer achieves a 2.0 ×–2.9 × speedup over vLLM, a 2.8 ×–4.3 × speedup over SGLang, and a 1.5 ×–2.2 × speedup over ServerlessLLM. As burst size increases, the relative gain decreases somewhat because a larger fraction of TTFT is spent after engine startup, but InstantInfer still substantially shortens the cold-start critical path.

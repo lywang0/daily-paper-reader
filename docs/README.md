@@ -6,41 +6,37 @@
 </div>
 
 ## 每次日报
-- 最新运行日期：2026-07-24
-- 运行时间：2026-07-24 21:43:43 UTC
+- 最新运行日期：2026-07-25
+- 运行时间：2026-07-25 21:00:02 UTC
 - 运行状态：成功
-- 本次总论文数：7
-- 精读区：4
-- 速读区：3
+- 本次总论文数：5
+- 精读区：1
+- 速读区：4
 
 ### 今日简报（AI）
-日报今日共收录7篇论文，精读4篇，重点关注混合精度通信与MoE服务系统。最值得看的是《Task-Oriented Communication with Hybrid-Precision Models》和《ExpertPlex》两篇9分论文，分别面向任务驱动通信与高吞吐MoE推理。建议优先精读这两篇，速读可关注BRIM稀疏推理加速器。
-- 详情：[/202607/24/README](/202607/24/README)
+今日精读聚焦多模态边缘智能中压缩、MoE路由与量化的联合优化，速读涵盖大模型冷启动、注意力机制加速与存内检索加速。  
+最值得关注的方向：多模态边缘智能的跨组件协同设计（精读），以及基于有限自动机的大模型冷启动加速（速读高分7.0）。  
+建议优先精读《Beyond Independent Optimization》理解联合优化思路，再速读《InstantInfer》掌握冷启动方案。
+- 详情：[/202607/25/README](/202607/25/README)
 
 ### 精读区论文标签
-1. [Task-Oriented Communication with Hybrid-Precision Models](/202607/24/2607.16766v1-task-oriented-communication-with-hybrid-precision-models)  
-   标签：评分：9.0/10、query:edge-llm
-   evidence：边缘推理，混合精度模型，直接针对边缘设备资源高效LLM推理
-2. [ExpertPlex: A High-Goodput Disaggregated Serving System for MoE LLMs with Adaptive Persistent Kernels](/202607/24/2607.18002v2-expertplex-a-high-goodput-disaggregated-serving-system-for-moe-llms-with-adaptive-persistent-kernels)  
-   标签：评分：9.0/10、query:edge-llm
-   evidence：面向MoE LLM的高吞吐分离式服务系统，采用自适应持久化内核
-3. [Beyond Independent Optimization: Compression, MoE Routing, and Quantization Interactions in Multimodal Edge Intelligence](/202607/24/2607.20981v1-beyond-independent-optimization-compression-moe-routing-and-quantization-interactions-in-multimodal-edge-intelligence)  
-   标签：评分：9.0/10、query:edge-llm
-   evidence：聚焦边缘部署、硬件感知基准测试、压缩、量化、MoE等多模态大模型优化
-4. [Adaptive Depth Sparse Framework: Similarity-Driven Resource Allocation for Pre-Trained LLMs](/202607/24/2607.21291v1-adaptive-depth-sparse-framework-similarity-driven-resource-allocation-for-pre-trained-llms)  
+1. [Beyond Independent Optimization: Compression, MoE Routing, and Quantization Interactions in Multimodal Edge Intelligence](/202607/25/2607.20981v1-beyond-independent-optimization-compression-moe-routing-and-quantization-interactions-in-multimodal-edge-intelligence)  
    标签：评分：8.0/10、query:edge-llm
-   evidence：自适应深度稀疏实现资源高效的LLM推理
+   evidence：综述边缘端多模态大模型的压缩、量化、MoE及硬件感知基准
 
 ### 速读区论文标签
-1. [BRIM: Workload-Balanced Dual-Sided Bit-Serial Sparse Inference Accelerator](/202607/24/2607.19431v1-brim-workload-balanced-dual-sided-bit-serial-sparse-inference-accelerator)  
+1. [InstantInfer: Enabling Fast LLM Cold Start with Communicating Finite Automata](/202607/25/2607.18957v1-instantinfer-enabling-fast-llm-cold-start-with-communicating-finite-automata)  
    标签：评分：7.0/10、query:edge-llm
-   evidence：硬件软件协同设计的双端位串行稀疏加速器
-2. [PolySim: Deterministic Polynomial Surrogates for Cross-Modal Retrieval on CiM](/202607/24/2607.20358v1-polysim-deterministic-polynomial-surrogates-for-cross-modal-retrieval-on-cim)  
+   evidence：使用通信有限自动机加速大模型冷启动
+2. [MoA-Structured Decode Attention DNF Derivation, KV-Cache Accumulation, GQA/MQA, and OpenACC Kernel](/202607/25/2607.19456v1-moa-structured-decode-attention-dnf-derivation-kv-cache-accumulation-gqamqa-and-openacc-kernel)  
+   标签：评分：7.0/10、query:edge-llm
+   evidence：利用MoA推导内存最优的注意力推理，并实现OpenACC GPU内核
+3. [D-NOVA: In-Storage Retrieval Accelerator via Dual-Bound 3D NAND-Optimized Similarity Search with Vector Adaptation](/202607/25/2607.17538v1-d-nova-in-storage-retrieval-accelerator-via-dual-bound-3d-nand-optimized-similarity-search-with-vector-adaptation)  
    标签：评分：6.0/10、query:edge-llm
-   evidence：边缘设备上的存内计算硬件加速，与硬件感知加速相关
-3. [Profiling Lightweight Large Language Models](/202607/24/2607.20806v1-profiling-lightweight-large-language-models)  
+   evidence：软硬协同设计的存内加速器用于RAG检索
+4. [VibeVoice-ASR-BitNet Technical Report](/202607/25/2607.21075v1-vibevoice-asr-bitnet-technical-report)  
    标签：评分：6.0/10、query:edge-llm
-   evidence：面向边缘轻量LLM推理的精度感知分析框架，同时测量能耗、时间、内存和精度
+   evidence：异构量化和SIMD优化实现边缘CPU实时推理
 
 
 <div class="dpr-home-promo-card">
