@@ -6,55 +6,64 @@
 </div>
 
 ## 每次日报
-- 最新运行日期：2026-07-30
-- 运行时间：2026-07-30 20:10:37 UTC
+- 最新运行日期：2026-07-31
+- 运行时间：2026-07-31 21:45:57 UTC
 - 运行状态：成功
-- 本次总论文数：11
-- 精读区：3
+- 本次总论文数：14
+- 精读区：6
 - 速读区：8
 
 ### 今日简报（AI）
-1) 今日推出两篇高分精读：混合长度LLM服务的GPU-PNM异构系统NELSSA与自动化Ascend C算子生成AgenticCANN，另有三篇速读覆盖ASR轻量模型、transformer剪枝与联邦边缘AI架构搜索。  
-2) 最值得关注两个方向：一是通过请求长度放置提升异构系统LLM推理效率（NELSSA），二是用agentic演化自动生成高性能AI算子（AgenticCANN）。  
-3) 建议优先阅读两篇精读文章，理解混合负载调度与算子自动生成的核心设计，再结合自身场景评估是否可复用其方法。
-- 详情：[/202607/30/README](/202607/30/README)
+今日精读6篇、速读8篇，重点聚焦低比特LLM推理中的旋转与量化协同技术。  
+最值得关注两篇9分工作：GyRot揭示旋转与细粒度分组量化的协同效应，LightRot提出轻量旋转方案及架构，均显著提升低比特推理精度。  
+建议优先精读这两篇论文，深入理解旋转矩阵与量化误差的交互机制，再结合CONQuEr等混合精度方法验证实际部署效果。
+- 详情：[/202607/31/README](/202607/31/README)
 
 ### 精读区论文标签
-1. [NELSSA: A GPU-PNM Heterogeneous System for Mixed-Length LLM Serving via Length-based Request Placement](/202607/30/2607.26633v1-nelssa-a-gpu-pnm-heterogeneous-system-for-mixed-length-llm-serving-via-length-based-request-placement)  
+1. [GyRot: Leveraging Hidden Synergy between Rotation and Fine-grained Group Quantization for Low-bit LLM Inference](/202607/31/2607.27694v1-gyrot-leveraging-hidden-synergy-between-rotation-and-fine-grained-group-quantization-for-low-bit-llm-inference)  
    标签：评分：9.0/10、query:edge-llm
-   evidence：GPU-PNM异构系统用于混合长度LLM服务
-2. [AgenticCANN: Automated Ascend C Operator Generation via Knowledge-Augmented Agentic Evolution](/202607/30/2607.26661v1-agenticcann-automated-ascend-c-operator-generation-via-knowledge-augmented-agentic-evolution)  
+   evidence：低比特LLM推理的量化框架与硬件加速器，算法-硬件协同设计
+2. [LightRot: A Light-Weighted Rotation Scheme and Architecture for Accurate Low-Bit Large Language Model Inference](/202607/31/2607.27704v1-lightrot-a-light-weighted-rotation-scheme-and-architecture-for-accurate-low-bit-large-language-model-inference)  
    标签：评分：9.0/10、query:edge-llm
-   evidence：自动生成Ascend C算子以优化NPU，软硬件协同设计
-3. [Decoding the Skew: Distribution-Aware MoE Inference with Adaptive Kernel Dispatch](/202607/30/2607.23099v2-decoding-the-skew-distribution-aware-moe-inference-with-adaptive-kernel-dispatch)  
+   evidence：用于低比特LLM推理的专用硬件加速器与轻量旋转方案
+3. [LAST: The Last Query Token Guides Visual Token Pruning for Edge-Cloud Collaborative MLLM Inference](/202607/31/2607.27952v1-last-the-last-query-token-guides-visual-token-pruning-for-edge-cloud-collaborative-mllm-inference)  
+   标签：评分：9.0/10、query:edge-llm
+   evidence：边缘-云协同MLLM推理中的查询引导token剪枝
+4. [SmartGen: Seamless Disaggregated LLM Inference with Selective KV Cache Transfer](/202607/31/2607.28150v1-smartgen-seamless-disaggregated-llm-inference-with-selective-kv-cache-transfer)  
+   标签：评分：9.0/10、query:edge-llm
+   evidence：提出解耦式LLM服务框架，通过选择性KV缓存传输缓解网络瓶颈
+5. [SpecBox: Speculative Sandbox Scheduling for Efficient LLM Agent Serving](/202607/31/2607.23933v1-specbox-speculative-sandbox-scheduling-for-efficient-llm-agent-serving)  
    标签：评分：8.0/10、query:edge-llm
-   evidence：面向GPU上MoE推理的分布感知核调度
+   evidence：面向LLM代理服务的运行时系统，通过推测性沙箱预分配提升资源利用
+6. [WIDE: Boosting Adaptive LLM Inference via Token-level Dynamic Width Pruning](/202607/31/2607.28418v1-wide-boosting-adaptive-llm-inference-via-token-level-dynamic-width-pruning)  
+   标签：评分：8.0/10、query:edge-llm
+   evidence：通过词元级动态宽度剪枝提升大语言模型推理效率，适用于预填充和解码阶段
 
 ### 速读区论文标签
-1. [VibeVoice-ASR-BitNet Technical Report](/202607/30/2607.21075v2-vibevoice-asr-bitnet-technical-report)  
+1. [OrchNAS: Orchestrated Neural Architecture Search Service for Personalised Federated Edge Intelligence](/202607/31/2607.22805v1-orchnas-orchestrated-neural-architecture-search-service-for-personalised-federated-edge-intelligence)  
    标签：评分：7.0/10、query:edge-llm
-   evidence：边缘CPU上使用异构量化和SIMD实现实时推理
-2. [CausalGate: Causal Importance Distillation for Transformer Module Pruning](/202607/30/2607.22720v2-causalgate-causal-importance-distillation-for-transformer-module-pruning)  
+   evidence：面向异构边缘环境的能量感知个性化模型设计
+2. [KAP: Bridging the Knowledge Selection-Runtime Consumption Gap in LLM Systems](/202607/31/2607.24260v1-kap-bridging-the-knowledge-selection-runtime-consumption-gap-in-llm-systems)  
    标签：评分：7.0/10、query:edge-llm
-   evidence：因果干预引导的LLM模块剪枝以降低推理成本
-3. [OrchNAS: Orchestrated Neural Architecture Search Service for Personalised Federated Edge Intelligence](/202607/30/2607.22805v1-orchnas-orchestrated-neural-architecture-search-service-for-personalised-federated-edge-intelligence)  
+   evidence：针对结构化先验知识导致的KV缓存内存流量问题，优化LLM服务
+3. [CONQuER: Hardware-Aware Mixed-Precision Quantisation with Online-Calibrated Surrogates](/202607/31/2607.25884v1-conquer-hardware-aware-mixed-precision-quantisation-with-online-calibrated-surrogates)  
    标签：评分：7.0/10、query:edge-llm
-   evidence：面向异构设备的联邦边缘智能与神经架构搜索
-4. [DualDecoder: Accelerate Long Context LLM Inference by Predictive Prefetch](/202607/30/2607.26475v1-dualdecoder-accelerate-long-context-llm-inference-by-predictive-prefetch)  
+   evidence：面向资源受限异构硬件的硬件感知混合精度量化，是硬件感知加速的核心方法
+4. [A Photonic-CXL Memory Appliance for Scalable KV Cache Management in LLM Inference](/202607/31/2607.27187v1-a-photonic-cxl-memory-appliance-for-scalable-kv-cache-management-in-llm-inference)  
    标签：评分：7.0/10、query:edge-llm
-   evidence：面向长上下文LLM推理的轻量级服务系统
-5. [Structured Redundancy Modeling for Efficient Visual Token Pruning in High-Resolution MLLMs](/202607/30/2607.23046v1-structured-redundancy-modeling-for-efficient-visual-token-pruning-in-high-resolution-mllms)  
+   evidence：面向LLM推理KV缓存管理的光子-CXL内存架构
+5. [Prox: Training-Free FFN Activation Sparsity via Approximate Intermediate-Channel Salience in LLMs](/202607/31/2607.27591v1-prox-training-free-ffn-activation-sparsity-via-approximate-intermediate-channel-salience-in-llms)  
+   标签：评分：7.0/10、query:edge-llm
+   evidence：免训练激活稀疏化降低LLM推理资源消耗，可用于边缘部署
+6. [A Sparse Glimpse of the Whole: Train-Free Self-Speculative Decoding](/202607/31/2607.27735v1-a-sparse-glimpse-of-the-whole-train-free-self-speculative-decoding)  
+   标签：评分：7.0/10、query:edge-llm
+   evidence：基于稀疏可召回KV缓存的免训练自推测解码，提升LLM高效推理
+7. [Conformal Cascade: Distribution-Free Accuracy Guarantees for Multi-Tier LLM Inference](/202607/31/2607.25018v2-conformal-cascade-distribution-free-accuracy-guarantees-for-multi-tier-llm-inference)  
    标签：评分：6.0/10、query:edge-llm
-   evidence：多模态大语言模型视觉令牌剪枝以加速推理
-6. [AngelSpec: Towards Real-World High Performance Inference with Speculative Decoding](/202607/30/2607.25852v2-angelspec-towards-real-world-high-performance-inference-with-speculative-decoding)  
+   evidence：基于保形预测的多级LLM级联，实现资源高效的推理
+8. [Rethinking Inference-Time Scaling in Local Computer-Use Agents: Failure Modes and Compute Tradeoffs](/202607/31/2607.28573v1-rethinking-inference-time-scaling-in-local-computer-use-agents-failure-modes-and-compute-tradeoffs)  
    标签：评分：6.0/10、query:edge-llm
-   evidence：投机解码框架实现高性能LLM推理
-7. [From Tokens to Watt-hours: Analytical Energy Estimation for LLM Inference on Modern GPUs](/202607/30/2607.26571v1-from-tokens-to-watt-hours-analytical-energy-estimation-for-llm-inference-on-modern-gpus)  
-   标签：评分：6.0/10、query:edge-llm
-   evidence：GPU上LLM推理的分析能量估计
-8. [InferScale: GPU-Native KV Injection for Personalized LLM Serving](/202607/30/2607.27090v1-inferscale-gpu-native-kv-injection-for-personalized-llm-serving)  
-   标签：评分：6.0/10、query:edge-llm
-   evidence：面向个性化LLM服务的KV注入框架
+   evidence：本地部署场景下推理时扩展的实证研究，涉及资源受限设备优化
 
 
 <div class="dpr-home-promo-card">
