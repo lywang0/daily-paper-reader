@@ -1,0 +1,942 @@
+Title: Gradient-free Task-Conditioned Retrieval for On-Device In-Context Learning
+
+URL Source: https://arxiv.org/pdf/2607.27766v1
+
+Published Time: Fri, 31 Jul 2026 00:35:19 GMT
+
+Number of Pages: 25
+
+Markdown Content:
+# Gradient-free Task-Conditioned Retrieval for On-Device In-Context Learning 
+
+XINYU LUO and HUI LIU, City University of Hong Kong, China 
+
+YIHUA SHAO, Institute of Automation Chinese Academy of Sciences, China 
+
+JUNYI YANG, ARINDAM BASU, and HAOLIANG LI ✉, City University of Hong Kong, China On-device in-context learning (ICL) relies on pre-inference retrieval to select demonstrations for useful context before downstream model inference. This retrieval must exploit task-specific information while operating over local memories under limited computation, memory, and data-exposure budgets. We propose 
+
+Conditional Retrieval Alignment (CoRA), a gradient-free framework that converts a frozen encoder into a task-conditioned retriever using paired candidate inputs and outputs. CoRA selects complementary encoder layers, constructs an output-derived conditioning space from candidate memory, and aligns candidate input representations to this space through closed-form ridge regression. Low-rank factorization then produces a compact retrieval basis where candidate outputs are used only during offline index construction, whereas query-time retrieval requires only the query input and precomputed index. We show that CoRA’s rank-constrained basis is the optimal low-rank compression of the output-conditioned fitted representation, and derive an exact two-pass streaming construction that avoids materializing the full fitted matrix. We further extend the framework to multimodal exemplar retrieval by incorporating visual representations into the conditioning and retrieval spaces. Experiments across ten textual datasets and four multimodal benchmarks with Llama-3.2-1B, MobileLLM-Pro, OpenFlamingo-3B, and Qwen3.5-2B, as well as end-to-end Raspberry Pi 5 deployment demonstrate that CoRA supports effective task-conditioned retrieval without retriever fine-tuning, backpropagation, or target-model calls. CCS Concepts: • Information systems → Query representation ; Learning to rank ; Retrieval efficiency ;
+
+Top-k retrieval in databases ; Retrieval on mobile devices ; Question answering .
+
+1 Introduction 
+
+Foundation models are increasingly deployed in settings that require efficient adaptation to diverse downstream tasks and user needs [ 27 , 32 , 61 ]. One lightweight adaptation mechanism is test-time context construction : a retriever selects a small set of textual or multimodal exemplars from a candidate pool to condition a model through in-context learning (ICL) [ 8, 15 , 43 , 64 ]. Because this selection occurs before the downstream model is invoked, we refer to it as pre-inference retrieval .Retrieval quality can affect the utility and efficiency of ICL [ 2 , 38 , 54 , 66 ]. The problem is particularly relevant in personal and on-device deployments, where retrieval is performed over local memories containing potentially sensitive information and must operate under limited compute and memory budgets [ 18 , 50 , 52 , 56 , 60 ]. In this setting, practical retrieval systems must jointly consider the quality of selected exemplars, the cost of constructing their representations and index, and the latency of query-time search [28]. The central difficulty is that input similarity alone does not fully determine the utility of an ICL exemplar. Useful demonstrations should be related to the query while also reflecting task-specific regularities in their input-output relations [ 22 , 31 , 48 ]. Existing approaches address this requirement in two main ways. One line adapts the retriever or representation space using task-specific learning signals [ 17 , 57 , 63 ]. Another involves a stronger target model through rewriting, reranking, pseudo-labeling, or target-guided retrieval [ 9 , 30 ]. These approaches can capture task-specific behavior, but their training procedures, repeated model calls, or backbone modifications  
+
+> Authors’ Contact Information: Xinyu Luo, xinyuluo8-c@my.cityu.edu.hk; Hui Liu, liuhui3@cityu.edu.hk, City University of Hong Kong, Hong Kong SAR, China; Yihua Shao, yihuajerry@gmail.com, Institute of Automation Chinese Academy of Sciences, Beijing, China; Junyi Yang, junyiyang8-c@my.cityu.edu.hk; Arindam Basu, arinbasu@cityu.edu.hk; Haoliang Li, haolia.li@cityu.edu.hk, City University of Hong Kong, Hong Kong SAR, China. arXiv:2607.27766v1 [cs.CL] 30 Jul 2026 2Luo et al.
+
+may be difficult to accommodate when retrieval must remain local. By contrast, lightweight retrievers such as BM25 [ 47 ] and frozen embedding similarity offer inexpensive search and compact representations [ 33 , 65 ], but they primarily rely on input-side similarity and do not explicitly use the output regularities available in paired candidate memories [ 1 , 2 , 11 , 37 ]. This leaves an open design tension between task-conditioned exemplar selection and efficient local retrieval. To understand this tension, our prior conference work [ 36 ] analyzed the mechanisms underlying learning-based demonstration selection. We found that their effectiveness can be related to two complementary signals: multi-level input similarity, which captures different types of lexical, syntactic, and semantic correspondence, and task-specific output similarity, which favors exemplars whose outputs are related to the desired task behavior. Based on these findings, that work introduced MLSM, which selects representative encoder layers and combines their task-agnostic similarity signals through lightweight optimization, and TTF, which injects task-specific information through retriever parameter updates. These methods established the importance of the two signals, but addressed them separately. MLSM does not explicitly condition its retrieval space on exemplar outputs, whereas TTF obtains task-specific information through parameter updates. The conference work therefore leaves open whether input-output information can be incorporated directly into a compact retrieval space without heavy retriever fine-tuning or target-model involvement. This article addresses this question with Conditional Retrieval Alignment (CoRA ), a gradient-free framework for task-conditioned exemplar retrieval. CoRA selects complementary frozen-encoder layers, aligns their candidate-input representations to a conditioning space constructed from paired candidate inputs and outputs, and extracts a compact low-rank retrieval basis through closed-form linear algebra. Candidate outputs are used only when constructing the index. Query-time retrieval requires only the query input representation and the precomputed index. CoRA thus makes output-informed exemplar selection compatible with local pre-inference retrieval, without retriever parameter updates, backpropagation, or target-model calls. CoRA further admits an exact streaming index-construction procedure that avoids materializing the full fitted representation matrix, and it extends naturally to multimodal retrieval by incorporating visual features into the conditioning and retrieval spaces. Our contributions are as follows: 
+
+• We introduce CoRA, a gradient-free task-conditioned retrieval framework that uses paired candidate memories to align multi-level frozen input representations with output-derived structure and derive a compact low-rank retrieval basis in closed form, thereby enabling task-conditioned demonstration selection without retriever fine-tuning or target-model interaction. 
+
+• We derive an exact two-pass streaming realization of CoRA and characterize its construction-time working-memory cost. The procedure separates offline output-conditioned index con-struction from lightweight query-time projection and nearest-neighbor search, supporting local deployment over growing candidate pools. 
+
+• We develop CoRA-M, which extends the framework to multimodal exemplar retrieval by incorporating visual candidate representations into the output-conditioned alignment while retaining the text-layer selection mechanism, enabling a unified retrieval formulation across text-only and visual-language tasks. 
+
+• We evaluate retrieval effectiveness, construction efficiency, and deployment behavior across ten textual datasets, four multimodal benchmarks, and an end-to-end Raspberry Pi 5 retrieval-and-inference pipeline. 
+
+Organization. Section 2 reviews related work and clarifies the relationship to our preliminary conference study. Section 3 presents CoRA’s textual and multimodal formulations and analyzes Gradient-free Task-Conditioned Retrieval for On-Device In-Context Learning 3
+
+its low-rank retrieval basis. Section 4 derives the streaming index-construction procedure and discusses hardware compatibility. Section 5 reports the experimental setup, results, and analyses. Section 6 concludes the article and discusses its limitations. 
+
+2 Related Work 2.1 Exemplar Retrieval for Textual In-Context Learning 
+
+Textual exemplar retrieval builds on lexical and dense relevance matching. BM25 [ 47 ] ranks can-didates according to lexical overlap, whereas pretrained-language-model-based dense retrieval represents queries and candidates in a latent semantic space. Zhao et al . [65] organize dense re-trieval methods along four dimensions: architecture, training, indexing, and integration with other retrieval signals. DHR combines dense lexical and semantic representations for more efficient hybrid retrieval [ 33 ]. These methods provide relevance matching, but do not directly model whether a retrieved example is useful as an ICL demonstration. ICL-specific methods adapt retrieval to demonstration selection. KATE [ 37 ] retrieves nearest neighbors using sentence representations, showing that semantically related demonstrations out-perform random selection. Skill-KNN [ 2 ] prompts a language model to describe skills required by candidate inputs and test queries, then retrieves demonstrations using these descriptions. This reduces sensitivity to task-irrelevant surface features without fine-tuning, but requires an additional generation stage and does not use candidate-memory outputs. Learning-based methods obtain stronger task signals from downstream model behavior. EPR [ 48 ]uses the language-model likelihood of the gold output to label candidate prompts as positive or negative, and trains a dense retriever on the resulting supervision. CEIL [ 57 ] models demonstration selection as a subset problem using a conditional determinantal point process, thereby accounting for both query relevance and interactions among selected examples. UDR [ 30 ] unifies supervision from heterogeneous tasks through multi-task list-wise ranking and iterative candidate mining. These methods capture richer notions of demonstration utility than fixed input similarity, but require language-model-derived supervision, retriever training, or both, thereby increasing offline data-construction and optimization costs. 
+
+2.2 Exemplar Retrieval for Multimodal In-Context Learning 
+
+Multimodal ICL requires a VLM to process prompts containing interleaved images, textual inputs, and outputs. Flamingo [ 1] established the effectiveness of interleaved multimodal demonstrations across vision-language tasks. Doveh et al . [17] introduce a curriculum-based ICL instruction-tuning approach that improves a VLM’s ability to follow multimodal demonstrations. MMICL [ 63 ] develops a multimodal context scheme and instruction-tuning dataset for prompts containing multiple images. These methods primarily improve how the downstream model consumes multimodal demonstrations rather than how a standalone retriever selects them. Retrieval methods determine which multimodal demonstrations to include in the prompt. MMICES [ 11 ] first filters candidate demonstrations according to visual similarity and then ranks them using language similarity. TACO [ 31 ] interprets each demonstration as a local task mapping and configures demonstration sequences that support a coherent global mapping for the query. Chen et al . [9] formulate selection as an exploration-exploitation process, using VLM-derived rewards and policy-gradient optimization to learn demonstration combinations. These approaches demonstrate the value of cross-modal and set-level selection, but depend on fixed fusion strategies, learned selection modules, or repeated downstream-model interaction. Privacy is an additional concern when visual and textual retrieval data contain user-specific information. Zhang et al . [60] proactively transform cross-modal data into adversarially protected 4 Luo et al. 
+
+versions before release, causing malicious retrieval models to produce erroneous retrieval results on the protected data. Our setting considers privacy at a different stage of the retrieval pipeline: paired memories and their representations remain on device, and retrieval is performed locally without transferring them to an external service. These approaches respectively protect data intended for release and reduce data exposure through local storage and computation. 
+
+2.3 On-Device Retrieval and Index Efficiency 
+
+Resource-constrained retrieval must account for representation computation, index storage and maintenance, and query-time ranking. Fast-Forward indexes [ 28 ] combine precomputed representa-tions, lightweight encoders, lexical-semantic score interpolation, and index-reduction techniques to support low-latency neural reranking without GPU acceleration. Although developed for document ranking, this separation between offline representation construction and online scoring is also relevant to on-device exemplar retrieval. On-device retrieval has also been studied in retrieval-augmented generation, where stored representations and generation contexts compete for limited memory. ECG models [ 25 ] use shared representations for document retrieval, context compression, and response generation. Our setting instead retrieves input-output ICL demonstrations and uses stored outputs to condition a frozen input representation space. It must therefore consider task-conditioned index construction in addition to query-time nearest-neighbor search. 
+
+2.4 Relationship to Our Preliminary Conference Work 
+
+Our preliminary conference work [ 36 ] investigated which similarity signals are acquired by learning-based demonstration retrievers. It formulated and empirically examined two hypotheses: 
+
+• H1: a learning-based retriever adaptively integrates task-agnostic input similarities encoded at different representational levels; 
+
+• H2: beyond input similarity, a learning-based retriever implicitly favors demonstrations whose outputs are similar to the unknown output associated with the test query. H1 was examined by comparing the retrieval behavior of different pretrained encoder layers and measuring their CKA similarity to the final representations of pretrained retrievers. H2 was examined by comparing the output similarities of positive and negative training examples and of demonstrations selected by learned and task-agnostic retrievers. The conference work introduced MLSM and TTF as separate realizations of these hypotheses. MLSM addresses H1 while keeping the underlying BERT encoder frozen. It first computes pairwise CKA scores among encoder layers on an unlabeled subset of the demonstration set, clusters the resulting layer-similarity profiles with 𝑘 -means, and selects the central layer from each cluster as a representative similarity expert. For a query, each selected layer produces a temperature-scaled distribution over a sampled set of candidate demonstrations according to cosine similarity. MLSM then aggregates these distributions with normalized layer weights, which are optimized on a sampled validation set by minimizing an agreement loss between the aggregated and layer-wise distributions, with early stopping. The weights may be estimated for an individual query or updated using a batch of queries. MLSM therefore combines complementary input-side similarities, but neither candidate outputs nor target-task labels enter its retrieval objective. TTF addresses H2 through task-specific retriever adaptation. It fine-tunes a retriever jointly with an auxiliary prediction module using labeled examples from the target demonstration set. For classi-fication tasks, the auxiliary module is a classification head. The retrieval representation is trained to support label prediction, such that examples associated with the same output are encouraged to be close to the corresponding label-specific classifier representation. For generation tasks, TTF adopts Gradient-free Task-Conditioned Retrieval for On-Device In-Context Learning 5
+
+an encoder–decoder architecture, where the decoder supplies sequence-generation supervision and average-pooled final-layer encoder representations are used for retrieval. This supervision jointly shapes the predictive module and the retrieval representation. Thus, TTF injects task-specific input-output relations into the retriever through gradient-based parameter fine-tuning. Although MLSM and TTF validated the complementary roles of multi-level input similarity and output-related task information, they treated these signals separately. MLSM requires query- or batch-level weight optimization and remains output-agnostic, whereas TTF obtains task specificity through labeled fine-tuning of the retriever. The conference study was also limited to textual retrieval and did not address compact index construction, multimodal conditioning, or end-to-end deployment under edge resource constraints. 
+
+3 Methodology 3.1 Problem Setup and Preliminaries 
+
+On-device Exemplar Retrieval for ICL. We consider exemplar retrieval as a local pre-inference operation performed before invoking the downstream model in on-device ICL. Given a test input 
+
+x𝑡 and a local candidate pool D = {( x𝑐 𝑖 , y𝑐 𝑖 )} 𝑛 𝑖 =1 of input-output pairs, the goal is to select a subset 
+
+S( x𝑡 ) ⊆ D with |S( x𝑡 )| = 𝑘 ≪ 𝑛 that best supports the downstream large model M for the target query. The retrieved exemplars are then combined with x𝑡 to form the prompt 𝑝 (x𝑡 , S) , which is provided to the downstream model to produce y𝑡 = M ( 𝑝 (x𝑡 , S)) .The retriever has access to a frozen pretrained encoder 𝑓 on device. Here, x denotes either a textual input or, more generally, a multimodal instance. We use gradient-free to mean that CoRA performs no gradient-based retriever optimization. The method nevertheless conducts task-conditioned adaptation by constructing a retrieval basis in closed-form from paired candidate memory. It does not backpropagate through M or invoke the target model during index construction or exemplar selection. All retrieval computations run locally under the available memory and latency budgets. We first present the textual formulation and subsequently extend it to multimodal retrieval. 
+
+Layerwise Representations as Retrieval Anchors. Probing studies on pretrained transformers have shown that linguistic information is distributed hierarchically across layers, with lower layers capturing surface-level cues, middle layers encoding syntactic regularities, and upper layers emphasizing higher-level semantics [ 24 , 39 ]. Recent analyses of dense retrieval further suggest that retrieval effectiveness is often associated with a task-dependent combination of layerwise similarities, rather than a universal reliance on the final-layer embedding alone [ 36 ]. Taken together, these observations indicate that intermediate representations can provide complementary retrieval cues, and that the most informative layers may vary across tasks, datasets, and application domains. Motivated by this evidence, we treat layerwise encoder states as candidate retrieval anchors rather than assuming that the final-layer representation is universally sufficient. For a textual sequence s,let I ( s) denote the set of its non-padding token indices. We define its layer-ℓ representation as 
+
+hℓ (s) = 1
+
+|I ( s)| ∑︁ 𝑞 ∈ I ( s)
+
+hℓ,𝑞 (s), (1) where hℓ,𝑞 (s) is the hidden state of token 𝑞 at layer ℓ. The same frozen encoder 𝑓 is used to encode candidate inputs, candidate outputs, and test inputs. CoRA uses these layerwise representations to construct an output-conditioned retrieval basis without updating the encoder parameters. 6 Luo et al. Query Feature Matrix 
+
+⋯
+
+⋯
+
+1 H෩௬ 
+
+> (௟భ)
+
+H෩௬ 
+
+> (௟మ)
+
+H෩௬
+
+> (௟೙೗)
+
+H෩(୴୧ୱ )
+
+⋯
+
+⋮
+
+⋯
+
+⋯
+
+H෩௫ 
+
+> (௟భ)
+
+H෩௫ 
+
+> (௟మ)
+
+H෩௫ 
+
+> (௟೙೗)
+
+H෩(୴୧ୱ )
+
+⋯
+
+⋮
+
+H෩௬
+
+> (୭୳୲ )
+
+Task Conditional Matrix 𝐶  
+
+> * 2 dimensions for
+> demonstration.
+> 𝑧 ௧Aligned representation of test query
+> Irrelevant Relevant
+
+(1) Task-aware Retrieval 
+
+> Retrieval
+> Encoder
+> Gradient-Based
+> Optimization
+> LLM Tools
+
+Hardware Unfriendly 
+
+High Latency 
+
+Traditional Methods for ICL 
+
+(2) Task-agnostic Retrieval 
+
+> [how many big cities are in m0]
+> [how many people are there in m0]
+> [how many rivers are in m0]
+> [name the longest river in m0]
+
+𝐷 
+
+𝑄 [how many states are next to major rivers] 
+
+Less Accurate 
+
+Lacking Semantics 
+
+(1) Representative Text Layer Selection. 
+
+> Text
+> Encoder
+
+(2) Task-Conditioned Retrieval Alignment. 
+
+(3) Retrieval in the Aligned Space. 
+
+CoRA Framework Task-Conditioned Hardware Friendly 
+
+⋯
+
+⋯
+
+1 H෩௬ 
+
+> (௟భ)
+
+H෩௬ 
+
+> (௟మ)
+
+H෩௬
+
+> (௟೙೗)
+
+H෩௬
+
+> (୴୧ୱ )
+
+⋯
+
+⋮
+
+> Vision
+> Encoder
+> For Multimodal:
+
+𝑛 
+
+Fig. 1. Left: Shortcomings of existing retrieval methods. Right: Overview of CoRA framework, which consists of three main stages. By projecting representations into a task-conditioned subspace without gradient-based parameter updates, it enables effective textual and multimodal retrieval on edge devices. 
+
+Method Desiderata. The above setup and preliminaries suggest three desiderata for our retrieval alignment: 𝑖 ) task-aware retrieval under frozen-encoder constraints, 𝑖𝑖 ) effective use of complementary signals across layers, and 𝑖𝑖𝑖 ) minimal additional overhead for on-device deployment. The next subsection presents CoRA, a gradient-free multi-layer retrieval alignment method designed to satisfy these desiderata. 
+
+3.2 CoRA: Task-Conditioned Multi-Layer Retrieval Alignment 
+
+Framework Overview. As shown in Figure 1, CoRA converts a frozen pretrained encoder into a task-conditioned multi-layer retriever through three stages. First, it applies representative-layer selection to retain complementary input-side features while reducing inter-layer redundancy. Second, it uses the paired candidate outputs to construct a conditioning matrix and fits the selected input representations to this matrix through closed-form ridge regression. A low-rank basis is then estimated from the resulting fitted representation matrix. Third, candidate and query inputs are mapped through this basis and ranked by similarity. Candidate outputs are required only during index construction and an unseen query is encoded using its input alone. The formulation extends to multimodal retrieval, and all computations reduce to lightweight closed-form linear algebra suitable for on-device deployment. 
+
+Representative Layer Selection. CoRA adopts the representative-layer construction introduced by MLSM in our preliminary conference work [ 36 ]. This inherited component uses inter-layer similarity to retain complementary input-side representations while reducing the redundancy caused by residual propagation [ 13 , 36 , 41 ]. CoRA builds on this construction by introducing the output-conditioned alignment described in the following paragraph. Let the frozen retriever encoder 𝑓 have 𝐿 transformer layers, indexed by ℓ ∈ { 1, . . . , 𝐿 }. We draw a small calibration subset 
+
+D𝑠 = {( x𝑐 𝑖 , y𝑐 𝑖 )} 𝑛 𝑠  
+
+> 𝑖 =1
+
+⊂ D , and use only the inputs {x𝑐 𝑖 }𝑛 𝑠  
+
+> 𝑖 =1
+
+in this stage to estimate inter-layer redundancy. For each sample x𝑐 𝑖 and each layer ℓ, we instantiate the layerwise token-average Gradient-free Task-Conditioned Retrieval for On-Device In-Context Learning 7
+
+representation hℓ (x𝑐 𝑖 ) ∈ R𝑑 . Stacking these vectors across the subset gives 
+
+H(ℓ ) = [hℓ (x𝑐 
+
+> 1
+
+); . . . ; hℓ (x𝑐 𝑛 𝑠 )] ∈ R𝑛 𝑠 ×𝑑 , (2) which summarizes the empirical behavior of layer ℓ.We quantify the similarity between layers using linear Centered Kernel Alignment (CKA) [ 26 ]. Specifically, we form a similarity matrix S ∈ R𝐿 ×𝐿 with entries 
+
+Sℓ,ℓ ′ = CKA (H(ℓ ) , H(ℓ′ ) ). (3) Each row Sℓ, · represents the similarity profile of layer ℓ with respect to all other layers. Because adjacent layers are often highly similar, selecting layers directly from raw pairwise similarities would favor neighboring and thus redundant layers. To encourage diversity, we treat each row vector Sℓ, · as a layer feature and cluster {Sℓ, · }𝐿 ℓ=1 into 𝑛 𝑙 groups using 𝑘 -means. For each cluster C𝑗 ,we then choose as its representative the layer with the largest average similarity to the layers in the same cluster. This yields the representative layer set Lkey = {ℓ𝑗 }𝑛 𝑙 
+
+> 𝑗 =1
+
+, which suppresses redundancy while retaining diverse layerwise retrieval cues for the subsequent task-conditioned alignment stage. 
+
+Task-Conditioned Retrieval Alignment. Representative layer selection suppresses redundancy, but the resulting features remain task-agnostic with respect to the downstream objective. They reflect the geometry of the frozen encoder rather than the input-output relation induced by the task for which exemplars are retrieved. In on-device ICL, learning this relation with gradient updates, downstream heads, or target-model feedback is infeasible, since the downstream model M is invoked only after retrieval and all intermediate computation must remain local. We therefore seek a closed-form alignment mechanism that uses only the local exemplar pairs in D while preserving the frozen nature of the encoder. Our key intuition is to identify the components of the input representations that are systematically associated with the output-side structure of the candidate pairs. This relation provides an output-conditioned retrieval space without requiring any update to the encoder parameters. For each ℓ𝑗 ∈ L key , we encode both the candidate inputs and their textual outputs using the same frozen encoder 𝑓 , apply mean pooling over non-padding token representations, and form 
+
+H(ℓ𝑗 ) 
+
+> 𝑥
+
+, H(ℓ𝑗 ) 
+
+> 𝑦
+
+∈ R𝑛 ×𝑑 , where the 𝑖 -th rows of H(ℓ𝑗 ) 
+
+> 𝑥
+
+and H(ℓ𝑗 ) 
+
+> 𝑦
+
+are the layer-ℓ𝑗 features of x𝑐 𝑖 and y𝑐 𝑖 ,respectively. We standardize each feature dimension via Z-score normalization within each layer and obtain ˜H(ℓ𝑗 ) 
+
+> 𝑥
+
+, ˜H(ℓ𝑗 ) 
+
+> 𝑦
+
+. To aggregate task signals from exemplar outputs across layers, we construct the conditioning matrix 
+
+C =  1 ˜H(ℓ1 ) 
+
+> 𝑦
+
+. . . ˜H(ℓ𝑛 𝑙 )
+
+> 𝑦
+
+ ∈ R𝑛 ×𝑝 , (4) where 1 ∈ R𝑛 is the all-ones column vector. For notational convenience, let 𝑑 cat = 𝑛 𝑙 𝑑 denote the concatenated input-feature dimension and 𝑝 = 1 + 𝑑 cat the column dimension of C.For each selected layer ℓ𝑗 , we obtain the component of its input representations fitted from the output-derived conditioning matrix through ridge regression: 
+
+ˆH(ℓ𝑗 ) 
+
+> 𝑥
+
+= PC ˜H(ℓ𝑗 ) 
+
+> 𝑥
+
+, PC = C  C⊤C + 𝜆 I −1 C⊤, (5) where 𝜆 > 0 is the ridge regularization coefficient. Here, PC is the regularized fitting operator induced by C. Accordingly, the fitted matrix ˆH(ℓ𝑗 ) 
+
+> 𝑥
+
+captures the component of the layerwise input representations explained by the output-derived conditioning matrix, while leaving the encoder parameters unchanged. 8 Luo et al. 
+
+We then consolidate the fitted components and the corresponding standardized input represen-tations from all representative layers by concatenation 
+
+ˆH𝑥 =  ˆH(ℓ1 ) 
+
+> 𝑥
+
+. . . ˆH(ℓ𝑛 𝑙 )
+
+> 𝑥
+
+ ∈ R𝑛 ×𝑑 cat , ˜H𝑥 =  ˜H(ℓ1 ) 
+
+> 𝑥
+
+. . . ˜H(ℓ𝑛 𝑙 )
+
+> 𝑥
+
+ ∈ R𝑛 ×𝑑 cat . (6) Finally, to obtain a compact retrieval space suitable for on-device deployment, we perform a spectral decomposition ˆH𝑥 = UΣV ⊤, and retain the top-𝑟 right singular vectors V1: 𝑟 ∈ R𝑑 cat ×𝑟 . The resulting aligned representation is 
+
+Z = ˜H𝑥 V1: 𝑟 ∈ R𝑛 ×𝑟 , (7) whose columns span a compact task-conditioned subspace for retrieval. The matrix Z forms the compact candidate index used for retrieval. Because V1: 𝑟 is estimated from ˆH𝑥 , the retained feature directions are determined by the dominant structure of the output-conditioned fit, while candidate and query representations are projected from their standardized input-side features. This also remains fully gradient-free and lightweight enough for on-device deployment. 
+
+Retrieval in the Aligned Space. CoRA performs retrieval in the learned aligned space. Let ¯Z =
+
+rownorm (Z) be its row-wise ℓ2-normalized form. For a test query x𝑡 , we extract layerwise token-average representations from representative layers Lkey , standardize them using the alignment statistics, and obtain its aligned embedding 
+
+z𝑡 = norm 
+
+  ˜hℓ1 (x𝑡 ) | . . . | ˜hℓ𝑛 𝑙 (x𝑡 )V1: 𝑟 
+
+
+
+∈ R𝑟 , (8) where norm (·) denotes ℓ2 normalization. Although V1: 𝑟 is learned through target-conditioned alignment, applying it to a test query requires only its input features, since the task signal is already encoded in the basis. We then compute the cosine similarity between z𝑡 and each row ¯Z𝑖, :,and select the top-𝑘 exemplars to form the ICL prompt. Because ¯Z can be precomputed offline, query-time retrieval only involves a lightweight projection and nearest-neighbor search in R𝑟 ,making it compatible with standard ANN indexing and the pre-inference on-device setting. 
+
+Extension to Multimodal Retrieval. Prior work on multimodal ICL suggests that textual content often plays a stronger role than visual content [ 6 , 11 ]. We therefore extend CoRA to multimodal retrieval in a text-centric manner, denoted as CoRA-M . Representative layer selection remains unchanged and is applied only to the textual transformer layers, yielding the same set Lkey . Visual information is introduced through the final pooled representation produced by the frozen vision encoder and multimodal projector. For a multimodal exemplar x𝑐 𝑖 , let v(x𝑐 𝑖 ) ∈ R𝑑 denote its projected visual embedding in the shared semantic space. Stacking these embeddings across D gives 
+
+H(vis ) 
+
+> 𝑥
+
+= [v(x𝑐 
+
+> 1
+
+); . . . ; v(x𝑐 𝑛 )] ∈ R𝑛 ×𝑑 , (9) and let ˜H(vis ) 
+
+> 𝑥
+
+be its standardized form. On the target side, unlike the text-only case, we do not concatenate the selected layerwise representations of y𝑐 𝑖 . Instead, we encode each target response with the frozen text encoder and use its mean-pooled final-layer representation 
+
+H(out ) 
+
+> 𝑦
+
+= [h𝐿 (y𝑐 
+
+> 1
+
+); . . . ; h𝐿 (y𝑐 𝑛 )] ∈ R𝑛 ×𝑑 , (10) with standardized form ˜H(out ) 
+
+> 𝑦
+
+. The reason is that, in the multimodal setting, the target response already serves as a compact semantic summary of the answer, while visual grounding is supplied separately by ˜H(vis ) 
+
+> 𝑥
+
+. Reintroducing multiple target-side text layers would therefore mainly enlarge the conditioning space and add redundant variation, rather than provide complementary task signal. We thus define 
+
+Cmm =  1 ˜H(out ) 
+
+> 𝑦
+
+˜H(vis )
+
+> 𝑥
+
+ ∈ R𝑛 × ( 1+2𝑑 ) . (11) Gradient-free Task-Conditioned Retrieval for On-Device In-Context Learning 9
+
+For each selected text layer ℓ𝑗 ∈ L key , we compute the target-conditioned component following Eq. 5 with C replaced by Cmm . The multimodal aligned representation is then formed by concatenating the target-conditioned textual blocks with the visual block 
+
+ˆHmm  
+
+> 𝑥
+
+=  ˆH(ℓ1 ) 
+
+> 𝑥
+
+. . . ˆH(ℓ𝑛 𝑙 ) 
+
+> 𝑥
+
+˜H(vis )
+
+> 𝑥
+
+ ∈ R𝑛 × ( 𝑛 𝑙 +1)𝑑 . (12) We then apply the same spectral decomposition and low-rank projection as in the text-only case (referring to Eq. 7). For a test query x𝑡 , the retrieval embedding becomes 
+
+z𝑡  
+
+> mm
+
+= norm 
+
+  ˜hℓ1 (x𝑡 ) | . . . | ˜hℓ𝑛 𝑙 (x𝑡 ) | ˜v(x𝑡 )V1: 𝑟 
+
+
+
+. (13) This extension preserves CoRA’s original text-centric retrieval backbone while allowing visual cues to enter the same target-conditioned subspace. The subsequent low-rank projection can therefore adapt the combined text-visual representation for retrieval while retaining a unified representation space across the two modalities. 
+
+3.3 Analytical Characterization of the Low-Rank Basis 
+
+We characterize the rank-constrained compression performed in CoRA’s basis-estimation step. Recall that 
+
+ˆH𝑥 = PC ˜H𝑥 ∈ R𝑛 ×𝑑 cat 
+
+is the representation matrix fitted from the output-derived conditioning matrix. Consider its full singular value decomposition 
+
+ˆH𝑥 = UΣV ⊤,
+
+where V ∈ R𝑑 cat ×𝑑 cat is orthogonal and 𝜎 1 ≥ · · · ≥ 𝜎 𝑑 cat ≥ 0 are the singular values, padded with zeros when necessary. Let V1: 𝑟 contain the first 𝑟 right singular vectors. 
+
+Proposition 3.1 (Optimal Rank-𝑟 Compression of the Output-Conditioned Fit). For 1 ≤
+
+𝑟 ≤ 𝑑 cat , V1: 𝑟 is an optimal solution to 
+
+max  
+
+> W∈R𝑑 cat ×𝑟
+> W⊤W=I𝑟
+
+ˆH𝑥 W 2 
+
+> 𝐹
+
+, (14) 
+
+and the optimal value is 
+
+ˆH𝑥 V1: 𝑟  
+
+> 2
+> 𝐹
+
+=
+
+> 𝑟
+
+∑︁ 
+
+> 𝑖 =1
+
+𝜎 2 
+
+> 𝑖
+
+. (15) 
+
+Equivalently, V1: 𝑟 solves 
+
+min  
+
+> W∈R𝑑 cat ×𝑟
+> W⊤W=I𝑟
+
+ˆH𝑥 − ˆH𝑥 WW ⊤ 2 
+
+> 𝐹
+
+, (16) 
+
+with minimum value Í𝑑 cat   
+
+> 𝑖 =𝑟 +1
+
+𝜎 2 
+
+> 𝑖
+
+.
+
+Proof. For any feasible W, define Q = V⊤W. Since V is orthogonal and W⊤W = I𝑟 , we have 
+
+Q⊤Q = I𝑟 . Using the SVD of ˆH𝑥 , the retained fitted energy is 
+
+ˆH𝑥 W 2 
+
+> 𝐹
+
+= ∥ΣQ ∥2 
+
+> 𝐹
+
+=
+
+> 𝑑 cat
+
+∑︁ 
+
+> 𝑖 =1
+
+𝜎 2 
+
+> 𝑖
+
+q𝑖, : 22 ,
+
+where q𝑖, : is the 𝑖 -th row of Q. The column orthonormality of Q implies 
+
+0 ≤ q𝑖, : 22 ≤ 1,
+
+> 𝑑 cat
+
+∑︁ 
+
+> 𝑖 =1
+
+q𝑖, : 22 = 𝑟 . 10 Luo et al. 
+
+Because 𝜎 21 ≥ · · · ≥ 𝜎 2 
+
+> 𝑑 cat
+
+, the weighted sum is maximized by assigning unit weight to the first 𝑟 
+
+singular directions and zero weight to the remaining directions. Therefore, 
+
+ˆH𝑥 W 2 
+
+> 𝐹
+
+≤
+
+> 𝑟
+
+∑︁ 
+
+> 𝑖 =1
+
+𝜎 2 
+
+> 𝑖
+
+,
+
+with equality attained by W = V1: 𝑟 .For the equivalent reconstruction objective, WW ⊤ is an orthogonal projector, and hence 
+
+ˆH𝑥 − ˆH𝑥 WW ⊤ 2 
+
+> 𝐹
+
+= ˆH𝑥  
+
+> 2
+> 𝐹
+
+− ˆH𝑥 W 2 
+
+> 𝐹
+
+.
+
+Thus, minimizing the reconstruction error is equivalent to maximizing the retained fitted energy. Substituting W = V1: 𝑟 and using ∥ ˆH𝑥 ∥2 
+
+> 𝐹
+
+= Í𝑖 𝜎 2 
+
+> 𝑖
+
+gives the minimum reconstruction error Í𝑑 cat   
+
+> 𝑖 =𝑟 +1
+
+𝜎 2 
+
+> 𝑖
+
+.
+
+□
+
+Interpretation. Proposition 3.1 characterizes the compression step used to estimate CoRA’s retrieval basis. The fitted matrix ˆH𝑥 summarizes input-side variation associated with the output-derived conditioning matrix, and its leading right singular subspace provides the most faithful 
+
+𝑟 -dimensional representation of this fitted structure. The trailing spectral energy Í𝑑 cat   
+
+> 𝑖 =𝑟 +1
+
+𝜎 2 
+
+> 𝑖
+
+is the exact approximation error under the rank constraint. For any 𝑟 -dimensional orthogonal basis W, define the normalized retained fitted energy as 
+
+𝜌 𝑟 (W) =
+
+ˆH𝑥 W 2
+
+> 𝐹
+
+ˆH𝑥 
+
+> 2
+> 𝐹
+
+. (17) Proposition 3.1 implies that CoRA’s basis satisfies 
+
+𝜌 𝑟 (V1: 𝑟 ) = max 
+
+> W⊤W=I𝑟
+
+𝜌 𝑟 (W) =
+
+Í𝑟 𝑖 =1 𝜎 2
+
+> 𝑖
+
+Í𝑑 cat  
+
+> 𝑖 =1
+
+𝜎 2
+
+> 𝑖
+
+. (18) Section 5.3 compares this quantity across alternative bases under the same rank budget and examines its relation to downstream retrieval performance. 
+
+4 On-Device Realization of the Retrieval Pipeline 4.1 On-Device Streaming Construction of the Retrieval Representation 
+
+We show that the final retrieval representation Z can be computed in two sequential passes over the exemplar pool without materializing the full fitted matrix ˆH𝑥 . Collect the layerwise ridge-regression coefficients as 
+
+B = B(ℓ1 ) · · · B(ℓ𝑛 𝑙 )  ∈ R𝑝 ×𝑑 cat . (19) The layerwise regularized regressions can then be written jointly as 
+
+B = arg min 
+
+> B
+
+˜H𝑥 − CB 2 
+
+> 𝐹
+
++ 𝜆 ∥B∥2 
+
+> 𝐹
+
+, ˆH𝑥 = CB . (20) 
+
+Pass 1: Sufficient Statistics and Global Solve. Partition D into chunks {D 𝑏 }𝑚 𝑏 =1, and let C𝑏 ∈
+
+R| D 𝑏 | × 𝑝 and ˜H𝑥,𝑏 ∈ R| D 𝑏 | × 𝑑 cat denote the corresponding row blocks of C and ˜H𝑥 . A first streaming pass accumulates the two sufficient-statistic matrices 
+
+G =
+
+> 𝑚
+
+∑︁ 
+
+> 𝑏 =1
+
+C⊤ 
+
+> 𝑏
+
+C𝑏 ∈ R𝑝 ×𝑝 , T =
+
+> 𝑚
+
+∑︁ 
+
+> 𝑏 =1
+
+C⊤ 
+
+> 𝑏
+
+˜H𝑥,𝑏 ∈ R𝑝 ×𝑑 cat . (21) After the first pass, B is obtained by solving 
+
+(G + 𝜆 I𝑝 )B = T. (22) Gradient-free Task-Conditioned Retrieval for On-Device In-Context Learning 11 
+
+The dimensions of this system depend on 𝑝 and 𝑑 cat , but not on the number of exemplars 𝑛 . The low-rank basis required for Eq. 7 can likewise be obtained without forming ˆH𝑥 . Since ˆH𝑥 = CB ,
+
+ˆH⊤ 
+
+> 𝑥
+
+ˆH𝑥 = (CB )⊤ (CB ) = B⊤G B ∈ R𝑑 cat ×𝑑 cat . (23) The top-𝑟 right singular vectors V1: 𝑟 are therefore the leading eigenvectors of B⊤G B , a 𝑑 cat × 𝑑 cat 
+
+matrix whose size is independent of 𝑛 .
+
+Pass 2: Chunkwise Index Construction. After obtaining V1: 𝑟 , a second sequential pass re-encodes each chunk, applies the input-side standardization statistics, and directly constructs its retrieval vectors as 
+
+Z𝑏 = ˜H𝑥,𝑏 V1: 𝑟 ∈ R| D 𝑏 | × 𝑟 . (24) Concatenating the chunkwise results yields Z ∈ R𝑛 ×𝑟 , exactly matching the index representation defined in Eq. 7. 
+
+Peak Memory Footprint. During the first pass, CoRA retains only one pair of feature blocks C𝑏 
+
+and ˜H𝑥,𝑏 , together with the sufficient-statistic matrices G and T. The global solve additionally produces the coefficient matrix B and the 𝑑 cat × 𝑑 cat matrix B⊤GB , from which the basis V1: 𝑟 is obtained. During the second pass, each input-feature block is projected using V1: 𝑟 and written incrementally to the retrieval index. Excluding the persistent storage of the resulting index, the construction-time working memory is therefore bounded by 
+
+O  |D 𝑏 |( 𝑝 + 𝑑 cat ) + 𝑝 (𝑝 + 𝑑 cat ) + 𝑑 2cat 
+
+ . (25) For fixed |D 𝑏 |, 𝑝 , and 𝑑 cat , this working-memory bound is independent of the number of exemplars 
+
+𝑛 . The resulting retrieval index Z ∈ R𝑛 ×𝑟 requires a separate O( 𝑛𝑟 ) storage term. The two-pass construction thus trades an additional sequential scan for working memory controlled by the chunk size and feature dimensions. Representative-layer selection further reduces this cost by keeping 
+
+𝑛 𝑙 , and hence 𝑑 cat , small. Section 5.4 empirically evaluates the resulting memory scaling as the candidate pool grows. 
+
+Extension to CoRA-M.. The identical streaming construction applies to the multimodal vari-ant CoRA-M by replacing C with Cmm ∈ R𝑛 × ( 1+2𝑑 ) and ˜H𝑥 with the multimodal concatenation 
+
+[ ˜H(ℓ1 ) 
+
+> 𝑥
+
+| · · · | ˜H(ℓ𝑛 𝑙 ) 
+
+> 𝑥
+
+| ˜H(vis ) 
+
+> 𝑥
+
+] ∈ R𝑛 × ( 𝑛 𝑙 +1)𝑑 . This changes 𝑑 cat to (𝑛 𝑙 + 1)𝑑 and 𝑝 to 1 + 2𝑑 , and no other changes to the streaming procedure are required. 
+
+4.2 Compatibility with Existing and Emerging Hardware. 
+
+Because the entire CoRA pipeline reduces to standard dense linear algebra primitives, matrix multiplications, a linear-system solve, an eigen-decomposition, and an inner-product-based nearest-neighbor search, it can be implemented on conventional CPU-based edge platforms using highly optimized numerical libraries such as BLAS/LAPACK or their embedded variants [ 3]. Looking ahead, recent work on in-memory computing (IMC) architectures has demonstrated hardware support for each of these primitives individually, including matrix inversion for linear regression [ 67 ], low-rank SVD kernels [ 40 ], and inner-product-based 𝑘 -nearest-neighbor [ 42 ] or approximate-nearest-neighbor search [ 35 ]. Since CoRA is composed solely of such operations, it is in principle compatible with IMC-style accelerators and could benefit from their advantages in latency and energy efficiency. 12 Luo et al.                    
+
+> Table 1. Summary of datasets and tasks. Each dataset is divided into a local candidate pool D={( x𝑐 𝑖 ,y𝑐 𝑖 )} 𝑛 𝑖 =1
+> and an evaluation query set T={x𝑡 𝑗 }𝑚 𝑗 =1. Given a test input x𝑡 , the retriever selects S( x𝑡 ) ⊆ D with
+> |S( x𝑡 )| =𝑘 to construct the in-context prompt.
+
+Classification Tasks Metric: Accuracy (Acc.) ↑
+
+Dataset Task Type Corpus Size Test Queries SST-5 [51] Sentiment Classification 8534 1101 MRPC [16] Paraphrase Detection 3668 408 QNLI [55] Natural Language Inference 104707 5463 CMSQA [53] Commonsense Reasoning 9740 1221 HellaSwag [59] Commonsense Reasoning 52611 20006 
+
+Generation Tasks Metric: Exact Match (EM) ↑
+
+Dataset Task Type Corpus Size Test Queries WebQs [7] Open-Domain QA 3778 2032 GeoQuery [58] Code Generation 404 208 Nl2Bash [34] Code Generation 7441 609 MTOP [29] Semantic Parsing 15564 2235 SMCalFlow [4] Semantic Parsing 102491 14751 
+
+5 Experiment 5.1 Experimental Setup 
+
+Tasks and Datasets. Following our conference study [ 36 ] and prior work [ 57 ], we evaluate CoRA on the same textual benchmark suite of ten publicly available datasets, comprising five classification datasets and five generation datasets across seven task categories. For each dataset, we construct a candidate pool D = {( x𝑐 𝑖 , y𝑐 𝑖 )} 𝑛 𝑖 =1 and a disjoint evaluation set T = {( x𝑡 𝑗 , y𝑡 𝑗 )} 𝑚 𝑗 =1. Given a test input x𝑡 , the retriever selects S( x𝑡 ) ⊆ D with |S( x𝑡 )| = 𝑘 to construct the in-context prompt. The evaluation target y𝑡 is used only to compute the downstream metric and is never accessed during retrieval or alignment. The candidate and evaluation sets contain no overlapping instances. Table 1 summarizes the task type, split, candidate-pool size, evaluation-set size, and metric for each dataset. 
+
+Baselines. We compare CoRA with representative retrieval methods that are feasible for local or pre-inference deployment under limited on-device computational budgets. The baselines include: 
+
+Random , which samples 𝑘 exemplars from the candidate pool; Top-𝑘 BM25 , which retrieves exem-plars using BM25 [ 47 ]; Top-𝑘 SBERT , which replaces BERT with sentence-BERT [ 46 ]; Top-𝑘 BERT ,which ranks exemplars by the cosine similarity between their average final-layer BERT embeddings and the query [ 14 ]; DPP-BERT , which applies MAP inference with a determinantal point process on Top-𝑘 BERT candidates for diverse subset selection [ 10 ]; Top-𝑘 Qwen3-Embedding , which ranks exemplars using cosine similarity between embeddings produced by the dedicated embed-ding model Qwen3-Embedding-0.6B [ 62 ]; and our previously proposed lightweight gradient-based retriever, MLSM [36 ], which combines layerwise BERT similarities by optimizing their agreement. We additionally compare CoRA with the training-based retrievers EPR [ 48 ], CEIL [ 57 ], and TTF [ 36 ]in Section 5.4, where their task-adaptation cost is included in the efficiency comparison. 
+
+Implementation Details. Following the textual retrieval configuration established in our con-ference study [ 36 ], we use BERT [ 14 ] as the frozen retrieval encoder, select 𝑛 𝑙 =3 representative layers from a calibration subset of 𝑛 𝑠 =1000 candidate inputs, and retrieve 𝑘 =20 exemplars for each Gradient-free Task-Conditioned Retrieval for On-Device In-Context Learning 13 
+
+query. We keep these shared settings fixed to enable direct comparison with MLSM and focus the evaluation on the task-conditioned alignment introduced by CoRA. We set the ridge regularization coefficient to 𝜆 =10 −6, and retain a conditional subspace of dimension 𝑟 =256 . Input and output representations are standardized independently for each selected layer using statistics computed from the candidate pool. For generation datasets, the reference response associated with each candidate is used to construct its output representation; evaluation responses are not used by the retriever. The downstream language models are instruction-tuned Llama-3.2-1B [20 ], 4-bit-quantized MobileLLM-Pro [ 23 ], and Qwen3.5-2B [ 44 ]. All retrieval methods use the same candidate pools, query sets, number of retrieved exemplars, prompt templates, exemplar ordering rule, and downstream decoding configuration. We report accuracy for classification and exact match for generation. 
+
+Multimodal Extension Setup. We evaluate CoRA-M on four multimodal exemplar-retrieval bench-marks: VQAv2 [ 19 ], OKVQA [ 49 ], VizWiz [ 21 ], and MSCOCO [ 12 ]. The first three evaluate visual question answering, whereas MSCOCO evaluates image captioning. For each benchmark, the candidate pool and evaluation set are disjoint, and evaluation targets are withheld from all retrieval procedures. CoRA-M uses CLIP [45] to obtain the textual and visual representations. Following established multimodal ICL protocols [ 6 , 11 ], we compare CoRA-M with Random ,
+
+RICES-image , RICES-text [1 ], and MMICES [ 11 ]. The downstream VLMs are OpenFlamingo-3B [5 ] and Qwen3.5-2B [ 44 ]. All methods use the same candidate pools, number and order of demonstrations, prompt templates, and decoding configuration. We report the standard VQA accuracy for VQAv2, OKVQA, and VizWiz, and CIDEr for MSCOCO. 
+
+5.2 Retrieval Effectiveness 
+
+Overall Performance on Textual Benchmarks. Table 2 and Table 3 reports ICL performance on five classification and five generation benchmarks with three downstream LLMs. CoRA achieves the highest average score in every model-by-task-category block, outperforming both static retrieval methods and MLSM. The improvements are observed across classification and generation settings, indicating that the output-conditioned retrieval basis can improve exemplar selection beyond input-similarity-based retrieval under diverse task formulations. The comparison with MLSM is particularly informative because CoRA retains its representative-layer selection procedure while changing how the selected representations are used for retrieval. MLSM computes input-side similarities at the selected layers and optimizes query- or batch-specific aggregation weights to combine them. In contrast, CoRA uses paired candidate outputs during index construction to fit a fixed low-rank retrieval basis, after which retrieval for an unseen query requires only its input representation and the precomputed index. CoRA achieves higher average results than MLSM across all evaluated backbones and task categories, indicating a consistent advantage under the considered evaluation protocol and across the tested retrieval scenarios. This comparison extends the two hypotheses from our preliminary conference work. Representa-tive layers preserve complementary input-side signals associated with H1, while the output-derived conditioning basis incorporates task-specific structure motivated by H2. Within the evaluated setting, the results suggest that integrating these two signals in a fixed retrieval basis is more effective than aggregating task-agnostic layerwise similarity signals alone. 
+
+Transferability Across Downstream LLMs. CoRA achieves the strongest classification and gener-ation averages with Llama-3.2-1B, MobileLLM-Pro, and Qwen3.5-2B, despite their differences in model architecture, scale, and deployment configuration. In particular, CoRA remains effective with MobileLLM-Pro, the 4-bit-quantized and most resource-constrained backbone in our evaluation. This result indicates that the retrieval basis can improve ICL even when the downstream model 14 Luo et al. 
+
+> Table 2. Main results on five textual classification benchmarks across three language models. “ ✝” indicates that gradient computation is required. Best score for each task is boldfaced, and Avg. denotes the average score across all five tasks.
+
+Classification SST-5 MRPC QNLI CMSQA SWAG Avg. 
+
+Llama-3.2-1B Random 0.3370 0.6912 0.5931 0.6544 0.6563 0.5864 Top-𝑘 BM25 0.3824 0.6961 0.6434 0.6495 0.6744 0.6091 Top-𝑘 SBERT 0.3787 0.7328 0.6354 0.6609 0.6831 0.6182 Top-𝑘 BERT 0.3878 0.7181 0.6577 0.6749 0.6828 0.6243 DPP-BERT 0.3733 0.6961 0.6755 0.6740 0.6868 0.6211 Top-𝑘 Qwen3-Emb. 0.3987 0.7206 0.6357 0.6667 0.6902 0.6224 MLSM ✝ 0.4024 0.7230 0.6822 0.6593 0.6850 0.6304 CoRA (ours) 0.4134 ±0.02 0.7333 ±0.05 0.7317 ±0.02 0.6753 ±0.02 0.6892 ±0.01 0.6486 ±0.02 
+
+MobileLLM-Pro Random 0.4187 0.5662 0.5872 0.6814 0.6471 0.5801 Top-𝑘 BM25 0.4668 0.6299 0.6672 0.6585 0.6614 0.6168 Top-𝑘 SBERT 0.4469 0.6078 0.6194 0.6650 0.6678 0.6014 Top-𝑘 BERT 0.4432 0.6275 0.6498 0.6683 0.6681 0.6114 DPP-BERT 0.4587 0.6275 0.6863 0.6699 0.6724 0.6229 Top-𝑘 Qwen3-Emb. 0.4614 0.6348 0.6273 0.6773 0.6735 0.6149 MLSM ✝ 0.4614 0.6176 0.6365 0.6773 0.6688 0.6123 CoRA (ours) 0.4834 ±0.01 0.6495 ±0.02 0.7272 ±0.01 0.6825 ±0.02 0.6725 ±0.01 0.6428 ±0.01 
+
+Qwen3.5-2B Random 0.3524 0.6912 0.7203 0.6822 0.6590 0.6210 Top-𝑘 BM25 0.4205 0.7328 0.7344 0.6257 0.6790 0.6385 Top-𝑘 SBERT 0.4051 0.7132 0.7434 0.6454 0.6888 0.6392 Top-𝑘 BERT 0.4133 0.7598 0.7617 0.6683 0.6857 0.6577 DPP-BERT 0.4196 0.7157 0.7545 0.6585 0.6920 0.6481 Top-𝑘 Qwen3-Emb. 0.4233 0.7279 0.7463 0.6626 0.6954 0.6511 MLSM ✝ 0.4033 0.7451 0.7706 0.6839 0.6873 0.6580 CoRA (ours) 0.4352 ±0.02 0.7774 ±0.04 0.8035 ±0.03 0.6924 ±0.02 0.7019 ±0.01 0.6821 ±0.03 
+
+operates under a restricted memory footprint. CoRA also attains the strongest aggregate results with Qwen3.5-2B, a more recent and higher-capacity backbone, showing that its retrieval formula-tion remains compatible with stronger downstream models and is applicable across heterogeneous model settings. The magnitude of improvement varies across models and task categories, which indicates that retrieval utility depends on both the downstream model and the task. Nevertheless, the consistent aggregate advantage across all three backbones supports the use of CoRA as a model-agnostic pre-inference retrieval component. It requires neither modification and fine-tuning of the textual encoder, nor retrieval-time interaction with the downstream model. 
+
+Task-wise Behavior and Failure Modes. CoRA performs strongly on several structured generation tasks, including GeoQuery, MTOP, and SMCalFlow, where the candidate outputs follow relatively Gradient-free Task-Conditioned Retrieval for On-Device In-Context Learning 15 
+
+> Table 3. Main results on five textual generation benchmarks across three language models. “ ✝” indicates that gradient computation is required. Best score for each task is boldfaced, and Avg. denotes the average score across all five tasks.
+
+Generation WebQs GeoQ. NL2B. MTOP SMCal. Avg. 
+
+Llama-3.2-1B Random 0.1654 0.1536 0.1396 0.0515 0.0623 0.1145 Top-𝑘 BM25 0.3135 0.4357 0.3346 0.5074 0.4274 0.4037 Top-𝑘 SBERT 0.3209 0.4679 0.3280 0.4559 0.4154 0.3976 Top-𝑘 BERT 0.3204 0.5000 0.3354 0.5302 0.4551 0.4282 DPP-BERT 0.3194 0.5214 0.3481 0.5177 0.4336 0.4280 Top-𝑘 Qwen3-Emb. 0.3140 0.4929 0.3330 0.4537 0.4196 0.4026 MLSM ✝ 0.3243 0.4571 0.3194 0.5289 0.4747 0.4209 CoRA (ours) 0.3334 ±0.03 0.5714 ±0.03 0.3248 ±0.04 0.5349 ±0.05 0.4854 ±0.01 0.4500 ±0.04 
+
+MobileLLM-Pro Random 0.1191 0.1321 0.1445 0.0157 0.0140 0.0851 Top-𝑘 BM25 0.2180 0.5071 0.2697 0.4179 0.3836 0.3593 Top-𝑘 SBERT 0.2116 0.5607 0.3498 0.3638 0.3796 0.3731 Top-𝑘 BERT 0.2180 0.5286 0.2866 0.4327 0.3992 0.3730 DPP-BERT 0.2028 0.4071 0.2972 0.4358 0.3884 0.3463 Top-𝑘 Qwen3-Emb. 0.2195 0.5357 0.2882 0.3570 0.3847 0.3570 MLSM ✝ 0.2190 0.5321 0.3403 0.4519 0.4164 0.3919 CoRA (ours) 0.2195 ±0.03 0.5751 ±0.02 0.2871 ±0.04 0.4633 ±0.01 0.4306 ±0.01 0.3951 ±0.02 
+
+Qwen3.5-2B Random 0.0374 0.3000 0.1856 0.1078 0.0850 0.1432 Top-𝑘 BM25 0.1973 0.7250 0.3807 0.6492 0.5491 0.5003 Top-𝑘 SBERT 0.2023 0.7786 0.5122 0.5875 0.5263 0.5214 Top-𝑘 BERT 0.2087 0.7607 0.4343 0.6260 0.5666 0.5193 DPP-BERT 0.1845 0.8036 0.3683 0.6416 0.5642 0.5125 Top-𝑘 Qwen3-Emb. 0.1929 0.7786 0.4830 0.5879 0.5245 0.5134 MLSM ✝ 0.2067 0.7750 0.4220 0.6644 0.5867 0.5310 CoRA (ours) 0.2187 ±0.02 0.8350 ±0.05 0.4576 ±0.02 0.6677 ±0.01 0.5922 ±0.02 0.5542 ±0.02 
+
+regular compositional patterns. These tasks provide output-side representations that can serve as informative conditioning signals during index construction. However, the benefits of output-conditioned alignment are not uniform across all generation settings. NL2Bash provides a representative challenging case. CoRA does not attain the best score on NL2Bash with any of the three downstream backbones, consistent with prior observations that this dataset is difficult for retrieval-based ICL [ 36 , 57 ]. A plausible explanation is the many-to-many relation between natural-language intents and Bash commands. Functionally equivalent solutions can differ substantially in the utilities, flags, and command compositions that they use. Consequently, surface-form output representations may provide a less stable proxy for the functional relation relevant to retrieval. This interpretation is also consistent with Table 6, where restricting CoRA to lower-layer representations improves NL2Bash performance relative to middle-, upper-, and 16 Luo et al. 
+
+Table 4. Results on multimodal benchmarks. Best score of each task is boldfaced. Avg. denotes the average score across all five tasks. 
+
+Method VQAv2 OKVQA VizWiz MSCOCO Avg. 
+
+OpenFlamingo-3B Random 35.38 10.81 7.87 72.17 31.56 RICES_image 36.22 11.60 17.59 84.03 37.36 RICES_text 36.57 12.53 10.91 74.13 33.53 MMICES 39.51 12.93 15.60 80.55 37.15 CoRA-M (ours) 41.22 ±0.01 13.20 ±0.02 17.74 ±0.01 86.54 ±0.03 39.68 ±0.01 
+
+Qwen3.5-2B Random 50.95 25.37 9.67 87.55 43.38 RICES_image 44.91 24.27 15.24 90.56 43.74 RICES_text 47.60 26.02 14.31 83.85 42.95 MMICES 51.21 27.60 16.30 89.70 46.20 CoRA-M (ours) 53.92 ±0.02 29.03 ±0.01 18.54 ±0.03 90.96 ±0.01 48.11 ±0.02 
+
+Table 5. Ablation study on key components of CoRA. w/o Fusion uses only the final encoder layer. w/o Cond. 
+
+replaces output-conditioned projection with an unconditional one. Subscript 𝑟 denotes the number of retained dimensions. Default CoRA uses 𝑟 =256 .                                              
+
+> Dataset Top-𝑘 BERT w/o Fusion w/o Cond. CoRA 𝑟 =32 CoRA 𝑟 =64 CoRA 𝑟 =128 CoRA 𝑟 =256 CoRA 𝑟 =512
+> SST-5 0.3878 0.3906 0.3969 0.3921 0.4042 0.4042 0.4133 0.4015 QNLI 0.6577 0.6886 0.7003 0.7201 0.7415 0.7410 0.7322 0.7346 WebQs 0.3204 0.3278 0.3297 0.3254 0.3302 0.3258 0.3327 0.3302 MTOP 0.5302 0.5199 0.5338 0.5139 0.5329 0.5302 0.5347 0.5242
+
+CKA-selected layer configurations. The result suggests that pattern-level input cues are particularly important for this task and identifies high-variability output spaces as a limitation of the current output-conditioning formulation. 
+
+Performance on Multimodal Retrieval. Table 4 reports multimodal ICL results on three visual question-answering benchmarks and the MSCOCO image-captioning benchmark. CoRA-M achieves the strongest result for every dataset with both OpenFlamingo-3B and Qwen3.5-2B. The improve-ment is therefore consistent across two downstream VLMs and across both question answering and captioning settings. The multimodal baselines considered here either retrieve demonstrations using a single modality or combine visual and textual signals through sequential filtering and ranking. In contrast, CoRA-M constructs a shared low-rank retrieval space in which visual candidate representations and output-side textual representations jointly condition the selected textual input features. The consistent gains in Table 4 are compatible with the benefit of this joint conditioning design for multimodal exemplar retrieval. Section 5.3 further examines the respective roles of visual representations and target-side textual conditioning through controlled ablations. 
+
+5.3 Analysis of Retrieval Design Gradient-free Task-Conditioned Retrieval for On-Device In-Context Learning 17 
+
+> Table 6. Effect of layer position on CoRA retrieval performance. Each setting uses three encoder layers, either from a fixed depth range or selected by CKA.
+
+Dataset Lower (1-3) Middle (5-7) Upper (10-12) CKA-selected NL2Bash 0.3419 0.2772 0.2637 0.3210 GeoQuery 0.5036 0.4429 0.5500 0.5714 
+
+Importance of Target Conditioning. To isolate the contribution of output-derived conditioning, we compare CoRA with an unconditional variant ( w/o Cond. ) that uses the same representative layers and low-rank dimensionality but replaces the output-conditioned operator in Eq. 5 with the identity map, i.e., PC = I. Consequently, w/o Cond. sets ˆH(ℓ𝑗 ) 
+
+> 𝑥
+
+= ˜H(ℓ𝑗 ) 
+
+> 𝑥
+
+and estimates its low-rank retrieval basis directly from the concatenated selected-layer input representations, without using candidate-output representations. As shown in Table 5, both projection-based variants outperform Top-𝑘 BERT on all four datasets, indicating that low-rank transformation of the selected multi-layer features can improve downstream ICL performance beyond direct final-layer similarity retrieval. CoRA further outperforms w/o Cond. on every dataset. This result indicates that conditioning the retrieval basis on paired candidate outputs provides information beyond input-side multi-layer representations alone and improves exemplar selection in the evaluated tasks. 
+
+Effects of Multi-Layer Representations and Layer Position. We examine whether the representative-layer construction improves retrieval beyond using the final encoder layer alone. In Table 5, full CoRA outperforms the w/o Fusion variant on all four datasets. This comparison indicates that the selected layers provide complementary input-side information that is not consistently retained in the final-layer representation. Combining these representations therefore yields a more informative input feature space for the subsequent output-conditioned alignment. The value of combining layers raises a related question, whether a fixed layer range is suitable across tasks. We address this question by comparing three fixed-depth layer groups with the CKA-selected layers used by CoRA. Table 6 shows contrasting layer preferences across the two generation tasks. NL2Bash performs best with lower-layer features, with performance gradually decreasing as the selected layers become deeper. In contrast, GeoQuery benefits from upper-layer features, while the CKA-selected configuration achieves the strongest result among the compared settings. These results show that no fixed layer range is uniformly preferable for exemplar retrieval across tasks with different input-output characteristics. The lower-layer preference on NL2Bash is consistent with the task’s reliance on pattern-level input cues, whereas the GeoQuery result suggests that higher-level representations are useful for regular compositional mappings. CKA-based selection therefore provides a data-dependent alternative to a fixed depth range. It achieves the strongest result on GeoQuery and remains more effective than middle- and upper-layer configurations on NL2Bash. 
+
+Effect of Low-Rank Dimensionality. Table 5 also evaluates the retained dimensionality 𝑟 of the retrieval basis. The effect of 𝑟 varies by task and does not follow a monotonic trend. Increasing the dimensionality from 𝑟 = 32 to an intermediate setting consistently improves performance across all four datasets, although the optimal value differs across tasks. QNLI reaches its strongest result at 
+
+𝑟 = 64 , SST-5 at 𝑟 = 128 or 256 , and WebQs and MTOP at 𝑟 = 256 . Further increasing the dimension to 𝑟 = 512 does not produce a consistent additional gain and instead reduces performance on several datasets. We therefore adopt 𝑟 = 256 as the default configuration, as it offers strong and 18 Luo et al. 10 20 30 40 50             
+
+> The Number of Exemplars (k)
+> 0.70
+> 0.72
+> 0.74
+> Accuracy
+> @MRPC
+> 10 20 30 40 50
+> The Number of Exemplars (k)
+> 0.60
+> 0.65
+> 0.70
+> Accuracy
+> @QNLI
+> 10 20 30 40 50
+> The Number of Exemplars (k)
+> 0.30
+> 0.31
+> 0.32
+> 0.33
+> Exact Match  @WebQs
+> 10 20 30 40 50
+> The Number of Exemplars (k)
+> 0.48
+> 0.50
+> 0.53
+> 0.55
+> Exact Match  @MTOP
+> BERT
+> MLSM
+> CoRA
+
+Fig. 2. Performance comparison on four datasets with various number of exemplars 𝑘 .Table 7. Ablation on visual signal placement and target-side textual conditioning in CoRA-M.                   
+
+> Dataset CoRA-M (shuffle-vis) CoRA-T CoRA-M (input-only) CoRA-M (target-only) CoRA-M (layerwise-target) CoRA-M VQAv2 49.57 51.83 52.21 52.46 52.38 53.89
+> VizWiz 15.03 17.41 17.87 17.13 17.48 18.56
+
+broadly competitive results across the evaluated tasks while maintaining a compact 𝑟 -dimensional index and query representation. 
+
+Effect of the Number of Retrieved Exemplars. Figure 2 examines how the number of retrieved exemplars 𝑘 affects downstream ICL performance. The preferred context size differs substantially across tasks rather than following a shared pattern. MRPC and WebQs attain their strongest CoRA results with relatively small values of 𝑘 , whereas QNLI and MTOP benefit from a larger context before performance plateaus or continues to improve. These task-specific trends indicate that increasing the number of demonstrations does not uniformly improve ICL performance. Nevertheless, CoRA remains competitive across the evaluated context sizes. It achieves the strongest result at every displayed value of 𝑘 on all four datasets. These results indicate that the benefit of output-conditioned retrieval is not tied to a single demonstration budget. In practice, this permits 𝑘 to be selected according to the available prompt-length and downstream-inference budget while retaining the benefit of the learned retrieval basis. 
+
+Analysis of Multimodal Signal Placement and Target-Side Textual Conditioning. Table 7 examines how visual features and target-side textual representations are incorporated into CoRA-M. The default CoRA-M configuration uses the final-layer representation of each candidate response together with its visual representation in the conditioning matrix, and additionally appends visual features to the retrieval representation. To isolate these design choices, input-only adds visual features only to the retrieval representation, whereas target-only adds them only to the conditioning matrix. Both retain the same final-layer target-text representation. CoRA-M (layerwise-target) 
+
+replaces the final-layer target-text representation with selected layerwise target features while retaining visual features on both sides. CoRA-T applies the text-only formulation without visual features, and CoRA-M (shuffle-vis) randomly permutes visual features across candidate examples while preserving their dimensionality and marginal distribution. The full CoRA-M configuration achieves the strongest result on both VQAv2 and VizWiz. Adding visual features only to the retrieval representation improves over CoRA-T on both datasets, whereas adding them to the conditioning matrix improves VQAv2 but not VizWiz. The combined configu-ration is consistently stronger than either one-sided variant, indicating that the two placements provide complementary information. Moreover, CoRA-M outperforms CoRA-M (layerwise-target) 
+
+on both datasets, showing that the final-layer target representation is a more effective target-side textual conditioning choice than the selected layerwise alternative. Gradient-free Task-Conditioned Retrieval for On-Device In-Context Learning 19 
+
+Table 8. Retained fitted energy and downstream ICL performance under a common rank budget of 𝑟 = 256 .All values of 𝜌 𝑟 (W) are evaluated with respect to the same output-conditioned fitted matrix ˆH𝑥 .
+
+Dataset Basis 𝜌 𝑟 (W) Downstream metric MRPC Random Orthogonal 0.116 0.7010 Unconditioned 0.648 0.7206 CoRA 0.927 0.7353 
+
+WebQS Random Orthogonal 0.113 0.3022 Unconditioned 0.593 0.3223 CoRA 0.884 0.3327 
+
+Table 9. Aggregate pre-inference retrieval latency cost (s) and peak CPU memory (MB) on MRPC under identical single-CPU settings. 𝑐𝑠 denotes the fixed chunk size used by streaming under limited memory budgets.                     
+
+> Method Top-𝑘 BERT DPP-BERT MLSM CoRA CoRA 𝑐𝑠 =64
+> Time 47.33 56.20 54.36 47.94 57.23 Memory 2315 2366 2609 3356 2396 01000 2000 3000 4000 5000 6000 7000
+> Corpus size
+> 2500
+> 3000
+> 3500
+> 4000
+> Peak memory
+> w/o streaming
+> w/ streaming
+
+Fig. 3. Peak CPU memory (MB) versus corpus size during the pre-inference retrieval workflow, with and without chunked streaming. 
+
+The shuffled-visual variant performs below CoRA-T on both datasets. By preserving visual feature dimensionality while disrupting their correspondence with candidate examples, this result indicates that CoRA-M gains depend on correctly aligned visual information rather than additional feature dimensions alone. Together, these ablations support the default CoRA-M design and motivate further analysis of its query-level retrieval behavior. 
+
+Retained Fitted Energy and Retrieval Performance. Following Eq. 17, we measure the fitted energy retained by different bases under the same rank budget. All retained-energy ratios are computed with respect to the same output-conditioned fitted matrix ˆH𝑥 . We compare CoRA’s basis with an unconditioned basis formed by the top-𝑟 right singular vectors of ˜H𝑥 , and a random orthogonal basis of the same dimension. Table 8 shows that CoRA retains the largest fraction of the output-conditioned fitted energy under the shared rank budget, consistent with Proposition 3.1. The unconditioned basis retains substantially less fitted energy, indicating that the dominant directions of the raw input repre-sentations do not fully coincide with those identified through output conditioning. The random orthogonal basis exhibits the lowest retained energy, reflecting its lack of alignment with the fitted representation. The downstream results follow the same ordering on both datasets. Relative to the unconditioned and random alternatives, CoRA combines greater preservation of the fitted structure with higher ICL performance. This agreement connects the rank-constrained basis construction characterized in Proposition 3.1 with its empirical utility for exemplar retrieval under the same compact representation budget. 
+
+5.4 Resource Cost and On-Device Deployment 
+
+Aggregate Pre-Inference Retrieval Cost and Memory Scaling. Table 9 reports aggregate pre-inference retrieval cost and peak CPU memory on MRPC under identical single-CPU settings. The reported time covers the complete workflow from representation computation through exemplar selection 20 Luo et al.   
+
+> Table 10. End-to-end on-device results on Raspberry Pi 5 (8 GB RAM). Use Qwen3.5-0.8B as the on-device model. Training-based methods run out of memory.
+
+Classification Method Top-𝑘 BERT DPP-BERT MLSM CoRA EPR/CEIL/TTF MRPC 0.7059 0.6985 0.6961 0.7353 OOM QNLI 0.7368 0.7690 0.7318 0.7752 OOM Generation Method Top-𝑘 BERT DPP-BERT MLSM CoRA EPR/CEIL/TTF WebQs 0.2106 0.2165 0.1969 0.2288 OOM MTOP 0.5839 0.5928 0.5996 0.6076 OOM and prompt construction for the evaluated candidate pool and query set, but excludes downstream-model inference. It should therefore be interpreted as an aggregate pre-inference cost rather than query-time latency alone. Under this measure, CoRA requires 47 .94 s, which is comparable to Top-𝑘 
+
+BERT and lower than DPP-BERT and MLSM. Unlike MLSM, CoRA performs no gradient evaluation or optimizer-based update during this workflow. When memory is constrained, chunked streaming with |D 𝑏 | = 64 reduces peak memory from 3,356 MB to 2,396 MB, placing it close to that of Top-𝑘 
+
+BERT. This reduction increases aggregate pre-inference time to 57.23 s, reflecting the additional sequential passes over the candidate pool required by streaming. Figure 3 examines memory scaling as the candidate-pool size increases from 100 to 7,000 on QNLI under identical CPU-only settings. Without streaming, peak memory increases from approximately 2.3 GB to 3.9 GB over the measured range because the workflow materializes the full feature matrix 
+
+˜H𝑥 and conditioning matrix C before fitting the retrieval basis. With streaming, peak memory remains within a narrower range after approximately 3,000 candidates. The remaining growth is attributable to the persistent projected index Z ∈ R𝑛 ×𝑟 , dataset objects, and label storage. This behavior is consistent with Eq. 25. The working memory for alignment is independent of 𝑛 for fixed chunk and feature dimensions, whereas persistent index storage retains an O( 𝑛𝑟 ) dependence. 
+
+End-to-End On-Device Deployment on Raspberry Pi 5. We evaluate textual CoRA in an end-to-end on-device setting using a Raspberry Pi 5 with 8 GB RAM, where the complete pre-inference retrieval workflow and downstream LLM inference are executed locally. To fit the device memory budget, we use Qwen3.5-0.8B as the on-device inference model. As shown in Table 10, CoRA achieves the strongest result on all four evaluated tasks relative to Top-𝑘 BERT, DPP-BERT, and MLSM. EPR, CEIL, and TTF could not complete their corresponding task-adaptation and pre-inference retrieval workflows within the available device memory and are therefore reported as OOM. In contrast, CoRA completes the full textual retrieval-and-inference pipeline without gradient-based retriever adaptation. This experiment establishes end-to-end feasibility for textual CoRA on the evaluated device configuration. 
+
+Task-Adaptation and Pre-Inference Retrieval Cost Compared with Training-Based Methods. We compare CoRA with three representative training-based demonstration-selection methods on MRPC: EPR, CEIL, and TTF. Because these methods require task-specific retriever adaptation before exemplar selection, Table 11 reports the total cost from method-specific adaptation through pre-inference retrieval, rather than retrieval alone. Gradient-free Task-Conditioned Retrieval for On-Device In-Context Learning 21 
+
+Table 11. Efficiency-accuracy trade-off on MRPC. Time includes the full task adaptation/training and retrieval pipeline. Peak memory is reported per GPU. Unlike the CPU-only setting in the main text, this experiment is conducted on an 8 ×RTX 4090 server because the training-based baselines require multi-GPU optimization. 
+
+Method GPU Setup Peak Mem./GPU (MB) Time (s) Acc. EPR 8×RTX 4090 11888 380 0.7549 CEIL 8×RTX 4090 23480 506 0.7645 TTF 8×RTX 4090 13000 491 0.7525 CoRA 1×RTX 4090 2248 21 0.7353 The training-based methods are executed on an 8×RTX 4090 server to accommodate their task-specific optimization procedures, whereas CoRA’s closed-form workflow runs on a single RTX 4090. We report peak memory per GPU together with total wall-clock time for the complete adaptation-to-retrieval workflow. Under these execution settings, CoRA uses substantially less device memory and completes the workflow markedly faster than EPR, CEIL, and TTF. These savings are accompanied by accuracy differences of 1.96 , 2.92 , and 1.72 percentage points, respectively, while CoRA reduces adaptation-to-retrieval time by factors of 18 .1, 24 .1, and 23 .4.These results position CoRA as an efficiency-oriented alternative. CEIL attains the strongest MRPC accuracy when multi-GPU task-specific optimization is available. CoRA instead provides a gradient-free option for settings in which adaptation time, memory, or retriever-training resources are constrained. 
+
+6 Conclusion and Limitations 
+
+We presented Conditional Retrieval Alignment (CoRA), a gradient-free framework for task-conditioned exemplar retrieval in on-device ICL. CoRA uses paired candidate inputs and outputs to construct an output-conditioned retrieval space from complementary frozen-encoder layers. Candidate outputs are required only during offline index construction. At query time, CoRA retrieves exemplars using the query input and a compact precomputed low-rank index. This design provides task-conditioned retrieval without retriever fine-tuning, backpropagation, or target-model calls. We further derived an exact streaming construction procedure and extended the framework to multimodal retrieval. Experiments across textual and visual-language benchmarks, together with end-to-end deployment on a Raspberry Pi 5 , demonstrate the effectiveness and practical feasibility of this approach under edge resource budgets. The current study also has several limitations. The current deployment study evaluates a software implementation on a Raspberry Pi 5. Extending the streaming construction to continuously evolving candidate pools, and designing specialized accelerators for better end-to-end energy consumption, remain important directions for future work. 
+
+References          
+
+> [1] Jean-Baptiste Alayrac, Jeff Donahue, Pauline Luc, Antoine Miech, Iain Barr, Yana Hasson, Karel Lenc, Arthur Mensch, Katherine Millican, Malcolm Reynolds, et al .2022. Flamingo: a visual language model for few-shot learning. Advances in neural information processing systems 35 (2022), 23716–23736. [2] Shengnan An, Bo Zhou, Zeqi Lin, Qiang Fu, Bei Chen, Nanning Zheng, Weizhu Chen, and Jian-Guang Lou. 2023. Skill-Based Few-Shot Selection for In-Context Learning. In Proceedings of the 2023 Conference on Empirical Methods in Natural Language Processing . 13472–13492. [3] E. Anderson, Z. Bai, C. Bischof, S. Blackford, J. Demmel, J. Dongarra, J. Du Croz, A. Greenbaum, S. Hammarling, A. McKenney, and D. Sorensen. 1999. LAPACK Users’ Guide (third ed.). Society for Industrial and Applied Mathematics, Philadelphia, PA.
+
+22 Luo et al. 
+
+[4] Jacob Andreas, John Bufe, David Burkett, Charles Chen, Josh Clausman, Jean Crawford, Kate Crim, Jordan DeLoach, Leah Dorner, Jason Eisner, et al . 2020. Task-oriented dialogue as dataflow synthesis. Transactions of the Association for Computational Linguistics 8 (2020), 556–571. [5] Anas Awadalla, Irena Gao, Josh Gardner, Jack Hessel, Yusuf Hanafy, Wanrong Zhu, Kalyani Marathe, Yonatan Bitton, Samir Gadre, Shiori Sagawa, et al . 2023. Openflamingo: An open-source framework for training large autoregressive vision-language models. arXiv preprint arXiv:2308.01390 (2023). [6] Folco Bertini Baldassini, Mustafa Shukor, Matthieu Cord, Laure Soulier, and Benjamin Piwowarski. 2024. What makes multimodal in-context learning work?. In Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition . 1539–1550. [7] Jonathan Berant, Andrew Chou, Roy Frostig, and Percy Liang. 2013. Semantic parsing on freebase from question-answer pairs. In Proceedings of the 2013 conference on empirical methods in natural language processing . 1533–1544. [8] Tom Brown, Benjamin Mann, Nick Ryder, Melanie Subbiah, Jared D Kaplan, Prafulla Dhariwal, Arvind Neelakantan, Pranav Shyam, Girish Sastry, Amanda Askell, et al . 2020. Language models are few-shot learners. Advances in neural information processing systems 33 (2020), 1877–1901. [9] Cheng Chen, Yunpeng Zhai, Yifan Zhao, Jinyang Gao, Bolin Ding, and Jia Li. 2025. Provoking multi-modal few-shot lvlm via exploration-exploitation in-context learning. In Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition . 3826–3835. [10] Laming Chen, Guoxin Zhang, and Eric Zhou. 2018. Fast greedy map inference for determinantal point process to improve recommendation diversity. Advances in neural information processing systems 31 (2018). [11] Shuo Chen, Zhen Han, Bailan He, Jianzhe Liu, Mark Buckley, Yao Qin, Philip Torr, Volker Tresp, and Jindong Gu. 2025. Can Multimodal Large Language Models Truly Perform Multimodal In-Context Learning?. In 2025 IEEE/CVF Winter Conference on Applications of Computer Vision (WACV) . IEEE, 6000–6010. [12] Xinlei Chen, Hao Fang, Tsung-Yi Lin, Ramakrishna Vedantam, Saurabh Gupta, Piotr Dollár, and C Lawrence Zitnick. 2015. Microsoft coco captions: Data collection and evaluation server. arXiv preprint arXiv:1504.00325 (2015). [13] Fahim Dalvi, Hassan Sajjad, Nadir Durrani, and Yonatan Belinkov. 2020. Analyzing redundancy in pretrained transformer models. In Proceedings of the 2020 Conference on Empirical Methods in Natural Language Processing (EMNLP) . 4908–4926. [14] Jacob Devlin, Ming-Wei Chang, Kenton Lee, and Kristina Toutanova. 2019. Bert: Pre-training of deep bidirectional transformers for language understanding. In Proceedings of the 2019 conference of the North American chapter of the association for computational linguistics: human language technologies, volume 1 (long and short papers) . 4171–4186. [15] Yucheng Ding, Chaoyue Niu, Fan Wu, Shaojie Tang, Chengfei Lyu, and Guihai Chen. 2024. Enhancing On-Device LLM Inference with Historical Cloud-Based LLM Interactions. In Proceedings of the 30th ACM SIGKDD Conference on Knowledge Discovery and Data Mining (Barcelona, Spain) (KDD ’24) . Association for Computing Machinery, New York, NY, USA, 597–608. doi:10.1145/3637528.3671679 [16] William B Dolan, Chris Quirk, and Chris Brockett. 2004. Unsupervised construction of large paraphrase corpora: Exploiting massively parallel news sources. In COLING 2004: Proceedings of the 20th international conference on computational linguistics . 350–356. [17] Sivan Doveh, Shaked Perek, M Jehanzeb Mirza, Wei Lin, Amit Alfassy, Assaf Arbelle, Shimon Ullman, and Leonid Karlinsky. 2024. Towards multimodal in-context learning for vision and language models. In European Conference on Computer Vision . Springer, 250–267. [18] Ge Gao, Alexey Taymanov, Eduardo Salinas, Paul Mineiro, and Dipendra Misra. 2024. Aligning llm agents by learning latent preference from user edits. Advances in neural information processing systems 37 (2024), 136873–136896. [19] Yash Goyal, Tejas Khot, Douglas Summers-Stay, Dhruv Batra, and Devi Parikh. 2017. Making the v in vqa matter: Elevating the role of image understanding in visual question answering. In Proceedings of the IEEE conference on computer vision and pattern recognition . 6904–6913. [20] Aaron Grattafiori, Abhimanyu Dubey, Abhinav Jauhri, Abhinav Pandey, Abhishek Kadian, Ahmad Al-Dahle, Aiesha Letman, Akhil Mathur, Alan Schelten, Alex Vaughan, et al . 2024. The llama 3 herd of models. arXiv preprint arXiv:2407.21783 (2024). [21] Danna Gurari, Qing Li, Abigale J Stangl, Anhong Guo, Chi Lin, Kristen Grauman, Jiebo Luo, and Jeffrey P Bigham. 2018. Vizwiz grand challenge: Answering visual questions from blind people. In Proceedings of the IEEE conference on computer vision and pattern recognition . 3608–3617. [22] Brandon Huang, Chancharik Mitra, Assaf Arbelle, Leonid Karlinsky, Trevor Darrell, and Roei Herzig. 2024. Multimodal task vectors enable many-shot multimodal in-context learning. Advances in Neural Information Processing Systems 37 (2024), 22124–22153. [23] Patrick Huber, Ernie Chang, Wei Wen, Igor Fedorov, Tarek Elgamal, Hanxian Huang, Naveen Suda, Chinnadhurai Sankar, Vish Vogeti, Yanghan Wang, et al . 2025. MobileLLM-Pro Technical Report. arXiv preprint arXiv:2511.06719 
+
+(2025). Gradient-free Task-Conditioned Retrieval for On-Device In-Context Learning 23 
+
+[24] Ganesh Jawahar, Benoît Sagot, and Djamé Seddah. 2019. What Does BERT Learn about the Structure of Language?. In 
+
+Proceedings of the 57th Annual Meeting of the Association for Computational Linguistics . 3651–3657. [25] Julian Killingback, Ofer Meshi, Henry Li, Hamed Zamani, and Maryam Karimzadehgan. 2026. A Unified Model and Document Representation for On-Device Retrieval-Augmented Generation. arXiv preprint arXiv:2604.14403 (2026). [26] Simon Kornblith, Mohammad Norouzi, Honglak Lee, and Geoffrey Hinton. 2019. Similarity of neural network representations revisited. In International conference on machine learning . PMlR, 3519–3529. [27] Sneha Kudugunta, Aditya Kusupati, Tim Dettmers, Kaifeng Chen, Inderjit Dhillon, Yulia Tsvetkov, Hannaneh Hajishirzi, Sham Kakade, Ali Farhadi, and Prateek Jain. 2024. Matformer: Nested transformer for elastic inference. Advances in Neural Information Processing Systems 37 (2024), 140535–140564. [28] Jurek Leonhardt, Henrik Müller, Koustav Rudra, Megha Khosla, Abhijit Anand, and Avishek Anand. 2024. Efficient Neural Ranking Using Forward Indexes and Lightweight Encoders. ACM Trans. Inf. Syst. 42, 5, Article 117 (April 2024), 34 pages. doi:10.1145/3631939 [29] Haoran Li, Abhinav Arora, Shuohui Chen, Anchit Gupta, Sonal Gupta, and Yashar Mehdad. 2021. MTOP: A compre-hensive multilingual task-oriented semantic parsing benchmark. In Proceedings of the 16th Conference of the European Chapter of the Association for Computational Linguistics: Main Volume . 2950–2962. [30] Xiaonan Li, Kai Lv, Hang Yan, Tianyang Lin, Wei Zhu, Yuan Ni, Guotong Xie, Xiaoling Wang, and Xipeng Qiu. 2023. Unified Demonstration Retriever for In-Context Learning. In Proceedings of the 61st Annual Meeting of the Association for Computational Linguistics (Volume 1: Long Papers) . 4644–4668. [31] Yanshu Li, Jianjiang Yang, Tian Yun, Pinyuan Feng, Jinfa Huang, and Ruixiang Tang. 2025. Taco: Enhancing multimodal in-context learning via task mapping-guided sequence configuration. In Proceedings of the 2025 Conference on Empirical Methods in Natural Language Processing . 736–763. [32] Ji Lin, Wei-Ming Chen, Yujun Lin, Chuang Gan, Song Han, et al . 2020. Mcunet: Tiny deep learning on iot devices. 
+
+Advances in neural information processing systems 33 (2020), 11711–11722. [33] Sheng-Chieh Lin and Jimmy Lin. 2023. A Dense Representation Framework for Lexical and Semantic Matching. ACM Trans. Inf. Syst. 41, 4, Article 110 (April 2023), 29 pages. doi:10.1145/3582426 [34] Xi Victoria Lin, Chenglong Wang, Luke Zettlemoyer, and Michael D Ernst. 2018. NL2Bash: A Corpus and Semantic Parser for Natural Language Interface to the Linux Operating System. In Proceedings of the Eleventh International Conference on Language Resources and Evaluation (LREC 2018) .[35] Chaoqiang Liu, Dan Chen, Yu Huang, Wenjing Xiao, Haifeng Liu, Yi Zhang, Huize Li, Xiaofei Liao, and Hai Jin. 2025. SeIM: In-Memory Acceleration for Approximate Nearest Neighbor Search. In 2025 62nd ACM/IEEE Design Automation Conference (DAC) . IEEE, 1–7. [36] Hui Liu, Wenya Wang, Hao Sun, Chris Xing Tian, Chenqi Kong, Xin Dong, and Haoliang Li. 2025. Unraveling the Mechanics of Learning-Based Demonstration Selection for In-Context Learning. In Proceedings of the 63rd Annual Meeting of the Association for Computational Linguistics (Volume 1: Long Papers) . 2623–2641. [37] Jiachang Liu, Dinghan Shen, Yizhe Zhang, William B Dolan, Lawrence Carin, and Weizhu Chen. 2022. What Makes Good In-Context Examples for GPT-3?. In Proceedings of Deep Learning Inside Out (DeeLIO 2022): The 3rd Workshop on Knowledge Extraction and Integration for Deep Learning Architectures . 100–114. [38] Yao Lu, Max Bartolo, Alastair Moore, Sebastian Riedel, and Pontus Stenetorp. 2022. Fantastically Ordered Prompts and Where to Find Them: Overcoming Few-Shot Prompt Order Sensitivity. In Proceedings of the 60th Annual Meeting of the Association for Computational Linguistics (Volume 1: Long Papers) . 8086–8098. [39] Xiaofei Ma, Zhiguo Wang, Patrick Ng, Ramesh Nallapati, and Bing Xiang. 2019. Universal text representation from bert: An empirical study. arXiv preprint arXiv:1910.07973 (2019). [40] Piergiulio Mannocci, Elisabetta Giannone, and Daniele Ielmini. 2023. In-Memory Principal Component Analysis by Analogue Closed-Loop Eigendecomposition. IEEE Transactions on Circuits and Systems II: Express Briefs 71, 4 (2023), 1839–1843. [41] Zeping Min and Xinshang Wang. 2025. DOCS: Quantifying weight similarity for deeper insights into large language models. In The Thirteenth International Conference on Learning Representations .[42] Chen Nie, Chao Jiang, Liming Xiao, Weifeng Zhang, and Zhezhi He. 2025. PICK: An SRAM-based Processing-in-Memory Accelerator for K-Nearest-Neighbor Search in Point Clouds. In 2025 62nd ACM/IEEE Design Automation Conference (DAC) . IEEE, 1–7. [43] OpenClaw contributors. 2026. OpenClaw. https://github.com/openclaw/openclaw. Open-source personal AI assistant, version 2026.3.13, accessed 2026-03-15. [44] Qwen Team. 2026. Qwen3.5: Towards Native Multimodal Agents. https://qwen.ai/blog?id=qwen3.5 [45] Alec Radford, Jong Wook Kim, Chris Hallacy, Aditya Ramesh, Gabriel Goh, Sandhini Agarwal, Girish Sastry, Amanda Askell, Pamela Mishkin, Jack Clark, et al . 2021. Learning transferable visual models from natural language supervision. In International conference on machine learning . PmLR, 8748–8763. 24 Luo et al. 
+
+[46] Nils Reimers and Iryna Gurevych. 2019. Sentence-BERT: Sentence Embeddings using Siamese BERT-Networks. In 
+
+Proceedings of the 2019 Conference on Empirical Methods in Natural Language Processing and the 9th International Joint Conference on Natural Language Processing (EMNLP-IJCNLP) . 3982–3992. [47] Stephen E Robertson, Steve Walker, Susan Jones, Micheline M Hancock-Beaulieu, Mike Gatford, et al . 1995. Okapi at TREC-3 . British Library Research and Development Department. [48] Ohad Rubin, Jonathan Herzig, and Jonathan Berant. 2022. Learning To Retrieve Prompts for In-Context Learning. In Proceedings of the 2022 Conference of the North American Chapter of the Association for Computational Linguistics: Human Language Technologies . 2655–2671. [49] Dustin Schwenk, Apoorv Khandelwal, Christopher Clark, Kenneth Marino, and Roozbeh Mottaghi. 2022. A-okvqa: A benchmark for visual question answering using world knowledge. In European conference on computer vision . Springer, 146–162. [50] Yijia Shao, Tianshi Li, Weiyan Shi, Yanchen Liu, and Diyi Yang. 2024. Privacylens: Evaluating privacy norm awareness of language models in action. Advances in Neural Information Processing Systems 37 (2024), 89373–89407. [51] Richard Socher, Alex Perelygin, Jean Wu, Jason Chuang, Christopher D Manning, Andrew Y Ng, and Christopher Potts. 2013. Recursive deep models for semantic compositionality over a sentiment treebank. In Proceedings of the 2013 conference on empirical methods in natural language processing . 1631–1642. [52] Kangkang Sun, Jun Wu, Ali Kashif Bashir, Jianhua Li, Hansong Xu, Qianqian Pan, and Yasser D Al-Otaibi. 2024. Personalized privacy-preserving distributed artificial intelligence for digital-twin-driven vehicle road cooperation. 
+
+IEEE Internet of Things Journal 11, 22 (2024), 35902–35916. [53] Alon Talmor, Jonathan Herzig, Nicholas Lourie, and Jonathan Berant. 2019. Commonsenseqa: A question answering challenge targeting commonsense knowledge. In Proceedings of the 2019 Conference of the North American Chapter of the Association for Computational Linguistics: Human Language Technologies, Volume 1 (Long and Short Papers) .4149–4158. [54] Anton Voronov, Lena Wolf, and Max Ryabinin. 2024. Mind your format: Towards consistent evaluation of in-context learning improvements. In Findings of the Association for Computational Linguistics: ACL 2024 . 6287–6310. [55] Alex Wang, Amanpreet Singh, Julian Michael, Felix Hill, Omer Levy, and Samuel Bowman. 2018. GLUE: A Multi-Task Benchmark and Analysis Platform for Natural Language Understanding. In Proceedings of the 2018 EMNLP Workshop BlackboxNLP: Analyzing and Interpreting Neural Networks for NLP . 353–355. [56] Cheng Wang, Zenghui Yuan, Pan Zhou, Zichuan Xu, Ruixuan Li, and Dapeng Oliver Wu. 2023. The security and privacy of mobile-edge computing: An artificial intelligence perspective. IEEE Internet of Things Journal 10, 24 (2023), 22008–22032. [57] Jiacheng Ye, Zhiyong Wu, Jiangtao Feng, Tao Yu, and Lingpeng Kong. 2023. Compositional exemplars for in-context learning. In International Conference on Machine Learning . PMLR, 39818–39833. [58] John M Zelle and Raymond J Mooney. 1996. Learning to parse database queries using inductive logic programming. In 
+
+Proceedings of the national conference on artificial intelligence . 1050–1055. [59] Rowan Zellers, Ari Holtzman, Yonatan Bisk, Ali Farhadi, and Yejin Choi. 2019. HellaSwag: Can a Machine Really Finish Your Sentence?. In Proceedings of the 57th Annual Meeting of the Association for Computational Linguistics . 4791–4800. [60] Peng-Fei Zhang, Guangdong Bai, Hongzhi Yin, and Zi Huang. 2023. Proactive Privacy-preserving Learning for Cross-modal Retrieval. ACM Trans. Inf. Syst. 41, 2, Article 35 (Jan. 2023), 23 pages. doi:10.1145/3545799 [61] Tianyi Zhang, Jonah Yi, Bowen Yao, Zhaozhuo Xu, and Anshumali Shrivastava. 2024. Nomad-attention: Efficient llm inference on cpus through multiply-add-free attention. Advances in Neural Information Processing Systems 37 (2024), 112706–112730. [62] Yanzhao Zhang, Mingxin Li, Dingkun Long, Xin Zhang, Huan Lin, Baosong Yang, Pengjun Xie, An Yang, Dayiheng Liu, Junyang Lin, Fei Huang, and Jingren Zhou. 2025. Qwen3 Embedding: Advancing Text Embedding and Reranking Through Foundation Models. arXiv preprint arXiv:2506.05176 (2025). [63] Haozhe Zhao, Zefan Cai, Shuzheng Si, Xiaojian Ma, Kaikai An, Liang Chen, Zixuan Liu, Sheng Wang, Wenjuan Han, and Baobao Chang. 2024. MMICL: Empowering Vision-language Model with Multi-Modal In-Context Learning. In 
+
+The Twelfth International Conference on Learning Representations .[64] Penghao Zhao, Hailin Zhang, Qinhan Yu, Zhengren Wang, Yunteng Geng, Fangcheng Fu, Ling Yang, Wentao Zhang, Jie Jiang, and Bin Cui. 2026. Retrieval-augmented generation for ai-generated content: A survey. Data Science and Engineering (2026), 1–29. [65] Wayne Xin Zhao, Jing Liu, Ruiyang Ren, and Ji-Rong Wen. 2024. Dense Text Retrieval Based on Pretrained Language Models: A Survey. ACM Trans. Inf. Syst. 42, 4, Article 89 (Feb. 2024), 60 pages. doi:10.1145/3637870 [66] Han Zhou, Xingchen Wan, Lev Proleev, Diana Mincu, Jilin Chen, Katherine A Heller, and Subhrajit Roy. 2024. Batch Calibration: Rethinking Calibration for In-Context Learning and Prompt Engineering. In The Twelfth International Conference on Learning Representations .Gradient-free Task-Conditioned Retrieval for On-Device In-Context Learning 25 
+
+[67] Pushen Zuo, Qishen Wang, Yubiao Luo, Ruiqing Xie, Shiqing Wang, Zezhi Cheng, Lin Bao, Zongwei Wang, Yimao Cai, Ru Huang, et al . 2025. Precise and scalable analogue matrix equation solving using resistive random-access memory chips. Nature Electronics (2025), 1–12.
