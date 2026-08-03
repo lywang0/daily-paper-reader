@@ -6,38 +6,46 @@
 </div>
 
 ## 每次日报
-- 最新运行日期：2026-08-02
-- 运行时间：2026-08-02 21:09:25 UTC
+- 最新运行日期：2026-08-03
+- 运行时间：2026-08-03 21:56:27 UTC
 - 运行状态：成功
-- 本次总论文数：6
-- 精读区：2
+- 本次总论文数：8
+- 精读区：4
 - 速读区：4
 
 ### 今日简报（AI）
-今日精读6篇论文，聚焦LLM推理效率优化，其中投机解码与路由调度是核心亮点。最值得关注：通过功能重建替代KV重建加速推测解码，以及带预算约束的路由器设计，两者均显著提升资源利用率。建议普通读者优先浏览“功能重建”与“预算路由”方向，可快速把握高效推理的前沿思路。
-- 详情：[/202608/02/README](/202608/02/README)
+今日研读8篇论文，精读聚焦模拟存内计算系统的KV缓存保护与LLM服务性能建模。  
+最值得关注的两大方向：面向噪声鲁棒性的选择性KV缓存保护（9.0分），以及感知饱和度的轻量级服务性能建模（9.0分）。  
+建议普通读者优先了解KV缓存优化对推理效率与稳定性的实际收益，再结合动态退出与级联方案探索成本-精度平衡。
+- 详情：[/202608/03/README](/202608/03/README)
 
 ### 精读区论文标签
-1. [Beyond KV Reconstruction: Functional Reconstruction for MLA Draft Models in Speculative Decoding](/202608/02/2607.27269v1-beyond-kv-reconstruction-functional-reconstruction-for-mla-draft-models-in-speculative-decoding)  
+1. [Selective KV Cache Protection for Noise-Resilient LLM Inference on Analog Compute-In-Memory Systems](/202608/03/2607.29076v1-selective-kv-cache-protection-for-noise-resilient-llm-inference-on-analog-compute-in-memory-systems)  
    标签：评分：9.0/10、query:edge-llm
-   evidence：投机解码中MLA草稿模型的功能重建，降低解码内存流量
-2. [WISERouter: LLM Routing with Workload Budget Constraint](/202608/02/2607.23765v1-wiserouter-llm-routing-with-workload-budget-constraint)  
+   evidence：面向模拟存算一体LLM推理的抗噪算法-硬件协同设计
+2. [SLIM: Saturation-Aware Lightweight Performance Modeling for LLM Serving](/202608/03/2607.29575v1-slim-saturation-aware-lightweight-performance-modeling-for-llm-serving)  
+   标签：评分：9.0/10、query:edge-llm
+   evidence：SLIM为LLM服务提供饱和度感知的轻量性能建模，并通过硬件剖析定位解码阶段注意力内核。
+3. [Characterizing LLM Kernel Access and Memory Interaction in Multi-Partition NUMA GPUs](/202608/03/2607.28824v1-characterizing-llm-kernel-access-and-memory-interaction-in-multi-partition-numa-gpus)  
    标签：评分：8.0/10、query:edge-llm
-   evidence：预算约束下的LLM路由，属于服务框架的调度能力
+   evidence：刻画多分区NUMA GPU上LLM内核访存与局部性，服务硬件感知优化
+4. [DeltaServe: Host-Agnostic Co-Serving of Inference and Fine-Tuning for LLMs](/202608/03/2607.28848v1-deltaserve-host-agnostic-co-serving-of-inference-and-fine-tuning-for-llms)  
+   标签：评分：8.0/10、query:edge-llm
+   evidence：面向LLM的服务框架，支持推理与微调协同调度
 
 ### 速读区论文标签
-1. [Penelope: Localized Latent Recurrence for Efficient Structured Reasoning](/202608/02/2607.25915v1-penelope-localized-latent-recurrence-for-efficient-structured-reasoning)  
+1. [BLADE: Boundary-Expanded and Layer-Adaptive Dynamic Exit for Efficient LLM Reasoning](/202608/03/2607.28966v1-blade-boundary-expanded-and-layer-adaptive-dynamic-exit-for-efficient-llm-reasoning)  
    标签：评分：7.0/10、query:edge-llm
-   evidence：用局部潜在循环替代冗长CoT词元，减少自回归推理计算
-2. [RAG-HAR+: Towards Cost-Efficient LLM-Based Human Activity Recognition for Edge Deployment](/202608/02/2607.26631v1-rag-har-towards-cost-efficient-llm-based-human-activity-recognition-for-edge-deployment)  
-   标签：评分：7.0/10、query:edge-llm
-   evidence：面向边缘部署的低成本LLM推理
-3. [Understanding Is Done Early: A Depth Division of Labor in Large Language Models and Its Use for Unbounded-Context Memory](/202608/02/2607.28263v1-understanding-is-done-early-a-depth-division-of-labor-in-large-language-models-and-its-use-for-unbounded-context-memory)  
-   标签：评分：7.0/10、query:edge-llm
-   evidence：面向无界上下文的内存高效LLM推理
-4. [Gradient-free Task-Conditioned Retrieval for On-Device In-Context Learning](/202608/02/2607.27766v1-gradient-free-task-conditioned-retrieval-for-on-device-in-context-learning)  
+   evidence：通过动态早退降低计算量，实现高效LLM推理
+2. [Conformal Cascade: Distribution-Free Accuracy Guarantees for Multi-Tier LLM Inference](/202608/03/2607.25018v3-conformal-cascade-distribution-free-accuracy-guarantees-for-multi-tier-llm-inference)  
    标签：评分：6.0/10、query:edge-llm
-   evidence：在有限计算与内存预算下进行设备端上下文学习的免梯度任务条件化检索
+   evidence：多级级联通过路由降低推理开销，适合资源受限场景
+3. [Mixture-of-Translators: Translating KV Caches Across Heterogeneous Large Language Models](/202608/03/2607.28979v1-mixture-of-translators-translating-kv-caches-across-heterogeneous-large-language-models)  
+   标签：评分：6.0/10、query:edge-llm
+   evidence：面向异构LLM的KV缓存翻译，提升多模型推理可扩展性。
+4. [Studying quantization trade-offs for efficient inference deployment in machine translation](/202608/03/2607.29397v1-studying-quantization-trade-offs-for-efficient-inference-deployment-in-machine-translation)  
+   标签：评分：6.0/10、query:edge-llm
+   evidence：GPU上量化权衡用于高效推理部署
 
 
 <div class="dpr-home-promo-card">
