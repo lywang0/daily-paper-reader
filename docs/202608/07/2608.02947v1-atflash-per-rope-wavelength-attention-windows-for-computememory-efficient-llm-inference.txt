@@ -1,0 +1,531 @@
+Title: ATFlash: Per-RoPE-Wavelength Attention Windows for Compute/Memory-Efficient LLM Inference
+
+URL Source: https://arxiv.org/pdf/2608.02947v1
+
+Published Time: Wed, 05 Aug 2026 00:18:37 GMT
+
+Number of Pages: 13
+
+Markdown Content:
+# ATFlash: Per-RoPE-Wavelength Attention Windows for Compute/Memory-Efficient LLM Inference 
+
+# Shun-ichiro Hayashi 1, Daichi Mukunoki 2, Tetsuya Hoshino 2, Takahiro Katagiri 2
+
+> 1
+
+Graduate School of Informatics, Nagoya University 
+
+> 2
+
+Information Technology Center, Nagoya University hayashi@hpc.itc.nagoya-u.ac.jp, {mukunoki, hoshino, katagiri}@cc.nagoya-u.ac.jp 
+
+Abstract 
+
+The attention score with rotary position embeddings (RoPE) decomposes exactly into a sum over its 2D-rotation frequency pairs, and each pair’s wavelength limits how far it can dis-criminate position. Aligned with this structure, we propose the per-RoPE-wavelength distance window: it prunes the query– key inner-product terms beyond a wavelength-proportional distance. Unlike a sliding window, every key remains reach-able, at least through the low-frequency pairs. The reduction rate is input-independent, with a closed form logarithmic in the sequence length N , in contrast to dynamic-sparse meth-ods like MInference. Such token-level selection is orthogonal to our frequency-level pruning. The window can therefore be applied on top of those methods. On Qwen2.5-0.5B and Llama-3.2-3B, the window prunes 37–48% of the query–key inner-product terms within each model’s native context length. Relative to full attention, the top-1 match rate stays at 96–98% and the mean output-distribution KL at the 10 −3-nat level on LongBench-v2 contexts. We examine absolute scores on long-context benchmarks such as RULER, OpenAI-MRCR, Long-CodeQA, and ∞Bench: they are broadly preserved. We imple-ment the window as a slice of the query–key contraction axis, leaving the online-softmax recurrences untouched, and port it with minimal diffs into the released FlashAttention-4 prefill and FlashInfer decode. On RTX PRO 6000 with Llama, both ports outpace stock with gains growing with context length, up to 1.29 × at 128K. End to end on Qwen2.5-7B-1M, with 57% of the inner-product terms pruned, the speedup reaches 
+
+1.31 × at a 1M-token context. 
+
+# 1 Introduction 
+
+Inference for large language models (LLMs) is increasingly limited by the compute of attention and by the memory band-width of the KV cache—the intermediate state kept for past tokens—as contexts grow longer and multi-agent deploy-ments spread. FlashAttention (Dao 2024) (hereafter FA)-class kernels are the fastest implementations that carry out this computation exactly , but being exact, they do not reduce the amount of computation itself. Many approximation meth-ods that cut computation suffer from one of the following: (a) the amount of reduction is input-dependent and cannot be predicted in advance; (b) they discard tokens or KV, so the dropped information becomes structurally unreachable; or (c) they are tightly coupled to a particular kernel imple-mentation and cannot be carried to other implementations. 
+
+Figure 1: Contrast of a sliding window, the per-RoPE-wavelength distance window, and full attention (conceptual diagram, causal attention). (a): out-of-window tokens disap-pear (gray). (b): the same row is split vertically by frequency pair r and truncated by the wavelength-proportional window. CASE: actual count of inner-product terms for the last query row (Qwen2.5-0.5B, k=2 , N =32768 ). Our starting point is that the attention score with rotary position embedding (RoPE) (Su et al. 2024) decomposes 
+
+exactly into a sum of per-frequency-pair contributions (Sec-tion 3). Each pair has its own wavelength λr ; high-frequency pairs complete one period in a few tokens, and low-frequency pairs in millions of tokens. How far each component can carry positional information is determined by model con-stants (the RoPE base and dimension), independent of the input. Aligned with this structure, imposing a wavelength-proportional distance window wr = min( kλ r , N ) on each frequency pair to prune the terms of the score sum is the per-RoPE-wavelength distance window —the core of our pro-posed method, ATFlash (Figure 1). Unlike conventional win-dows that drop tokens, every token continues to be referenced through the low-frequency pairs whenever N < kλ max .We make four contributions. 
+
+• Method : We propose a per-RoPE-wavelength distance arXiv:2608.02947v1 [cs.LG] 3 Aug 2026 window aligned with the exact pair decomposition of the RoPE score. The window can be implemented as a slice of the reduction axis of online softmax, and because it discards no token it can be inserted while preserving the skeleton and numerical path of FA-class kernels. It has a single free parameter, the number of retained periods k,and requires neither training nor hand-tuning (Section 3). 
+
+• Theory : We derive the reduction rate in closed form. The reduction is logarithmic in N , and for N ≥ kλ max it asymptotes to O(1) terms per query and O(N ) overall. Measured reduction matches the closed form at every point (within the 1–2-point integral-approximation error), so reduction is predictable before running (Section 4). 
+
+• Implementation and portability : We port the window with minimal diffs into the released FlashAttention-4 (hereafter FA4) prefill and the FlashInfer decode, and on RTX PRO 6000 (sm_120, GDDR7) each surpasses its stock implementation at all evaluated Llama context lengths while remaining bit-identical with the window off. Recovery of the theoretical ceiling on Llama lines up at 85–96% across the two ports, confirming that the loss in converting theoretical reduction into real time is not implementation-specific (Sections 5–7). 
+
+• Two-layer robustness verification : We show that the method maintains 37–48% reduction in the non-extrapolation regime, a Kullback–Leibler (KL) diver-gence on the order of 10 −3, and 100% recall on in-text needle retrieval, with a two-order-of-magnitude gap over a sliding window at equal compute, at two layers— distribution and capability (Sections 6.1–6.2). Bench-mark scores are broadly preserved; the exception is re-trieval over structureless strings, where k acts as a dial— at uniform k=64 , still pruning 29% of the terms, the worst case returns to the full-attention score. 
+
+# 2 Related Work 
+
+Exact FA-class kernels. FA computes exact attention with-out materializing the score matrix, using tile-wise online softmax (Milakov and Gimelshein 2018) (sequential updates of a running max and a normalizer); from FlashAttention-2 (Dao 2024) onward the family has specialized by hardware generation (Hopper in FA3 (Shah et al. 2024), Blackwell data-center in FA4 (Zadouri et al. 2026)). This family deep-ens hardware fit while retaining all inner-product terms, and is orthogonal to our method, which selectively drops terms— we demonstrate in Section 5 that the two can be combined. 
+
+The frequency structure of RoPE. RoPE (Su et al. 2024) applies a rotation with a geometrically spaced angular ve-locity θr for each dimension pair. The structure of the wave-length λr = 2 π/θ r —high frequency for short distance, low frequency for long distance—and the division of roles— high frequency for position, low frequency for meaning—are widely observed (Barbero et al. 2025). On the other hand, it is also known that when q, k are isotropic the expectation of the RoPE contribution does not depend on distance (Barbero et al. 2025), so one cannot justify a window by assuming a 
+
+distance decay of the score. What our method relies on is not decay but the wavelength (Section 3.1), which is fun-damentally different from conventional windows based on a decay assumption. 
+
+Sparse and windowed attention. The sliding win-dow (Beltagy, Peters, and Cohan 2020), attention sinks with a recent window (Xiao et al. 2024), and KV eviction by cu-mulative scores (Zhang et al. 2023) reduce computation, but all impose the same window or selection on every frequency, so the dropped tokens become structurally unreachable. 
+
+Input-dependent dynamic sparsification. A training-free line is active here: MInference (Jiang et al. 2024) is the standard baseline with offline search over vertical-slash pat-terns, FlexPrefill (Lai et al. 2025) and XAttention (Xu et al. 2025) make the selection online and lighter, and SpargeAt-tention (Zhang et al. 2025) combines block sparsity with quantization. Approaches that use the RoPE frequency struc-ture as a cue have also appeared: FASA (Wang et al. 2026) predicts token importance from dominant frequency compo-nents and dynamically selects KV entries at decode, and Tri-Attention (Mao et al. 2026) compresses KV with a trigono-metric distance preference; both use frequencies only as a 
+
+selector , and the surviving tokens are computed at all fre-quencies. In all of these the selection is input-dependent, so the reduction is not fixed before execution. 
+
+Training-based methods. DSA (DeepSeek-AI 2025) builds a learned selector into pretraining, and SFA (Xie et al. 2026) prunes inner-product terms with learned codes. Their units of reduction differ, but both presuppose training the model itself and cannot be retrofitted. Our method carries none of the constraints (a)–(c) of Sec-tion 1: the window is determined in closed form from the wavelengths and hence input-independent, and it is training-free and retrofittable onto the standard attention layers of any pretrained RoPE model. Like SFA, our method prunes inner-product terms, but it derives the window analytically from the wavelengths and learns no codes. 
+
+Customizable attention frameworks. The customization axes of FlexAttention (Dong et al. 2024) and FlashInfer (Ye et al. 2025) run along the token (row/column) direction of the score matrix, whereas our pruning operates inside 
+
+each inner product—along the frequency-pair axis of the head dimension—which neither programming model can currently express. We realize it by minimal-diff insertion into the released FA4 and FlashInfer. 
+
+# 3 Method: Per-RoPE-Wavelength Windows 
+
+3.1 Pair Decomposition of the RoPE Score 
+
+For a query q (at position n) and a key k (at position m) with head dimension d, RoPE applies a two-dimensional rotation with angular velocity θr = B−2r/d (B is the base) to each dimension pair r ∈ { 0, . . . , d/ 2 − 1}. Writing the rotated query and key as ˜q, ˜k, the score depends only on the relative position z = n − m and can be written exactly as a sum of per-pair contributions, 
+
+˜q⊤ ˜k
+
+√d = 1
+
+√d
+
+X
+
+> r
+
+∆xm,r , ∆xm,r = ar cos( zθ r )+ br sin( zθ r )
+
+(1) Figure 2: The wavelength λr = 2 π/θ r of each pair (log axis). Qwen2.5-0.5B, Qwen2.5-7B-1M, Llama-3.2-3B (ef-fective λ′ 
+
+> r
+
+after llama3-style scaling), and gpt-oss-20b (ef-fective λ′ 
+
+> r
+
+under YaRN ×32) are shown together; horizontal lines mark each model’s training length (dashed) and the 5×
+
+extrapolation guide (solid). where ar , b r are coefficients determined by the components of q and k. The wavelength of each pair, 
+
+λr = 2 π/θ r (2) is the number of tokens over which cos , sin complete one period along the distance z, and beyond it a single pair can no longer discriminate position (aliasing). That is, high-frequency (small λr ) pairs carry positional information only nearby, while low-frequency (large λr ) pairs remain infor-mative out to long distances (Figure 2). The truncation of our method therefore assumes no score decay; it aligns with the upper limit of the distance over which each pair can dis-criminate position. We cast this as a hypothesis, that a pair’s term becomes redundant at distances where the pair cannot discriminate position, and verify it on output distributions and capabilities from Section 6.1 onward. 
+
+3.2 Window Rule 
+
+We therefore vary the distance window per frequency: 
+
+wr = min( k λ r , N ) (3) and at cell (n, m ) we keep in the score sum (1) only the pairs satisfying z ≤ wr . The number of retained periods k
+
+is the only free parameter of this rule, the wavelengths λr
+
+being model constants and N the input length; because the dependence on k is only logarithmic (Section 4), we default to k=2 . The parameter thus acts as a dial between atten-tion accuracy and compute that can be set at deployment time, much as weight precision is chosen per deployment, and its cost is known in closed form before running. High frequencies get short windows and low frequencies get long windows, producing a staircase-like profile in which farther cells have fewer active pairs (fewer inner-product terms)— for Qwen2.5-0.5B at N =32768 , k=2 , from 32 terms at z=0 
+
+down to 13 at the farthest distance shown (Figure 1, CASE). Crucially, distant tokens continue to be referenced through the low-frequency pairs; our method drops terms of the score sum per frequency rather than dropping tokens .Full token retention holds in the range N < kλ max , where the lowest-frequency window covers the sequence. A slid-ing window corresponds to the special case of imposing the highest-frequency window on all pairs (Figure 1(a)(b)). The window table (the list of window widths for each pair) is generated from the effective frequencies in the model config. Frequency transforms such as YaRN or llama3-style rope_scaling are reflected in the window rule through the ef-fective θ′ 
+
+> r
+
+(and hence λ′ 
+
+> r
+
+), with no per-scaling-scheme hand-tuning (Figure 2). 
+
+3.3 Implementation as a Slice of the Reduction Axis of Online Softmax 
+
+Because the window (3) does not depend on the input and is fixed in advance, the set of active pairs per tile is determined statically. Out-of-window pruning is implemented not as a multiplicative mask but as a shortening ( slice ) of the reduc-tion length of the inner product. As the distance z grows, pairs fall out of the window from the high-frequency side, so the active-pair set is a contiguous slice on the low-frequency side; we round its boundary to a multiple of the K-direction atom (16 elements) of the matrix multiply-accumulate (MMA) in-struction. As a result, the tiling, running max, and normalizer of the FA-class kernel are left entirely unchanged , and only the effective inner-product length of each tile shrinks stati-cally (tokens and V are loaded in full; nothing is discarded). The low-frequency terms that remain even at the farthest distance fit within a single MMA tile (Figure 1, CASE), preserving Tensor Core fill density. As in Figure 3, the window insertion merely advances the start of the pair loop to the window boundary. More important is the memory side (right of the figure): out-of-window pair components not only skip computation but are not loaded into SRAM at all for the relevant parts of K⊤ and q (gray in the figure). Thus the window cuts the QK compute and the transfer of K⊤ and q at the same ratio (the transfer of 
+
+V is not reduced). This “slice of the reduction axis” form underlies the cross-implementation portability of Section 5. 
+
+# 4 Theory: Closed-Form QK Reduction Rate 
+
+Because the window is fixed in advance, the amount of reduc-tion is deterministic and can be analyzed without running. We measure the computational cost by the number of terms of the query–key inner product in score computation: whereas full attention requires d/ 2 pairs of multiply-accumulate per causal cell, with the window only the pairs with z ≤ wr are computed. We define the reduction rate as “ 1−(number of terms retained inside the window) /(number of causal cells 
+
+× d/ 2)”. This definition is a term-count proxy that excludes softmax, the V product, and memory transfer; wall-clock time is measured in Section 7. Approximating the pair index by a continuous variable 
+
+ρ, the window width becomes the geometric progression 
+
+w(ρ) = wmin B2ρ/d (wmin = 2 πk ), and the number of re-tained terms over the interval [n0, n 1] can be written as the double integral 
+
+S(n0, n 1) = 
+
+Z n1
+
+> n0
+
+Z d/ 20
+
+min  w(ρ), n  dρ dn (4) Figure 3: FA’s online-softmax loop and where the per-RoPE-wavelength distance window is inserted (a full view including the double loop of prefill; decode corresponds to the last query row n=N only). Left: FA’s recurrences (running max μ, normalizer 
+
+ℓ′, output o′) and the causal mask. Center: the pair decomposition of the score xm and the window predicate (gray box). Right: the memory-side behavior (gray = out-of-window components, not loaded for this reduction). which solves in closed form by splitting the integral at the saturation boundary ρ∗(n) = d 
+
+> 2
+
+ln( n/w min )/ ln B (where 
+
+w(ρ∗)= n). For the whole prefill ( [0 , N ], N ≫ wmin ), 
+
+reduction prefill ≈ ln( N/w min ) − 3/2ln B (5) For Qwen2.5 at N =32 K the substituted value is 46.1% and the exact discrete sum is 47.6%; the difference is the integral-approximation error. The reduction rate for decode (the last row) has the same form, and its difference from the whole prefill is only the constant 1/(2 ln B) (3.6 points for B=10 6). Three structural facts can be read from this closed form. (i) The reduction rate is logarithmic in N (slope 1/ ln B)and deepens for longer contexts. (ii) The dependence on k
+
+is also logarithmic; doubling k costs only ln 2 / ln B of the reduction—so headroom on the quality side can be bought cheaply. (iii) For N ≥ kλ max the min of every window set-tles on the kλ r side (no window is clipped by N ), the number of retained terms reaches the constant P 
+
+> r
+
+wr independent of 
+
+N , and it becomes O(1) terms per query and O(N ) over the whole sequence (Qwen2.5, k=2 : 64% at N =200 K, 76% reduction at 1M). Note that kλ max is orders of magnitude be-yond practical context lengths (Figure 2); all experiments in this paper lie in the full-retention regime N < kλ max —the 
+
+O(N ) behavior is an asymptotic guarantee. Figure 4 shows the closed-form curves; Llama-3.2-3B is counted on its ef-fective wavelengths after llama3-style scaling, and gpt-oss-20b on its full-attention layers only (a hybrid architecture interleaving sliding-window and full-attention layers). The QK-pruned column of Table 1 (measured counts on real q, k )matches the closed form within the integral-approximation error at every point. 
+
+# 5 Implementation: Window Ports 
+
+We implement the method as minimal-diff ports into the re-leased implementations: FA4 for prefill and FlashInfer for decode. The FA4 port changes 4 files ( +296 / − 13 lines) in 
+
+Figure 4: QK term reduction against sequence length N : the closed form of Eq. (5); agreement with measurement is in Table 1. Light blue: the closed form for Qwen2.5 ( B=10 6)under YaRN at the minimal scale per N .the forward path of the CuTeDSL implementation. The base is the released upstream main (public commit 5835c73 ). The insertion truncates the QK reduction of the unmasked band to the leading MMA-K chunks of the effective inner-product length per distance band and narrows the asyn-chronous load of K columns to the same width (a prefix-only load for the contiguous slice on the low-frequency side); it does not touch the masked band, softmax, the PV product, or the online accumulation. Because all added branches resolve to compile-time constants, the window-off path generates the same trace as upstream—a bit-identical design .Because FA4’s decode path drops occupancy at query length 1, the FA4 port targets prefill. For decode we ported the same window into the decode kernel of FlashInfer 0.6.13 (the released wheel). This kernel partitions the KV sequence across blocks and merges the partial online-softmax states afterward; the loop inside each split is identical to Figure 3. The only changes are adding the window condition to the asynchronous K-load predicate and nullifying the partial QK dot under the same predicate (about 100 lines in effect); the LongBench-v2 N QK-pruned top-1 KL div full ours Qwen2.5-0.5B 8K 37.6% 97.4% 0.0020 0.36 0.38                                
+
+> 16K 42.6% 96.9% 0.0029 0.26 0.30
+> 32K 47.6% 96.2% 0.0045 0.26 0.34
+> 64K †50.4% 94.9% 0.0174 0.16 0.24
+> 160K ‡53.8% 88.1% 0.0954 0.08 0.18
+> Llama-3.2-3B 8K 38.5% 97.8% 0.0026 0.28 0.22 16K 42.5% 96.6% 0.0055 0.34 0.34 32K 45.6% 96.4% 0.0056 0.24 0.24 64K 48.1% 97.0% 0.0055 0.16 0.18
+
+Table 1: Sequence-length scaling ( k=2 , all query positions). QK-pruned = share of inner-product terms pruned. full/ours 
+
+= accuracy on official LongBench-v2 4-choice questions, 50 per band, scored by choice-letter likelihood with con-texts tail-truncated to each N ; not comparable to the official generation-based scoring. †YaRN s=2 , ‡YaRN s=5 .window-off specialization follows the stock code path. The FlashInfer port likewise resolves at compile time, and we confirm in measurement that both ports are bit-identical to stock with the window off. 
+
+# 6 Evaluation of Output Quality 
+
+This section verifies output quality at 2 layers: a rela-tive comparison against full attention (preservation rates; Section 6.1), and the absolute scores of the benchmarks themselves (Section 6.2). The experiments run on NVIDIA GH200 and H100 GPUs. 
+
+6.1 Fidelity: Preserved Output Distributions 
+
+Setup. We embedded the window into PyTorch’s eager atten-tion implementation (transformers 4.57.1; 5.5.3 for RULER and gpt-oss-20b) and compared it against full attention (win-dow off) on real models and real tasks, in fp32 (bf16 for gpt-oss-20b). The main fidelity metric is the average KL divergence (nats) from the full-attention model’s output dis-tribution, alongside the argmax match rate (top-1). 
+
+Results. Table 1 shows sequence-length scaling in the LongBench-v2 context. The wavelength-proportional k=2 
+
+window reduces the number of inner-product terms by 37– 48% in the non-extrapolation regime (within each model’s native context; up to 32K for Qwen2.5-0.5B and up to 64K for Llama) while keeping top-1 at 96–98% and KL on the order of 10 −3 nats. In the YaRN extrapolation regime the reduction grows to 53.8% (Qwen 160K) and top-1 declines gently to 88.1%. This decline mainly reflects the full-attention model itself beginning to break down in the extrapolation regime, not a long-context collapse of the window’s pruning—within the verification region, top-1 and KL stay nearly flat even as the reduction share grows (Table 1). 
+
+6.2 Capability: Absolute Benchmark Scores 
+
+Preserved distributions would mean little if capabilities broke. This section scores the window on benchmarks in absolute terms: if the terms beyond a pair’s wavelength carry noise rather than positional signal (the hypothesis of Sec-tion 3.1), pruning them should not hurt task scores—and we in fact observe scattered cases where scores rise. We verify this on worst-case retrieval (needle-in-a-haystack, Retr.KV), 
+
+long-context reference (MRCR, LongCodeQA, ∞Bench, RULER), and mathematical reasoning (GSM8K, chain-of-thought) (Table 2). 
+
+Setup. Conventions of Table 2: RULER uses its 0–100 official metric, shown as the mean of 4 tasks with the multi-key NIAH broken out; the 5-task means are 35.8 / 35.7. The 
+
+∞Bench columns give the equal-weight mean of 10 tasks with Math.Find and Retr.KV broken out, and the 12-task means are full 0.418 / ours 0.375 / MInf 0.420. LongCode is the QA subset of LongCodeBench, exhaustive over the buckets that fit the native context, and these benches score paired window-ON/OFF runs of the same samples. MRCR, LongCodeQA, and the ∞Bench columns are scored with the window injected into a vLLM (v0.22.1) at-tention backend of Qwen2.5-7B-Instruct-1M (greedy, offi-cial scoring); RULER and GSM8K use the eager-attention injection of Section 6.1. MRCR and the 4 ∞Bench tasks PassKey, Number, Retr.KV, and Math.Find are scored with fp32 attention scores, since we identified and fixed a bf16 score-rounding issue that flipped greedy selections on low-margin digit and hex retrieval; the remaining 8 tasks and LongCodeQA are confirmed invariant to the numeric type by a symmetric paired probe with the pre-fixed criterion |∆| > 2 SE and stay bf16. The QK-pruned row gives the window’s input-independent term reduction at each column’s median context, example-weighted for ∞Bench and over the median input +output length for GSM8K. The GSM8K entry divides by the stock implementation’s actual term count, since gpt-oss-20b is a hybrid of sliding-window and full-attention layers. MInference (MInf) values are measured on the official Qwen2.5-1M inference stack; within the native regime DCA reduces to identity, so they are effectively MInference alone, and because the serving stack differs, absolute levels are not always directly comparable to full/ours. The ours +MInf row overlays the window on MInference’s retained cells and prunes a further 43–50% of the retained terms. 
+
+Results. On LongBench-v2 4-choice QA (Table 1), the windowed accuracy exceeds full attention in all 5 Qwen2.5-0.5B bands, including the 2 extrapolation bands, while Llama-3.2-3B is higher in 1 of its 4 bands, equal in 2, and lower in 1; given the small per-band samples we read this as a tendency, not a significant margin. Across all 6 non-extrapolation conditions the same-answer rate is 0.88–0.96: decisions, not just distributions, are preserved. The worst case for windowing is retrieval of a specific fact placed far away. Embedding a needle at 5 depths in real LongBench-v2 text and measuring recall with greedy gener-ation, at both N =8 K and 16K the per-wavelength window (k=1 –8) achieves 100% recall at all policies and all depths 
+
+(compute ratio 0.57–0.76), whereas sliding[256] (compute ratio 0.03) is 0% at all depths . This gap is not explained by the amount of reduction: even in the iso-compute control with the compute ratio matched to 0.45, the sliding window’s model Qwen2.5-7B-1M ( d=128 ) Qwen2.5-0.5B ( d=64 ) gpt-oss-20b benchmark MRCR LongCode ∞Bench RULER GSM8K subset custom QA 10 task Math.Find Retr.KV ∗ 4 task MK-NIAH 0-shot context 66–160K 31–245K ≤262K ∼117K ∼169K 16K 16K ∼1.2K                                                                            
+
+> n165 233 1425 350 350 20 1200 300 300 500
+> k222216 →2216 →264 2216 →22QK-pruned (ours) 45.8% 46.3% 48.6% 48.2% 37.8% 50.5% 40.3% 29.0% 42.6% 42.6% 29.8% 9.8% full 0.204 0.622 0.393 0.334 0.750 20.6 96.7 0.908 ours 0.181 0.627 0.386 0.334 0.343 0.300 0.350 0.750 21.3 93.7 96.0 0.920
+> MInf 0.229 0.670 0.389 0.349 0.800 ————ours +MInf 0.218 0.640 ———0.350 —0.800 ————
+
+Table 2: Absolute benchmark scores. Bold = best within each rule-separated block; the gray/orange cell pairs contrast the fixed 
+
+k=2 window with the variable-k profile; ∗ = significant drop for the window. Conventions and symbols: Section 6.2. KL is more than two orders of magnitude larger; within the same budget it reaches only the most recent 44% of the context, whereas the per-wavelength window covers all dis-tances. On the official RULER metric the window stays level with full attention; only point-retrieval MK-NIAH (a stan-dard test distinct from the needle experiment above) drops at 
+
+k=2 and recovers under the variable-k profile (Table 2). Ap-plying the window only to gpt-oss-20b’s full-attention layers, GSM8K accuracy stays on par with the unwindowed model through multi-step reasoning (Table 2; answer match 95.2%). 
+
+Benchmark scoring at the 7B model scale. We addition-ally score the window on OpenAI-MRCR, a multi-needle co-reference retrieval benchmark, and on LongCodeQA, a code-domain 4-choice benchmark; where the window is inactive— 16K—the ON/OFF scores coincide exactly. Pooled over all bands (native n=165 pairs; Table 2), the window broadly preserves the score (full 0.204 / ours 0.181, not significant). These 165 rows are drawn deterministically and score-blind from all 583 native-length rows, and all four arms score the identical set. Paired tests (Wilcoxon signed-rank for continu-ous scores, exact McNemar for accuracies) find a significant drop for the window on only 1 task, Retr.KV ( p=0 .004 ); MRCR ( p=0 .98 ), LongCodeQA, Math.Find ( p=1 .0), and all remaining paired tasks show no significant difference, con-sistent with score preservation. This task is a point lookup over sequences with no semantic structure—the boundary case for the hypothesis of Section 3.1, which presumes posi-tional information contributes. At the k=2 default this costs accuracy; the ours 0.30 versus full 0.75 is not a rounding artifact but the window pruning retrieved keys. The loss is a compute setting rather than a hard limit: at uniform k=64 ,still pruning 29.0% of the terms, Retr.KV returns to the full-attention score ( 0.300 →0.750 ; McNemar p=0 .004 ), while the variable profile, which keeps low-frequency pairs near 
+
+k=2 , does not recover it (0.350)—what matters is long-range reach, not high-frequency precision. 
+
+# 7 Evaluation of Speed 
+
+Setup. The main measurement platform is the RTX PRO 6000 (Blackwell generation sm_120, 96 GB GDDR7)—a representative single-GPU inference platform outside the specialization targets of FA3/FA4. Measurement is a sin-gle request (batch 1); timing is the median of CUDA events, and decode is set up to eliminate the apparent speedup of L2 residency. The only FA-class implementations available as public wheels for this machine are the cuDNN backend of SDPA (PyTorch’s scaled dot-product attention) and FlashIn-fer (the public FA2–FA4 wheels do not support sm_120, but FA4 runs when built from source, and this build—at the same commit as the port base in Section 5—serves as stock FA4), and we compare against the per-case min (cuDNN, FlashIn-fer), the fastest available FA-class implementation . Each port is measured as latency normalized to its stock host; be-cause the window-off path is bit-identical to stock, this ratio isolates the effect of the window itself. 
+
+Window-table basis. The quality experiments (Sec-tions 6.1–6.2) use the effective wavelength λ′ 
+
+> r
+
+, whereas the speed measurements use the raw RoPE base. The two coincide for Qwen2.5-7B-1M, which has no rope scaling; for Llama, which has llama3-style scaling, this amounts to stronger pruning than k=2 on the effective basis; the result-ing end-to-end quality and its recovery by one step of k are reported in Section 7.2. 
+
+7.1 Measured Performance of the Ports 
+
+Decode: the FlashInfer port. With the window on, FlashIn-fer decode surpasses stock FlashInfer at all evaluated Llama context lengths (latency reductions of 6.0–22.3%; Figure 5, left). At a 160K shape outside the native context, decode keeps growing ( 1.296 × over stock) while prefill holds at the 128K level ( 1.193 × over the per-case best). On Qwen2.5-0.5B (2 KV heads, d=64 ) the K read does not dominate decode bandwidth and the window has no effect ( 1.00 ×). 
+
+Prefill: the FA4 port. With the window on, FA4 surpasses stock FA4 at all evaluated context lengths, and the reduc-tion (the arrows in Figure 5, right) grows with N (Llama 12.5 →22.7%). On Llama, moreover, both ports run below cuDNN at every context length (prefill by 6.3–16.4%). On the Qwen2.5-7B-1M shape, the same shape as the 1M run, the picture is sharper still: the windowed kernel is the fastest of the 4 systems at every N including 8K, with the reduc-tion growing from 10.4% at 8K to 29.9% at 512K. At 512K Figure 5: Latency of the two ports (Llama-3.2-3B, same run, lower is better). Left: decode; right: prefill. Bars are relative to each stock implementation (FlashInfer/FA4); dashed lines mark stock ( = 1 .0). Values inside the bars are measured times; arrows give the reduction vs stock.                 
+
+> context 64K 128K
+> k2prefill →42decode →3top-1 0.92 0.97 0.76 0.84
+> KL 0.037 0.016 0.281 0.148
+> e2e (prefill/decode) 1.11 1.11 1.17 (1.19/1.06) 1.16
+
+Table 3: The k dial (Llama-3.2-3B, LongBench-v2, n=8 ): where quality drops, one notch of k on the named side recov-ers it at about 1% of whole-request time; ratios are OFF/ON. the gain over stock ( 1.43 ×) exceeds the theoretical ceiling 
+
+2/(1 + s)=1 .35 (s = the QK slice ratio of the implemented window table) because the 3 full-attention systems degrade super-quadratically there while the window stays quadratic; the window’s intrinsic recovery is 0.77–0.83 at 8K–256K. 
+
+Agreement of recovery rates. Recovery of the theoret-ical ceiling lines up across the 2 implementation families (CUDA templates, CuTeDSL) on Llama—85–91% (Flash-Infer port) and 92–96% (FA4 port)—showing that the same methodology of minimal insertion, bit-identical window-off, and prefix-limited loads converts the bulk of the theoretical reduction into wall-clock time. 
+
+7.2 End-to-End Whole-Request Time (Llama) 
+
+Setup. We integrate the two ports into a single inference pipeline, where the KV cache written by the FA4-port prefill is read by the FlashInfer-port decode with no conversion, and measure whole-request time with the window switched on and off in the same binary (LongBench-v2 long documents truncated to each KV size, n=8 ). 
+
+Results. The saving grows monotonically with context length (Table 3). On this extreme-long-document pool the ON/OFF top-1 match falls from 0.90–0.95 at 8K–64K to 0.76 at 128K, but one notch of the retained-period count k
+
+recovers the quality. The cost is about 1% of whole-request time, demonstrating end to end that k acts as the deployment-time dial between accuracy and compute (Section 3.2). 
+
+7.3 Scaling to 1M Contexts (Qwen2.5-7B-1M) 
+
+Setup. To probe the regime where the logarithmic reduc-tion is deepest, we run the same pipeline on Qwen2.5-7B-                    
+
+> Nceiling 2/1+ sprefill decode whole-request (time) 256K ∼1.31 ×1.18 ×1.05 ×1.17 ×(58.8 →50.2 s) 512K ∼1.35 ×1.22 ×1.05 ×1.22 ×(207.5 →168.9 s) 1M ∼1.40 ×1.31 ×1.06 ×1.31 ×(766.8 →587.2 s)
+
+Table 4: End-to-end whole-request time on Qwen2.5-7B-Instruct-1M (window ON/OFF in the same binary; 64K-chunked prefill; n=6 at every N ). Ratios are OFF/ON; paren-theses give measured seconds (OFF →ON). The maximum per-request deviation from the median is ≤ ± 2.5 s; run-to-run deviation is ≤0.23% at 256K/512K (3 runs). Instruct-1M (native context 262,144, RoPE base 10 7, no rope scaling), with the window tables regenerated from its ef-fective frequencies and the prefill executed in 64K chunks (bit-identical to single-shot prefill, both arms). 
+
+Results. On LongBench-v2 long documents truncated to 256K/512K/1M tokens, the ON/OFF gains grow monotoni-cally with context, reaching a 1.31 × whole-request speedup at 1M (Table 4). The gap between the attention-only theoret-ical ceiling 2/(1 + s) and the measured prefill gains reflects non-attention compute and narrows at longer contexts as at-tention dominates. Quality holds at 256K (native) and 512K: top-1 is 0.996/0.992, and the LongBench-v2 answer accuracy at 256K is identical ON and OFF. 1M lies ×3.85 beyond the native context; top-1 falls to 0.77 there, which we report as extrapolation behavior. 
+
+# 8 Conclusion 
+
+Limitations. (i) The window is fixed in advance, and in-put adaptation is out of scope. (ii) The theoretical reduction rate is a term-count proxy (Section 4); wall-clock time is complemented by measurement. (iii) The speed measure-ments are on a representative platform of a single hardware generation (sm_120, GDDR7); generalization to other gen-erations is unverified. (iv) Quality verification centers on teacher-forced metrics. At the default k=2 one ∞Bench task degrades significantly (Retr.KV), retrieval over structureless strings, and uniform k=64 —still pruning 29% of the terms— recovers it (Section 6.2), so k trades computation against this worst case rather than fixing a hard limit. (v) Kernel speed is median-based without error bars (end-to-end devi-ations: Table 4). (vi) We do not compare directly with the frequency-exploiting sparse methods or the sink-augmented window (Xiao et al. 2024). 
+
+Future work. Main directions are V -side reduction via block-sparsification and content-addressed management of unrotated KV toward multi-request inference. 
+
+Conclusion. The ports into the released FA4 and FlashIn-fer surpass their stock implementations at all evaluated Llama context lengths, and end to end the whole-request speedup reaches 1.31 × at a 1M-token context (Table 4). 
+
+# Acknowledgments 
+
+This work was supported by the Joint Usage/Research Center for Interdisciplinary Large-scale Information Infrastructures (JHPCN) and the High Performance Computing Infrastruc-ture (HPCI) in Japan, under project ID jh260017. This work was also supported by JST, the Next Generation Edge AI Semiconductor Research and Development Project, Grant Number JPMJES2511. The experiments in this paper used the supercomputer Miyabi (OFP-II) at the Joint Center for Advanced High Performance Computing (JCAHPC), the su-percomputer Genkai at the Research Institute for Informa-tion Technology, Kyushu University, and the computational resources of R-CCS Cloud provided by the RIKEN Center for Computational Science (R-CCS). 
+
+# References 
+
+Barbero, F.; Vitvitskyi, A.; Perivolaropoulos, C.; Pascanu, R.; and Veličković, P. 2025. Round and Round We Go! What Makes Rotary Positional Encodings Useful? In International Conference on Learning Representations (ICLR) .Beltagy, I.; Peters, M. E.; and Cohan, A. 2020. Longformer: The Long-Document Transformer. arXiv:2004.05150. Dao, T. 2024. FlashAttention-2: Faster Attention with Better Parallelism and Work Partitioning. In International Confer-ence on Learning Representations (ICLR) .DeepSeek-AI. 2025. DeepSeek-V3.2: Pushing the Frontier of Open Large Language Models. arXiv:2512.02556. Dong, J.; Feng, B.; Guessous, D.; Liang, Y.; and He, H. 2024. FlexAttention: A Programming Model for Generating Optimized Attention Kernels. arXiv:2412.05496. Jiang, H.; Li, Y.; Zhang, C.; Wu, Q.; Luo, X.; Ahn, S.; Han, Z.; Abdi, A. H.; Li, D.; Lin, C.-Y.; Yang, Y.; and Qiu, L. 2024. MInference 1.0: Accelerating Pre-filling for Long-Context LLMs via Dynamic Sparse Attention. In Advances in Neural Information Processing Systems (NeurIPS) .Lai, X.; Lu, J.; Luo, Y.; Ma, Y.; and Zhou, X. 2025. Flex-Prefill: A Context-Aware Sparse Attention Mechanism for Efficient Long-Sequence Inference. In International Confer-ence on Learning Representations (ICLR) .Mao, W.; Lin, X.; Huang, W.; Xie, Y.; Fu, T.; Zhuang, B.; Han, S.; and Chen, Y. 2026. TriAttention: Efficient Long Reasoning with Trigonometric KV Compression. arXiv:2604.04921. Milakov, M.; and Gimelshein, N. 2018. Online normalizer calculation for softmax. arXiv:1805.02867. Shah, J.; Bikshandi, G.; Zhang, Y.; Thakkar, V.; Ramani, P.; and Dao, T. 2024. FlashAttention-3: Fast and Accurate Attention with Asynchrony and Low-precision. In Advances in Neural Information Processing Systems (NeurIPS) .Su, J.; Ahmed, M.; Lu, Y.; Pan, S.; Bo, W.; and Liu, Y. 2024. RoFormer: Enhanced Transformer with Rotary Position Em-bedding. Neurocomputing , 568: 127063. Wang, Q.; Yousefijamarani, Z.; Heisler, M. L.; Gu, R.; Bai, X.; Shan, Y.; Zhang, W.; Wang, L.; Xiong, Y.; Zhang, Y.; and Fan, Z. 2025. MEPIC: Memory Efficient Posi-tion Independent Caching for LLM Serving. arXiv preprint arXiv:2512.16822. Version 1, December 18, 2025. Wang, Y.; Wang, Y.; Yue, Z.; Zeng, H.; Wang, Y.; Lourent-zou, I.; Tu, Z.; Chu, X.; and McAuley, J. 2026. FASA: Frequency-aware Sparse Attention. In International Confer-ence on Learning Representations (ICLR) .Xiao, G.; Tian, Y.; Chen, B.; Han, S.; and Lewis, M. 2024. Efficient Streaming Language Models with Attention Sinks. In International Conference on Learning Representations (ICLR) .Xie, Y.; Wen, T.; Huang, T.; Chen, B.; You, C.; Jegelka, S.; and Wang, Y. 2026. Scaling Attention via Feature Sparsity. arXiv:2603.22300. Xu, R.; Xiao, G.; Huang, H.; Guo, J.; and Han, S. 2025. XAt-tention: Block Sparse Attention with Antidiagonal Scoring. In International Conference on Machine Learning (ICML) ,69819–69831. Ye, Z.; Chen, L.; Lai, R.; Lin, W.; Zhang, Y.; Wang, S.; Chen, T.; Kasikci, B.; Grover, V.; Krishnamurthy, A.; and Ceze, L. 2025. FlashInfer: Efficient and Customizable Attention En-gine for LLM Inference Serving. In Proceedings of Machine Learning and Systems (MLSys) .Zadouri, T.; Hoehnerbach, M.; Shah, J.; Liu, T.; Thakkar, V.; and Dao, T. 2026. FlashAttention-4: Algorithm and Kernel Pipelining Co-Design for Asymmetric Hardware Scaling. arXiv:2603.05451. Zhang, J.; Xiang, C.; Huang, H.; Wei, J.; Xi, H.; Zhu, J.; and Chen, J. 2025. SpargeAttention: Accurate and Training-free Sparse Attention Accelerating Any Model Inference. In International Conference on Machine Learning (ICML) ,76397–76413. Zhang, Z.; et al. 2023. H 2O: Heavy-Hitter Oracle for Effi-cient Generative Inference of Large Language Models. In Ad-vances in Neural Information Processing Systems (NeurIPS) .Appendix 
+
+This appendix records (A) a family of window rules of which the per-RoPE-wavelength distance window is one point, (B) the distinction between the cache footprint, which position-independent caching shrinks, and the read-time ro-tation count, which the window prunes, (C) the closed form of the reduction rate, including the decode case that the main text states without writing out, (D) the two implementation routes the pair decomposition admits, and why we take the one that keeps an FA-class kernel intact, and (E) notes on measurement and verification. 
+
+# A Generalizing the window rule 
+
+We use the notation of the main text throughout ( d, the pair index r, the wavelength λr , the RoPE base B, the context length N , the per-pair window width wr ). The default window wr = min( kλ r , N ) of the main text is one point of a larger family. Factorizing a window into a retention profile kr times a power of the wavelength, clamped between a floor and a ceiling, gives 
+
+wr = min  max( kr λγr + a r+1  
+
+> d/ 2
+
+, β ), W  (6) where kr is the retention profile (a constant k, or a gradi-ent that keeps more periods at high frequencies), γ is the wavelength exponent, β is a floor in tokens that keeps near distances in full, W is a ceiling, and a r+1  
+
+> d/ 2
+
+is an additive term that is linear in the pair index r and carries no wavelength dependence at all; it is 0 in most settings. The default win-dow is the special case kr =k, γ =1 , β =0 , W =N, a =0 ;setting kr =0 , a =W degenerates to a linear window, which the figures label as such. Figure 6 illustrates the factorization panel by panel. The retention profile is either constant or interpolates from a high-frequency value khi down to a low-frequency value 
+
+klo . We sweep two interpolations, and the figures name them accordingly: k-arithmetic decreases kr by a constant amount per pair, linear in r; the variable-k profile of the main text is this case with kr = 16 − 14  
+
+> d/ 2−1
+
+r, running from 16 at the highest frequency to 2 at the lowest. k-geometric instead decreases kr by a constant ratio per pair, so it falls faster at high frequencies. The other labels follow the same equation: 
+
+cN is a ceiling set as a fraction of the sequence length, and 
+
+n% is the fraction of the lowest pairs made position-free. 
+
+Sliding W is the sliding window, the special case in which every pair receives the same width. 
+
+Position-free pairs as a limit. A pair whose rotation is removed (NoPE) has no wavelength, so no distance renders it positionally uninformative: it is the limit θr → 0, in which 
+
+wr ≥ N for every N and the pair is retained permanently. The fraction of low-frequency pairs treated this way is a sepa-rate knob from the window factorization itself. Architectures that interleave rotated and unrotated attention layers there-fore fall inside the same description: the rotated layers are pruned by Eq. (6) and the unrotated ones are not pruned at all. 
+
+Figure 6: Factorization of the window pattern into a retention profile, a power of the RoPE wavelength, and floor/ceiling terms. 
+
+Sweeping the family. Figure 7 sweeps the knobs of Eq. (6) against the compute they save, measured as the fraction of inner-product terms pruned, the quantity the main text re-ports as QK-pruned. The sweep runs on Qwen2.5-0.5B at 
+
+N =8192 ; the error axis is the relative deviation of the win-dowed attention output from full attention, taken per head as the 95th percentile over query positions and summarized by the median head. This deviation is measured on the at-tention output itself; closeness of the model’s output distri-bution and task scores are established separately in the main text. Three things are visible. The sliding window is domi-nated everywhere: at any level of pruning it carries an error far above every wavelength-scaled setting. The wavelength-scaled families—the exponent γ, the floor β, the cap cN ,and a gradient in kr —collapse onto a common front over the practical range, so within this setting the additional knobs buy little over the plain γ=1 default that the main text uses. Making a fraction of the low-frequency pairs position-free costs error at equal compute, which is the expected price of removing the very components that carry long-range posi-tion. 
+
+Fidelity along the sequence. The main text reports the mean KL divergence per band. Figure 8 resolves it along the query position: within the non-extrapolation regime the curves stay in the 10 −3 nat range, and only the two YaRN-extended settings depart from it. Figure 7: Error of the window families of Eq. (6) against the fraction of inner-product terms pruned (QK-pruned); Qwen2.5-0.5B, N =8192 . Left: the whole sweep on a logarithmic error axis; right: the practical range on a linear axis. Series and marker conventions are given by the in-figure legends; the families are defined in the text. 
+
+Figure 8: KL divergence from full attention against query position in the sequence, per context length. Solid lines give the mean per-token KL within each position bin; the shaded band above each line extends from that mean to the 95th percentile of the same bin (the upper tail). 
+
+# B Cache footprint versus rotation count 
+
+Position-independent caching (MEPIC (Wang et al. 2025)) keeps the KV cache unrotated and fuses the rotation into attention at read time; this shrinks the memory the cache must hold—its footprint —because entries carry no position yet and can be shared or deduplicated across requests. The per-wavelength window does not shrink the cache. What it re-duces is the number of rotations that have to be applied at read time: out-of-window pair components are never brought into on-chip memory (SRAM), so the corresponding rotations— and the trigonometric evaluations or table lookups behind them—are not performed either. The two reductions therefore act on different axes of the same runtime-fused path and can be applied together. The main text measures the analogous composition with token-level sparsity: overlaying the window on the cells kept by a dynamic-sparse method prunes a further 43–50% of the retained terms. In the single-request, single-GPU setting of our speed measurements the trigonometric work is not the bottleneck, which is why the main text quantifies compute in inner-product terms and in transferred bytes. Multi-request serving by itself does not change this either: per request, the rotation work still grows only linearly. What changes the picture is the position-independent cache itself. There the cache holds 
+
+one unrotated entry per token , shared across the requests that reference it, and the rotation is fused into every read: the trigonometric work then scales not with the tokens written but with the reads of that entry, summed over all sharing requests (Wang et al. 2025). Reads dwarf writes in exactly the settings that motivate such caches, and it is this read-time rotation that the per-wavelength window prunes pair by pair. That regime is outside the scope of this paper. 
+
+# C Deriving the reduction rate 
+
+The main text solves the double integral over rows and pair index for the whole prefill. It is worth solving it once for an ar-bitrary row interval, because prefill and decode then become the same expression evaluated on different rows rather than two separate derivations. We then carry the same integral through the window family of Eq. (6). 
+
+Step 1: an arbitrary row interval. Following the main text we relax the discrete pair index r to a continuous variable 
+
+ρ; for the default window ( kr =k, γ=1 ) this gives w(ρ) = 
+
+wmin B2ρ/d with wmin = 2 πk . Let s(n) denote the number of inner-product terms the window retains in query row n,the integrand of the main text’s double integral S (the letter 
+
+K is kept for the truncation order of Appendix D): 
+
+s(n) = 
+
+Z d/ 20
+
+min  w(ρ), n  dρ. (7) Figure 9: The split of Eq. (8) for a single query row, to scale (Qwen2.5-0.5B constants, k=2 , n=16384 ). The painted ar-eas equal the two terms: orange under the dashed continuous 
+
+w(ρ) up to ρ∗(n)=16 .6, yellow beyond; gray: pruned. The cyan steps mark the discrete min( wr , n ) actually counted; their deviation from the curve is the integral-approximation error (pruned: 46.3% discrete, 44.7% continuous). Full attention computes d 
+
+> 2
+
+n terms in the same row. For 
+
+n ≥ wmin the minimum switches at the saturation boundary 
+
+ρ∗(n) = d 
+
+> 2
+
+ln( n/w min )/ ln B, where w(ρ∗)= n, so 
+
+s(n) = 
+
+Z ρ∗
+
+> 0
+
+w(ρ) dρ 
+
+| {z }
+
+> ρ<ρ ∗(n)
+
++
+
+ d
+
+2 − ρ∗(n)
+
+
+
+n
+
+| {z }
+
+> ρ≥ρ∗(n)
+
+. (8) The first term integrates the window widths of the pairs left of the boundary and evaluates to d  
+
+> 2 ln B
+
+(n − wmin ); the second counts the remaining pairs, for which the causal length n
+
+binds instead. Figure 9 draws the split to scale for a single query row, each area labeled by its own term. Integrating the pruned count d 
+
+> 2
+
+n − s(n) over the rows 
+
+[n0, n 1] and dividing by the d 
+
+> 2
+
+· n21−n20 
+
+> 2
+
+terms that full attention holds there gives the reduction rate of that interval, which we denote R(n0, n 1). Writing 
+
+F (n) = n2
+
+ln nwmin 
+
+− 32
+
+
+
++ 2 wmin n (9) for the primitive that this integration produces (up to constant factors), 
+
+R(n0, n 1) = 
+
+ F (n) n1
+
+> n0
+
+(n21 − n20) ln B . (10) 
+
+Step 2: prefill and decode as substitutions. Both cases of the main text are substitutions into Eq. (10), and each constant can be read straight off F . The whole prefill is (n0, n 1) = (1 , N ), where F (1) is negligible and F (N )/(N 2 ln B) re-mains; dropping the 2wmin N term for N ≫ wmin leaves the prefill form with exactly the constant the primitive carries, 
+
+− 32 . Decode is the last row alone, (n0, n 1) = ( N −1, N ): the bracket is then the unit-step difference F (N ) − F (N −1) ,which is F ′(N ) to leading order, with 
+
+F ′(n) = 2 n ln nwmin − 1 + 2 wmin , (11) and division by the denominator (2 N −1) ln B ≃ 2N ln B
+
+leaves −1. In the notation of the main text, as N → ∞ below saturation, 
+
+reduction prefill = R(1 , N )= ln( N/w min ) − 3/2ln B + O wmin /N ,
+
+reduction decode = R(N −1, N )= ln( N/w min ) − 1ln B + O wmin /N .
+
+(12) The two constants are therefore not separate results: the whole prefill reads the primitive, decode reads its deriva-tive. The O(wmin /N ) terms can be written out: evaluat-ing the last row directly, with no outer integration, gives 
+
+1 − s(N )/( d 
+
+> 2
+
+N ) = ln( N/w min ) − 1 + wmin /N / ln B, so the decode error is exactly wmin /(N ln B), and the prefill form carries 2wmin /N in the same place. Neither leading term is a limit value: the rates rise along the logarithmic law until saturation ends it, and the only value the reduction converges to as N → ∞ is 1 (Step 3). 
+
+The interval itself, not only its two extremes. Keeping the general interval has a direct use. In a long-running session, a further user message or a returned tool result is appended on top of a context that is already long, and with the existing KV retained, only the new rows are computed. Each such step evaluates [n0, n 1] with n0 the length already present, which is Eq. (10) with neither extreme substituted—the whole prefill (n0=1 ) and decode ( n1−n0=1 ) are its endpoints. The reduc-tion rises as n0 moves up the context, because the short early rows, the ones no window can prune, are no longer counted: over the second half of the context, [N/ 2, N ], Eq. (10) gives, to the same order,  ln( N/w min ) − 1.27 / ln B, about 1.7 points above the whole prefill at B=10 6, or half of the 3.6-point gap to decode. (This is distinct from chunked prefill, which splits one input but still computes every row from 1 to 
+
+N , so its total remains R(1 , N ).) 
+
+Step 3: what converges as N grows. Two things do. First, both intervals share the slope 1/ ln B, so their gap converges to the constant ( 32 − 1) / ln B = 1 /(2 ln B)—the 3.6 points quoted in the main text at B=10 6. Decode is the deeper of the two because the prefill value averages in the early rows, which are still short enough for the window to cover them. Second, the logarithmic law itself holds only until the boundary saturates: at N = kλ max = wmin B we have 
+
+ρ∗=d/ 2, no window is clipped by n, and Eq. (8) collapses to 
+
+s = P 
+
+> r
+
+wr , independent of n. The decode reduction reaches 
+
+1 − 1/ ln B there (92.8% at B=10 6) and tends to 1 beyond it, since the retained count stays fixed while the row keeps growing. Step 4: the same integral over the general family. Car-ried through the same steps, Eq. (6) shows that the wavelength exponent reduces to the same law. With w(ρ) = kλ (ρ)γ and 
+
+λ(ρ) = 2 πB 2ρ/d , the window is again a geometric pro-gression, w(ρ) = k(2 π)γ B2γρ/d , so every expression above survives under the two replacements 
+
+ln B −→ γ ln B, wmin −→ k(2 π)γ . (13) The exponent therefore acts exactly as a rescaling of the RoPE base to Bγ : a γ-window on a model of base B prunes like the default window on a model of base Bγ . Saturation moves to 
+
+N = kλ γ
+
+> max
+
+, where the decode reduction is 1 − 1/(γ ln B).The other end of the family behaves differently in kind. The degenerate linear window ( kr =0 , a=W , i.e. w(ρ) = 
+
+W (ρ+1) /(d/ 2) ) saturates at ρ∗ = d 
+
+> 2
+
+(n/W ) − 1, and the same two integrals give a retention rate 1 − n/ (2 W ) up to O(1 /d ) corrections. Its reduction is therefore linear in 
+
+n rather than logarithmic: it reaches one half at n=W and then follows 1 − W/ (2 n) once every window is saturated. Both ends tend to full pruning, but the wavelength-scaled family approaches it logarithmically while the linear window approaches it as 1/n —which is the structural reason the two are not interchangeable at a fixed compute budget. The floor β and the ceiling W keep the integral elemen-tary; they only add breakpoints where w(ρ) meets them, splitting [0 , d/ 2] into further subintervals of the same two kinds. The one exception is the mixed case: when the expo-nential and the additive linear term are both active, w(ρ∗)= n
+
+is transcendental in ρ∗, and its root is a value of the Lambert function W0 (not the window ceiling W ). The family is thus elementary at either end but not in between. 
+
+# D Two routes: slicing and accumulation 
+
+The exact pair decomposition admits two implementation routes. One slices the reduction axis and leaves the sur-rounding kernel alone; the other turns the sum over pairs into a recurrence and accumulates the exponential along it. We take only the first, and this section records why. 
+
+(a) Slicing the reduction axis (the main text). Because the window is static, the set of active pairs per tile is known at compile time, so the tiling, the running maximum, and the normalizer of an FA-class kernel are left untouched and only the effective inner-product length shrinks. Nothing about the model is assumed beyond the RoPE constants. 
+
+(b) Accumulating the exponential in increment form. 
+
+With the partial sum of the score over pairs written as 
+
+cm,r = cm,r −1 + ∆ xm,r , where m is the key position and 
+
+∆xm,r the per-pair contribution of the main text’s score de-composition, and with ℓm,r = ecm,r , the exponential law gives the identity 
+
+ℓm,r = ℓm,r −1 + e cm,r −1  e ∆xm,r − 1, (14) which is exact. Each pair then contributes only through the increment e∆xm,r − 1, which for small arguments can be truncated, 
+
+e ∆xm,r − 1 = ∆ xm,r + ∆x2
+
+> m,r
+
+2! + ∆x3
+
+> m,r
+
+3! + · · · , (15) 
+
+Figure 10: Relative error of the truncated increment against the truncation order, for a model with query–key normaliza-tion (OLMo-2-1B) and for one without (Qwen2.5-0.5B). so that the exponential is never evaluated directly. The catch is the range of ∆x, and it is not a matter of degree. Figure 10 contrasts a model that normalizes queries and keys with one that does not. With normalization the error falls steadily with the order: the median head reaches 5.4 × 10 −4 at K=4 and 
+
+1.1 × 10 −8 at K=8 . Without it the median error is two to three orders of magnitude larger at equal truncation order (2.4 × 10 −1 at K=4 ). More damaging for a kernel, which must be correct for every head, the worst heads diverge as the order grows: the largest head error rises from 9.4 × 10 2 at 
+
+K=1 to 1.5×10 19 at K=8 , and one head overflows outright, because the expansion is applied to logits of magnitude ∼
+
+9.4 × 10 2. Route (b) also gives up the running-maximum subtraction that makes the standard formulation safe, so it is a different kernel architecture rather than a modification of one. We take route (a) because it is model-agnostic: it requires no assumption on the logit range and it preserves bit-identity with the host kernel when the window is off. Route (b) re-mains open, and with it the question that both routes share— how to avoid holding ex per element at all. 
+
+Precision as the other side of the compute–accuracy trade. Pruning terms shortens the score sum, which can narrow the margins that decide the arg-max. We observed this directly on the digit-retrieval task Math.Find: under bf16 the windowed arm’s score was depressed while the full-attention arm was invariant to the numeric type, and rescoring both arms in fp32 closed the gap; the paired test in the main text returns p=1 .0. Splitting a low-precision product to recover accuracy is therefore a natural direction for spending part of what the window saves; we make no performance claim here. 
+
+# E Notes on measurement and verification 
+
+These notes record protocol details that the main text com-presses for space; none of them changes a reported number. 
+
+Answer-format addendum for retrieval-style tasks. The four retrieval-style ∞Bench tasks (PassKey, Number, Retr.KV, Code.Run) are scored under a one-line prompt ad-dendum that fixes the answer format. Two-site execution of ∞Bench. Byte-identity of the 
+
+∞Bench data and tokenizer across the main text’s two GPU platforms was verified. 
+
+MRCR native sample. The recipe behind the main text’s draw of the n=165 native rows: within each length bin the rows are sorted by length, and contiguous blocks from a fixed offset are accumulated wave by wave. In the extrapo-lation band (491–496K tokens, n=3 , where the dual-chunk attention (DCA) mechanism of the official serving stack is active) every method scores near zero. 
+
+Choice of the official RULER metric. On the broad-reference tasks—variable tracking (VT), common-words ex-traction (CWE), and frequent-words extraction (FWE)— strict accuracy is zero even for full attention; the official metric is the one under which the baseline itself is measur-able. 
+
+Implementation checks behind bit-identity. Beyond bit-identity with the window off, the ports passed: equality of the window-on path at k=∞ with the window-off path; cor-rectness against a reference implementation; hash-identical kernel outputs before and after rebasing the window patch (FA4 port); and, for the FlashInfer port, agreement of out-put hashes across four configurations on Llama with the window tables rounded, at injection, to that port’s 16-byte vector-load granularity (a load-path constant, distinct from the slice-boundary rounding of the main text). 
+
+Decode timing without L2 residency. The decode plat-form has a nominal bandwidth of 1,792 GB/s and a 128 MiB L2; timed reads cycle through a KV pool of at least 512 MiB.

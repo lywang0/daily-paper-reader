@@ -1,0 +1,324 @@
+Title: On Design Principles for Efficient Heterogeneous DRAM-PIM-GPU Systems
+
+URL Source: https://arxiv.org/pdf/2608.04169v1
+
+Published Time: Thu, 06 Aug 2026 00:07:44 GMT
+
+Number of Pages: 7
+
+Markdown Content:
+# On Design Principles for Efficient Heterogeneous DRAM-PIM-GPU Systems 
+
+Corey Lammie ∗† , Hadjer Benmeziane ∗, William Andrew Simon ∗, Irem Boybat ∗∗IBM Research, S¨ aumerstrasse 4, 8803 R¨ uschlikon, Switzerland, †Email: corey.lammie@ibm.com 
+
+Abstract —Heterogeneous DRAM-based processing-in-memory (PIM)-GPU systems promise significant efficiency gains for decode-phase large language model (LLM) inference, particularly in long-output generation, yet current design practices overlook critical factors that determine real-world performance. Through systematic evaluation of diverse architectures and workloads (OPT-7B/70B, Mamba2-2.7B/70B), we reveal three fundamental design principles: (i) static power consumption (DRAM leakage, refresh, and GPU idle power) can dominate the efficiency cal-culus, causing dynamic-only models to overestimate tokens/s/W by up to 3.85 × for realistic deployments (Mamba2-2.7B, batch size 1, 128 input tokens, and 2,048 output tokens); (ii) decoding performance is monotonically non-decreasing with channel count across all evaluated models and workloads, generally plateauing at high channel counts for low-batch workloads; under a fixed-capacity sweep, all models instead share a common near-optimal hierarchy configuration, with substantially larger misconfigura-tion penalties for attention-based models; (iii) workload mapping strategies provide bounded improvements (up to 14.0%/17.4% kernel-level latency/energy reduction, up to 5.6% end-to-end gain) and are not primary bottlenecks. Significant efficiency gains require system-wide co-optimization. These principles provide design-space guidance for architects designing the next genera-tion of memory-accelerated LLM systems. 
+
+Index Terms —DRAM-PIM, System-level Exploration, LLM Inference Acceleration 
+
+I. Introduction 
+
+Large Language Models (LLMs) push modern hard-ware against memory-bandwidth bottlenecks: GPUs excel at compute, but attention, recurrent state updates, and other memory-intensive operations stall on bandwidth. Processing In-Memory (PIM), particularly DRAM-based PIM (DRAM-PIM), offers a promising path forward by bringing compu-tation closer to data and reducing costly data movement [1]. Due to the high maturity of DRAM and low adoption barrier of DRAM-PIM, heterogeneous systems that co-locate or inte-grate DRAM-PIM units with GPUs, such as those depicted in Fig. 1a-c, are emerging as an attractive platform for decode-phase LLM acceleration in long-output generation [2]. Although recent work highlights the potential of using DRAM-PIM for LLM execution, the broader architectural implications remain insufficiently understood. Key design factors, namely DRAM hierarchy organization, static power, 
+
+© 2026 IEEE. Personal use of this material is permitted. Permission from IEEE must be obtained for all other uses, in any current or future media, including reprinting/republishing this material for advertising or promotional purposes, creating new collective works, for resale or redistribution to servers or lists, or reuse of any copyrighted component of this work in other works. Bank Bank Group Rank DRAM-PIM Chip 
+
+(a) (b) Near-Bank PU (c) 
+
+Channel 
+
+GPU+PIM (Integrated) 
+
+GPU 
+
+Bank Bank Group Bank 
+
+Bank Group 
+
+... ... 
+
+> GPU+PIM (CXL)
+
+CXL (PCIe6) 
+
+DRAM-PIM GPU 
+
+> GPU+PIM (NVLink)
+
+NVLink3 
+
+GPU Bank Row Buffer Bank Row Buffer 
+
+> Near-Bank PU
+
+(d) 
+
+> OLP Accumulator
+
+Dot Product Unit Register Adder Register Multiplier Multiplier ILP DRAM-PIM DRAM-PIM DRAM DRAM 
+
+Fig. 1. (a) DRAM-PIM chip architecture with reconfigurable channels, ranks, bank groups, and banks. (b) Near-Bank Processing Unit (NBPU) connected to pairs of banks. (c) Heterogeneous DRAM-PIM-GPU systems considered. (d) Decoding performance vs. channel count for GPU+PIM (CXL) (OPT-7B, ISL=2048, OSL=2048); GPU baseline ( ×1 A100 (80 GiB)) varies batch size. 
+
+workload mapping, and interconnect choice, interact in non-obvious ways. For instance, adding DRAM channels can yield arXiv:2608.04169v1 [cs.AR] 4 Aug 2026 diminishing returns when workloads lack sufficient memory-level parallelism (Fig. 1d), and static power from idle com-ponents can negate PIM throughput gains entirely at low batch sizes. Through comprehensive system-level evaluation, we derive three actionable design principles that provide con-crete guidance for designing efficient heterogeneous memory systems:  
+
+> •
+
+We quantify the impact of static power (DRAM leakage, refresh, GPU idle) on system-level efficiency, showing that neglecting it overestimates tokens/s/W by up to 3.85 × and fundamentally shifts optimal design points;  
+
+> •
+
+We demonstrate that decoding performance is monotoni-cally non-decreasing with channel count across all evaluated models and workloads, generally plateauing at high channel counts for low-batch workloads. Under a fixed-capacity sweep, all models instead share a common near-optimal region; the risk is an approximately 2 × larger fractional misconfiguration penalty for attention-based than SSM-based models;  
+
+> •
+
+Finally, we present RowLocalChunk, a locality-aware work-load mapping, showing that it reduces kernel-level la-tency/energy by up to 14.0%/17.4%, while end-to-end (mapping-level) gains remain bounded (up to 5.6%). 
+
+II. Background and Motivation 
+
+DRAM-based PIM extends commodity memory with low-cost compute capability [1], with feasibility demonstrated in manufactured silicon (Samsung, SK Hynix, UPMEM). In het-erogeneous systems, GPUs can handle compute-bound kernels while PIM units accelerate bandwidth-limited operations such as KV-cache accesses and state updates [3], [4], aligning naturally with modern LLMs. Achieving system-level effi-ciency, however, depends jointly on static power (e.g., DRAM leakage/refresh, GPU idle power during PIM execution), DRAM hierarchy organization (e.g., channels, ranks, bank groups, banks), workload partitioning/mapping (fixed vs. dy-namic [5]), data layout [6], and GPU–PIM interconnect choice (e.g., integrated vs. Compute Express Link (CXL)/NVLink-attached [2]), each shaping latency, bandwidth, and power differently. Existing evaluation tools address only subsets of these factors: NicePIM [6] and Pimba [3] target workload mapping; PAPI [5] and AttAcc [4] additionally model inter-connects; none jointly capture static power alongside hierarchy exploration for LLM decode. We evaluate all of these factors jointly across OPT and Mamba2 decode workloads. 
+
+III. Experimental Setup 
+
+We study heterogeneous GPU–DRAM-PIM systems across hierarchy organizations, workload mappings, and interconnect options. We instantiate a representative Near-Bank Processing Unit (NBPU) design following Pimba [3]/AttAcc [4]: 640 NBPUs operating at 378 MHz per unit, one per two banks (for the default 40-channel/1,280-bank hierarchy), each supporting MX8 dot-product/multiply–accumulate and accumulation per the cited architectures — an architectural capability we adopt from these proposals rather than independently re-verify at the ALU level, since this simulator tracks NBPU activity only as an opaque per-cycle compute-event count. Active NBPU energy is accounted per executed compute event, scaling with operation count, while idle pim (Fig. 4) is the co-located PIM-HBM’s precharged-standby background power plus its average refresh power (capacity-normalized as above), charged only to CXL/NVLink co-located configurations and never to integrated DRAM-PIM, which shares the GPU’s own already-installed HBM. Our goal is comparative design-space evaluation rather than cycle-exact reproduction of a commercial GPU. We there-fore calibrate static GPU power using NVML idle measure-ments, DRAM leakage and refresh using prior experimental DRAM characterization [7] and DRAMPower-style parame-ters [8], and interconnect latency/bandwidth using published NVLink/CXL values. We adapt and extend ramulator2 [9] (memory) plus attacc simulator [4] and Pimba [3] (system) to model static power (DRAM refresh/leakage), flexible op-eration mapping, and both integrated and co-located DRAM-PIM–GPU configurations across interconnect types. This cap-tures GPU idle power during PIM execution, transfer/compute contention, and hierarchy-mapping interplay. Each system pairs one or more NVIDIA A100 GPUs (80 GiB HBM2e, peak memory bandwidth 1,935 GB/s, 5HBM stacks, 108 SMs [10]) with DRAM-PIM. We con-sider three integration strategies, as introduced in Section II: integrated DRAM-PIM sharing the GPU memory bus, and co-located DRAM-PIM connected via CXL (PCIe 6.0) or NVLink3. We hold the physical-channel transfer rate at 3,024 MT/s; aggregate DRAM-PIM bandwidth scales with the configured channel count. HBM2-vs-HBM2e differences fall within our ±20% sensitivity envelope ( §IV-A). The DRAM is configured with a refresh interval of 3.9 𝜇 s, matching Pimba’s reported HBM 𝑡 REFI [3], and a refresh energy of 4.89 nJ per bank per event (0.72–4.89 nJ sensitivity) – our own density/capacity-scaled modeling estimate, derived using the DRAMPower methodology [8] rather than a value either work reports directly. Where per-unit PIM capacity is fixed but distributed across different numbers of physical banks (Fig. 6), we scale refresh energy per bank event linearly with per-bank capacity: 
+
+𝐸 ref ,bank = 4.89 nJ × 𝐶 bank 
+
+64 MiB ,
+
+where 64 MiB is the per-bank capacity of the reference 1,280-bank organization. At fixed 𝑡 REFI , aggregate refresh power therefore tracks the fixed per-unit capacity rather than the num-ber of banks. A separate, physically co-located PIM-HBM unit (CXL/NVLink-attached) additionally draws a flat 8.41 W/unit precharged-standby background power (2.10–8.41 W sensitiv-ity), our own capacity-scaled estimate for an 80 GiB HBM stack derived from the DDR3L background-power characteri-zation in [7] (no HBM-specific value is directly reported); this value is kept separate from the A100 (80 GiB) system-level power measurement, and this background term is not charged for integrated DRAM-PIM, which shares the GPU’s own already-installed HBM. Context-active GPU power is mod-TABLE I               
+
+> Static-power and interconnect parameters. Refresh energy ×1,280 banks / refresh interval ≈1.60 W/unit nominal refresh power.
+> Component Value
+> A100 context-active (board, incl. HBM) 80 W PIM-HBM background power (co-located only) 8.41 W/unit [7] Refresh energy 4.89 nJ/bank/event [8] Refresh interval 3.9 𝜇 s [3] NVLink3 BW (directional) 300 GB/s [10] NVLink3 latency 1.0 𝜇 s [4] CXL over PCIe 6.0 BW (directional) 120 GB/s
+
+eled at a nominal 80 W per A100 board, including installed HBM, based on our observed NVIDIA Management Library (NVML) telemetry. We additionally validate, per GPU, that context power plus dynamic energy over time never exceeds the A100 PCIe 300 W board limit [10]. Table I summarizes all static-power and interconnect parameters (main/nominal values; sensitivity ranges are evaluated in Table II, §IV-A). Following common practice [3], prefill operations are ex-ecuted entirely on the GPU(s), as they are predominantly compute-bound. Our analysis targets decode, which dom-inates latency in long-output chat/code-generation deploy-ments. Self-attention and state update operations, which in-volve high-volume, fine-grained data access patterns natu-rally suited to in-memory computation, are offloaded to the DRAM-PIM chip(s). All remaining operations execute on the GPU(s). DRAM-PIM computation uses the MX8 format [11], storing KV-cache/state at 1.0 byte/value (metadata included) for both performance and capacity accounting. We addi-tionally report an idealized GPU-INT8 baseline (“GPU+Q”) alongside GPU-FP16: KV-cache/state uses 1.0625 bytes/value for capacity accounting (1 byte plus one BF16 scale factor per 32-value group) but the idealized 1.0 byte/value rate for traffic/latency/energy, with no quantization overhead. Capac-ity is checked independently per physical allocation domain (weights, activations, KV/state); co-located DRAM-PIM adds a separate 80 GiB PIM-HBM pool per unit, while integrated DRAM-PIM shares the GPU’s own HBM; an equal-unit, not iso-area/iso-cost/fixed-power-budget, comparison, for which integrated results provide the shared-capacity reference. The 
+
+≤6.25% storage-density gap between GPU-INT8 and MX8 is a second-order effect next to this topology-level capacity difference, but can determine feasibility outright for workloads near the 80 GiB boundary (e.g., OPT-7B at B=128, ISL=2048, OSL=128). Transfer latencies ( 𝑘 bytes) over NVLink3 and CXL/PCIe 6.0 are modeled with a canonical fixed-latency-plus-bandwidth link model: 
+
+𝑡 𝑠 (𝑘 ) = 𝐿 𝑠 + 𝑘 /𝐵 𝑠 , 𝑠 ∈ { NVLink , CXL },
+
+with NVLink directional bandwidth 𝐵 NVLink = 300 GB/s and latency 𝐿 NVLink = 1.0 𝜇 s, and CXL directional bandwidth 
+
+𝐵 CXL = 120 GB/s and fixed latency 𝐿 CXL = 4𝑙 𝑝 +2𝑙 𝑒 +𝑙 𝑠 = 180 ns, with port latency 𝑙 𝑝 = 25 ns, PCIe latency 𝑙 𝑒 = 30 ns, switch latency 𝑙 𝑠 = 20 ns. This replaces an earlier AttAcc-derived empirical curve fit for NVLink calibrated to a bidirectional-
+
+Algorithm 1 RowLocalChunk mapping.  
+
+> 1:
+
+𝑐ℎ𝑢𝑛𝑘 𝑟 ← ⌊atom sz /elem w⌋; 𝑐ℎ𝑢𝑛𝑘 𝑐 ←⌊page sz /atom sz ⌋ 
+
+> 2:
+
+𝑁 𝑟 ← ⌈ 𝑑 model /𝑐ℎ𝑢𝑛𝑘 𝑟 ⌉ · 𝐵 ; 𝑁 𝑐 ← ⌈ 𝐿 max /𝑐ℎ𝑢𝑛𝑘 𝑐 ⌉ 
+
+> 3:
+
+quota ← distribute (𝑁 𝑟 𝑁 𝑐 , 𝑈 ) ⊲ largest-remainder  
+
+> 4:
+
+Init row own [𝑟 ], col own [𝑐 ] ← ∅; 𝑁 𝑐𝑜𝑟 𝑒 ←
+
+max (1, heads ×𝐵 ) 
+
+> 5:
+
+for all (𝑟, 𝑐 ) in row-major order do  
+
+> 6:
+
+𝐶 ← { 𝑢 ∈ 𝑈 | quota [𝑢 ] > 0} 
+
+> 7:
+
+𝑐ℎ𝑜𝑠𝑒𝑛 ←
+
+
+
+min (𝐶 ∩ row own [𝑟 ]) , if ≠ ∅
+
+min (𝐶 ∩ col own [𝑐 ]) , else if ≠ ∅
+
+arg min 𝑢 ∈𝐶 load [𝑢 ], else  
+
+> 8:
+
+Assign (𝑟, 𝑐 ) → 𝑐ℎ𝑜𝑠𝑒𝑛 ; update quota, ownership  
+
+> 9:
+
+Core: reuse bank’s core, else 𝑖𝑑𝑥 mod 𝑁 𝑐𝑜𝑟 𝑒 (round-robin)  
+
+> 10:
+
+end for  
+
+> 11:
+
+return per-unit chunk mapping MTensor: 3 rows x 2 cols -> 6 chunks, 4 banks r 0c0 r 0c1r 1c0r 2c0 r 2cr1c11r 1c 1r 1c0 r 2c 1r2c 0r 0c 0r 0c 1                
+
+> Row Switch (2X Heap-based -> 0X RowLocalChunk )
+> Bank 0 Commands: Bank 2 Commands :
+> ACT ACT RD ACT RD RD RD PRE PRE PRE
+> r0c0r0c1r2c0r1c0r1c1r2c1RowLocalChunk Heap-based B0
+> B1 B2 B3
+> Fig. 2. Allocation of 6 tensor chunks (3 rows ×2 columns) to 4 banks. Heap-based (Pimba) assigns chunks to globally least-filled rows, potentially fragmenting tensor rows across banks. In contrast, RowLocalChunk performs a quota-based triage (row-owner →col-owner →least-loaded).
+
+aggregate 600 GB/s figure that does not correspond to a one-way transfer rate. GPU ↔GPU tensor-parallel collective com-munication (used by every 8-GPU/70B result in this paper) is modeled separately from the GPU ↔PIM link above, via a canonical recursive halving/doubling all-reduce over the same directional NVLink bandwidth: 𝑡 AR = 2 log 2 (𝑃 )𝐿 AR + 2 𝑃 −1 
+
+> 𝑃
+
+· 
+
+> 𝑘 𝐵 NVLink
+
+, with per-round collective latency 𝐿 AR = 6.06 𝜇 s chosen to preserve the empirical intercept of the AttAcc curve fit it replaces, which is retained in our codebase only as a legacy comparison mode and does not produce any result reported in this paper. Our 8-GPU results therefore combine PCIe-A100 board specifications (1,935 GB/s HBM2e, 300 W board limit) with an NVLink3/NVSwitch-style all-to-all collective network. We evaluate two standard decoder-based transformers with KV caching, representative of GPT-like LLMs, OPT-7B and OPT-70B [12], and two State Space Models (SSMs): Mamba2-2.7B using the original Mamba2 configuration [13], and a (a) (b) (c) (d) OPT-7B (x1 unit) OPT-70B (x8 units)     
+
+> Mamba2-70B (x8 units) Mamba2-2.7B (x1 unit)
+> B=32, ISL=512 B=32, ISL=512 B=32, ISL=512 B=32, ISL=512
+
+Fig. 3. Decoding performance for (a) OPT-7B, (b) OPT-70B ( ×8), (c) Mamba2-2.7B, (d) Mamba2-70B ( ×8). DRAM hierarchy: 𝑐ℎ = 40 , 𝑝𝑠𝑒𝑢𝑑𝑜𝑐ℎ𝑎𝑛𝑛𝑒𝑙 =
+
+2, 𝑏𝑔 = 4, 𝑏𝑎𝑛𝑘 = 4. 
+
+scaled Mamba2-70B model with 192 decoder blocks, hidden dimension 7680, 80 heads, head dimension 384, state dimen-sion 192, and 2-byte data elements. For the smaller networks (≤ 7𝐵 ), a single GPU-DRAM-PIM unit is used. For the larger ones, 8 units are used. Each unit is a tensor-parallel shard pairing one A100 (80 GiB) with a DRAM-PIM chip; weights, activations, and KV cache are sharded uniformly. At B=128 and ISL=OSL=2048, the OPT-style 70B FP16 KV cache exceeds the aggregate 640-GiB GPU capacity, while its one-byte representation alone reaches 640 GiB before accounting for headroom; we therefore mark infeasible baselines as OOM. The GPU-only baseline uses the same number of A100 GPUs as the heterogeneous configuration; total memory capacity is not matched for co-located PIM, while integrated PIM pro-vides the shared-capacity reference. Unless otherwise stated, a fixed DRAM hierarchy of 40 channels, 2 pseudochannels, 4 bank groups, and 4 banks is used to facilitate comparison with related work. For all baselines, the equivalent number of GPUs (to units) is used. 
+
+A. Workload Mapping Strategy 
+
+As baseline, we use Pimba’s heap-based allocator [3], which assigns chunks to the least-filled DRAM row via a min-heap. This approach is simple and load-balanced, but it scatters adjacent chunks across distant banks/rows, producing high row-switching and nondeterministic layouts. We intro-duce RowLocalChunk (Algorithm 1) 1, a simple deterministic locality-aware mapping prioritizing spatial locality while pre-serving global balance. Per-unit integer quotas are computed via largest-remainder; chunks are traversed in row-major order 
+
+> 1
+
+Notation: atom sz = 32 B is the storage size of one 32-element MX8 atom [11], elem w = 1 B/element, and page sz = 1024 B is the row-buffer size; 
+
+𝑑 model /𝐿 max hidden dim/max length; 𝐵 batch; 𝑈 PIM units. Largest-remainder: 
+
+⌊ 𝑁 𝑟 𝑁 𝑐 /| 𝑈 | ⌋ baseline plus residue-ranked top-ups (a) (b)   
+
+> Proportion Power Latency
+> OPT-70B (B=128, ISL/OSL=2048, x8 units, CXL)
+> Mamba2-70B (B=128, ISL/OSL=2048, x8 units, CXL)
+> Proportion Power Latency
+
+Fig. 4. Power and latency breakdown for OPT-70B and Mamba2-70B ( ×8 units, B=128, ISL/OSL=2048, GPU+PIM (CXL)). 
+
+and assigned via three-stage triage: same-row owner, same-column owner, then least-loaded bank. This mitigates the scattered allocations of heap-based methods (Fig. 2). 
+
+IV. Results 
+
+A. Static Power Consumption 
+
+We evaluate tokens/s/W across batch size (B), Input Se-quence Lengths (ISLs), and Output Sequence Lengths (OSLs), with and without static power (Fig. 3). Including static power notably reduces relative tokens/s/W, especially at large B and ISL. The 3.85 × headline is relative overestimation (largest where dynamic-only models predict the largest PIM gains, hence at Mamba2-2.7B, B=1), not absolute PIM benefit. At B=1, default-hierarchy PIM matches the GPU baseline; throughput-amortized gains emerge only at B ≥32 (a single-channel hierarchy recovers ≤4% even at B=1; see §IV-B). B=1, ISL=128                                                     
+
+> (a) (b) (c) (d)
+> B=32, ISL=512 B=128, ISL=2048 B=1, ISL=128 B=32, ISL=512 B=128, ISL=2048 B=1, ISL=128 B=32, ISL=512 B=128, ISL=2048 B=1, ISL=128 B=32, ISL=512 B=128, ISL=2048
+> OPT-7B (x1 unit, CXL)
+> Mamba2-2.7B (x1 unit, CXL) Mamba2-70B (x8 units, CXL)
+> OPT-70B (x8 units, CXL)
+> 128 512 1024 2048
+> 0.0
+> 0.2
+> 0.4
+> 0.6
+> 0.8
+> 128 512 1024 2048
+> 0
+> 5
+> 10
+> 15
+> 20
+> 128 512 1024 2048
+> 0
+> 8
+> 16
+> 24
+> 32
+> 128 512 1024 2048
+> 0.000
+> 0.015
+> 0.030
+> 0.045
+> 0.060
+> 128 512 1024 2048
+> 0.0
+> 0.4
+> 0.8
+> 1.2
+> 1.6
+> 128 512 1024 2048
+> 0.0
+> 0.8
+> 1.6
+> 2.4
+> 3.2
+> 128 512 1024 2048
+> 0.0
+> 0.4
+> 0.8
+> 1.2
+> 1.6
+> 128 512 1024 2048
+> 0
+> 10
+> 20
+> 30
+> 40
+> 128 512 1024 2048
+> 0
+> 25
+> 50
+> 75
+> 100
+> 128 512 1024 2048
+> 0.000
+> 0.015
+> 0.030
+> 0.045
+> 128 512 1024 2048
+> 0.00
+> 0.25
+> 0.50
+> 0.75
+> 1.00
+> 128 512 1024 2048
+> 0.0
+> 0.8
+> 1.6
+> 2.4
+> 3.2
+
+Fig. 5. Decoding performance vs. channel count [1–64] with fixed pseudochannel/bg/banks (2,4,4) for (a) OPT-7B, (b) OPT-70B ( ×8), (c) Mamba2-2.7B, (d) Mamba2-70B ( ×8). GPU(s) vs. GPU+PIM (CXL). All configurations include static power. PIM capacity per unit scales with channel count, from ∼2 GiB at 1 channel to ∼128 GiB at 64 channels (OPT-70B/Mamba2-70B use 8 units, so total system capacity is 8 × these values). 
+
+Trends are broadly consistent across model scales, though adding more units diminishes per-unit gains as added static power offsets throughput. Integrated and co-located (CXL, NVLink) configurations achieve similar performance, suggest-ing that interconnect choice is secondary to static power man-agement. Despite the 2.5 × NVLink3-vs-CXL bandwidth gap, transfer volume is small (PIM-offloaded kernels exchange only compact partial sums and KV slices); the comm component remains a small fraction of decode latency and energy across all three configurations, with static power dominating the en-velope. For the modeled decode offload strategy, interconnect bandwidth is not the dominant efficiency limiter. Fig. 4 reports the power/latency breakdown for OPT-70B and Mamba2-70B under GPU+PIM (CXL). Static components (leakage, refresh, GPU idle) account for 66–69% of total sys-tem power , dominating the efficiency envelope. The high idle-GPU share arises from context-active board power that persists when no GPU kernels are executing, compounded by frequent synchronization/data-transfer phases of low utilization. Time spent on gemv is substantially larger for transformers than for SSM state updates, reflecting different memory access patterns: attention reads scale with sequence length, while SSM updates operate over fixed-size buffers. Sensitivity anal-ysis (Table II) confirms robustness of the reported DRAM-PIM advantage: independently perturbing DRAM frequency, CXL bandwidth, GPU–GPU all-reduce latency, GPU context-active power, PIM-HBM background power, and PIM refresh energy, each across its full documented sensitivity range, places PIM’s (CXL) tokens/s/W advantage over GPU (OPT-70B, B=28 – the capacity-valid substitute for the submitted B=128 stress point at this ISL/OSL, which OOMs for GPU-FP16 – ISL=OSL=2048, ×8 units) between 1.35 × and 2.09 ×
+
+when static power is included (nominal 1.63 ×). Excluding static power, the advantage (2.01 ×, 4.198 tok/s/W nominal) 
+
+TABLE II 
+
+Sensitivity analysis: PIM (CXL) tokens/s/W vs. GPU, OPT-70B, B=28, ISL=OSL=2048, ×8 units, incl. static power. 
+
+Parameter Range tok/s/W (vs. GPU) 
+
+GPU context-active power 54–105 W 0.863–1.333 (1.35–2.09 ×)PIM-HBM background power 2.10–8.41 W 1.044–1.102 (1.63–1.72 ×)DRAM frequency 0.8–1.2 × nominal 1.044–1.060 (1.63–1.66 ×)CXL bandwidth 32–120 GB/s 1.031–1.044 (1.61–1.63 ×)PIM refresh energy/event 0.72–4.89 nJ 1.044–1.056 (1.63–1.65 ×)GPU–GPU all-reduce latency 1.0–6.06 𝜇 s 1.041–1.046 (1.63–1.64 ×)
+
+is exactly invariant across every range tested. 
+
+B. DRAM Hierarchy Co-optimization 
+
+Given a fixed pseudochannel, bank groups, and banks (2, 4, 4), we vary the number of channels (Fig. 5). Per-unit PIM capacity scales with channel count, from approximately 2 GiB at 1 channel to 128 GiB at 64 channels, matching the canonical 80 GiB only at 40 channels; Fig. 5 therefore represents whole-unit provisioning, where capacity and parallel resources scale together with channel count, rather than an isolated channel-count experiment. Decoding performance is monotonically non-decreasing with channel count for every model and workload we evaluate, generally plateauing at high channel counts for low-batch workloads: more channels provide both more independent memory streams for row-locality-sensitive PIM kernels ( gemv , state update ). At B=1, gains from added channels are modest (5–32% depending on model and OSL); performance generally begins to plateau between 32 and 64 channels, depending on the model and sequence length. At B ≥32, every capacity-valid configuration for every model peaks at the largest channel count we evaluate (64), with gains of 140–2300% over a single channel. OPT-7B (x1 unit, CXL) OPT-70B (x8 units, CXL) Mamba2-2.7B (x1 unit, CXL) Mamba2-70B (x8 units, CXL) Fig. 6. t-SNE (channels, pseudochannels, ACT4-group count) for the 22 (of 25) configurations in the extended fixed-capacity logical design space; 3 excluded as infeasible (Sec. IV-B). Physical bank count (16–5,120) and NBPU count (8–2,560) vary across the sweep; bank groups/banks fixed at (4,4); PIM capacity fixed at 80 GiB per unit. (a-d) Raw tokens/s/W per model, each embedded independently; (e) normalized tokens/s/W. B=28, ISL/OSL=2048, GPU+PIM (CXL). (b) OPT-70B  (x8 units, CXL) Mamba2-70B  (x8 units, CXL) 
+
+> (a)
+
+Fig. 7. Comparison of Pimba and RowLocalChunk for OPT-70B (top) and Mamba2-70B (bottom). Columns show PIM-kernel latency, PIM-kernel energy, and end-to-end tokens/s/W. Crosses indicate OOM/invalid configurations. 
+
+Further, in Fig. 6, we fix PIM capacity at 80 GiB per unit and vary its distribution across channels/pseudochannels, holding bank groups/banks fixed at (4,4); the sweep is parametrized as (channels, pseudochannels, num act4 groups) with their product fixed at 320, where num act4 groups is the logical count of 4-bank ACT4 activation groups per pseudochannel (distinct from the fixed physical bank-group count of 4) that this sweep varies to hold per-unit capacity fixed while the physical bank count changes. Of 25 mathematically distinct triples, 3 require a refresh-barrier latency exceeding the simulator’s fixed refresh interval for any workload and cannot complete. All four models agree closely on the best configuration – (40,2,4) and (80,1,4) both reach within 0.3% of each model’s own peak tokens/s/W; however, they differ sharply in sensitivity to a poor choice. The worst configuration, (2,2,80), retains only 33.6%/51.6% of peak for OPT-7B/OPT-70B versus 67.3%/76.8% for Mamba2-2.7B/Mamba2-70B. 
+
+C. Workload Mapping Evaluation 
+
+For both Pimba and RowLocalChunk (§III-A, Al-gorithm 1), DRAM commands are interleaved across banks/pseudochannels/channels, so locality improvements are not masked by controller-level parallelism (Fig. 7). RowLo-calChunk reduces kernel latency by 4.4–14.0% and kernel energy by 6.3–17.4% across evaluated OSLs by cutting acti-vate/precharge cycles for adjacent chunks. End-to-end decode gain is modest (0.6–5.6%) because mapping governs only the PIM portion: PIM kernels are a fraction of total decode energy once GPU compute, communication, and static idle power are included (Fig. 4), compressing kernel-level gains. 
+
+V. Conclusion 
+
+Through systematic evaluation of heterogeneous DRAM-PIM-GPU systems across LLM decode workloads, we estab-lished three design principles. First, static power can dominate the efficiency calculus and must be included in system-level evaluations. Second, decoding performance is monotonically non-decreasing with channel count across all evaluated models and workloads, generally plateauing at high channel counts for low-batch workloads; under a fixed-capacity sweep, all models instead share a common near-optimal region. Third, workload mapping provides bounded gains and is not the dominant bottleneck; significant efficiency gains require system-wide co-optimization. This motivates architectural reconfigurability. 
+
+References 
+
+[1] A. A. Khan et al. , “The Landscape of Compute-near-memory and Compute-in-memory: A Research and Commercial Overview,” 2024. [Online]. Available: 10.48550/arxiv.2401.14428 [2] Y. Gu et al. , “PIM Is All You Need: A CXL-Enabled GPU-Free System for Large Language Model Inference,” in Proceedings of the 30th ACM International Conference on Architectural Support for Programming Languages and Operating Systems, Volume 2 . ACM, Mar. 2025, pp. 862–881. [3] W. Kim et al. , “Pimba: A Processing-in-Memory Acceleration for Post-Transformer Large Language Model Serving,” in Proceedings of the 58th IEEE/ACM International Symposium on Microarchitecture . ACM, Oct. 2025, pp. 292–307. [4] J. Park et al. , “AttAcc! Unleashing the Power of PIM for Batched Transformer-based Generative Model Inference,” in Proceedings of the 29th ACM International Conference on Architectural Support for Programming Languages and Operating Systems, Volume 2 . ACM, Apr. 2024, pp. 103–119. [5] Y. He et al. , “PAPI: Exploiting Dynamic Parallelism in Large Language Model Decoding with a Processing-In-Memory-Enabled Computing System,” in Proceedings of the 30th ACM International Conference on Architectural Support for Programming Languages and Operating Systems, Volume 2 . ACM, Mar. 2025, pp. 766–782. [6] J. Wang et al. , “NicePIM: Design Space Exploration for Processing-In-Memory DNN Accelerators With 3-D Stacked-DRAM,” IEEE Transac-tions on Computer-Aided Design of Integrated Circuits and Systems ,vol. 43, no. 5, pp. 1456–1469, May 2024. [7] S. Ghose et al. , “What Your DRAM Power Models Are Not Telling You: Lessons from a Detailed Experimental Study,” Proceedings of the ACM on Measurement and Analysis of Computing Systems , vol. 2, no. 3, Dec. 2018. [8] L. Steiner et al. , “DRAMPower 5: An Open-Source Power Simulator for Current Generation DRAM Standards,” in Proceedings of the Rapid Simulation and Performance Evaluation for Design Workshop , ser. RAPIDO ’25. ACM, 2025, p. 8–16. [9] H. Luo et al. , “Ramulator 2.0: A Modern, Modular, and Extensible DRAM Simulator,” IEEE Computer Architecture Letters , vol. 23, no. 1, pp. 112– 116, Jan. 2024. [10] J. Choquette, W. Gandhi, O. Giroux, N. Stam, and R. Krashinsky, “NVIDIA A100 Tensor Core GPU: Performance and Innovation,” IEEE Micro , vol. 41, no. 2, pp. 29–35, Mar. 2021. [11] D. Rouhani et al. , “With Shared Microexponents, A Little Shifting Goes a Long Way,” in Proceedings of the 50th Annual International Symposium on Computer Architecture . ACM, 2023. [12] S. Zhang et al. , “OPT: Open Pre-trained Transformer Language Models,” 2022. [Online]. Available: 10.48550/arXiv.2205.01068 [13] T. Dao and A. Gu, “Transformers are SSMs: generalized models and effi-cient algorithms through structured state space duality,” in Proceedings of the 41st International Conference on Machine Learning , ser. ICML’24. JMLR.org, 2024.

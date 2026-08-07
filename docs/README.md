@@ -6,68 +6,77 @@
 </div>
 
 ## 每次日报
-- 最新运行日期：2026-08-04
-- 运行时间：2026-08-04 22:04:24 UTC
+- 最新运行日期：2026-08-07
+- 运行时间：2026-08-07 20:38:29 UTC
 - 运行状态：成功
-- 本次总论文数：16
+- 本次总论文数：19
 - 精读区：8
-- 速读区：8
+- 速读区：11
 
 ### 今日简报（AI）
-今日16篇论文聚焦AI系统优化，精读重点为自动化算子生成与边缘推理加速。最值得关注：AgenticCANN用知识增强智能体实现Ascend C算子自动生成（9.0分），TrimMoE提出通信感知的深度自适应框架提升分布式边缘推理效率。建议普通读者优先了解边缘侧高效部署LLM的实用方案，如TrimMoE的自适应分层思路。
-- 详情：[/202608/04/README](/202608/04/README)
+今日精读8篇、速读11篇，聚焦LLM推理优化与边缘部署。最值得关注EdgeXpert（MoE+投机解码）与Opt.Gear技术报告，均获高分；速读中预填充-解码分离及量化压缩方向也有新见解。建议普通读者优先浏览精读两篇的摘要与结论，再按需深入速读列表中的系统设计类论文。
+- 详情：[/202608/07/README](/202608/07/README)
 
 ### 精读区论文标签
-1. [AgenticCANN: Automated Ascend C Operator Generation via Knowledge-Augmented Agentic Evolution](/202608/04/2607.26661v2-agenticcann-automated-ascend-c-operator-generation-via-knowledge-augmented-agentic-evolution)  
+1. [EdgeXpert: An Edge Device for Memory-Efficient LLM Inference with Mixture-of-Experts and Speculative Decoding](/202608/07/2608.05303v1-edgexpert-an-edge-device-for-memory-efficient-llm-inference-with-mixture-of-experts-and-speculative-decoding)  
+   标签：评分：10.0/10、query:edge-llm
+   evidence：软硬件协同的边缘LLM加速器，结合MoE与推测解码
+2. [Opt.Gear Technical Report](/202608/07/2608.01034v2-optgear-technical-report)  
    标签：评分：9.0/10、query:edge-llm
-   evidence：面向NPU加速的Ascend C算子自动生成，针对边缘侧低语料硬件环境
-2. [TrimMoE A communication aware and adaptive depth framework for distributed edge inference](/202608/04/2608.00573v1-trimmoe-a-communication-aware-and-adaptive-depth-framework-for-distributed-edge-inference)  
+   evidence：面向端侧部署的基座模型，在NPU上加速prefill和解码
+3. [LLM Serving in the Wild: An Empirical Study of Frameworks, Methods, and System Designs](/202608/07/2608.03036v1-llm-serving-in-the-wild-an-empirical-study-of-frameworks-methods-and-system-designs)  
    标签：评分：9.0/10、query:edge-llm
-   evidence：面向分布式边缘服务器上的MoE大模型服务，通信感知的自适应深度框架
-3. [HetRoute Heterogeneous and Cost-aware Collaborative Routing Framework for Distributed Edge MoE Inference](/202608/04/2608.00577v1-hetroute-heterogeneous-and-cost-aware-collaborative-routing-framework-for-distributed-edge-moe-inference)  
+   evidence：研究五个LLM服务框架在实际系统中的使用
+4. [Heterogeneous LLM Serving with General-Purpose Processing-Near-Memory for Retrieval-Based Sparse Attention](/202608/07/2608.03555v1-heterogeneous-llm-serving-with-general-purpose-processing-near-memory-for-retrieval-based-sparse-attention)  
    标签：评分：9.0/10、query:edge-llm
-   evidence：面向分布式边缘MoE服务的异构代价感知协作路由
-4. [Opt.Gear Technical Report](/202608/04/2608.01034v1-optgear-technical-report)  
+   evidence：面向检索式稀疏注意力的异构解码服务系统，结合近内存处理
+5. [Heterogeneity-Aware Microscaling for Efficient Low-Bit LLM Inference](/202608/07/2608.03867v1-heterogeneity-aware-microscaling-for-efficient-low-bit-llm-inference)  
    标签：评分：9.0/10、query:edge-llm
-   evidence：面向NPU的端侧LLM硬件感知加速
-5. [Spatial Prefix Caching for Wireless Edge LLM Inference: A Stochastic-Geometry and Queueing Framework](/202608/04/2608.01126v1-spatial-prefix-caching-for-wireless-edge-llm-inference-a-stochastic-geometry-and-queueing-framework)  
+   evidence：面向高效LLM推断的异构感知低比特格式与加速器
+6. [On Design Principles for Efficient Heterogeneous DRAM-PIM-GPU Systems](/202608/07/2608.04169v1-on-design-principles-for-efficient-heterogeneous-dram-pim-gpu-systems)  
    标签：评分：9.0/10、query:edge-llm
-   evidence：基于空间前缀缓存的无线边缘LLM推理优化
-6. [Celty: SpMspV GPU Kernel and SIMT Co-Design for Efficient Dual-Sparse LLM Inference](/202608/04/2608.01536v1-celty-spmspv-gpu-kernel-and-simt-co-design-for-efficient-dual-sparse-llm-inference)  
+   evidence：面向LLM解码阶段的高效异构DRAM-PIM-GPU系统设计原理
+7. [Deltoris: Enabling Real-time VLA Inference in Embodied AI via Bit-level Sparsity and Speculative Inference](/202608/07/2608.04428v1-deltoris-enabling-real-time-vla-inference-in-embodied-ai-via-bit-level-sparsity-and-speculative-inference)  
    标签：评分：9.0/10、query:edge-llm
-   evidence：针对双稀疏LLM推理的稀疏格式、GPU内核与SIMT微架构协同设计
-7. [Learning-Based Collaborative MEC for LLM Inference with Soft-Deadline Awareness via Transformer-Enhanced PPO](/202608/04/2608.02031v1-learning-based-collaborative-mec-for-llm-inference-with-soft-deadline-awareness-via-transformer-enhanced-ppo)  
+   evidence：面向边缘VLA推理的软硬件协同设计框架，结合位级稀疏与推测推理
+8. [BALANCE: Hybrid Autoregressive-Speculative LLM Inference in Wireless Edge Networks](/202608/07/2608.05926v1-balance-hybrid-autoregressive-speculative-llm-inference-in-wireless-edge-networks)  
    标签：评分：9.0/10、query:edge-llm
-   evidence：面向边缘服务器上LLM推理的软截止感知协同MEC调度方法
-8. [Structured Memory for Edge Language Models: Persistent Context and Corpus Retrieval via O(1) SSM State Injection](/202608/04/2608.02560v1-structured-memory-for-edge-language-models-persistent-context-and-corpus-retrieval-via-o1-ssm-state-injection)  
-   标签：评分：9.0/10、query:edge-llm
-   evidence：面向边缘语言模型的高效推理，通过SSM状态注入将预填充降为O(1)
+   evidence：面向边缘LLM推理的混合自回归-投机解码框架，权衡时延与内存
 
 ### 速读区论文标签
-1. [Diagnose Before You Compress: Prediction-Independent Bottleneck Witness Refinement for LLM Serving Traces](/202608/04/2608.00423v1-diagnose-before-you-compress-prediction-independent-bottleneck-witness-refinement-for-llm-serving-traces)  
+1. [When Does Disaggregation Pay? Simulating Prefill--Decode--Attention--FFN Specialization for Agentic LLM Inference](/202608/07/2608.03741v1-when-does-disaggregation-pay-simulating-prefill--decode--attention--ffn-specialization-for-agentic-llm-inference)  
    标签：评分：8.0/10、query:edge-llm
-   evidence：面向LLM服务迹的缩减与瓶颈诊断
-2. [From Cloud to Crowd: Democratizing LLM Service with Decentralized Edge Collaboration for RAG](/202608/04/2608.00922v1-from-cloud-to-crowd-democratizing-llm-service-with-decentralized-edge-collaboration-for-rag)  
+   evidence：模拟异构GPU/LPU上代理式LLM推理的预填充-解码与注意力-FFN专业化
+2. [Recurrent Residual Quantization: A Progressive Multi-Precision Representation for LLMs](/202608/07/2608.04048v1-recurrent-residual-quantization-a-progressive-multi-precision-representation-for-llms)  
    标签：评分：8.0/10、query:edge-llm
-   evidence：面向资源受限边缘设备的小模型去中心化协作服务
-3. [PrefixPlace: Provable Prefix Key-Value Placement for Large Language Model Serving under Heterogeneous Compute and Transfer Costs](/202608/04/2608.01655v1-prefixplace-provable-prefix-key-value-placement-for-large-language-model-serving-under-heterogeneous-compute-and-transfer-costs)  
+   evidence：多精度后训练量化框架，用单个检查点支持灵活精度-内存权衡，助力LLM高效部署
+3. [RAC: Reference-Aware Activation Compression for Communication-Efficient Split LLM Inference](/202608/07/2608.04991v1-rac-reference-aware-activation-compression-for-communication-efficient-split-llm-inference)  
    标签：评分：8.0/10、query:edge-llm
-   evidence：面向LLM服务的前缀KV放置规划器，显式考虑异构计算和传输成本，符合异构计算主题
-4. [LaCache: Robust Semantic Caching for LLM Serving](/202608/04/2608.01718v1-lacache-robust-semantic-caching-for-llm-serving)  
-   标签：评分：8.0/10、query:edge-llm
-   evidence：LLM服务中的鲁棒语义缓存设计
-5. [Energy-Efficient LLM Serving via Disaggregated Attention--FFN and Flexible Frequency Scaling](/202608/04/2608.01891v1-energy-efficient-llm-serving-via-disaggregated-attention--ffn-and-flexible-frequency-scaling)  
-   标签：评分：8.0/10、query:edge-llm
-   evidence：面向节能LLM服务的硬件感知GPU频率调节
-6. [Latency-Tolerant Cloud-Edge Collaborative Vision-Language-Action Models via Emergent Representational Specialization](/202608/04/2608.00569v1-latency-tolerant-cloud-edge-collaborative-vision-language-action-models-via-emergent-representational-specialization)  
+   evidence：面向本地-云端边缘部署的通信高效拆分LLM推断
+4. [From Chains to Trees: Parent-Conditioned Drafting for Semi-Autoregressive Speculative Decoding](/202608/07/2608.02123v1-from-chains-to-trees-parent-conditioned-drafting-for-semi-autoregressive-speculative-decoding)  
    标签：评分：7.0/10、query:edge-llm
-   evidence：面向移动机器人的云边协同推理与边缘端轻量头设计
-7. [Bole: Efficient Tree Speculation for Hybrid-Attention Language Models](/202608/04/2608.01651v1-bole-efficient-tree-speculation-for-hybrid-attention-language-models)  
+   evidence：用于推测解码的父条件草稿树
+5. [ARCHead: Activation-Metric Residual Correction for Large Language Model Output Heads](/202608/07/2608.02703v1-archead-activation-metric-residual-correction-for-large-language-model-output-heads)  
    标签：评分：7.0/10、query:edge-llm
-   evidence：通过内核与运行时协同设计加速混合注意力LLM的解码
-8. [FOCUS: FP4 Optimization via Coupled-Relaxation and Dual-Granularity Scaling](/202608/04/2608.01847v1-focus-fp4-optimization-via-coupled-relaxation-and-dual-granularity-scaling)  
+   evidence：量化语言模型头压缩，降低LLM存储占用
+6. [AnchorKV: Anchor-Residual KV Cache Compression](/202608/07/2608.02901v1-anchorkv-anchor-residual-kv-cache-compression)  
    标签：评分：7.0/10、query:edge-llm
-   evidence：面向高效LLM推理的硬件感知FP4量化
+   evidence：KV缓存压缩实现20倍内存缩减
+7. [Pruning-Aware Multi-Cluster Co-Inference for Large AI Models in AI-RANs](/202608/07/2608.03026v1-pruning-aware-multi-cluster-co-inference-for-large-ai-models-in-ai-rans)  
+   标签：评分：7.0/10、query:edge-llm
+   evidence：面向边缘AI-RAN的大AI模型剪枝感知多簇协同推理
+8. [Lightweight Chunk Selection for Mobile Retrieval-Augmented Generation](/202608/07/2608.03148v1-lightweight-chunk-selection-for-mobile-retrieval-augmented-generation)  
+   标签：评分：7.0/10、query:edge-llm
+   evidence：面向移动RAG的轻量级分块选择，降低计算与内存开销，契合资源受限边缘LLM推理需求。
+9. [Unified Lookup-Table Inference with Signed-Digit K/V Caches for Ternary LLMs](/202608/07/2608.03229v1-unified-lookup-table-inference-with-signed-digit-kv-caches-for-ternary-llms)  
+   标签：评分：7.0/10、query:edge-llm
+   evidence：基于查找表的三值LLM推理，使注意力与三值投影统一
+10. [SlimVLM: Sensitivity-aware Dynamic Structured Pruning with Adaptive Visual Token Selection for Efficient Vision-Language Models](/202608/07/2608.03580v1-slimvlm-sensitivity-aware-dynamic-structured-pruning-with-adaptive-visual-token-selection-for-efficient-vision-language-models)  
+   标签：评分：7.0/10、query:edge-llm
+   evidence：面向资源受限设备VLM的敏感度感知结构化剪枝
+11. [ATFlash: Per-RoPE-Wavelength Attention Windows for Compute/Memory-Efficient LLM Inference](/202608/07/2608.02947v1-atflash-per-rope-wavelength-attention-windows-for-computememory-efficient-llm-inference)  
+   标签：评分：6.0/10、query:edge-llm
+   evidence：面向LLM推理的计算/内存高效注意力窗口，可与稀疏方法叠加
 
 
 <div class="dpr-home-promo-card">

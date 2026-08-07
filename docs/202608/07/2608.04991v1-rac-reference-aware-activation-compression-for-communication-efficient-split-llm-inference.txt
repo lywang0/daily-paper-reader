@@ -1,0 +1,499 @@
+Title: RAC: Reference-Aware Activation Compression for Communication-Efficient Split LLM Inference
+
+URL Source: https://arxiv.org/pdf/2608.04991v1
+
+Published Time: Thu, 06 Aug 2026 01:21:20 GMT
+
+Number of Pages: 10
+
+Markdown Content:
+# RAC: Reference-Aware Activation Compression for Communication-Efficient Split LLM Inference 
+
+Guotao Yang, Mingxi Zhao, Haopeng Li, Zhengchao Wang, Sheng Chen, Yitao Hu ∗, and Keqiu Li 
+
+Tianjin University, China 
+
+Abstract —Large language model (LLM) agents repeatedly pro-cess long, privacy-sensitive contexts, while cloud-only deployment exposes user data beyond the trusted endpoint and fully local deployment often requires costly hardware. Split inference offers a middle ground by executing the model head, tail, and tools locally and the middle layers in the cloud, but its local–cloud– local path transfers boundary hidden states at every invocation and creates a critical communication bottleneck. We present 
+
+RAC , a reference-aware codec that retrieves exact-token histor-ical spans for prefill uplinks, reuses the reconstructed uplink state for same-round prefill downlinks, and generates boundary-specific decode references with lightweight causal predictors. RAC applies grouped affine alignment and calibrated residual quantization with optional prefill outliers, while sender-side wire-format reconstruction synchronizes subsequent references and offline calibration accounts for quality and packed representation costs. Across three models and nine evaluated model–link pairs, Raw-to-RAC mean time to first token (TTFT) and time per output token (TPOT) ratios are 1.24–2.72 × and 1.01–2.79 ×, while the 12 non-perplexity task-score changes range from −0.40 to +2.50 
+
+points. 
+
+Index Terms —large language models, split inference, activation compression, residual quantization 
+
+I. Introduction 
+
+Large language models (LLMs) are increasingly used as agents that call tools, consume returned data, and revise their plans, repeatedly extending the context with reasoning traces, documents, and tool outputs [1]–[3]. Current LLM services are predominantly deployed entirely in the cloud, benefiting from its abundant computing resources. However, this deployment requires users to upload substantial amounts of data to remote servers, raising privacy concerns. Although fully local LLM deployment keeps plaintext inputs on the trusted endpoint, the high cost of the required hardware often makes it impractical. The demand for both abundant cloud computing resources and strong privacy at the edge has given rise to edge–cloud split inference [4], [5]. In the three-way organization shown in Fig. 1, a trusted local device executes the model head and tail while the cloud executes the middle layers. This arrangement retains plaintext inputs, logits, and tool invocations locally. Existing work strengthens the privacy of edge–cloud split inference by learning noise that suppresses information in transmitted features and by applying privacy-oriented pruning to retain task-relevant information while reducing sensitive content [6], [7]. This deployment introduces an online communication bot-tleneck . During prefill, each boundary carries a full-sequence hidden state, making time to first token (TTFT) sensitive to 
+
+> *
+
+Corresponding author: Yitao Hu (e-mail: yitao@tju.edu.cn ). - + - +           
+
+> H
+> Q(H)
+> Q(E)Local
+> Model Head
+> Cloud
+> Model Middle
+> Local
+> Model Tail
+> a) Raw
+> b) Direct Quant.
+> c) RAC Latency
+> Accuracy Latency
+> Accuracy Latency
+> E=H-R̃
+> Ehas smaller dynamic range, more quantization-friendly than H
+> R̃ : Reference state
+> E: Residual state
+> Q(·) : Quantization
+> H: Hidden state
+> H
+> Q(E)
+> Accuracy
+> Q(H)
+> R̃ R̃ R̃ R̃
+
+Fig. 1. Comparison with baseline methods. 
+
+prompt length and available bandwidth. During decode, every generated token requires an uplink and a downlink for a one-token hidden state, making time per output token (TPOT) sensitive to round-trip time, serialization, and small-message overhead. Multi-round agent workloads amplify both costs. Direct quantization, sparsification, and mixed-precision com-pression can degrade inference accuracy. Direct quantization and the low-bit components of mixed-precision representations are sensitive to long-tailed channel distributions and outliers, while sparsification loses information by discarding activation values. Some sparsification and mixed-precision schemes ad-ditionally introduce indices, masks, and high-precision meta-data [8]–[10]. These limitations motivate transforming the hidden-state value distribution into a more concentrated distribution with fewer outliers before transmission so that the transformed state can be quantized more accurately. In Transformer-based LLM inference, subtracting a similar reference hidden state from the current state can produce such a concentrated residual while allowing the receiver to reconstruct an approxima-tion of the original state . Practical agent workflows provide three sources of reference states: repeated system prompts, tool schemas, and stable context spans across rounds; the two boundary states linked by the Transformer blocks within one forward pass; and adjacent decode steps that share almost the entire causal context. Turning these reuse opportunities into a practical codec arXiv:2608.04991v1 [cs.DC] 5 Aug 2026 raises two key questions . First, how can each phase and direction obtain a reference that is both inexpensive to con-struct and sufficiently similar to the current boundary state? Second, how can reference coding preserve task quality while keeping alignment, quantization, outlier handling, metadata, and critical-path processing costs low enough to retain its communication benefit? We present RAC , a reference-aware boundary-compression system for split LLM inference. RAC retrieves matching his-torical spans for prefill uplinks, reuses the shared reconstructed uplink state for same-round prefill downlinks, and predicts the current decode state from the preceding activation. The sender fits a grouped affine mapping from each reference to the current hidden state, quantizes the residual with a calibrated 4-bit or 8-bit representation and optional outlier payload, and locally reconstructs the state that the receiver obtains. Offline calibration chooses phase- and direction-specific configura-tions that meet the quality target while accounting for packed values, scales, alignment coefficients, and outlier metadata. RAC does not change model partitioning, the attention key-value cache, sampling, or tool semantics. This paper makes the following contributions:  
+
+> •
+
+We develop a hidden-state codec that quantizes residuals relative to phase-specific reference states.  
+
+> •
+
+We implement the codec for the two boundary transfers of three-way split inference, including phase-aware reference construction, alignment, residual quantization, and sender-side reconstruction.  
+
+> •
+
+We evaluate RAC on three LLMs using task quality, end-to-end latency, component ablations, activation-payload ratios, and stage-level runtime costs. Across nine model– link pairs, the Raw-to-RAC mean TTFT ratios are 1.24– 2.72 ×.
+
+II. Background 
+
+A. Large Language Model Inference 
+
+Transformer-based LLMs process an input sequence through stacked attention and feed-forward blocks and then generate output tokens autoregressively. Inference has two phases [11], [12]: prefill processes the complete prompt in parallel to produce the first output token, whereas decode appends one token at a time while reusing the attention key-value state of earlier tokens. Consequently, prefill operates on full-sequence hidden states and decode repeatedly operates on a single-token hidden state. These phase-dependent tensor shapes and execution patterns determine the computational and memory characteristics of LLM inference. 
+
+B. Split LLM Inference Model 
+
+Split LLM inference partitions consecutive Transformer blocks across a local device and an edge or cloud server, which jointly execute the model by exchanging intermediate activations. It lets resource-constrained endpoints use remote computing and memory resources while retaining input and output functions locally, reducing local hardware requirements and limiting plaintext data exposure. This balance has motivated broad research in collaborative inference and distributed LLM serving [4], [5], [13], [14]. We consider a local–cloud–local organization in which the trusted endpoint executes the model head and tail while the cloud executes the middle layers. In this three-way organization, two cut points 𝑙 1 < 𝑙 2 divide the LLM into contiguous functions 
+
+𝑓 = 𝑓 tail ◦ 𝑓 middle ◦ 𝑓 head ,𝐻 l2c = 𝑓 head (𝑋 ),𝐻 c2l = 𝑓 middle (𝐻 l2c ).
+
+(1) Here, 𝑋 denotes the model input. The local device first executes the head layers and produces the local-to-cloud boundary state 
+
+𝐻 l2c . The cloud executes the middle layers on 𝐻 l2c and returns the cloud-to-local state 𝐻 c2l . The local tail then continues the forward pass, produces logits, and samples the next token. Thus, 
+
+𝐻 l2c and 𝐻 c2l are the two intermediate tensors exchanged by this execution pattern. The model revision, layer placement, and cut points determine the shapes and semantics of these boundary states. After either state crosses a cut, the receiving partition must obtain a shape-compatible tensor before executing the next unchanged model function. Boundary activations are distinct from model parameters, plaintext tokens, logits, tool data, and the persistent attention key-value cache. 
+
+C. Boundary Communication Across Inference Phases 
+
+LLM inference consists of prefill followed by autoregressive decode [11], [12]. During prefill, one [𝐵, 𝑁, 𝑑 ] hidden state crosses each boundary: one is transferred on the uplink and the other on the downlink, where 𝐵 , 𝑁 , and 𝑑 denote batch size, input length, and hidden width. The communication volume therefore grows with the prompt and primarily affects TTFT. At each decode step, one [𝐵, 1, 𝑑 ] state crosses each boundary. These two causally ordered boundary crossings recur for every generated token. Decode communication is consequently more sensitive to round-trip time, serialization, and small-message overhead [13]. 
+
+III. Motivation 
+
+A. Differencing Concentrates Data Distributions 
+
+Existing activation-compression methods encode the current hidden state directly. Uniform low-bit quantization must cover the tensor’s full dynamic range, so a few extreme values enlarge the quantization step for the remaining values; global quantization is especially sensitive because one scale covers the entire tensor. Sparsification avoids representing many values but discards information and may additionally transmit indices or masks, while mixed-precision methods retain selected outliers at the cost of high-precision values and metadata [8]–[10]. Directly reducing precision or retaining only selected values therefore creates a fundamental tension between communication cost and preservation of the information needed by downstream layers. A complementary approach is to transform the coded distri-bution before quantization. Suppose that the sender and receiver construct the same aligned reference e𝑅 for the current hidden 1 5 9 13 17                     
+
+> 0
+> 0.2
+> 0.4
+> 0.6
+> 0.8
+> 1
+> 15913 17 15913 17 15913 17
+> GLM Qwen Llama
+> (a) Across-input similarity (b) Same-round cross-layer (c) Adjacent-step uplink (d) Adjacent-step downlink
+> Cosine similarity
+> Number of head/tail layers
+> Fig. 2. Cosine similarity between current boundary states and candidate references across models: repeated inputs, same-round cross-layer states, and adjacent decode states at the uplink and downlink boundaries.
+
+state 𝐻 . The sender encodes the residual 𝐻 − e𝑅 , and the receiver reconstructs the state as 
+
+𝐸 = 𝐻 − e𝑅, b𝐻 = e𝑅 + b𝐸, (2) where b𝐸 is the dequantized residual. When e𝑅 captures the dominant structure and extreme values of 𝐻 , 𝐸 has a narrower, more concentrated distribution than 𝐻 , so the same bit width can represent it with a finer step. The potential benefit therefore depends on whether each transfer can obtain an inexpensive shared reference that is sufficiently similar to 𝐻 , and whether the resulting residual can be encoded without excessive error or auxiliary cost. These questions motivate the phase-specific opportunities examined next. 
+
+B. Phase-Specific Reference Opportunities 
+
+Repeated spans across rounds. Agent workloads often reuse system prompts, tool declarations, control tokens, and portions of the conversation history. Matching token spans therefore provide a low-cost lookup key for historical prefill-uplink states. In Fig. 2(a), across-input similarity begins near 0.95 for all three models but decreases as the number of head or tail layers grows, ending near 0.70 for Qwen, 0.60 for GLM, and 0.38 for Llama. Repeated spans thus provide useful structure, but token equality does not imply identical activations because causal prefixes and token positions can differ even under a fixed model revision and cut configuration; the matched reference must therefore be aligned before residual formation. 
+
+Same-round cross-boundary structure. Fig. 2(b) shows that Qwen’s cross-layer similarity rises from roughly 0.58 to 0.88 and GLM’s from roughly 0.06 to above 0.90 as fewer middle layers separate the boundaries; Llama rises more modestly from about 0.04 to 0.32. Because the downlink state 𝐻 c2l is obtained by applying the cloud-side middle layers to the uplink state 𝐻 l2c ,both endpoints already possess the reconstructed uplink state when the downlink is encoded. The model-dependent range shows that this same-round reference avoids historical lookup but still requires fitted grouped affine alignment rather than an identity mapping. 
+
+Continuity across decode steps. Consecutive-step similar-ity is consistently positive but differs by boundary. Fig. 2(c) and (d) show uplink ranges of about 0.62–0.70 for Qwen, 0.37–0.70 for GLM, and 0.38–0.54 for Llama, compared with downlink ranges of roughly 0.71–0.80, 0.54–0.69, and 0.45– 0.49, respectively. Consecutive steps use the same layer weights and contexts that differ only by the newest token, providing stable predictive structure for constructing boundary-specific references. Because activation structures vary across boundaries and models, separate predictors are required. The first decode step has no preceding activation and is therefore transmitted directly. 
+
+C. Key Questions 
+
+The observations above raise two key questions. Q1: How can RAC construct effective phase-aware references with-out adding serial preparation? Prefill uplinks, prefill down-links, and decode use different reference sources. RAC must make each reference available before its boundary activation is ready. 
+
+Q2: How can RAC align and encode residuals under quality and cost constraints? A reference that appears similar need not quantize well: cosine similarity ignores magnitude and offset, and outliers can still enlarge the residual range. Alignment, finer groups, and explicit outlier values improve reconstruction but add computation and metadata. The system must therefore select phase-specific alignment and quantization configurations that preserve task quality while keeping the packed representation and exposed processing cost low. Sec-tion IV addresses Q1 through overlapped reference preparation, and Q2 through quality- and cost-constrained aligned residual encoding. 
+
+IV. RAC Design 
+
+A. Overview 
+
+As shown in Fig. 3, RAC augments the local-head–cloud-middle–local-tail execution path with a prefill searcher, two de-code predictors, and an aligned residual codec at each boundary. The searcher builds references from repeated historical spans for prefill uplinks, while the shared reconstructed uplink state serves as the reference for prefill downlinks. The predictors generate references for the two decode directions from their preceding LOCAL Head CLOUD Middle LOCAL Tail                                                                                       
+
+> turn t−2 turn t−1 turn t
+> • • HQ(E) H• • • HQ(E) H• •
+> • • HQ(E) H• • • HQ(E) H• •
+> • • H−RHhist Q(E) +RMhist H• • • HQ(E) +RHcur H• •
+> RMcur : current Middle input
+> RHcur : current Head output
+> ⋮
+> step t−1 step tH−RH,pred Q(E) +RM,pred H• • • H−RM,pred Q(E) +RT,pred H• •
+> Predictor P1Predictor P2
+> H−RH,pred Q(E) +RM,pred H• • • H−RM,pred Q(E) +RT,pred H• •
+> • •
+> −RH,hist +RM,hist −RM,cur +RH,cur
+> −RH,hist +RM,hist −RM,cur +RH,cur
+> ⋮
+> • •
+> Decode Stage  Prefill Stage
+> Searcher
+> build best reference
+> −RMcur
+> Current turn/step activation Decode predicted reference Prefill intra-turn reference Prefill cross-turn matched reference
+
+Fig. 3. RAC overview across prefill and decode. Historical-span search supplies the prefill uplink reference, the reconstructed uplink state supplies the same-round downlink reference, and boundary-specific predictors construct decode references from preceding activations. Each referenced transfer applies affine-aligned residual quantization. 
+
+boundary states. The codec aligns each reference, quantizes the residual, and reconstructs the transmitted activation using phase-and direction-specific parameters selected by offline quality and packed-cost calibration. During prefill, the local head generates an uplink activation, and the searcher selects historical states for matched spans. Among uncovered positions, repeated tokens may reuse earlier reconstructed activations from the current sequence, while the remaining positions are encoded directly. The sender encodes residuals against the selected references, and the cloud reconstructs the activation, executes the middle layers, and returns a downlink encoded against the shared reconstructed uplink state. During decode, the first step is transferred directly because no preceding state exists; later steps use the two predictors to generate boundary-specific references and encode the corresponding residuals. 
+
+B. Phase-Aware Reference Construction 
+
+Insight and approach. Reference similarity is phase-, direction-, model-, and split-dependent. RAC retrieves repeated spans for prefill uplinks, reuses the reconstructed uplink for prefill downlinks, and predicts separate decode references. Historical-span selection and prefetch overlap local-head execu-tion, the same-round downlink reference is available after uplink reconstruction, and decode prediction overlaps the remaining model computation or communication. These schedules make each reference available before residual formation. 
+
+1) Repeated-Span Retrieval for Prefill Uplinks: Let 𝑥 1: 𝑁 and 
+
+𝐻 denote the current prompt and prefill-uplink state. Rolling hashes index 𝑤 -token windows in earlier requests and extend each hit to its longest exact match. At position 𝑖 , candidate 
+
+𝑐 = (𝑟, 𝑗, 𝐿 ) ∈ C 𝑖 satisfies 𝑥 𝑖 :𝑖 +𝐿 −1 = 𝑥 (𝑟 )  
+
+> 𝑗 :𝑗 +𝐿 −1
+
+and 𝐿 ≥ 𝑤 ,where 𝑟 , 𝑗 , and 𝐿 identify the historical request, start position, and span length. RAC retains up to eight recent hits per hash bucket. RAC performs deterministic left-to-right selection using token-match metadata: 
+
+𝑐 ★𝑖 = lex arg max 
+
+> 𝑐 ∈ C 𝑖
+
+ 𝐿 𝑐 , 𝜏 𝑐 
+
+, (3) where 𝜏 𝑐 denotes recency. RAC prioritizes the longest exact span and breaks ties by recency. After selecting 𝑐 ★𝑖 , the scan advances to position 𝑖 + 𝐿 𝑐 ★𝑖 . If C𝑖 is empty, the scan advances to 
+
+𝑖 + 1. Positions covered by a selected span use the corresponding historical activation states as references. Among the uncovered positions, repeated tokens may reuse an earlier reconstructed activation from the current sequence as an intra-sequence reference; all remaining positions are encoded directly. Because selection depends only on tokens and historical metadata, the selected activation spans are prefetched while the local head executes. After 𝐻 becomes available, RAC aligns the selected references and forms the residuals. 
+
+2) Same-Round References for Prefill Downlinks: For the downlink of the same split execution, both endpoints already possess the reconstructed uplink state: 
+
+𝑅 cross = b𝐻 l2c . (4) The cloud uses 𝑅 cross for 𝐻 c2l without historical lookup. Because the two tensors come from different layers and their similarity is model- and split-dependent, RAC does not assume element-wise closeness; grouped affine alignment transforms the shared state before residual formation. 
+
+3) Predicted References for Decode: The first decode step has no preceding activation and is therefore transmitted directly. From the second step onward, each boundary uses a dedicated 0                  
+
+> 0.2
+> 0.4
+> 0.6
+> 0.8
+> 1
+> 13579
+> 0
+> 0.2
+> 0.4
+> 0.6
+> 0.8
+> 1
+> 1357913579
+> (a) GLM uplink (b) Qwen uplink (c) Llama uplink
+> (d) GLM downlink (e) Qwen downlink (f) Llama downlink
+> Cosine similarity
+> Input index
+> Previous activation Predicted reference
+> Fig. 4. Per-input cosine similarity between the current decode boundary state and either the immediately preceding activation or the predictor-generated reference. Results are shown for both split boundaries of GLM, Qwen, and Llama.
+
+one-layer causal Transformer trained on consecutive activations from the corresponding target layer. Training records target-layer activations and optimizes next-activation prediction within a bounded history; at inference, the predictor retains this bounded causal state and uses a key-value cache. For 𝑡 ≥ 2, the predicted reference at boundary 𝑏 is 
+
+𝑅 𝑡 ,𝑏  
+
+> pred
+
+= 𝑃 𝜙 𝑏 
+
+ b𝐻 𝑡 −1,𝑏 ; 𝑆 𝑡 −1,𝑏 
+
+, 𝑡 ≥ 2, (5) where 𝑆 𝑡 −1,𝑏 denotes the predictor’s retained causal state. Separate parameters 𝜙 𝑏 account for the observed difference between uplink and downlink similarity patterns. Fig. 4 validates this construction on ten evaluated inputs. Prediction improves cosine similarity for every model, input, and boundary; relative to direct reuse of the preceding activation, the mean gain is 0.156–0.201 for the uplink and 0.059–0.118 for the downlink, so the aggregate gain is not driven by a few favorable inputs. Predictors 𝑃 1 and 𝑃 2 serve the uplink and downlink boundaries, respectively, and their outputs are used only as communication references, never as model inputs or token-generation states. 
+
+4) Reference Construction Scheduling: Token hashing, exact-span selection, historical lookup, and selected-reference prefetch overlap local-head execution. After 𝐻 becomes avail-able, alignment and residual formation, residual quantization, and sender-side reconstruction remain on the prefill-uplink sender path. Decode prediction overlaps the remaining model computation or communication after the preceding state be-comes available. Section V-F reports these exposed codec stages. 
+
+C. Quality- and Cost-Constrained Aligned Residual Encoding 
+
+Insight and approach. A similar reference can preserve the activation’s dominant structure, but cosine similarity alone does not correct channel-wise scale and offset or control residual outliers. RAC first fits grouped affine mappings, then quantizes the aligned residual with calibrated group sizes and optional prefill outliers. Online, the sender applies the same wire-format reconstruction as the receiver to keep subsequent references synchronized. Offline calibration reuses this reconstruction path to select phase- and direction-specific parameters that meet the quality target while accounting for value, scale, coefficient, and outlier bytes. 
+
+1) Grouped Affine Alignment: Assuming 𝑔 𝑎 | 𝑑 , RAC 
+
+partitions the hidden dimension into 𝐽 𝑎 = 𝑑 /𝑔 𝑎 alignment groups. For the 𝑔 𝑎 -channel slices 𝐻 𝑗 and 𝑅 𝑗 over the fitting positions, group 𝑗 solves 
+
+(𝛼 ★𝑗 , 𝛽 ★𝑗 ) = arg min 
+
+> 𝛼,𝛽
+
+𝐻 𝑗 − ( 𝛼𝑅 𝑗 + 𝛽 ) 2F. (6) For zero-variance 𝑅 𝑗 , 𝛼 ★𝑗 = 0 and 𝛽 ★𝑗 = mean (𝐻 𝑗 ).Both endpoints use the serialized coefficients (𝛼 𝑗 , 𝛽 𝑗 ) =
+
+Round wire (𝛼 ★𝑗 , 𝛽 ★𝑗 ), where Round wire denotes rounding to the configured coefficient format: 
+
+e𝑅 𝑗 = 𝛼 𝑗 𝑅 𝑗 + 𝛽 𝑗 , (7a) 
+
+𝐸 = 𝐻 − e𝑅. (7b) Smaller 𝑔 𝑎 improves fit but serializes more coefficient pairs; decode may therefore require coarser groups than prefill. Calibration selects 𝑔 𝑎 per model, split, phase, and direction. 
+
+2) Grouped Residual Quantization: RAC partitions 𝐸 into 
+
+𝑔 𝑞 -element groups. An optional mask 𝑀 𝑗 ∈ { 0, 1}𝑔 𝑞 separates sparse outliers from the dense base: 
+
+𝑂 𝑗 = 𝑀 𝑗 ⊙ 𝐸 𝑗 , 𝐸 𝑑 𝑗 = 𝐸 𝑗 − 𝑂 𝑗 .Without outliers, 𝑀 𝑗 = 0. For 𝑞 ∈ { 4, 8}, define 
+
+𝑄 max = 2𝑞 −1 − 1, (8a) 
+
+𝑠 ★,𝐸 𝑗 = max |𝐸 𝑑 𝑗 |
+
+𝑄 max 
+
+, ¯𝑠 𝐸 𝑗 = RoundUp wire (𝑠 ★,𝐸 𝑗 ) ≥ 𝑠 ★,𝐸 𝑗 ,
+
+(8b) 
+
+𝑞 𝑗 = clip [− 𝑄 max ,𝑄 max ]
+
+
+
+⌊𝐸 𝑑 𝑗 / ¯𝑠 𝐸 𝑗 ⌉
+
+
+
+. (8c) All-zero groups carry a zero marker and skip division. Here, RoundUp wire rounds upward in the configured scale format, preventing dense-value clipping. Four-bit integer (INT4) quan-tization packs two values per byte, and each group carries its serialized scale. Calibration selects (𝑔 𝑎 , 𝑔 𝑞 , 𝑞, 𝑘 𝑔 ) in outlier mode and (𝑔 𝑎 , 𝑔 𝑞 , 𝑞 ) otherwise, balancing local adaptation against scale, alignment, and outlier metadata, especially for single-token decode. 
+
+3) Outlier Metadata and Calibration: In outlier mode, 𝑀 𝑗 
+
+selects the 𝑘 𝑔 largest magnitudes per fixed group; the packet carries in-group offsets and b𝑂 𝑗 = Round FP16 (𝑂 𝑗 ), where FP16 denotes the 16-bit floating-point format. Fixed group order avoids full coordinates. Calibration considers group size, outlier count, selection time, metadata bytes, and reconstruction quality. For decode, RAC disables mixed-precision outlier handling: it neither extracts outliers nor transmits selected values at their original precision, so the packet carries no outlier mask, offsets, or high-precision payload. The quantization group spans one complete token vector, i.e., 𝑔 𝑞 = 𝑑 for a [𝐵, 1, 𝑑 ] boundary state. Consequently, each token requires only one quantization scale per batch element, minimizing the auxiliary data used by decode quantization. 
+
+4) Reconstruction and Error: The receiver resolves 𝑅 ,applies the serialized alignment, dequantizes the dense base, and restores outliers: 
+
+b𝐸 𝑗 = DQ (𝑞 𝑗 ; ¯ 𝑠 𝐸 𝑗 ) + b𝑂 𝑗 , (9a) 
+
+b𝐻 = e𝑅 + b𝐸. (9b) Here, DQ denotes dequantization using the serialized residual scale. For a common reference 𝑅 and common serialized alignment coefficients, 
+
+𝐻 − b𝐻 = 𝐸 − b𝐸. (10) Thus the reference changes the coded distribution but adds no independent error term. For round-to-nearest, let 𝑛 𝑑 𝑗 count dense values. Eq. (8) prevents dense clipping, and disjoint dense/outlier positions give 
+
+∥𝐸 − b𝐸 ∥2F =∑︁ 
+
+> 𝑗
+
+𝐸 𝑑 𝑗 − DQ (𝑞 𝑗 ; ¯ 𝑠 𝐸 𝑗 ) 2F +∑︁ 
+
+> 𝑗
+
+∥𝑂 𝑗 − b𝑂 𝑗 ∥2F
+
+≤∑︁ 
+
+> 𝑗
+
+𝑛 𝑑 𝑗 
+
+( ¯𝑠 𝐸 𝑗 )2
+
+4 +∑︁ 
+
+> 𝑗
+
+∥𝑂 𝑗 − b𝑂 𝑗 ∥2F.
+
+(11) For the same grouping, outlier-selection rule and count, and bit width, let 𝐻 𝑑 𝑗 be the dense base obtained by applying that rule to direct-coded 𝐻 𝑗 (thus 𝐻 𝑑 𝑗 = 𝐻 𝑗 without outliers), and define 𝑀 𝑑 𝑋, 𝑗 = max |𝑋 𝑑 𝑗 | for 𝑋 ∈ { 𝐸, 𝐻 }. If 𝑀 𝑑 𝐻, 𝑗 > 0, let 
+
+𝜌 𝑗 = 𝑀 𝑑 𝐸, 𝑗 /𝑀 𝑑 𝐻, 𝑗 ; then before wire-scale rounding 
+
+𝑛 𝑑 𝑗 
+
+4
+
+𝑀 𝑑 𝐸, 𝑗 
+
+𝑄 max 
+
+!2
+
+= 𝜌 2
+
+> 𝑗
+
+𝑛 𝑑 𝑗 
+
+4
+
+𝑀 𝑑 𝐻, 𝑗 
+
+𝑄 max 
+
+!2
+
+. (12) A uniform 0 ≤ 𝜌 𝑗 ≤ 𝜌 < 1 bounds each residual pre-rounding dense term by 𝜌 2 times its direct-coded counterpart; it does not guarantee a 𝜌 2 reduction of Eq. (11), because wire-scale rounding and FP16 outlier error remain. If 𝑀 𝑑 𝐻, 𝑗 = 0, the ratio is undefined and no range-reduction claim is made. 
+
+V. Evaluation 
+
+A. Experiment Setup 
+
+Testbed. Our testbed comprises a local platform equipped with two NVIDIA RTX 3090 GPUs and a cloud platform equipped with either one or four NVIDIA A800 GPUs. We use Linux Traffic Control to emulate heterogeneous wide-area network conditions [15]. Unless otherwise stated, the end-to-end latency experiments use a request concurrency of eight. 
+
+Models. We evaluate RAC using three representative mod-els: GLM-4-9B-0414, Qwen3-30B-A3B, and Llama-3.3-70B-Instruct [16]–[18]. They span parameter scales from 9B to 70B and include both dense and mixture-of-experts architectures, allowing us to examine RAC across heterogeneous computation and memory characteristics under split inference. For compact labels in figures and discussion, GLM, Qwen, and Llama denote GLM-4-9B-0414, Qwen3-30B-A3B, and Llama-3.3-70B-Instruct, respectively. 
+
+Datasets. For quality evaluation, we use WikiText-2, Hel-laSwag, GSM8K, and MATH-500 [19]–[22]. WikiText-2 eval-uates language-modeling quality, HellaSwag evaluates com-monsense reasoning, and GSM8K and MATH-500 evaluate mathematical reasoning at different difficulty levels. For per-formance evaluation, we use ShareGPT [23], a collection of publicly shared multi-turn conversations; our workload includes heterogeneous input and output lengths. 
+
+Baselines. We compare RAC with five baselines: Raw, TopK (8-bit ratio), TopK (4-bit ratio), Global INT8 (global 8-bit integer quantization), and Global INT4 (global 4-bit integer quantization). The end-to-end quality evaluation includes all five baselines; the latency evaluation includes Raw, RAC, and the two TopK configurations; and the bandwidth-sensitivity evaluation compares RAC with Raw. 
+
+Metrics. For performance, we report time to first token (TTFT), time per output token (TPOT), and output-token throughput. TTFT and TPOT are summarized using the mean, median, and 99th percentile. We also report the transferred activation-value payload relative to Raw, separately for prefill and decode; this payload ratio excludes metadata and control traffic. For quality, we report word-level perplexity (PPL) on WikiText-2, normalized accuracy on HellaSwag, flexible and strict exact match (EM) on GSM8K, and MathVerify accuracy on MATH-500. Accuracy and EM values use a 0–100 percentage scale. Lower latency and perplexity are better, whereas higher throughput and accuracy are better. TABLE I                                                                                                                                             
+
+> End-to-end quality and activation-value payload (metadata/control excluded), normalized to Raw as prefill/decode. Accuracy, exact-match, and MathVerify values use a 0–100 percentage scale. Each derived row reports RAC minus Raw; an em dash denotes N/A. Arrows show the preferred direction; boldface and underlining mark the best and second-best quality values.
+> Model Method Payload / Raw (%)
+> Prefill / Decode
+> Language modeling Commonsense Mathematical reasoning WikiText-2
+> PPL ↓
+> HellaSwag
+> Norm. Acc. ↑
+> GSM8K
+> Flexible EM ↑
+> GSM8K
+> Strict EM ↑
+> MATH-500
+> MathVerify ↑
+> GLM-4
+> 9B-0414 Raw 100 / 100 40.77 80.16 80.59 80.44 56.00 TopK (4-bit ratio) 25 / 25 123.00 50.73 14.63 12.05 5.00 TopK (8-bit ratio) 50 / 50 42.93 72.78 64.22 69.90 38.20 Global INT8 50 / 50 31.87 79.50 80.89 80.82 53.80 Global INT4 25 / 25 214.87 45.69 1.82 0.61 0.80
+> RAC (Ours) 27.8 / 25.0 39.66 80.10 80.21 80.36 56.60
+> Δvs. Raw —-1.11 -0.06 -0.38 -0.08 +0.60
+> Qwen3
+> 30B-A3B Raw 100 / 100 19.18 77.74 86.05 89.38 80.00
+> TopK (4-bit ratio) 25 / 25 56.73 60.02 16.00 14.78 24.40 TopK (8-bit ratio) 50 / 50 26.80 72.27 75.13 74.68 68.80 Global INT8 50 / 50 20.62 76.63 84.38 86.96 77.60 Global INT4 25 / 25 1110.52 32.13 0.68 0.08 0.60
+> RAC (Ours) 27.8 / 25.0 19.45 77.42 87.11 89.76 79.80
+> Δvs. Raw —+0.27 -0.32 +1.06 +0.38 -0.20
+> Llama-3.3
+> 70B-Instruct Raw 100 / 100 13.46 84.85 91.89 73.77 65.80
+> TopK (4-bit ratio) 25 / 25 36.17 80.83 81.43 42.23 53.40 TopK (8-bit ratio) 50 / 50 20.02 83.66 91.05 49.81 60.40 Global INT8 50 / 50 20.36 82.91 80.44 85.22 48.00 Global INT4 25 / 25 16932.98 26.35 1.90 0.00 0.80
+> RAC (Ours) 27.8 / 25.0 13.54 84.87 92.04 76.27 65.40
+> Δvs. Raw —+0.08 +0.02 +0.15 +2.50 -0.40
+
+B. End-to-End Quality 
+
+Table I compares end-to-end quality across the three eval-uated models. RAC has the smallest absolute deviation from Raw among the five compressed methods in 14 of the 15 model–metric cells; the exception is GLM’s GSM8K flexible exact-match accuracy, where global 8-bit integer quantization differs by 0.30 points and RAC by 0.38 points. RAC’s non-perplexity changes range from −0.40 to +2.50 points, with the largest change occurring on Llama’s GSM8K strict exact-match accuracy. Its relative WikiText-2 perplexity changes are 
+
+−2.72%, +1.41%, and +0.59% for GLM, Qwen, and Llama, respectively; the direction of the change is not uniform across the three evaluated models. The payload ratios in Table I are constant across the evaluated 1k, 2k, and 8k sequence lengths, so we report normalized ratios rather than repeating the absolute megabyte counts. For all three models, RAC transfers approximately 27 .8% of the Raw prefill payload and 25 .0% of the Raw decode payload, corresponding to payload reductions of approximately 72 .2% and 75 .0%, respectively. The 2.8-percentage-point prefill premium reflects its optional high-precision outliers, whereas decode disables outlier transmission and remains at the dense INT4 activation-value ratio. The remaining methods are not quality-matched to Raw or RAC. Both TopK configurations reduce every higher-is-better score, with larger losses for TopK (4-bit ratio). Global INT8 is closer but inconsistent across models and metrics, while Global INT4 yields perplexity values from 214.87 to 16932.98 and near-zero GSM8K or MATH-500 scores in several cells. Accordingly, the TopK latency results represent different quality operating points rather than equal-quality comparisons. 
+
+C. End-to-End Latency 
+
+Fig. 5 reports all three bandwidth configurations and all six latency statistics. Across nine model–link pairs, mean TTFT and TPOT are lower than Raw, with Raw-to-RAC ratios of 1.24–2.72 × and 1.01–2.79 ×; the 99th-percentile TTFT is also lower in all nine. At Qwen’s 100/5-Mbit/s point, median TTFT, median TPOT, and 99th-percentile TPOT regress by 12.16, 6.81, and 11.66 ms, respectively; the last metric also regresses by 4.23 ms at 100/10 Mbit/s. Thus, lower mean latency does not eliminate median or tail variability. TPOT gains otherwise grow as decode bandwidth falls because serialization occupies more of the critical path. Because TopK has lower task quality (Table I), its latency curves represent different quality operating points. 
+
+D. Exploratory Joint Bandwidth Sensitivity 
+
+Because the model checkpoint identity was not retained, we interpret Fig. 6 only within the measured sweep. Across 25 bandwidth pairs, RAC has lower TTFT in 21, lower TPOT in 18, and higher throughput in 19. Its advantage is strongest at lower decode bandwidths, while several high-bandwidth pairs cross over in favor of Raw. The measured crossover shows that serialization savings must exceed codec and fixed transfer costs and that the calibrated operating point should reflect the target network regime. 10 2
+
+10 3
+
+10 2
+
+10 2.5
+
+10 3
+
+10 3
+
+10 4
+
+10 5 1 10 5 1 10 5 1
+
+10 2
+
+10 3
+
+GLM-4 Qwen3 Llama-3.3 
+
+10 5 1 10 5 1 10 5 1
+
+10 2
+
+10 3
+
+GLM-4 Qwen3 Llama-3.3 
+
+10 5 1 10 5 1 10 5 1
+
+10 2
+
+10 2.5
+
+10 3
+
+GLM-4 Qwen3 Llama-3.3 
+
+(a) Mean TTFT (b) Median TTFT (c) 99th-percentile TTFT 
+
+(d) Mean TPOT (e) Median TPOT (f) 99th-percentile TPOT 
+
+> Latency (ms; log scale)
+
+Decode bandwidth (Mbit/s; prefill bandwidth = 100 Mbit/s) 
+
+Raw RAC TopK (8-bit ratio) TopK (4-bit ratio) 
+
+Fig. 5. End-to-end latency across models and bandwidth configurations. Each model group orders decode bandwidths as 10, 5, and 1 Mbit/s while the prefill bandwidth remains 100 Mbit/s. The six panels report the mean, median, and 99th percentile of time to first token (TTFT) and time per output token (TPOT) for Raw, RAC, TopK (8-bit ratio), and TopK (4-bit ratio). Vertical axes use logarithmic scales. 100 500 1000 1510 25 75 prefill bandwidth (Mbit/s) 
+
+123100 500 1000 prefill bandwidth (Mbit/s) 
+
+123100 500 1000 prefill bandwidth (Mbit/s) 
+
+123(a) TTFT speedup (b) TPOT speedup (c) Throughput gain decode bandwidth (Mbit/s) Fig. 6. RAC improvement over Raw across the joint bandwidth sweep: (a) Raw/RAC mean-TTFT speedup, (b) Raw/RAC mean-TPOT speedup, and (c) RAC/Raw output-token-throughput gain. Each cell represents one prefill/decode bandwidth pair; values above one favor RAC. All panels use the same linear scale. 
+
+E. Component Ablation 
+
+Table II compares reference-aware compression with config-urations that remove prediction, search, or affine alignment. All three reduce both GSM8K exact-match scores and MATH-500 accuracy for every model, whereas WikiText-2 and HellaSwag differences are small and mixed. For GLM, removing prediction changes GSM8K flexible and strict exact match by −10 .38 and −9.85 points and MATH-500 by −22 .0 points. Prediction removal also lowers strict exact match by 1.13 points for Qwen and 5.00 points for Llama. These results show that prediction contributes temporal reference structure; search supplies his-torical structure for prefill uplinks, and affine alignment adapts references across the referenced prefill and decode transfers. 
+
+F. Runtime Overhead 
+
+Fig. 7 reports selected post-activation stages for each transfer. Affine residual construction has the largest prefill-uplink 99th percentile, while every displayed decode stage has a sub-millisecond mean, consistent with full-sequence versus one-token processing. The mean same-round wait remains below 0.007 ms. Token hashing, span selection, reference prefetch, predictor execution, and predictor wait are omitted because they overlap model computation or communication. The figure therefore focuses on stages exposed after the activation becomes available. TABLE II                                                                                   
+
+> Quality ablation across the three evaluated models. Accuracy, exact-match, and MathVerify values use a 0–100 percentage scale. Boldface and underlining mark the best and second-best values among RAC and its ablation variants, respectively.
+> Model Variant Language modeling Commonsense Mathematical reasoning WikiText-2
+> PPL ↓
+> HellaSwag
+> Norm. Acc. ↑
+> GSM8K
+> Flexible EM ↑
+> GSM8K
+> Strict EM ↑
+> MATH-500
+> MathVerify ↑
+> GLM-4
+> 9B-0414
+> RAC (Ours) 39.66 80.10 80.21 80.36 56.60
+> w/o prediction 39.66 80.16 69 .83 70 .51 34 .60 w/o search 38.86 80 .04 77 .71 78 .39 47 .40 w/o affine alignment 39 .82 80 .07 78.92 79.38 49.40
+> Qwen3
+> 30B-A3B
+> RAC (Ours) 19.45 77 .42 87.11 89.76 79.80
+> w/o prediction 19.45 77.80 86.08 88 .63 78 .00 w/o search 19 .49 77 .38 84 .31 88 .55 78.60 w/o affine alignment 19.48 77.45 86 .02 88.86 78.60
+> Llama-3.3
+> 70B-Instruct
+> RAC (Ours) 13.54 84.87 92.04 76.27 65.40
+> w/o prediction 13.54 84.88 91.89 71 .27 61 .20 w/o search 13.56 84 .81 91 .43 75.65 62 .00 w/o affine alignment 13 .59 84 .83 91 .51 74 .75 63.80 0.1110 100 Affine residual Quantization Sender recon. Receiver recon. Time (ms) 0.01 0.1110 Affine residual Quantization Same-round wait Receiver recon. Time (ms) 0.11Residual formation Quantization Sender recon. Receiver recon. Time (ms) (a) Prefill uplink (b) Prefill downlink (c) Decode GLM Qwen Llama Fig. 7. Runtime summaries for selected post-activation stages: (a) prefill uplink, (b) prefill downlink, and (c) decode. Segments span the mean to the 99th percentile; dark ticks mark the 95th percentile. All horizontal axes are logarithmic.
+
+VI. Related Work 
+
+Split inference and LLM serving. Device–cloud systems partition consecutive submodels and optimize placement under latency, accuracy, and resource constraints [4], [5], [13], [14], [24]. RAC leaves the partitioned LLM unchanged, calibrating the boundary codec offline. LLM-serving systems optimize batching, attention-memory management, phase scheduling, and prefill–decode disaggregation [11], [12], [25]–[27]. State offloading, prompt reuse, and KV-cache transport instead move model state or persistent attention history [28]–[30]. RAC oper-ates under fixed three-way placement and compresses transient boundary activations without changing phase placement or transporting the KV cache. 
+
+Intermediate-representation compression. Learned bottle-necks train compact transmitted features [31]–[34], whereas quantization, sparsification, mixed precision, and smoothing encode existing tensors without model changes [8]–[10], [35]. Direct quantization covers the full tensor range; RAC quantizes only the aligned difference. RAC constructs phase-specific references from repeated spans, same-round boundaries, or con-secutive decode steps, then calibrates grouping, bit width, and outlier handling through sender-side wire-format reconstruction and packed-cost accounting. 
+
+Privacy-oriented split inference. Perturbation and pruning defenses reduce information retained by transmitted features [6], [7]. RAC targets communication efficiency rather than formal privacy and can be combined with such defenses; compression alone is not a confidentiality guarantee. 
+
+VII. Conclusion 
+
+We presented RAC, a reference-aware boundary codec for split LLM inference. RAC retrieves exact-token historical spans for prefill uplinks, reuses the reconstructed uplink state for same-round prefill downlinks, and generates boundary-specific decode references using lightweight causal predictors. For each referenced transfer, RAC fits a grouped affine mapping, quantizes the aligned residual using calibrated 4-bit or 8-bit groups with optional prefill outliers, and reconstructs the transmitted activation at the sender to keep subsequent references synchronized with the receiver. Its activation payload is approximately 27 .8% of Raw for prefill and 25 .0% for decode. Across nine model–link pairs, Raw-to-RAC mean TTFT and TPOT ratios are 1.24–2.72 × and 1.01–2.79 ×, while the 12 non-perplexity score changes range from −0.40 to +2.50 points. References 
+
+[1] T. B. Brown, B. Mann, N. Ryder, M. Subbiah, J. Kaplan, P. Dhariwal, A. Neelakantan, P. Shyam, G. Sastry, A. Askell et al. , “Language models are few-shot learners,” in Advances in Neural Information Processing Systems , vol. 33, 2020, pp. 1877–1901. [2] S. Yao, J. Zhao, D. Yu, N. Du, I. Shafran, K. R. Narasimhan, and Y. Cao, “ReAct: Synergizing reasoning and acting in language models,” in International Conference on Learning Representations , 2023. [3] T. Schick, J. Dwivedi-Yu, R. Dess` ı, R. Raileanu, M. Lomeli, E. Hambro, L. Zettlemoyer, N. Cancedda, and T. Scialom, “Toolformer: Language models can teach themselves to use tools,” in Advances in Neural Information Processing Systems , vol. 36, 2023, pp. 68 539–68 551. [4] Y. Kang, J. Hauswald, C. Gao, A. Rovinski, T. Mudge, J. Mars, and L. Tang, “Neurosurgeon: Collaborative intelligence between the cloud and mobile edge,” in Proceedings of the 22nd International Conference on Architectural Support for Programming Languages and Operating Systems , 2017, pp. 615–629. [5] A. E. Eshratifar, M. S. Abrishami, and M. Pedram, “JointDNN: An efficient training and inference engine for intelligent mobile cloud computing services,” IEEE Transactions on Mobile Computing , vol. 20, no. 2, pp. 565–576, 2021. [6] F. Mireshghallah, M. Taram, P. Ramrakhyani, A. Jalali, D. Tullsen, and H. Esmaeilzadeh, “Shredder: Learning noise distributions to protect inference privacy,” in Proceedings of the Twenty-Fifth International Conference on Architectural Support for Programming Languages and Operating Systems , 2020, pp. 3–18. [7] S. Ding, L. Zhang, M. Pan, and X. Yuan, “PATROL: Privacy-oriented pruning for collaborative inference against model inversion attacks,” in 
+
+Proceedings of the IEEE/CVF Winter Conference on Applications of Computer Vision , 2024, pp. 4716–4725. [8] T. Dettmers, M. Lewis, Y. Belkada, and L. Zettlemoyer, “LLM.int8(): 8-bit matrix multiplication for transformers at scale,” in Advances in Neural Information Processing Systems , vol. 35, 2022, pp. 30 318–30 332. [9] G. Xiao, J. Lin, M. Seznec, H. Wu, J. Demouth, and S. Han, “SmoothQuant: Accurate and efficient post-training quantization for large language models,” in Proceedings of the 40th International Conference on Machine Learning , 2023, pp. 38 087–38 099. [10] Z. Yao, R. Y. Aminabadi, M. Zhang, X. Wu, C. Li, and Y. He, “Zero-Quant: Efficient and affordable post-training quantization for large-scale transformers,” in Advances in Neural Information Processing Systems ,vol. 35, 2022, pp. 27 168–27 183. [11] A. Agrawal, N. Kedia, A. Panwar, J. Mohan, N. Kwatra, B. Gulavani, A. Tumanov, and R. Ramjee, “Taming Throughput-Latency tradeoff in LLM inference with Sarathi-Serve,” in 18th USENIX Symposium on Operating Systems Design and Implementation (OSDI 24) . USENIX Association, 2024, pp. 117–134. [12] Y. Zhong, S. Liu, J. Chen, J. Hu, Y. Zhu, X. Liu, X. Jin, and H. Zhang, “DistServe: Disaggregating prefill and decoding for goodput-optimized large language model serving,” in 18th USENIX Symposium on Operating Systems Design and Implementation (OSDI 24) . USENIX Association, 2024, pp. 193–210. [13] A. Borzunov, D. Baranchuk, T. Dettmers, M. Riabinin, Y. Belkada, A. Chu-machenko, P. Samygin, and C. Raffel, “Petals: Collaborative inference and fine-tuning of large models,” in Proceedings of the 61st Annual Meeting of the Association for Computational Linguistics (Volume 3: System Demonstrations) . Association for Computational Linguistics, 2023, pp. 558–568. [14] S. Ye, B. Ouyang, L. Zeng, T. Qian, X. Chu, J. Tang, and X. Chen, “Jupiter: Fast and resource-efficient collaborative inference of generative LLMs on edge devices,” in IEEE INFOCOM 2025–IEEE Conference on Computer Communications . IEEE, 2025, pp. 1–10. [15] “tc-netem(8)—linux manual page,” https://man7.org/linux/man-pages/ man8/tc-netem.8.html, accessed: 2026-07-26. [16] Z.ai, “GLM-4-9B-0414 model card,” https://huggingface.co/zai-org/ GLM-4-9B-0414, 2025, accessed: 2026-07-26. [17] A. Yang, A. Li, B. Yang, B. Zhang, B. Hui, B. Zheng, B. Yu et al. , “Qwen3 technical report,” arXiv preprint arXiv:2505.09388 , 2025. [18] Meta, “Llama-3.3-70B-Instruct model card,” https://huggingface.co/ meta-llama/Llama-3.3-70B-Instruct, 2024, accessed: 2026-07-26. [19] S. Merity, C. Xiong, J. Bradbury, and R. Socher, “Pointer sentinel mixture models,” in International Conference on Learning Representations , 2017. [Online]. Available: https://openreview.net/forum?id=Byj72udxe [20] R. Zellers, A. Holtzman, Y. Bisk, A. Farhadi, and Y. Choi, “HellaSwag: Can a machine really finish your sentence?” in Proceedings of the 57th Annual Meeting of the Association for Computational Linguistics .Association for Computational Linguistics, 2019, pp. 4791–4800. [21] K. Cobbe, V. Kosaraju, M. Bavarian, M. Chen, H. Jun, L. Kaiser, M. Plap-pert, J. Tworek, J. Hilton, R. Nakano, C. Hesse, and J. Schulman, “Training verifiers to solve math word problems,” arXiv preprint arXiv:2110.14168 ,2021. [22] H. Lightman, V. Kosaraju, Y. Burda, H. Edwards, B. Baker, T. Lee, J. Leike, J. Schulman, I. Sutskever, and K. Cobbe, “Let’s verify step by step,” arXiv preprint arXiv:2305.20050 , 2023. [23] ShareGPT, “ShareGPT,” https://sharegpt.com/, accessed: 2026-07-26. [24] H. Li, C. Hu, J. Jiang, Z. Wang, Y. Wen, and W. Zhu, “JALAD: Joint accuracy- and latency-aware deep structure decoupling for edge-cloud execution,” in 2018 IEEE 24th International Conference on Parallel and Distributed Systems , 2018, pp. 671–678. [25] G.-I. Yu, J. S. Jeong, G.-W. Kim, S. Kim, and B.-G. Chun, “Orca: A dis-tributed serving system for Transformer-Based generative models,” in 16th USENIX Symposium on Operating Systems Design and Implementation (OSDI 22) . USENIX Association, 2022, pp. 521–538. [26] W. Kwon, Z. Li, S. Zhuang, Y. Sheng, L. Zheng, C. H. Yu, J. E. Gonzalez, H. Zhang, and I. Stoica, “Efficient memory management for large language model serving with PagedAttention,” in Proceedings of the 29th ACM Symposium on Operating Systems Principles , 2023, pp. 611–626. [27] P. Patel, E. Choukse, C. Zhang, A. Shah, ´ I. Goiri, S. Maleki, and R. Bianchini, “Splitwise: Efficient generative LLM inference using phase splitting,” in 2024 ACM/IEEE 51st Annual International Symposium on Computer Architecture , 2024, pp. 118–132. [28] Y. Sheng, L. Zheng, B. Yuan, Z. Li, M. Ryabinin, B. Chen, P. Liang, C. R´ e, I. Stoica, and C. Zhang, “FlexGen: High-throughput generative inference of large language models with a single GPU,” in Proceedings of the 40th International Conference on Machine Learning , ser. Proceedings of Machine Learning Research, vol. 202. PMLR, 2023, pp. 31 094–31 116. [29] I. Gim, G. Chen, S. seob Lee, N. Sarda, A. Khandelwal, and L. Zhong, “Prompt cache: Modular attention reuse for low-latency inference,” in 
+
+Proceedings of Machine Learning and Systems , vol. 6, 2024, pp. 325– 338. [30] Y. Liu, H. Li, Y. Cheng, S. Ray, Y. Huang, Q. Zhang, K. Du, J. Yao, S. Lu, G. Ananthanarayanan, M. Maire, H. Hoffmann, A. Holtzman, and J. Jiang, “CacheGen: KV cache compression and streaming for fast large language model serving,” in Proceedings of the ACM SIGCOMM 2024 Conference . Association for Computing Machinery, 2024, pp. 38–56. [31] A. E. Eshratifar, A. Esmaili, and M. Pedram, “BottleNet: A deep learning architecture for intelligent mobile cloud computing services,” in 2019 IEEE/ACM International Symposium on Low Power Electronics and Design , 2019, pp. 1–6. [32] J. Shao and J. Zhang, “BottleNet++: An end-to-end approach for feature compression in device-edge co-inference systems,” in 2020 IEEE International Conference on Communications Workshops , 2020, pp. 1–6. [33] Y. Matsubara, R. Yang, M. Levorato, and S. Mandt, “Supervised compression for resource-constrained edge computing systems,” in 2022 IEEE/CVF Winter Conference on Applications of Computer Vision , 2022, pp. 923–933. [34] Y. Matsubara, R. Yang, M. Levorato, and S. Mandt, “SC2 Benchmark: Supervised compression for split computing,” Transactions on Machine Learning Research , 2023. [35] B. Jacob, S. Kligys, B. Chen, M. Zhu, M. Tang, A. Howard, H. Adam, and D. Kalenichenko, “Quantization and training of neural networks for efficient integer-arithmetic-only inference,” in Proceedings of the IEEE Conference on Computer Vision and Pattern Recognition , 2018, pp. 2704–2713.
