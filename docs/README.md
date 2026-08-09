@@ -6,42 +6,29 @@
 </div>
 
 ## 每次日报
-- 最新运行日期：2026-08-08
-- 运行时间：2026-08-08 20:36:19 UTC
+- 最新运行日期：2026-08-09
+- 运行时间：2026-08-09 20:53:24 UTC
 - 运行状态：成功
-- 本次总论文数：7
-- 精读区：0
-- 速读区：7
+- 本次总论文数：3
+- 精读区：1
+- 速读区：2
 
 ### 今日简报（AI）
-今日聚焦长上下文问答的隐藏状态内存压缩，速读7篇相关研究，其中3篇获7.0分。最值得关注的方向是选择性解压（SeDeM）与稀疏采样重构（S$^4$R），均旨在压缩KV缓存同时保留查询关键信息。建议普通读者先了解KV缓存量化的注意力保持变换，再深入比较这三类方法的精度与效率权衡。
-- 详情：[/202608/08/README](/202608/08/README)
+今日精读1篇、速读2篇，聚焦设备端大模型的高效部署与推理优化。最值得关注的是消费级GPU上实现个性化SLM的节能省显存微调方法（满分推荐），另有两篇KV缓存压缩与INT2量化实证研究可作参考。建议从满分论文入手，优先掌握PEFT在资源受限场景下的应用技巧。
+- 详情：[/202608/09/README](/202608/09/README)
 
 ### 精读区论文标签
-- 本次无精读推荐。
+1. [Energy- and Memory-Efficient PEFT Methods for Personalized On-Device SLMs on Consumer GPUs](/202608/09/2608.04488v1-energy--and-memory-efficient-peft-methods-for-personalized-on-device-slms-on-consumer-gpus)  
+   标签：评分：10.0/10、query:edge-llm
+   evidence：面向端侧SLM的节能省内存PEFT方法系统比较
 
 ### 速读区论文标签
-1. [SeDeM: Selective Decompression of Hidden-State Memories for Long-Context Question Answering](/202608/08/2608.00311v1-sedem-selective-decompression-of-hidden-state-memories-for-long-context-question-answering)  
-   标签：评分：7.0/10、query:edge-llm
-   evidence：通过选择性解压隐藏状态记忆，减少长上下文问答中的KV缓存与计算开销。
-2. [S$^4$R: Selective Sampling, Subspaces, and Sparse Reconstruction for Compressed Long-Context KV Caching](/202608/08/2608.00528v1-s4r-selective-sampling-subspaces-and-sparse-reconstruction-for-compressed-long-context-kv-caching)  
-   标签：评分：7.0/10、query:edge-llm
-   evidence：基于选择性采样与稀疏重构的低秩KV缓存压缩，降低长上下文推理的内存开销，促进资源高效部署。
-3. [Spend Bits Where Queries Look: KV Cache Vector Quantization with Attention-Preserving Transforms](/202608/08/2608.04074v1-spend-bits-where-queries-look-kv-cache-vector-quantization-with-attention-preserving-transforms)  
-   标签：评分：7.0/10、query:edge-llm
-   evidence：通过注意力保持的向量量化压缩KV缓存，降低解码带宽需求，是可用于边缘端的资源高效推理技术。
-4. [TensorCast: The Missing Tensor Management Layer in Large Language Model Infrastructure](/202608/08/2608.06007v1-tensorcast-the-missing-tensor-management-layer-in-large-language-model-infrastructure)  
-   标签：评分：7.0/10、query:edge-llm
-   evidence：提出LLM基础设施中张量生命周期管理抽象层，解决服务框架中张量管理策略的复用与组合问题。
-5. [CascadeLUT: Information-Ordered Streaming Inference for Bandwidth-Constrained FPGAs](/202608/08/2608.00720v1-cascadelut-information-ordered-streaming-inference-for-bandwidth-constrained-fpgas)  
+1. [Practical Online KV Cache Compaction for LLM Agents: An Empirical Study](/202608/09/2608.00902v1-practical-online-kv-cache-compaction-for-llm-agents-an-empirical-study)  
    标签：评分：6.0/10、query:edge-llm
-   evidence：提出面向带宽受限FPGA的信息有序流式推理，属硬件感知加速方法，可迁移至边缘推理。
-6. [Design-Time Optimization of Deep Neural Networks for Intermittent Learning on Microcontrollers](/202608/08/2608.03589v1-design-time-optimization-of-deep-neural-networks-for-intermittent-learning-on-microcontrollers)  
+   evidence：在线KV缓存压缩降低推理内存瓶颈，可迁移至边缘端资源受限场景
+2. [Output-Aware Rotation for INT2 KV-Cache Quantization](/202608/09/2608.02691v2-output-aware-rotation-for-int2-kv-cache-quantization)  
    标签：评分：6.0/10、query:edge-llm
-   evidence：面向MCU设备端DNN推理的硬件感知能量预测与多目标优化
-7. [LLM Inference Under Bursty Workload Distribution: Modifying the WAIT Algorithm](/202608/08/2608.06135v1-llm-inference-under-bursty-workload-distribution-modifying-the-wait-algorithm)  
-   标签：评分：6.0/10、query:edge-llm
-   evidence：面向突发流量的LLM服务调度算法扩展，优化吞吐与延迟
+   evidence：INT2 KV缓存量化降低长上下文LLM推理的内存与带宽需求
 
 
 <div class="dpr-home-promo-card">
