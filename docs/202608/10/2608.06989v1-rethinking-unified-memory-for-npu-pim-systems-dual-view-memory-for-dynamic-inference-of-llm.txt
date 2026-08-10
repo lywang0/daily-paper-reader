@@ -1,0 +1,999 @@
+Title: Rethinking Unified Memory for NPU-PIM Systems: Dual-View Memory for Dynamic Inference of LLM
+
+URL Source: https://arxiv.org/pdf/2608.06989v1
+
+Published Time: Mon, 10 Aug 2026 00:40:44 GMT
+
+Number of Pages: 15
+
+Markdown Content:
+# Rethinking Unified Memory for NPU–PIM Systems: Dual-View Memory for Dynamic Inference of LLM 
+
+Shixin Zhao †
+
+Institute of Computing Technology Chinese Academy of Sciences University of Chinese Academy of Sciences 
+
+Beijing, China zhaoshixin18@mails.ucas.ac.cn 
+
+Lian Liu †
+
+Institute of Computing Technology Chinese Academy of Sciences 
+
+Beijing, China liulian211@mails.ucas.ac.cn 
+
+Tianhua Han 
+
+Institute of Computing Technology Chinese Academy of Sciences University of Chinese Academy of Sciences 
+
+Beijing, China hantianhua22@mails.ucas.ac.cn 
+
+Mengdi Wang 
+
+Institute of Computing Technology Chinese Academy of Sciences 
+
+Beijing, China wangmengdi@ict.ac.cn 
+
+Yinhe Han 
+
+Institute of Computing Technology Chinese Academy of Sciences 
+
+Beijing, China yinhes@ict.ac.cn 
+
+Ying Wang B
+
+Institute of Computing Technology Chinese Academy of Sciences 
+
+Beijing, China wangying2009@ict.ac.cn 
+
+Abstract —Heterogeneous architectures that combine neural processing unit (NPU) and processing-in-memory (PIM) are increasingly adopted to accelerate LLM inference. Prior work focuses on building a unified memory that allows NPUs and PIM to share data without duplication. However, these designs implicitly assume that each tensor is bound to a fixed execution device, and therefore rely on static, device-biased data mappings. We observe that this assumption does not hold in modern LLM workloads. Due to phase changes (e.g., prefill vs. decode) and dynamic behaviors such as MoE routing, the optimal execution device for the same tensor can change at runtime. Under such dynamic execution, device-biased mappings become mismatched to access patterns, leading to substantial bandwidth underutiliza-tion and performance loss. This paper presents PFM (PIM-as-Flexible-Memory), a dual-view memory system that decouples physical data layout from accessor-visible logical views. PFM stores data in a jointly optimized physical layout and exposes dif-ferent logical interpretations to NPUs and PIM, enabling efficient access across devices without data duplication or relayout. We further design accessor-aware address translation and runtime scheduling mechanisms to support dynamic execution when LLM workloads fluctuate and the optimal execution device dynam-ically changes. Our evaluation across LLMs shows that PFM improves end-to-end throughput by up to 2.32 ×, demonstrating its effectiveness and broad applicability as a unified memory management solution for NPU-PIM systems. 
+
+Index Terms —Processing-in-Memory, NPU-PIM System, LLM Inference 
+
+I. I NTRODUCTION 
+
+Large language models (LLMs) power diverse applications, from natural language understanding [54], [38], [12] to conver-sational AI [45], [58], [21], [5]. LLM inference is inherently heterogeneous: some operators are compute-intensive, whereas others are memory-bound [25], [18], [65]. Consequently, NPU-PIM architectures are well-suited to LLM serving. NPUs accelerate compute-heavy operators with high throughput, 
+
+> †
+
+Both authors contributed equally to this research 
+
+> B
+
+Corresponding author 
+
+while PIM offloads memory-bound operators through near-data execution [23], [57], [29], [60]. However, realizing this potential requires one prerequisite: NPUs and PIM must efficiently share the same data. Existing designs still fail to provide such support for modern LLM inference because they are fundamentally built for static 
+
+execution, whereas LLM inference is increasingly dynamic .In practice, the same tensor may be accessed by different 
+
+accessors (i.e., NPUs or PIM) at different times since the best execution device for the same operator varies [65], [13], [4]. Once this happens, existing systems either incur costly migration or suffer large bandwidth loss because the data layout is optimized for a mismatched accessor. This challenge arises from the mismatch between the data layout preferences of NPUs and PIM. NPUs prefer fine-grained channel interleaving to maximize bus-level bandwidth by spreading consecutive accesses across channels [44]. PIM, in contrast, prefers bank-level parallelism together with intra-bank data continuity to reduce inter-bank traffic during near-data execution [62], [49]. As a result, a layout optimized only for one device is often inefficient for the other. A straightfor-ward way to accommodate these conflicting requirements is to physically separate the memory spaces of NPU and PIM. Such 
+
+separated memory systems (e.g., UPMEM and HBM-PIM designs) preserve each device’s preferred layout [10], [27]. However, whenever data must be reused across devices, they incur explicit migration or duplication, leading to substantial latency and capacity overhead. To eliminate these costs, recent work has moved toward unified memory systems , where NPU and PIM share one physical address space through a layout-aware memory controller. Representative examples include IANUS [48], which adopts a globally PIM-friendly organization, and FACIL [49], which supports multiple address mappings within a single memory space and pre-execution controller-level mapping selection. This shift is an important arXiv:2608.06989v1 [cs.AR] 7 Aug 2026 AI:82                
+
+> Step 1
+> …AI:2 AI:0 AI:7
+> Step 2
+> …AI:32 AI:20
+> NPU bias
+> PIM bias
+> PIM bias Step 1 Step 2
+> 80%N 20%P
+> 20%N 80%P
+> 50%N 50%P
+> BW Util.
+> Device-bias Joint Optimized Mismatch Accessor
+> E0 E1 En E0 E1 En
+> ……
+> Dual view Scheduling
+> ↓83.4%
+> Step 1
+> BW Util.
+> 93.6%
+> 96.7%
+> 95.3%
+> 89.9%
+> 93.6%
+> Step 2
+> (a)
+> (b) Device-bias static allocation (c) Dual-view mapping & scheduling
+> PIM NPU
+> To PIM To NPU AI: arithmetic intensity Fig. 1. Motivation for PFM. (a) Step-varying expert intensity in MoE decoding changes the preferred execution device. (b) Existing device-biased mappings cause large bandwidth loss under device switching. (c) PFM sustains efficient NPU–PIM execution via dual-view mapping and runtime scheduling when the accessor changes.
+
+step forward because it removes explicit physical partitioning and makes cross-device sharing easier. Despite these advances, existing unified memory architec-tures remain insufficient for the demands of dynamic LLM inference. These designs share a fundamental assumption: 
+
+each tensor is effectively bound to a fixed execution device at allocation time and therefore mapped according to a static, device-biased layout . This assumption no longer holds in mod-ern LLM inference workloads, as illustrated in Figure 1(a). For example, in Mixture-of-Experts (MoE) models, dynamic routing causes expert activation and arithmetic intensity to fluctuate across decoding steps. Under such dynamic access, 
+
+the optimal execution device for the same tensor can change over time , and existing static device-biased mappings become a performance bottleneck. As illustrated in Figure 1(b), when the runtime accessor mismatches the layout bias, effective bandwidth can drop to less than 20% of peak. Fig. 1 is based on profiled MoE execution and tensor-access replay under our evaluation setup, with device-biased mappings following prior unified-memory designs [49]. Even FACIL, the most flexible prior unified memory design, achieves only 29.5% of the performance of an oracle that dynamically selects both execution device and layout. These results reveal that the true bottleneck is not physical separation itself, but the inability of existing unified memory systems to support dynamic cross-device access . A natural solution is to relayout data at runtime whenever the preferred accessor changes. However, this is impractical for LLM inference, where execution preference can vary across decoding steps, making frequent relayout high-overhead. 
+
+Key Insight. Different from prior unified memory designs, efficient NPU-PIM memory management for dynamic LLM inference should decouple physical layout from accessor-visible interpretation . Rather than physically duplicating data or repeatedly relayouts when execution shifts between NPU and PIM, a single physical layout can be jointly optimized once and exposed through different logical views tailored to each accessor. This enables both devices to access the same data efficiently without migration overhead. Based on this insight, we propose PFM (PIM-as-Flexible-Memory), a lightweight hardware-software co-design that turns PIM into unified, flexible memory for NPU-PIM sys-tems. As illustrated in Figure 1(c), PFM maintains one con-tinuous address space while exposing device-optimized logical views, thereby enabling data sharing without duplication and efficient execution migration between NPU and PIM. PFM is built around two key mechanisms: (1) Dual-view mapping optimization. PFM manages LLM-critical data (e.g., KV caches and expert weights) at 
+
+superpage granularity 1 and optimizes fine-grained placement 
+
+within each superpage [25], [40], [67]. Using offline pro-filing, PFM formulates physical-address-to-hardware-address mapping as an optimization problem that balances the NPU’s demand for multi-channel interleaving with the PIM’s prefer-ence for bank-local continuity and parallelism. The result is an operator-specific superpage layout that supports both devices efficiently. (2) Dual-view addressing & scheduling for NPU-PIM. 
+
+At runtime, PFM sustains high bandwidth through two lightweight extensions to the memory controller: 1) an Ad-dress Remapping Unit (ARU) that translates physical ad-dresses into hardware addresses by applying the precomputed operator-specific mappings on the fly; and 2) a Flexible Access Scheduler (FAS) that enforces NPU-oriented and PIM-oriented scheduling policies on their respective request streams and arbitrates residual conflicts to maximize effective bandwidth. Our main contributions are as follows:  
+
+> •
+
+We identify dynamic execution-device switching as a key limitation of existing unified memory systems for NPU–PIM architectures, and show that static device-biased mappings lead to substantial performance degra-dation.  
+
+> •
+
+We present PFM, the first flexible memory manage-ment that combines offline dual-view mapping optimiza-tion with runtime dual-view addressing & scheduling to decouple physical layout from accessor-visible logical views, enabling efficient cross-device execution without data duplication.  
+
+> •
+
+We integrate PFM into mainstream LLM frameworks and demonstrate up to 2.32 × throughput improvement on representative LLMs over the best prior unified memory design. II. B ACKGROUND 
+
+A. LLM Architecture & Procedure 1) LLM Architecture: As shown in Figure 2(a), modern LLMs consist of stacked Transformer blocks [56], [6], each combining a self-attention layer for long-range dependency modeling and a feed-forward network (FFN) for nonlinear transformation. To scale model capacity, recent models adopt the mixture-of-experts (MoE) architecture [20], [32], where the FFN is replaced by multiple parallel expert networks, as illustrated in Figure 2(c). During inference, only a subset of experts is activated per token, enabling massive parameter counts without proportional computational cost [14], [66].   
+
+> 1We use the term superpage to refer to large pages [40], [67]. QKV Gen.
+> Projection
+
++
+
++       
+
+> … Gating function
+> E1 E2 En
+> Aggregation
+> …
+> Activation
+> Linear
+> Linear
+> score
+> E1
+> …
+> En E2
+> (a) LLM Architecture
+> (b) Acted Tokens per Expert
+> (c) Inference Procedure on MoE
+> 0
+> 80
+> 40
+> 020 40 60
+> Expert ID
+> Step 1
+> Step 2
+> MoE Layers
+> (Multi FFNs)
+> KV Cache
+> Softmax
+> 𝑄𝐾 𝑇
+> Attention
+> QKV
+> 𝑆𝑉
+> # Acted Tokens
+> Decoder 0  Decoder 1  Decoder N
+
+Fig. 2. LLM architecture and procedure. (a) Classic LLM architecture. (b) 
+
+Dynamic expert activation behaviors during the decode step in the MoE model. 
+
+(c) The architecture of MoE layers with the example of expert selection. 
+
+2) LLM Inference Procedure: LLM inference comprises two phases: the prefill phase for prompt processing and the autoregressive decode phase for token generation. Each phase consists of several core operators, primarily self-attention and FFN or MoE layers. These phases and operators exhibit distinct computational characteristics, introducing variability at both coarse and fine granularities. At the phase level ,the prefill phase is compute-intensive, while the decode phase is memory-bound due to the autoregressive decoding manner and frequent KV cache accesses [25], [43]. At the operator level , MoE architectures introduce finer-grained variability. As illustrated in Figure 2(b), dynamic expert selection leads to fluctuations in arithmetic intensity across steps, shifting between compute-intensive and memory-bound patterns. This multi-dimensional variability demands an acceleration system that adapts its compute and memory resources in real-time to maintain high efficiency. 
+
+B. NPU-PIM System for LLM Inference 
+
+Heterogeneous NPU-PIM architectures [16], [48], [29] sup-port efficient LLM inference by leveraging complementary strengths of different processing units. In these systems, LLM operators are partitioned based on their computational char-acteristics: the NPU handles compute-intensive kernels (e.g., GEMM in the prefill phase), while PIM modules are dedicated to memory-bound operations (e.g., decode-time attention [41], [17] or MoE experts with low arithmetic intensity [60], [24]). Compared to NPU-only systems, this collaborative execution achieves up to 3.0 × speedup [60], [17], [16]. As illustrated in Figure 3(a), the architecture integrates a high-performance NPU with PIM-enabled memory modules via a high-throughput interconnect. The NPU features compute units such as tensor cores, while PIM integrates lightweight processing units (PUs) near DRAM arrays to exploit massive internal bandwidth. In such a system, PIM-enabled modules are an integral part of the NPU memory hierarchy, sharing the same physical memory space. NPU 
+
+Buffer 
+
+> Memory
+> Controller
+
+PIM 
+
+> PU
+> Bank 0
+> row buffer
+> BG Ctrl.
+> PU
+> Bank 0
+> row buffer
+> PU
+> Bank 0
+> row buffer
+> BG Ctrl.
+> PU
+> Bank 0
+> row buffer
+> PU
+> Bank 0
+> row buffer
+> BG Ctrl.
+> PU
+> Bank 0
+> row buffer
+> PU
+> Bank 0
+> row buffer
+> Ctrl.
+> PU
+> Bank 1
+> row buffer
+> Bank Group
+> PIM channel
+> PIM channel
+> PIM channel
+
+Fig. 3. Heterogeneous NPU-PIM architecture. Channel Bank Row  Column                                    
+
+> PU PU PU PU
+> Channel Bank Row Column NPU-centric
+> PIM-centric
+> ……
+> Predefined Address Mapping
+> PA-to-HA
+> PA
+> Allocation: f(Shape, device) →mapping
+> Tensor
+> …………
+> 0
+> PU PU PU PU
+> ……………………
+> 123
+> 0123
+> 00112233
+> Bank 0 Bank 1 Bank 2 Bank 3 Bank 0 Bank 1 Bank 2 Bank 3
+> Channel 0 Channel N
+> NPU
+> Bank-level parallelism computing path of PIM
+> …
+> Channel-level current memory access of NPU
+> (a)
+> (b)
+
+Fig. 4. Address mapping examples for NPU- and PIM-optimized layouts. (a) Address-bit placement for channel-interleaved NPU access and bank-localized PIM access. (b) Resulting data layouts, where green denotes the NPU-optimized layout and blue denotes the PIM-optimized layout. 
+
+C. NPU- v.s. PIM-optimized Memory Layout 
+
+The physical realization of NPU-PIM heterogeneous col-laboration requires a deep understanding of their divergent data layout requirements. NPUs and PIM units constrain data mapping to the physical DRAM hierarchy in distinct ways to maximize their respective efficiencies. NPUs favor channel-interleaved layouts to support con-tiguous, vectorized accesses. As the green line in Figure 4 shows, consecutive elements within one data block (e.g., 0 ) are partitioned across different channels, while distinct data blocks are allocated to different banks. This mapping strategy is adopted because it enables the memory controller to acti-vate multiple channels concurrently, thereby maximizing bus-level bandwidth utilization. Moreover, within each channel, elements are preferentially placed in the same row to minimize row activation overhead. In contrast, PIM units prioritize bank-level parallelism 
+
+while requiring intra-bank data continuity for local pro-cessing. As the blue line in Figure 4 shows, PIM-optimized layouts map contiguous data blocks within individual banks (e.g. 0 entire in channel 0, bank 0), rather than fragmenting them across banks and channels. This organization ensures each PIM unit has sufficient local data for computation while enabling a single instruction to trigger parallel in-situ execu-tion across all banks within a row, maximizing overall com-pute throughput. Due to these divergent layout requirements, prior PIM-based systems often rely on a separated memory management where the NPU and PIM operate in isolated physical regions [55], [17]. However, this necessitates explicit data migration and layout transformation, incurring substantial performance penalties and memory capacity overhead. Proj.  FFN Attn. QKV gen.  Proj.  FFN Attn. QKV gen.         
+
+> Prefill Decode
+> QKV gen. Attn.
+> E0
+> E1
+> En
+> Sum
+> NPU PIM …QKV gen. Attn.
+> E0
+> E1
+> En
+> Sum …
+> (a)
+> (b)
+> Step 1 Step 2 Fig. 5. LLM inference on NPU-PIM system.
+
+D. Unified Memory Management on NPU-PIM 
+
+To address these inefficiencies, recent research has pursued 
+
+unified memory management , enabling the NPU and PIM to share a physical memory space. The cornerstone of these unified systems is a layout-aware memory controller (MC) that supports multiple DRAM address mapping schemes concur-rently. Specifically, existing unified memory architectures manage layout diversity through either a globally uniform layout (e.g., IANUS [48] applying a universal PIM-friendly mapping) or static, device-specific layouts [49], [41]. FACIL [49], a typical device-specific unified memory management strategy, relies on static allocation and device-biased address mapping, binding tensors to predefined configurations (e.g., NPU- or PIM-centric) at compile time. During each memory access, the memory controller retrieves these strategies to translate physical addresses into DRAM-specific indices. Consequently, existing systems assume the target execution device for an operator remains constant at runtime, requiring device-biased mapping decisions. III. L IMITATIONS & M OTIVATION 
+
+A. Runtime Dynamics Requirements for LLM 
+
+Runtime Dynamism in LLM Inference. LLM inference workloads exhibit runtime dynamism. In Mixture-of-Experts (MoE) architectures, expert activation patterns and arithmetic intensity fluctuate across tokens and decoding steps [59]. As shown in Figure2(b), in Qwen1.5-MoE-A2.7B [52], expert 0’s demand pivots from highly compute-intensive (arithmetic intensity of 78) at step 0 to memory-bound (arithmetic in-tensity of 6) at step 1. This implies the optimal device for a given operator changes dynamically. As shown in Fig-ure 5, the same expert can be dispatched to different devices across adjacent decoding steps. Beyond MoE layers, other operators exhibit similar dynamic preferences. In small-batch scenarios, attention’s QKV generation demands high compute throughput during prefill but becomes memory-bound during decode, favoring different devices. Existing unified memory systems [49], [48] assume a tensor’s preferred device can be statically determined at allocation time, leading to device-biased address mappings that cannot adapt to runtime shifts. 
+
+Quantitative Impact Analysis. To quantify the impact of this static allocation, Figure 6 compares the end-to-end inference throughput of GPT-OSS 120B [39] under diverse representative strategies. NeuPIMs represents separated mem-ory management, binding attention/KV-cache-dominated ex-ecution to PIM and FFN execution to NPU. IANUS uses PIM-optimized mapping for all operators. FACIL, representing existing unified memory systems, enables runtime operator 00.5 11.5 22.5             
+
+> 3
+> 128 256 512 128 256 512 L_in:1024, L_out:128 L_in:128, L_out:1024 NeuPIM sIANUS FACIL Relayout Oracle
+> 𝐿 𝑖𝑛 : 1024 𝐿 out : 128 𝐿 𝑖𝑛 : 128 𝐿 out : 1024
+> Norm. Throughput
+> Fig. 6. Normalized end-to-end inference throughput (tokens/s) on GPT-OSS 120B [39] using real-world expert activation traces from LMSYS-Chat-1M [63].
+
+migration but retains device-biased address mappings. At-tention tensors use PIM-optimized mappings; for MoE ex-perts, half use NPU-optimized mappings while the others use PIM-optimized mappings after prefilling; all other tensors use NPU-optimized mappings. Oracle uses the same NPU-PIM hardware as the evaluated systems but assumes ideal runtime operator placement and ideal layout support: each operator is executed on the better device and fully exploits that device’s bandwidth/compute capability without scheduling or relayout overhead. All strategies are evaluated by replaying the corresponding operator/tensor access patterns on our HBM-PIM memory model, using the same hardware configuration, timing parameters, and PIM organization as Section VII-A. The Oracle design achieves a speedup of up to 2.26 × over the NeuPIMs strategy, while FACIL captures only 29.5% of this potential on average. This result highlights the substantial potential of runtime device switching for LLM inference, if data can remain efficiently accessible after migration. However, the performance gap of FACIL reveals a funda-mental limitation: despite providing a unified address space and supporting migration, current designs fail to resolve the underlying data layout mismatch during runtime. The root cause is that a device-biased mapping becomes inefficient when the accessor changes. As shown in Figure 7, when an operator migrates to a device that does not match its device-biased mapping (e.g., NPU accessing a PIM-optimized layout), bandwidth degradation limits execution efficiency to less than 20% of peak. 
+
+B. From Static Bias to Joint Potential 
+
+To bridge the performance gap, an ideal system should adaptively optimize data access based on the runtime execution device. We analyze two potential approaches: runtime relayout and joint mapping optimization. 
+
+The Overhead of Runtime Relayout. One approach is to perform dynamic relayout whenever an operator is scheduled to a different device. We compare a dynamic Relayout strategy against Oracle. Relayout periodically remaps expert weights to the NPU- or PIM-preferred layout according to recent expert-execution history, and we sweep relayout intervals of 1, 5, 10, and 20 decoding steps and report the best end-to-end result for each model. Even with this optimistic interval selection and considering only read-out/write-back data movement, Relay-out remains 13.61% below Oracle on DeepSeekMoE, 53.6% below Oracle on GPT-OSS, and 49.83% below Oracle on 10 100 1000 1 2 4 8 16      
+
+> Bandwidth(GB/s)  NPU optimized
+> IANUS
+> FACIL
+> Number of channel
+> (a)
+> Bandwidth(GB/s)
+> Accessed tensor shape
+> (b)
+> 110 100 1000
+> IANUS
+> FACIL
+> NPU optimized Fig. 7. The bandwidth under different mapping strategies when accessing an HBM2e stack. (a) Achievable bandwidth under varying numbers of channels; for the same number, bandwidth is affected by row conflicts. (b) Achievable bandwidth under the address mappings used in FACIL [49] and IANUS [48] when loading the weight/KV tensor of Mixtral [20].
+
+Mixtral, while relayout traffic accounts for 10.13%, 46.32%, and 42.95% of end-to-end execution time on average, respec-tively. As shown in Figure 6, Relayout can even underperform a single device-biased strategy because the data movement overhead offsets the benefit of switching to a more favorable layout. Therefore, for MoE-scale LLMs with step-level expert-activation changes, runtime relayout is not a practical strategy. 
+
+The Potential for Joint Optimization. A promising di-rection is to find a joint address mapping that satisfies both NPU and PIM requirements without physical relayout. Modern large-page management (e.g., 2 MB superpage) provides the physical foundation. For instance, in an HBM3 stack (16 channels, 1024 banks) with a 1 KB row size, a single 2 MB page spans all 1024 banks with 2 KB per bank. This allows the NPU to exploit multi-channel interleaving while ensuring each PIM unit with bank-level parallelism. Achieving peak performance requires the memory controller to dynamically schedule DRAM accesses to match the accessor patterns, a capability missing in current device-biased unified memory systems. For NPU accesses, the controller must ”stitch” data from different channels correctly; for PIM, it must synchronize commands across parallel banks. This dual-access scheduling challenge, combined with the need to search for optimal joint mappings, motivates our flexible and accessor-aware design. 
+
+C. Key Insight: Flexible Logical View 
+
+These observations reveal that the fundamental bottleneck is not the lack of a shared physical space, but the rigidity 
+
+of the logical-to-physical mapping. We propose a flexible memory management architecture that decouples the logical data view from the physical DRAM mapping . Our key insight is to allow a single, jointly-optimized physical lay-out to be perceived differently depending on the accessor. By employing a balanced physical mapping that spans the DRAM hierarchy, combined with an accessor-aware memory controller that performs runtime address translation and re-quest scheduling, we simultaneously provide high-bandwidth, channel-interleaved access for the NPU and bank-parallel ex-ecution for PIM. This logical-view flexibility avoids repeated data relayout while allowing the runtime scheduler to adapt operator placement to changing arithmetic intensity. Data = PFMMalloc( 
+
+> dim , dtype , layout )
+
+Memory Allocation 
+
+Memory Access      
+
+> Load(Data, Dev) Page
+> Table
+> Dual-mode
+> Mapping
+> 12
+> MapID
+> Memory Allocator
+> 3Virtual Address (VA)
+> PFM Controller
+> 1
+> VA DRAM
+> Page
+> Table
+> MDT
+> # MapID Map Config
+> 2
+> PA+MapID
+> 3
+> 0
+> ……
+> N
+> Map Config
+> NPU-optim:
+> PIM-optim:max(#acted banks)
+> max(#acted channels)
+> min(#switching rows)
+> 4
+> PA
+> (Row,B,C,Col)
+> (C,B,Row,Col)
+> (Row,B,C,Col)
+
+（a）
+
+（b） 
+
+> Optimal Map Config
+> HA
+> Fig. 8. Memory allocation and access with PFM.
+
+IV. PFM: PIM AS FLEXIBLE MEMORY 
+
+We propose PFM (PIM-as-Flexible-Memory), a lightweight hardware-software co-design that unifies PIM and NPU mem-ory spaces while preserving device-optimal data layouts. This section outlines PFM’s principles and interface (Section IV-A), presents its dual-view mapping (Section IV-B), enabling simul-taneous, access-specific views, and details the runtime address translation and scheduling mechanisms that make unified, flexible memory practical (Section IV-C). 
+
+A. Overview 1) Design Principles: PFM adheres to two guiding princi-ples: minimal hardware modification and maximal software compatibility . On the software side, a lightweight user-level API provides efficient management over memory allocation and automatic layout optimization. Computing kernels (e.g., cuBLAS [1]) remain unchanged. On the hardware side, mod-ifications are confined to the memory controller (named as the PFM controller), which supports dual-view addressing and flexible access scheduling. We do not modify DRAM cell arrays, timing protocols, or NPU cores. 
+
+2) PFM Interface for Memory Allocation and Access: 
+
+Guided by these principles, PFM introduces PFMMalloc ,which couples allocation with layout optimization. As depicted in Figure 8(a), it first 1 analyzes tensor dimensions, data types, and logical layout (e.g., column- or row-major), then models access performance for both NPU and PIM. By solving a multi-objective optimization problem, PFM 2 derives the optimal PA-to-HA (Physical Address to Hardware Address) mapping. This mapping is stored in the PFM controller’s Map-ping Descriptor Table (MDT), enabling a “dual-optimized” abstraction. During runtime access, PFM leverages DRAM command scheduling and lightweight data relayout to optimize the access efficiency. It provides NPU with cross-channel contiguous access and PIM with bank-aligned distribution. Then 3 the virtual address (VA) is returned to the user, and 4 the physical address (PA) is assigned to the page table. Based on the MapID generated above, PFMMalloc pre-serves conventional allocation semantics while augmenting each allocated superpage with mapping metadata. After phys-ical superpages are assigned, PFMMalloc records the MapID and the corresponding physical footprint class, which captures the channels, banks, and rows occupied by that mapping. During deallocation, PFMMalloc removes the MapID binding and returns each superpage to the free list of its footprint class. A later allocation can reuse that space whenever its required footprint is compatible, even if the new tensor uses a different MapID. For example, two MapIDs may swap the channel and row bit positions, e.g., using the lower three bits for channels versus rows. Although their access orders differ, both can occupy the same channel-row footprint, so a freed superpage from one MapID can be reused by the other. Thus, PFM avoids maintaining isolated memory pools for each MapID. If no compatible free superpage is available, PFMMalloc falls back to allocating a new superpage and binding it to the requested MapID; correctness does not depend on reusing the same physical location. This fallback may reduce reuse oppor-tunities under severe fragmentation, but it preserves the same VA-to-PA semantics and avoids assuming ideal placement. Similarly, in KV-cache eviction and restoration, the runtime can still follow block-level mechanisms such as PagedAtten-tion: an evicted block releases its backing superpages, and a restored block only needs compatible superpages with the proper MapID, not the exact same physical addresses. 
+
+Access path. As illustrated in Figure 8(b), memory requests first undergo standard VA-to-PA translation 1 according to the page table. Then, it 2 uses the MDT and the request origin 
+
+(NPU or PIM) to resolve hardware addresses and 3 applies a dual-view memory scheduler : NPU requests are reordered for channel concurrency and row locality; PIM requests are batched for bank-parallel broadcasts. The scheduler in the PFM controller arbitrates between the two modes, prioritizing latency-sensitive requests while enhancing overall efficiency through batching and exploiting idle periods. 
+
+B. Dual-view Mapping Optimization 
+
+This section details the dual-view mapping optimization, which aims to identify joint address mappings that maximize end-to-end performance. We employ a fast analytical model to accurately compare relative access efficiencies between NPU and PIM, enabling rapid mapping search. 
+
+1) Page Size: PFM uses 2 MB superpages for co-optimized mapping as they : (1) match existing NPU/GPU huge page interface [35], [37]; (2) reduce TLB pressure for large-scale LLM weight/KV caches; (3) provide sufficient layout optimization space. The expanded intra-page address space enables finer control over data placement across channels and banks, allowing PFM to simultaneously satisfy the NPU’s and the PIM’s demand. 
+
+2) Mapping Formulation: Consider a two-dimensional 
+
+(N, K ) tensor in a given layout (e.g., column-major) placed in memory with levels L0, L 1, . . . , L m−1, including chan-nel, bank, row, and column, etc. The memory space is divided into contiguous 2 MB pages. Within each page, PFM solves a configurable mapping f : logical index →
+
+hardware address fields, which determines the PA-to-HA map-ping. As shown in Figure 9(a), the mapping can be represented by a binary matrix X ∈ { 0, 1}m×n, where n is the number of address bits (e.g., 21 bits for a 2 MB page). Each column Memory Level  𝐿 0 (col) 0 1 2 101112 20 Col Ro Bk Bg            
+
+> pch
+> Ch 06710 11 12 20 15 17 19 Col
+> 1 1 1 11 1 1
+> ………………
+> 𝑃 𝑛  = 2048 𝑃 𝑘 = 1024
+> 128
+> 32
+> 02047
+> …
+> bank
+> …
+> PU
+> *NPU Access order in bank
+> ………
+> 432 1*
+> 2
+> 3Row-major access PIM
+> 𝑃 𝑘 𝑃 𝑛
+> (a) Mapping Formulation (b) Mapping Example
+> 𝐿 1(row)
+> 𝐿 2(bk)
+> 𝐿 3(bg)
+> 𝐿 4(pch)
+> 𝐿 5(ch)
+> Fig. 9. Illustration of address mapping formulation.
+
+j corresponds to an address bit, and each row i to a memory level Li, with Xi,j = 1 indicating that address bit j is assigned to level Li. The value of n is expressed as n = pn + pk,where pn and pk are determined by the tensor’s layout. For example, under a column-major layout with the tensor size 
+
+(N, K ), we have pn = log 2(N ) and pk = log 2
+
+ page size 
+
+> N
+
+
+
+,so that the lower pn bits of the address encode the contigu-ous dimension, while the higher pk bits represent the stride dimension. In contrast, for a row-major layout, we have pn =log 2
+
+ page size 
+
+> K
+
+
+
+and pk = log 2(K), with the lower pk bits now representing the contiguous dimension. This ensures that the mapping accurately reflects the memory access patterns of different layouts. Meanwhile, the two-dimensional notation is an abstraction of the linearized memory layout rather than a restriction to matrix weights. Higher-dimensional tensors are first linearized according to the framework layout, while preserving the contiguous dimension that dominates memory access. For example, a PagedAttention-style KV-cache block with shape [block size , num kv heads , head dim ] is modeled as [block size , num kv heads × head dim ]: the head dimen-sion within each token is treated as the contiguous dimension, and the block dimension captures the token sequence within the page. The resulting (N, K ) representation is then handled by the same mapping formulation. 
+
+Constraints. Based on the above formalism, we define two key constraints to satisfy the validity of mapping. 
+
+Capacity constraints. Each memory level Li can address only a finite number of locations, determined by its physical capacity. We denote the address bitwidth available for Li
+
+as Bi, representing the number of bits required to uniquely identify each addressable location. For instance, the number of banks within each bank group typically equals to 4, so that the address bits that can be allocated for bank level is 2. When assigning address bits to a memory level, the number of bits allocated must not exceed Bi: Pnj=1 Xi,j ≤ Bi.
+
+Structural constraints. Each physical address dimension must be mapped to exactly one memory level. For every address bit j, Pmi=1 Xi,j = 1 . This enforces a one-to-one assignment of address bits to memory levels. 
+
+3) Optimization Goal: Given the formulation, PFM defines performance goals for NPU and PIM, respectively. 
+
+NPU-objective. NPU favors spreading across channels with minimal row thrashing. Thus, we define the bandwidth utiliza-Address Remapping Unit 
+
+Memory 
+
+Requests NPU Request 
+
+Buffer Flexible Access Scheduler Dispatch FIFO Mapping Descriptor Table  
+
+> # MapID Map Config 0…… N(Row,B,C,Col) (C,B,Row,Col) (Row,B,C,Col) RD, 0x601000 RD, 0x601010 RD, 0x601020 RD, ... PIMMAC, 0x008205 PIMMAC, 0x008215 PIMMAC, 0x008225 PIMMAC, ...
+> Request Decoder
+> MapID
+> CMD
+> PA
+
+AGU   
+
+> << &Mask gen. << &
+> Map Cfg.
+> Mask gen.
+
+PIM Request Buffer 
+
+> NPU CMD PIM CMD
+
+Bank State Tracker PIM CMD Selector 
+
+NPU CMD Selector  
+
+> Ch
+> sel. bank sel. CMD queue #ch 0 #ch 0 CMD queue Bank parallelism comparator
+
+Priority Arbiter #ch 0 
+
+… …  
+
+> ch 0 Ctrl. #ch 1 ch 1 Ctrl. #ch N ch N Ctrl.
+> C/A C/A C/A
+
+Relayout Buffer 
+
+> CMD CMD CMD data data data data
+> Channel Controller #ch N Priority
+> NPU CMD PIM CMD Refresh, etc
+> #ch 0 Priority
+> NPU CMD
+> PIM CMD Refresh, etc
+> RD RD RD ... PIMMAC PIMMAC PIMMAC ... (0,1,6,0) (1,1,6,0) (2,1,6,0) ... (ch,bk,row,col) (0,0,130,0) (0,1,130,0) ... (0,2,130,0)
+> RD/(1,6,0) PIMMAC/… RD/(1,6,0) RD/(1,6,0)
+
+……
+
+> HA HA
+
+Fig. 10. The PFM controller path: dual-view hardware address translation and scheduling. 
+
+tion for NPU as: NPU (f ) = BNPU 
+
+Bpeak 
+
+(1) where BNPU is the achievable bandwidth under mapping f ,and Bpeak is the theoretical peak bandwidth. The achievable bandwidth is determined by: BNPU =  
+
+> data size
+> Tmem (f)
+
+, where Tmem (f ) is the time to transfer ( pn, p k) data under given mapping f . This is governed by the slowest parallel unit in the memory levels: 
+
+Tmem (f ) = max 
+
+> l∈Lparallel
+
+Taccess (l, f ) (2) where Lparallel denotes levels that support concurrent access, such as independent pseudo-channels (PCHs) in HBM. Within each PCH, lower memory levels (e.g., bank groups, banks) op-erate serially. Therefore, Tmem (f ) = max i∈{ pch } Taccess (i, f ),where Taccess (pch , f ) aggregates over its bank groups and banks accordingly. For a given bank, access time depends on the times of row and column activations: 
+
+Taccess (bank , f ) = # row-act · tRCD + # col · tCCD (3) where tRCD and tCCD are DRAM row activation and column-to-column delay. In the mapping solver, tCCD is selected ac-cording to the bank-group relationship of consecutive column commands: accesses to different bank groups use tCCD S ,while accesses within the same bank group use tCCD L . Thus, the analytical search accounts for bank-group interleaving, and the final cycle-level evaluation further enforces all DRAM timing constraints through Ramulator. The row activation times #row-act and column access times #col are determined jointly by the mapping matrix X and the tensor’s layout. For example, here we let pn and pk denote the number of address bits associated with the contiguous and stride dimensions, respectively. As illustrated in Figure 9(b), one row activation occurs whenever the accessed address maps to a different row within the same bank. The total times of row activation can be expressed as: 
+
+#row-act = 2 Ppn −1  
+
+> j=0 Xrow,j
+
+· 2Pnj=pn Xcol,j , (4) where Ppn−1 
+
+> j=0
+
+Xrow,j is the number of contiguous-dimension bits mapped to the row field, capturing the distinct rows visited along the contiguous axis; Pnj=pn Xcol,j is the number of stride-dimension bits mapped to the column field, which causes the same row to be revisited due to non-contiguous accesses. The number of column access is given by: #col =2P  
+
+> jXcol,j
+
+. This formulation explicitly links access latency to both the mapping function f and the tensor’s logical layout (pn, pk), enabling accurate performance estimation across different memory mappings. Furthermore, the theoretical peak bandwidth is computed as: Bpeak = ( #channels × #pins per channel ) × frequency. 
+
+PIM-objective. PIM favors (i) many banks in parallel and (ii) low intra-bank serialization by activating more banks per batch while minimizing per-bank access latency. We capture this trade-off with the bank-level parallelism gain: PIM (f ) = #active banks (f )#banks total 
+
+· Tref 
+
+Tbank (f ) (5) where the first term #active banks (f )/#banks total measures the fraction of total banks that can be activated concurrently within a batch under mapping f . This term counts banks that contain useful operands for the current PIM batch. Since a pseudo-channel contains multiple bank groups and each bank group contains multiple banks, both bank-group bits and bank bits determine how many useful banks are populated by the mapped tensor data. This number is determined by the address bits assigned to levels at or above the bank (e.g., bank group, channel): 
+
+#active banks (f ) = 2  
+
+> P
+> i∈L ≥bank
+> Pnj=0 Xi,j
+
+, (6) with L≥bank denoting all such memory levels. The second term, Tref /T bank (f ), reflects intra-bank access efficiency. Here, Tref is a reference latency representing ideal access conditions that only consider time to access required rows and columns in a bank: 
+
+Tref = 2pn+pk
+
+#active banks (f ) · Nrow 
+
+· tRCD + Ncol · tCCD , (7) where Nrow and Ncol denote the number of rows in each bank and the column numbers per row. We model the actual latency Tbank (f ) by taking the maxi-mum of (i) the intra-bank DRAM access time and (ii) the time to stream the external operand(s)/results through the channel: 
+
+Tbank (f ) = max T bank access (f ), T io (f ) (8) The max operator represents a steady-state pipelined bottle-neck model for offline mapping search. DRAM-array access and external operand/result streaming use different datapaths and can be overlapped across PIM batches, so the slower stage bounds steady-state throughput. The final cycle-level evalua-tion still enforces the full HBM-PIM timing model. The first term, T bank access (f ) = 2 P  
+
+> jXrow ,j
+
+·tRCD +2 P  
+
+> jXcol ,j
+
+·tCCD , captures DRAM-internal latency, counting the number of distinct row and column activations per bank under f . The second term models the time to supply input/output data for PIM computing via external channels can be expressed as 
+
+Tio (f ) = 2pn
+
+2P  
+
+> j∈[0 ,pn −1] Xch,j
+
+· Bch 
+
++ 2pk
+
+2P  
+
+> j∈[pn,n ]Xch,j
+
+· Bch 
+
+,
+
+(9) where pn and pk are input/output data dimension, 
+
+2P  
+
+> j∈[0 ,pn −1] Xch,j
+
+and 2P  
+
+> j∈[pn,n ]Xch,j
+
+are the numbers of channels spanned by pn and pk, respectively. Moreover, 
+
+Bch denotes per-channel bandwidth. 
+
+4) Mapping Optimization: Based on the two objectives, we solve a per-superpage multi-objective mixed-integer linear programming problem: 
+
+max  
+
+> f
+
+NPU (f ) + α · PIM (f ), (10) where α is chosen from operator characteristics through lightweight profiling that captures operator compute load variability (e.g., arithmetic intensity, reuse window). Using an open-source solver COIN-OR [8] with PulP [50] api, PFM materializes each solution as a Mapping Descriptor inside the 2MB page. For the evaluated HBM configuration, the feasible mapping space is roughly 10 15 candidates, and the COIN-OR/PuLP solver takes up to 30 minutes per tensor. This search is performed offline during profiling/setup and does not affect runtime inference. 
+
+C. Dual-view Addressing & Scheduling 
+
+To realize dual-optimized access without duplication, PFM augments the NPU-side memory controller with two lightweight components: (i) a Dual-View Address Remapping Unit (ARU) and (ii) a Flexible Access Scheduler (FAS). ARU converts physical addresses into device-specific hardware co-ordinates (NPU-view or PIM-view) using per-page descriptors; FAS then schedules the requests to maintain high utilization for both NPU and PIM. 
+
+1) Address Remapping Unit (ARU): As illustrated in the left part of Figure 10, ARU enables flexible address mapping through two key components: the Mapping Descriptor Table (MDT) and an address generation unit (AGU). The MDT stores descriptions of mapping functions, each specifying how physical address bits are assigned across memory levels. At runtime, the address generation unit translates incoming addresses into hardware addresses by applying the selected mapping rule from the MDT. The mapping is obtained during 
+
+PFMMalloc with our dual-view mapping optimization. To minimize modifications to existing system interfaces, memory requests retain their standard format, including com-mand (cmd) and address (addr) fields. PFM extends these re-quests by embedding two additional fields within reserved bits: (1) a MapID field that identifies the desired address mapping scheme, and (2) a PIM operation type field specifying ex-tended PIM instructions, such as matrix multiply-accumulate (PIMMAC ) [27], [28]. For the PIM instructions, the exact bit allocation depends on the underlying PIM architecture. For instance, in a design similar to AiM [27] supporting 16 PIM instructions, unused bits in the request, e.g, CA[3:0], can indicate the PIM instruction type. Meanwhile, other reserved bits, e.g., CA[8:4], can encode the MapID . All other fields remain unmodified and regular DRAM requests set reserved bits to 0, ensuring compatibility with conventional memory protocols. 
+
+Address generation pipeline. Upon receiving a request, the ARU parses the command field to extract MapID and retrieves the corresponding mapping configuration from the MDT. The address generation unit then decomposes the address according to this mapping. For example, if addr[13:10] is designated as the channel index, it right-shifts the address by 10 bits and applies a mask to extract the 4-bit channel value. Physical addresses for other memory levels are computed similarly. Depending on the type of instruction, the ARU routes the request to one of two dedicated buffers, providing device-specific access for downstream scheduling. 
+
+2) Flexible Access Scheduler (FAS): After completing ad-dress translation, PFM employs a dual-view scheduler to manage NPU and PIM requests separately while coordinating their execution via priority arbitration. As shown in Figure 10, the scheduler includes request queues, NPU and PIM CMD selectors, a bank state tracker, and a priority arbiter feeding per-channel dispatch FIFOs. This runtime scheduler is what composes per-superpage mappings into a globally coordinated memory system. The mapping optimizer exposes efficient access candidates for each tensor page, while FAS observes shared channel/bank state and request queues to arbitrate among concurrent tensors, preventing independent local map-pings from issuing uncoordinated requests to the same memory resources. For NPU requests, the scheduler applies an access re-ordering strategy guided by offline mapping. The dual-view mapping from PFMMalloc naturally exposes multi-channel parallelism, which the scheduler exploits by prioritizing in-struction groups that span multiple channels to maximize bus-level concurrency. Within each channel, the bank state tracker identifies active rows, allowing row-hit accesses to be sched-uled first and reducing row conflicts. These choices are made by lightweight comparators in the NPU CMD selector, with per-channel queues buffering pending requests. To mitigate fragmentation from non-contiguous accesses, a relayout buffer aggregates scattered segments across channels and reconstructs them into logical tensor order before delivery to the NPU, improving stream continuity. For PIM requests, the scheduler leverages the bank state tracker to identify and aggregate instructions targeting different banks to reduce command overhead and enhance parallel efficiency. These are batched into per-channel groups and stored in the PIM CMD selector. Lightweight comparators within the selector quickly identify parallelizable candidates, Compilation Runtime         
+
+> LLM Specification System Configuration
+> aShared Data
+> (KV, weight)
+> cudaMalloc(W) PFMMalloc(W)
+> bc
+> Dual-mode Mapping
+> e
+> Row Col Ch BG BRCol BBG Ch RKV: W: # MapID Map Config 0
+> ……
+> N(Row,B,C,Col) (C,B,Row,Col) (Row,C,B,Col)
+> MDT
+> d
+> NPU Kernel PIM Kernel Kernel Scheduling
+> gff
+> NPU Performance PIM Performance Fig. 11. LLM inference workflow with PFM.
+
+enabling rapid dispatch for arbitration. 
+
+Priority arbitration. The arbiter produces the joint sched-ule. It first services mandatory DRAM maintenance (e.g., refresh) to preserve timing guarantees. When both queues are non-empty, it prioritizes NPU memory accesses, as computa-tion in NPU tends to be bursty and compute-intensive [19], [11]. After the NPU’s data bursts complete and it enters a compute-bound window, the arbiter opportunistically drains PIM batches as background work. Symmetrically, during pro-longed PIM execution, the arbiter exploits idle banks to pre-emptively serve urgent NPU loads/stores. Selected commands are then staged into per-channel dispatch FIFOs and executed by the corresponding channel controllers. V. LLM I NFERENCE WITH PFM Having introduced PFM’s mechanisms, we now detail how to instantiate PFM in an LLM inference framework. The end-to-end workflow is designed to adapt dynamically to shifting workload demands while avoiding costly data duplication. 
+
+A. Workflow 
+
+As illustrated in Figure 11, the workflow begins with a lightweight offline compilation phase that analyzes a the LLM specification to identify tensors shared by both NPU and PIM, primarily KV caches and weights. Then it generates the needed mapping templates. Developers replace standard allocation calls (e.g., cudaMalloc ) with PFMMalloc b to trigger dual-view mapping c and bind an optimized PA-to-HA mapping for each tensor. These mappings are registered in the MDT d for runtime access. The compiler e also generates both NPU and PIM kernels for the same LLM operators, enabling runtime flexible execution. At runtime , PFM’s scheduler f monitors the execution context and uses a performance model to dynamically as-sign each operator to the NPU or PIM. The selected kernel is launched g with associated layout metadata, enabling the hardware to deliver NPU-optimized, channel-interleaved streams or PIM-oriented, bank-parallel broadcasts. This “al-locate once, run anywhere” design seamlessly unifies data placement and device scheduling with minimal modifications to the existing inference framework. 
+
+B. NPU-PIM Kernel Scheduling 1) Runtime Device Selection: To manage runtime variabil-ity during LLM inference, PFM employs a selection mecha-nism based on lightweight yet accurate performance modeling. At its core is a roofline model based predictor that estimates execution time for each operator on both NPU and PIM. For illustration, consider a dynamically activated expert with weight matrix W ∈ Rdin ×dout , processing n tokens at the current step. The NPU execution time is modeled as: 
+
+TNPU = max 
+
+ n · din · dout 
+
+PNPU 
+
+, W
+
+BNPU 
+
+
+
+, (11) where PNPU and BNPU denote peak compute throughput (FLOPs/s) and effective memory bandwidth (Bytes/s). This captures the NPU’s compute-memory trade-off: execution is compute-bound for large n, but limited by weight loading otherwise. For PIM, performance depends on both compute and data layout quality: 
+
+TPIM = max 
+
+ n · din · dout 
+
+Peff PIM 
+
+, W
+
+Beff PIM 
+
+
+
++ Tsetup , (12) where effective throughput and bandwidth are scaled by the bank-level parallelism γ ∈ [0 , 1] , as Beff PIM = γ · B peak PIM . When 
+
+γ → 1, PIM approaches peak bandwidth; when γ ≪ 1, poor alignment leaves many banks idle. Tsetup accounts for fixed PIM command injection and bank-locking overhead, with both 
+
+γ and Tsetup determined offline. At runtime, the scheduler compares TNPU and TPIM and dispatches the operator to the device with lower predicted latency. 
+
+2) Runtime Kernel Launch: At runtime, PFM implements a unified heterogeneous execution engine that intercepts operator calls from the inference framework. Guided by the perfor-mance model, it dynamically selects the optimal device (either NPU or PIM) and invokes the computing kernel through a unified PFMlaunch interface. NPU execution proceeds through standard CUDA/HIP stream submission, whereas PIM execution serializes the kernel ID and parameters into a control message, delivered to the PIM array. This entire process is transparent to upper layers, enabling developers to use standard MoE modules without modification or awareness of the underlying hardware heterogeneity. VI. C ASE STUDY 
+
+We present a representative execution case from Mixtral-8×7B [20] to illustrate how PFM’s dual-view mapping enables efficient data access for both NPU and PIM. We analyze a single expert weight tensor of size 4096 × 14336 (INT8, 56 MB), stored in column-major order. The tensor is divided into 28 superpages, each spanning 4096 × 512 elements. Our analysis focuses on the layout and access behavior of one such page. 0411 18 20  14 
+
+> Offset
+> burst size
+> Col_L Ch Bank Row
+> 0x78000
+> 0x7fc00
+> 512
+> 00xfff
+> Row 2
+> Row 1
+> Row 3
+
+…   
+
+> 00xfff
+> 128
+> Bank 0
+> Bank 1
+> 4096
+> 0x78fff
+> 0x7ffff  128
+> 1
+> Ch 31
+> Bank 15
+> Row 3
+> Col 7*4+0
+> Ch 31
+> Bank 15
+> Row 3
+> Col 7*4+3
+> …
+> 128B
+> Ch IO
+> …
+> …
+> …
+> …
+> Bank IO
+> Input
+> …
+> …
+> …
+> …
+> Bank IO
+> Bank IO
+> broadcast
+> PU
+> Row buffer
+> 12
+> 256b
+> 256b
+> 2256b
+> Output
+> 8B
+> ×16
+> Time
+> Ch
+> 0
+> 1
+> 31
+> Reorder buffer
+> 6
+> Col_H
+> …
+> 128
+> …
+> Col_H: 0 Col_H: 7
+> …
+> ch31
+> NPU
+> Core
+
+…
+
+…   
+
+> 00x7f
+> 0xf80 0xfff
+> Ch 0131
+> (d)
+> …
+> …
+
+… 
+
+> Ch0 Ch1
+
+…
+
+> …
+> Bank 15
+> Bank 1 Bank 0
+> Bank 14
+
+…
+
+…     
+
+> Ch31
+> Bank 0
+> Bank 1
+> Bank 15
+> (e)
+> 04810 19 20
+> Offset
+> burst size
+> Col_L Row Bank Row
+> 15 7
+> Col_H
+> 0418 20
+> Offset
+> burst size
+> Col Ch Bank Row
+> 913
+> (a) PFM’s Mapping (b) FACIL’s Mapping (c) IANUS’s Mapping
+> Ch
+> Row 0
+> …
+> Bank 15
+> ch0 ch1
+> 1
+> Bank 0
+> Bank 1
+> Bank 15
+
+…
+
+…
+
+…
+
+…
+
+…
+
+…
+
+…
+
+…
+
+…
+
+…
+
+…
+
+…
+
+…
+
+…
+
+> PIM Processing NPU Access
+
+…
+
+…
+
+…
+
+…
+
+…
+
+…
+
+…… …
+
+…
+
+…
+
+> (f)
+
+Fig. 12. The case study of PFM design. (a) Illustration of the mapping strategy acquired by PFM’s dual-view mapping for one tensor in Mixtral-8 ×7B; Mapping strategies of (b) FACIL and (c) IANUS; (d) Illustration of weight tensor address with PFM’s mapping; (e) Tensor layout in the memory; (f) Procedure of PIM computation & Timeline for NPU data access. 
+
+A. Optimized Tensor Layout 1) Addressing & Layout with PFM: To simplify the PA-to-HA mapping, we merge the bank and bank group levels and treat pseudo-channels as channels. The resulting HBM configuration comprises 32 channels, each with 16 banks, with each row containing 1 KB and a 32-byte burst. Under this configuration, the dual-view mapping is shown in Figure 12(a), with the corresponding addressing in Figure 12(d). Each 2 MB page is partitioned into four 4096 × 128 sub-tensors, each mapped to a fixed row index. Within a sub-tensor, data are striped across banks such that the same bank index across channels stores a 4096 × 8 tile, while the column dimension is further interleaved to distribute each 4096 × 1 vector evenly across 32 channels. The resulting physical layout is illustrated in Figure 12(e). 
+
+2) Benefits of PFM Mapping: PFM’s address mapping significantly enhances both NPU access and PIM computing efficiency. By assigning channel (ch) bits to the lower address range [11:7], PFM enables all-channel parallelism whenever more than 2048B are accessed simultaneously (Eq. (2)). The row bits are the top two positions [20:19], allowing the entire 2MB page to be accessed with only four times of row activation per bank, thus minimizing row activation overhead for both NPU (Eq. (3)-(4)) and PIM operations (Eq. (7)). Moreover, by partitioning the column field into Col H and Col L and embedding them at both ends of the channel field, PFM reduces I/O transfer overhead during PIM computation (Eq. (9)). Col L enables concurrent data transfers across channels, whereas only part of the column field is assigned to Col H to minimize cross-channel reductions during GEMV execution, further improving processing efficiency. 
+
+B. Efficient Tensor Access 
+
+Figure 12(f) illustrates tensor processing on both devices. On the PIM side, computation runs in all-bank mode: each channel’s I/O path supplies the GEMV input vector, and banks perform partial inner reductions. The global reduction on the base die [41] accounts for only a small fraction (1/128) of total execution overhead and thus does not stall the pipeline. On the NPU side, 32 channels each with 32-bit width operate in parallel to saturate the 1024-pin interface [35], and the relayout buffer in the PFM controller reassembles data streams before passing them to the NPU core. With the PFM mapping, each 128 B segment lies within a single channel and requires four bursts for full retrieval, adding three extra bursts (24 cycles or ∼15 ns at 3.2 Gbps, double rate). With multiple channels operating in parallel and operator latency typically exceeding 100 μs [61], this delay is negligible and does not affect throughput. VII. E VALUATION 
+
+A. Experimental Setup 
+
+Baselines. We evaluate PFM against three representative sys-tems: NPU-only, PSM and PUM.  
+
+> •
+
+NPU-only is a GPU system based on vLLM [25], using NVIDIA A100-80G GPUs for LLM inference [35]. It re-flects current industry practice and serves as our primary performance reference.  
+
+> •
+
+PSM employs separated memory management, following a NeuPIMs-like [17] setup. Here, “NeuPIMs-like” means that the memory space is divided into NPU-side and PIM-side regions: model weights are placed in NPU regions, while KV cache is placed in PIM regions. This static allocation facilitates PIM acceleration for memory-bound decode-time attention but limits system flexibility.  
+
+> •
+
+PUM employs unified memory with PIM-friendly address mapping for all tensors, following the PIM-side mapping used in FACIL [49]. This baseline exposes shared data to PIM without separating the NPU and PIM memory regions, and it isolates the performance impact of unified memory with a PIM-biased layout. In small-batch settings, PUM is consistent with the full FACIL mechanism because FACIL also stores all tensors in a PIM-friendly layout to favor PIM execution. In large-batch settings, FACIL maps FFN layers to NPU-friendly layout and KV cache to PIM-friendly layout, which becomes equivalent to PSM in our evaluation. Therefore, large-batch FACIL performance can be inferred from the PSM baseline, while PUM reports the cost of an all-PIM-friendly unified-memory design. TABLE I CONFIGURATION DETAILS OF HBM-PIM. 
+
+> HBM Parameters
+> HBM2e 3.2Gbps, 16GB/HBM, 8 channel/HBM 2 pseudo channel/ch, 2 rank/pch, 4 bank groups/rank, 4 bank/BG
+> HBM Timing (ns)
+> tRP = 15, tRCD = 14, tRAS = 33, tRRD L = 6, tWR = 16 tCCD S = 1.25, tCCD L = 3.50, tREFI = 3900, tRFC = 350, tFAW = 30
+> Processing Unit Parameters
+> PU: 666 MHz; 1 PU per bank (1024 PU per stack); 12.8TFLOPS per stack
+
+For fair comparison, PFM uses the same hardware as the NPU-PIM baselines: all HBM modules are replaced with HBM-PIM stacks. All systems share identical HBM capacity and A100 computational resources, differing only in memory manage-ment strategy. For all quantitative motivation and evaluation figures, NPU-PIM systems use A100-class compute resources with HBM replaced by AttAcc-style HBM-PIM stacks. The main evaluation baselines follow the PSM/PUM definitions above, while the additional motivation-only strategies are defined in Section III. 
+
+Simulation. We developed a system-level simulator integrat-ing GPGPU-Sim 4.0 [22], [3] and Ramulator 2.0 [33], [46]. Since GPUs are among the mainstream hardware platforms for production LLM inference, we evaluate the NPU side using GPUs. We run the evaluated models with vLLM, collect the CUDA kernels issued during execution, and simulate the compute-related kernels with GPGPU-Sim. During simulation, we also record their memory access patterns. The resulting traces are replayed through Ramulator 2.0 to model NPU-side memory timing under different PA-to-HA mappings. For operators scheduled to PIM, we generate PIM memory requests from operator shapes, tensor layouts, and selected mappings, following the trace-generation methodology of At-tAcc [41]. We enhance Ramulator 2.0 with the HBM-PIM timing model, PIM execution constraints, and PFM’s ARU/-FAS controller logic. The modeled PIM constraints include SIMD width and register-level reuse. The lookup/address-remapping latency measured from our RTL implementation is added to the affected memory-request latency, so the reported performance includes MDT lookup, address generation, and scheduler-side handling overheads. End-to-end latency and throughput are composed from the simulated prefill, decode, attention, FFN, and MoE expert kernels, using sampled expert-activation behavior for MoE models. We validate the simulator against real A100 measure-ments [36] and open-source NPU-PIM simulators [17], [41]; across the validation cases, the simulation error ranges from -15.57% to 0%, with an average error of -5.14%. 
+
+Hardware Specification. We adopt an HBM-PIM architec-ture, with detailed parameters summarized in Table I. Each memory stack operates at 3.2 Gbps, providing 16 GB capacity and 8 channels per stack, with timing parameters following vendor specifications [2], [47]. The PIM design follows the near-bank architecture used in AttAcc [41], where each bank is coupled with a Processing Unit (PU) running at 666 MHz, delivering a peak throughput of 12.8 TFLOPS per stack.                           
+
+> TABLE II EVALUATED LLM CONFIGURATIONS .
+> Model # Layers # Dim Experts # Hardware Config.
+> LLaMA3-8B [12] 32 4096 Dense 1×NPU DeepSeekMoE-16B [9] 28 2048 2+64 (2+4) 1×NPU Mixtral 8 ×7B [20] 32 4096 8 (2) 2×NPUs GPT-OSS-120B [39] 36 4096 128 (4) 4×NPUs
+
+Models. We use four representative LLMs for evalu-ation: LLaMA3-8B (LLaMA3) [12], DeepSeekMoE-16B (DSMoE) [9], Mixtral 8 ×7B (Mixtral) [20], and GPT-OSS-120B (GPT-OSS) [39]. LLaMA3-8B employs a dense ar-chitecture, whereas the remaining models are based on the MoE paradigm, dynamically activating a subset of experts. Specifically, DSMoE activates 2 shared experts and 4 out of 64 (4/64) routed experts per token; Mixtral activates 2/8 experts; and GPT-OSS selects 4/128 experts. The details of each model, along with the corresponding number of NPUs, are summarized in Table II. Each NPU provides 80 GB mem-ory capacity. The diverse models validate PFM’s adaptability across workload profiles. 
+
+Workloads. Our evaluation focuses on inference latency and throughput under diverse scenarios. Batch sizes vary to capture both latency-sensitive services (with small batch sizes) and throughput-oriented processing (with large batch sizes) sce-narios. Furthermore, we evaluate performance across a range of input and output sequence lengths ( Lin and Lout ) to capture the impact of varying demands. 
+
+B. End-to-end Performance 
+
+Latency-sensitive Performance. Figure 14 reports end-to-end inference latency under small batch sizes (1 and 4), rep-resenting latency-critical scenarios. Compared to NPU-only, PSM, PUM, and PFM achieve average speedups of 1.04 ×,2.10 ×, and 2.23 ×, respectively. PSM provides modest gains by accelerating decode-time attention on PIM, which becomes more pronounced for long output sequences ( Lout = 1024 ). PUM further improves performance by offloading the entire decode phase to PIM, which is well-suited for memory-intensive operations in small-batch settings. However, its PIM-biased memory layout degrades NPU bandwidth during the prefill phase. As a result, when prefill dominates execution (e.g., Lin = 1024 , Lout = 128 ), PUM shows limited benefit, and PFM achieves up to 1.21 × speedup over PUM. Across all configurations, PFM consistently outperforms both baselines. By extending PIM acceleration to additional decode operators and adopting a dual-optimized layout that preserves NPU efficiency during prefill, PFM avoids the performance trade-offs observed in PUM, delivering robust latency improvements across diverse input–output regimes. 
+
+Throughput-oriented Performance. Figure 13 reports in-ference throughput under large batch sizes (128–512) for both dense and MoE models. Compared to NPU-only, PSM, and PUM, PFM improves average throughput by 1.20 ×,1.06 ×, and 1.55 × (up to 1.95 ×, 2.29 ×, and 2.32 ×), re-spectively. These gains primarily stem from PFM’s runtime and performance-aware scheduling. Under large batches, while Norm. Throughput                                  
+
+> 00.5 11.5 2
+> 2.5
+> 128 256 512 128 256 512 128 256 512 128 256 512 128 256 512 128 256 512 128 256 512 128 256 512 ababababLLaMA3 Mixtral DSMoE GPT-OSS
+
+NPU-only PSM PUM PFM 
+
+LLaMA3  Mixtral  DSMoE  GPT-OSS                                                    
+
+> BS Fig. 13. Normalized end-to-end inference throughput (tokens/s) on LLaMA3, Mixtral, DSMoE and GPT-OSS. a means Lin = 1024 ,Lout = 128 ; b means
+> Lin = 128 ,Lout = 1024 .Norm. Latency
+> 00.2 0.4 0.6 0.8 114141414141414141,024 128 1,024 128 1,024 128 1,024 128 llama3 mixtral deepseekmoe gpt
+> NPU-only PSM PUM PFM
+> a
+> BS
+> bababab
+> DSMoE Mixtral GPT-OSS LLaMA3
+> Fig. 14. The normalized end-to-end inference latency with small batch sizes (BS=1 and 4). a means Lin = 1024 ,Lout = 128 ; b means Lin = 128 ,
+> Lout = 1024 .
+
+linear layers benefit from increased data reuse [41], [17], attention remains memory-bound due to batch-independent KV cache accesses and thus continues to benefit from PIM acceleration. PFM further offloads sparsely activated MoE experts to PIM, where limited invocation frequency leads to low arithmetic intensity. This improves resource utilization and reduces tail latency, thereby boosting overall throughput. Importantly, PFM maintains high NPU efficiency for compute-intensive operators through its dual-optimized memory layout. In contrast, PSM accelerates only attention and thus provides limited benefits for MoE models. PUM suffers from degraded NPU performance due to its biased memory layout, making it less effective for dense models and highly NPU-dominated workloads. By enabling flexible operator-to-device mapping without sacrificing NPU efficiency, PFM consistently delivers higher and more scalable throughput across diverse scenarios. 
+
+C. Performance Analysis 
+
+To gain deeper insight into the performance gains of the PFM-based LLM inference system, we conduct a comprehen-sive analysis of its behavior across diverse workloads. 
+
+Prefill & Decode. Figure 15 compares prefill and decode latency under single-batch workloads. The oracle assumes ideal memory access without layout-induced overhead, serving as the theoretical upper bound. As shown in Figure 15(a), PFM reduces prefill latency by 3.43 × over PUM through its dual-optimized memory layout, which maintains high band-width for NPU-bound operations. However, since decoding is autoregressive and often dominates end-to-end latency, this advantage translates to a smaller overall speedup, consistent with the end-to-end results in Figure 13. During decoding in Norm. Latency 
+
+0123
+
+4 Oracle PSM PUM PFM    
+
+> LLaMA3 Mixtral LLaMA3 Mixtral
+
+(a) Prefill Latency  (b) Decode Latency          
+
+> Fig. 15. Normalized latency on prefill and decode phases with a single batch. Prefill uses Lin = 1024 ,Lout = 128 , and decode uses Lin = 128 ,Lout =1024 . Oracle denotes an upper bound with ideal operator placement and layout support on the same NPU-PIM hardware. Norm. Latency
+> LLaMA3 BS: 128
+
+Mixtral 
+
+0
+
+1
+
+234 NPU-only PSM PUM PFM 
+
+DSMoE  GPT-OSS           
+
+> BS: 128 256 512 128 256 512 128 256 512
+> Fig. 16. The normalized inference latency on MoE blocks.
+
+Figure 15(b), PFM outperforms PSM by supporting broader operator offloading. Since decode-phase operations exhibit low arithmetic intensity (1 FLOP/byte), they are well-suited for PIM execution. Against the oracle design, PFM achieves 96.8% of the end-to-end efficiency. This near-optimal perfor-mance demonstrates that its dual-optimized memory layout effectively reconciles the conflicting access patterns of NPU and PIM. 
+
+Performance on MoE. Figure 16 evaluates PFM on MoE models. Instead of offloading experts entirely on NPUs, PSM adopts a typical static allocation strategy [64], [4], which decides the computing devices with offline profiling. Com-pared to NPU-only, PSM, and PUM, PFM reduces MoE block latency by 1.76 ×, 2.01 ×, and 2.05 ×, respectively. The significant activation variation of different experts leads to low efficiency in NPU-only and PUM designs. PSM with static allocation, while attempting to allocate each expert to TABLE III BANDWIDTH UTILIZATION WITH DIVERSE TENSOR SHAPE DURING                      
+
+> MIXTRAL INFERENCE .
+> 4K ×4K (QKV) 4K ×512 (KV cache) 4K ×14K (MoE) 14K ×4K (MoE)
+> PUM NPU 14.33 % 23.52% 16.61% 15.26% PIM 95.12% 94.18% 96.29% 95.71% PFM NPU 93.94% 90.86% 93.64% 89.97% PIM 94.09% 93.53% 95.31% 96.48%
+
+its suitable device, cannot adapt to step-to-step variations 2
+
+in activation patterns, resulting in persistent imbalances. In contrast, PFM dynamically schedules experts across NPU and PIM based on runtime behavior, mitigating load imbalance and improving hardware utilization. This adaptive execution enables consistently higher and more scalable performance for MoE-based LLM inference. 
+
+D. Bandwidth Utilization 
+
+We further evaluate the bandwidth utilization of data access on both the NPU and PIM devices, covering QKV weight, expert weight, and KV cache access. As shown in Table III, we compare the bandwidth utilization of NPU and PIM when running Mixtral. Unlike PUM, which achieves high access bandwidth (an average 95.33%) only at the PIM side, PFM effectively balances bandwidth efficiency for both NPU-side and PIM-side accesses. Overall, PFM achieves a bandwidth utilization of 92.10% on NPU accesses and 94.85% on PIM accesses. Similar trends are consistently observed across mod-els, demonstrating the effectiveness of the proposed technique in enabling efficient large-scale LLM inference. 
+
+E. Area Overhead 
+
+We implemented and synthesized the ARU and FAS mod-ules in the memory controller to evaluate area overhead, using RTL design and Synopsys Design Compiler [51] with a 7nm predictive process kit [7]. The main contributors to the area are buffers for instruction/data and control logic. In the ARU, the MDT contains 32 registers. In the FAS, large request buffers (1 MB each for NPU and PIM) are provisioned to enable scheduling over a wider instruction window, each holding up to 128K memory requests. The NPU-PIM command selectors store 128 schedulable instructions per channel (1 KB buffer per channel), and the dispatch FIFO adopts the same configuration. A 64 KB relayout buffer supports multiple burst transfers for data reorganization. The total area is 2.82 mm 2. Because ARU/FAS resides in the memory-controller path, the most relevant public estimate is the memory-controller/HBM-interface region. Based on die-photo floorplan estimates [15], each A100 HBM2E interface occupies 11.4 mm 2. Since A100 uses five active HBM2E interfaces, the active memory-interface area is 57.0 mm 2, and ARU/FAS adds 4.95% over this region. As a secondary scale reference, this corresponds to 0.34% of the full A100 die [35]. 
+
+> 2We provide real MoE expert activation traces at (https://anonymous.4open. science/r/PFM-9F2D).
+
+VIII. D ISCUSSION 
+
+Compatibility. PFM guarantees the consistency expected by existing NPU-PIM systems. For virtual memory management, PFM leverages the native 2 MB superpages already supported by modern GPUs [35], [37]. In consequence, our design does not introduce modifications to the fundamental virtual-to-physical address translation. From the software stack, PFM is fully compatible with existing inference frameworks [53], [26], [42], requiring only negligible modification on memory allocation. It allows PFM to deliver performance gains without disrupting the established software stack. 
+
+Scalability. PFM’s dual-view mapping optimization and run-time scheduling are memory technology agnostic and can be applied to various memory technologies, including HBM, GDDR, and LPDDR. The approach is also largely independent of NPU architectures, making it compatible with a wide range of NPU designs [34], [30], [31]. This flexibility enables broad applicability while preserving efficiency. 
+
+Limitations PFM relies on offline profiling and a finite number of MDT entries to store mapping templates. This is effective for common LLM serving deployments because tensors with similar shapes/layouts can share one MapID, and our 32-entry MDT is sufficient for multiple evaluated concurrent models. However, if expert activation patterns or the set of served models changes substantially, PFM may require re-profiling or a larger MDT to maintain mapping coverage. IX. C ONCLUSION 
+
+We present PFM, a unified and flexible memory manage-ment on NPU-PIM systems that addresses the significant data sharing and dynamic demands of LLM inference. Unlike prior designs that assume biased data access, PFM enables flexible, dual-view memory access by decoupling logical views from physical layouts via a software-hardware co-design. This de-sign allows both NPU and PIM to efficiently access shared data without duplication. Implemented with minimal modifications to the memory controller and software stack, PFM improves up to 2.26 × end-to-end LLM inference throughput improve-ment over the existing NPU-PIM system, demonstrating its necessity for efficient LLM serving. ACKNOWLEDGMENT 
+
+We sincerely thank the anonymous reviewers for their suggestions to improve the paper. This work was supported by the National Key R&D Program of China: 2023YFB4404400. REFERENCES [1] “cublas docs,” 2024, https://docs.nvidia.com/cuda/cublas/index.html. [2] J. S. S. T. Association, “High bandwidth memory dram (hbm1, hbm2) jesd235d,” 2020. [Online]. Available: https://www.jedec.org/ sites/default/files/docs/JESD235D.pdf [3] A. Bakhoda, G. L. Yuan, W. W. Fung, H. Wong, and T. M. Aamodt, “Analyzing cuda workloads using a detailed gpu simulator,” in 2009 IEEE international symposium on performance analysis of systems and software . IEEE, 2009, pp. 163–174. [4] S. Cao, S. Liu, T. Griggs, P. Schafhalter, X. Liu, Y. Sheng, J. E. Gon-zalez, M. Zaharia, and I. Stoica, “Moe-lightning: High-throughput moe inference on memory-constrained gpus,” in Proceedings of the 30th ACM International Conference on Architectural Support for Programming Languages and Operating Systems, Volume 1 , 2025, pp. 715–730. [5] W.-L. Chiang, Z. Li, Z. Lin, Y. Sheng, Z. Wu, H. Zhang, L. Zheng, S. Zhuang, Y. Zhuang, J. E. Gonzalez et al. , “Vicuna: An open-source chatbot impressing gpt-4 with 90%* chatgpt quality,” See https://vicuna. lmsys. org (accessed 14 April 2023) , vol. 2, no. 3, p. 6, 2023. [6] A. Chowdhery, S. Narang, J. Devlin, M. Bosma, G. Mishra, A. Roberts, P. Barham, H. W. Chung, C. Sutton, S. Gehrmann et al. , “Palm: Scal-ing language modeling with pathways,” Journal of Machine Learning Research , vol. 24, no. 240, pp. 1–113, 2023. [7] L. T. Clark, V. Vashishtha, L. Shifren, A. Gujja, S. Sinha, B. Cline, C. Ramamurthy, and G. Yeric, “Asap7: A 7-nm finfet predictive process design kit,” Microelectronics Journal , vol. 53, pp. 105–115, 2016. [8] COIN-OR Foundation, “Projects – COIN-OR: Computational infrastruc-ture for operations research,” https://www.coin-or.org/projects/, 2025. [9] D. Dai, C. Deng, C. Zhao, R. Xu, H. Gao, D. Chen, J. Li, W. Zeng, X. Yu, Y. Wu et al. , “Deepseekmoe: Towards ultimate expert special-ization in mixture-of-experts language models,” in Proceedings of the 62nd Annual Meeting of the Association for Computational Linguistics (Volume 1: Long Papers) , 2024, pp. 1280–1297. [10] F. Devaux, “The true processing in memory accelerator,” in 2019 IEEE Hot Chips 31 Symposium (HCS) . IEEE Computer Society, 2019, pp. 1–24. [11] Y. Dong, Y. Miao, W. Li, X. Zheng, C. Wang, and F. Lyu, “Accelerating llm inference throughput via asynchronous kv cache prefetching,” arXiv preprint arXiv:2504.06319 , 2025, accessed: 2025-08-18. [12] A. Dubey, A. Jauhri, A. Pandey, A. Kadian, A. Al-Dahle, A. Letman, A. Mathur, A. Schelten, A. Yang, A. Fan et al. , “The llama 3 herd of models,” arXiv preprint arXiv:2407.21783 , 2024. [13] Z. Fang, Y. Huang, Z. Hong, Y. Lyu, W. Chen, Y. Yu, F. Yu, and Z. Zheng, “Klotski: Efficient mixture-of-expert inference via expert-aware multi-batch pipeline,” in Proceedings of the 30th ACM Interna-tional Conference on Architectural Support for Programming Languages and Operating Systems, Volume 2 , 2025, pp. 574–588. [14] W. Fedus, B. Zoph, and N. Shazeer, “Switch transformers: Scaling to trillion parameter models with simple and efficient sparsity,” Journal of Machine Learning Research , vol. 23, no. 120, pp. 1–39, 2022. [15] J. Handy and T. Coughlin, “The future of low-latency memory: Why near memory requires a new interface,” Objective Analysis and Coughlin Associates, Tech. Rep., 2021. [16] Y. He, H. Mao, C. Giannoula, M. Sadrosadati, J. G´ omez-Luna, H. Li, X. Li, Y. Wang, and O. Mutlu, “Papi: Exploiting dynamic parallelism in large language model decoding with a processing-in-memory-enabled computing system,” in Proceedings of the 30th ACM International Conference on Architectural Support for Programming Languages and Operating Systems, Volume 2 , 2025, pp. 766–782. [17] G. Heo, S. Lee, J. Cho, H. Choi, S. Lee, H. Ham, G. Kim, D. Ma-hajan, and J. Park, “Neupims: Npu-pim heterogeneous acceleration for batched llm inferencing,” in Proceedings of the 29th ACM International Conference on Architectural Support for Programming Languages and Operating Systems, Volume 3 , 2024, pp. 722–737. [18] J. Hu, H. Jia, M. Hassan, L. Yao, B. Kusy, and W. Hu, “Lightllm: A versatile large language model for predictive light sensing,” in 
+
+Proceedings of the 23rd ACM Conference on Embedded Networked Sensor Systems , 2025, pp. 158–171. [19] Intel NPU Acceleration Library, “Decoding llm performance—prefill phase is compute bound on npu,” https://intel.github.io/ intel-npu-acceleration-library/llm performance.html, accessed: 2025-08-18. [20] A. Q. Jiang, A. Sablayrolles, A. Roux, A. Mensch, B. Savary, C. Bam-ford, D. S. Chaplot, D. d. l. Casas, E. B. Hanna, F. Bressand et al. ,“Mixtral of experts,” arXiv preprint arXiv:2401.04088 , 2024. [21] A. T. Kabakus ¸ and ˙ I. Dogru, “The battle of chatbot giants: an ex-perimental comparison of chatgpt and bard,” International Journal of Engineering Research and Development , vol. 16, no. 2, pp. 679–691, 2024. [22] M. Khairy, Z. Shen, T. M. Aamodt, and T. G. Rogers, “Accel-sim: An extensible simulation framework for validated gpu modeling,” in 
+
+2020 ACM/IEEE 47th Annual International Symposium on Computer Architecture (ISCA) . IEEE, 2020, pp. 473–486. [23] G. Kim, J. Kim, N. Kim, W. Shin, J. Won, H. Joo, H. Choi, B. An, G. Shin, D. Yun et al. , “Sk hynix ai-specific computing memory solution: From aim device to heterogeneous aimx-xpu system for comprehensive llm inference,” in 2024 IEEE Hot Chips 36 Symposium (HCS) . IEEE Computer Society, 2024, pp. 1–26. [24] T. Kim, K. Choi, Y. Cho, J. Cho, H.-J. Lee, and J. Sim, “Monde: Mixture of near-data experts for large-scale sparse models,” in Proceedings of the 61st ACM/IEEE Design Automation Conference , 2024, pp. 1–6. [25] W. Kwon, Z. Li, S. Zhuang, Y. Sheng, L. Zheng, C. H. Yu, J. Gonzalez, H. Zhang, and I. Stoica, “Efficient memory management for large language model serving with pagedattention,” in Proceedings of the 29th symposium on operating systems principles , 2023, pp. 611–626. [26] W. Kwon, Z. Li, S. Zhuang, Y. Sheng, L. Zheng, C. H. Yu, J. E. Gonzalez, H. Zhang, and I. Stoica., “vllm: Easy, fast, and cheap llm serving for everyone.” September 2023. [Online]. Available: https://github.com/vllm-project/vllm [27] S. Lee, K. Kim, S. Oh, J. Park, G. Hong, D. Ka, K. Hwang, J. Park, K. Kang, J. Kim et al. , “A 1ynm 1.25 v 8gb, 16gb/s/pin gddr6-based accelerator-in-memory supporting 1tflops mac operation and various activation functions for deep-learning applications,” in 2022 IEEE In-ternational Solid-State Circuits Conference (ISSCC) , vol. 65. IEEE, 2022, pp. 1–3. [28] S. Lee, S.-h. Kang, J. Lee, H. Kim, E. Lee, S. Seo, H. Yoon, S. Lee, K. Lim, H. Shin et al. , “Hardware architecture and software stack for pim based on commercial dram technology: Industrial product,” in 
+
+2021 ACM/IEEE 48th Annual International Symposium on Computer Architecture (ISCA) . IEEE, 2021, pp. 43–56. [29] C. Li, Y. Yin, X. Wu, J. Zhu, Z. Gao, D. Niu, Q. Wu, X. Si, Y. Xie, C. Zhang et al. , “H2-llm: Hardware-dataflow co-exploration for heterogeneous hybrid-bonding-based low-batch llm inference,” in 
+
+Proceedings of the 52nd Annual International Symposium on Computer Architecture , 2025, pp. 194–210. [30] H. Liao, J. Tu, J. Xia, H. Liu, X. Zhou, H. Yuan, and Y. Hu, “Ascend: a scalable and unified architecture for ubiquitous deep neural network computing: Industry track paper,” in 2021 IEEE International Sympo-sium on High-Performance Computer Architecture (HPCA) . IEEE, 2021, pp. 789–801. [31] H. Liao, J. Tu, J. Xia, and X. Zhou, “Davinci: A scalable architecture for neural network computing,” in 2019 IEEE Hot Chips 31 Symposium (HCS) . IEEE Computer Society, 2019, pp. 1–44. [32] A. Liu, B. Feng, B. Xue, B. Wang, B. Wu, C. Lu, C. Zhao, C. Deng, C. Zhang, C. Ruan et al. , “Deepseek-v3 technical report,” arXiv preprint arXiv:2412.19437 , 2024. [33] H. Luo, Y. C. Tu˘ grul, F. N. Bostancı, A. Olgun, A. G. Ya˘ glıkc ¸ı, and O. Mutlu, “Ramulator 2.0: A modern, modular, and extensible dram simulator,” IEEE Computer Architecture Letters , vol. 23, no. 1, pp. 112– 116, 2023. [34] T. Norrie, N. Patil, D. H. Yoon, G. Kurian, S. Li, J. Laudon, C. Young, N. Jouppi, and D. Patterson, “The design process for google’s training chips: Tpuv2 and tpuv3,” IEEE Micro , vol. 41, no. 2, pp. 56–63, 2021. [35] NVIDIA, “Nvidia a100 tensor core gpu architecc ture,” 2020, https://images.nvidia.com/aem-dam/en-zz/Solutions/data-center/ nvidia-ampere-architecture-whitepaper.pdf. [36] NVIDIA, “Introduction to the nvidia dgx a100 system,” 2021. [Online]. Available: https://docs.nvidia.com/dgx/dgxa100-user-guide/ introduction-to-dgxa100.html [37] NVIDIA, “Nvidia h100 tensor core gpu architecture,” 2023, https: //resources.nvidia.com/en-us-tensor-core/gtc22-whitepaper-hopper. [38] OpenAI, “Chatgpt,” September 2023. [Online]. Available: https: //chatgpt.com/blog/chatgpt [39] OpenAI, “Gpt-oss-120b,” 2025, https://huggingface.co/openai/ gpt-oss-120b. [40] M. Parasar, A. Bhattacharjee, and T. Krishna, “Vespa: Vipt enhancements for superpage accesses,” in arXiv preprint arXiv:1701.03499 , 2017. [41] J. Park, J. Choi, K. Kyung, M. J. Kim, Y. Kwon, N. S. Kim, and J. H. Ahn, “Attacc! unleashing the power of pim for batched transformer-based generative model inference,” in Proceedings of the 29th ACM International Conference on Architectural Support for Programming Languages and Operating Systems, Volume 2 , 2024, pp. 103–119. [42] A. Paszke, S. Gross, F. Massa, A. Lerer, J. Bradbury, G. Chanan, T. Killeen, Z. Lin, N. Gimelshein, L. Antiga et al. , “Pytorch: An imperative style, high-performance deep learning library,” Advances in neural information processing systems , vol. 32, 2019. [43] P. Patel, E. Choukse, C. Zhang, A. Shah, ´ I. Goiri, S. Maleki, and R. Bianchini, “Splitwise: Efficient generative llm inference using phase splitting,” in 2024 ACM/IEEE 51st Annual International Symposium on Computer Architecture (ISCA) . IEEE, 2024, pp. 118–132. [44] P. Pessl, D. Gruss, C. Maurice, M. Schwarz, and S. Mangard, “{DRAMA }: Exploiting {DRAM } addressing for {Cross-CPU } at-tacks,” in 25th USENIX security symposium (USENIX security 16) , 2016, pp. 565–581. [45] B. Roziere, J. Gehring, F. Gloeckle, S. Sootla, I. Gat, X. E. Tan, Y. Adi, J. Liu, R. Sauvestre, T. Remez et al. , “Code llama: Open foundation models for code,” arXiv preprint arXiv:2308.12950 , 2023. [46] SAFARI Research Group, “Ramulator 2.0,” 2023, https://github.com/ CMU-SAFARI/ramulator2. [47] S. Semiconductor, “Khaa44801b-mc16: 8gb hbm2e flashbolt,” 2020. [Online]. Available: https://semiconductor.samsung.com/dram/ hbm/hbm2e-flashbolt/khaa44801b-mc16/ [48] M. Seo, X. T. Nguyen, S. J. Hwang, Y. Kwon, G. Kim, C. Park, I. Kim, J. Park, J. Kim, W. Shin et al. , “Ianus: Integrated accelerator based on npu-pim unified memory system,” in Proceedings of the 29th ACM International Conference on Architectural Support for Programming Languages and Operating Systems, Volume 3 , 2024, pp. 545–560. [49] S. H. Seo, J. Kim, D. Lee, S. Yoo, S. Moon, Y. Park, and J. W. Lee, “Facil: Flexible dram address mapping for soc-pim cooperative on-device llm inference,” in 2025 IEEE International Symposium on High Performance Computer Architecture (HPCA) . IEEE, 2025, pp. 1720–1733. [50] Stuart, Mitchell and Anita, Kean and Andrew, Mason and Michael, O’Sullivan and Antony, Phillips and Franco, Peschiera, “Pulp,” 2024, https://coin-or.github.io/pulp/. [51] Synopsys, “Design compiler,” http://www.synopsys.com/Tools/ Implementation/RTLSynthesis/DesignCompiler/Pages. [52] Q. Team, “Qwen1.5-moe-a2.7b,” 2024. [Online]. Available: https: //huggingface.co/Qwen/Qwen1.5-MoE-A2.7B [53] S. Team, “Sglang: Efficient execution of structured language model programs,” September 2024. [Online]. Available: https://github.com/ sgl-project/sglang [54] T. C. Team, “Introducing the next generation of claude.” September 2024. [Online]. Available: https://www.anthropic.com/news/ claude-3-family [55] UPMEM, “Upmem software development kit (sdk),” 2025. [Online]. Available: https://sdk.upmem.com/ [56] B. Workshop, T. L. Scao, A. Fan, C. Akiki, E. Pavlick, S. Ili´ c, D. Hesslow, R. Castagn´ e, A. S. Luccioni, F. Yvon et al. , “Bloom: A 176b-parameter open-access multilingual language model,” arXiv preprint arXiv:2211.05100 , 2022. [57] Y. Wu, Z. Wang, and W. D. Lu, “Pim gpt a hybrid process in memory accelerator for autoregressive transformers,” npj Unconventional Com-puting , vol. 1, no. 1, p. 4, 2024. [58] L. Xie, C. Zheng, H. Xia, H. Qu, and C. Zhu-Tian, “Waitgpt: Monitoring and steering conversational llm agent in data analysis with on-the-fly code visualization,” in Proceedings of the 37th Annual ACM Symposium on User Interface Software and Technology , 2024, pp. 1–14. [59] Z. Yu, Y. Guan, Z. Yu, C. Zhou, S. Pei, Y. Kang, Y. Ding, and P.-A. Tsai, “Orders in chaos: Enhancing large-scale moe llm serving with data movement forecasting,” 2025. [Online]. Available: https://arxiv.org/abs/2510.05497 [60] S. Yun, K. Kyung, J. Cho, J. Choi, J. Kim, B. Kim, S. Lee, K. Sohn, and J. H. Ahn, “Duplex: A device for large language models with mixture of experts, grouped query attention, and continuous batching,” in 2024 57th IEEE/ACM International Symposium on Microarchitecture (MICRO) . IEEE, 2024, pp. 1429–1443. [61] H. Zhang, A. Ning, R. B. Prabhakar, and D. Wentzlaff, “Llmcompass: Enabling efficient hardware design for large language model inference,” in 2024 ACM/IEEE 51st Annual International Symposium on Computer Architecture (ISCA) . IEEE, 2024, pp. 1080–1096. [62] Y. Zhao, M. Gao, F. Liu, Y. Hu, Z. Wang, H. Lin, J. Li, H. Xian, H. Dong, T. Yang et al. , “Um-pim: Dram-based pim with uniform & shared memory space,” in 2024 ACM/IEEE 51st Annual International Symposium on Computer Architecture (ISCA) . IEEE, 2024, pp. 644– 659. [63] L. Zheng, W.-L. Chiang, Y. Sheng, T. Li, S. Zhuang, Z. Wu, Y. Zhuang, Z. Li, Z. Lin, E. P. Xing, J. E. Gonzalez, I. Stoica, and H. Zhang, “Lmsys-chat-1m: A large-scale real-world llm conversation dataset,” 2023. [64] S. Zhong, Y. Sun, L. Liang, R. Wang, R. Huang, and M. Li, “Hybrimoe: Hybrid cpu-gpu scheduling and cache management for efficient moe inference,” arXiv preprint arXiv:2504.05897 , 2025. [65] Y. Zhong, S. Liu, J. Chen, J. Hu, Y. Zhu, X. Liu, X. Jin, and H. Zhang, “{DistServe }: Disaggregating prefill and decoding for goodput-optimized large language model serving,” in 18th USENIX Symposium on Operating Systems Design and Implementation (OSDI 24) , 2024, pp. 193–210. [66] Y. Zhou, T. Lei, H. Liu, N. Du, Y. Huang, V. Zhao, A. M. Dai, Q. V. Le, J. Laudon et al. , “Mixture-of-experts with expert choice routing,” 
+
+Advances in Neural Information Processing Systems , vol. 35, pp. 7103– 7114, 2022. [67] W. Zhu, A. L. Cox, and S. Rixner, “A comprehensive analysis of superpage management mechanisms and policies,” in 2020 USENIX Annual Technical Conference (USENIX ATC) , 2020.
