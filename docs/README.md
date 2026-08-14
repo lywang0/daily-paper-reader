@@ -6,42 +6,49 @@
 </div>
 
 ## 每次日报
-- 最新运行日期：2026-08-13
-- 运行时间：2026-08-13 21:16:37 UTC
+- 最新运行日期：2026-08-14
+- 运行时间：2026-08-14 21:02:09 UTC
 - 运行状态：成功
-- 本次总论文数：6
-- 精读区：2
-- 速读区：4
+- 本次总论文数：9
+- 精读区：3
+- 速读区：6
 
 ### 今日简报（AI）
-今日精读聚焦稀疏混合专家模型，揭示计算最优不等于集群最优，并推出边缘MoE的自适应专家预取方案APEX；速读覆盖LLM云芯片互连、实时分层分类与边缘推理调度。
-
-最值得关注的是MoE系统级优化：从集群扩展到边缘推理，均需考虑硬件感知与内存带宽瓶颈，而非单纯追求计算效率。
-
-建议普通读者优先回顾两篇9分论文，理解MoE在真实系统中的资源权衡，速读可暂缓。
-- 详情：[/202608/13/README](/202608/13/README)
+今日精读聚焦边缘云推理与LLM矩阵乘法优化，共梳理9篇论文，其中3篇精读、6篇速读。  
+最值得关注的是SPADE分布式边缘云投机解码与输入自适应矩阵乘缩减，二者均获8分，直击推理成本痛点；速读中LLM剪枝与HBF应用亦有亮点。  
+建议普通读者优先了解投机解码和矩阵乘优化思路，后续可深入对比不同剪枝方法的实际收益。
+- 详情：[/202608/14/README](/202608/14/README)
 
 ### 精读区论文标签
-1. [Compute-Optimal Is Not Cluster-Optimal: Systems-Aware Scaling for Sparse Mixture-of-Experts](/202608/13/2608.10605v1-compute-optimal-is-not-cluster-optimal-systems-aware-scaling-for-sparse-mixture-of-experts)  
-   标签：评分：9.0/10、query:edge-llm
-   evidence：将模型架构与系统软硬协同设计建模为优化问题
-2. [APEX: Adaptive Expert Prefetching for Memory-Efficient Edge MoE Inference](/202608/13/2608.11688v1-apex-adaptive-expert-prefetching-for-memory-efficient-edge-moe-inference)  
-   标签：评分：9.0/10、query:edge-llm
-   evidence：面向边缘MoE推理的自适应专家预取框架，直接解决内存受限下的LLM部署问题
+1. [SPADE: Speculative Decoding for Precise and Low Cost Distributed Edge Cloud Inference](/202608/14/2608.13076v1-spade-speculative-decoding-for-precise-and-low-cost-distributed-edge-cloud-inference)  
+   标签：评分：8.0/10、query:edge-llm
+   evidence：面向边缘设备高效推理的云端分布式推测解码框架
+2. [Reduced Matrix Multiplication: Input-Adaptive Matrix-Product Reduction for LLM Inference](/202608/14/2608.13426v1-reduced-matrix-multiplication-input-adaptive-matrix-product-reduction-for-llm-inference)  
+   标签：评分：8.0/10、query:edge-llm
+   evidence：免训练、输入自适应的矩阵乘法缩减，用于高效LLM推理
+3. [OpScale: Operator-level Provisioning and Autoscaling for LLM Serving](/202608/14/2608.13499v1-opscale-operator-level-provisioning-and-autoscaling-for-llm-serving)  
+   标签：评分：8.0/10、query:edge-llm
+   evidence：面向LLM服务的算子级资源供给与自动伸缩
 
 ### 速读区论文标签
-1. [C2C-Explorer: An Exploration Framework for Chip-to-Chip Interconnect Architectures in LLM Cloud Computing Systems](/202608/13/2608.08611v1-c2c-explorer-an-exploration-framework-for-chip-to-chip-interconnect-architectures-in-llm-cloud-computing-systems)  
+1. [Achieving Near-Zero-Overhead Multi-Model Hierarchical Classification in Real-Time Detection Pipelines](/202608/14/2608.11770v1-achieving-near-zero-overhead-multi-model-hierarchical-classification-in-real-time-detection-pipelines)  
    标签：评分：7.0/10、query:edge-llm
-   evidence：面向LLM工作负载的芯片间互连设计空间探索，实现工作负载到硬件的协同优化
-2. [Achieving Near-Zero-Overhead Multi-Model Hierarchical Classification in Real-Time Detection Pipelines](/202608/13/2608.11770v1-achieving-near-zero-overhead-multi-model-hierarchical-classification-in-real-time-detection-pipelines)  
+   evidence：边缘SoC上利用NPU/DLA异构计算实现近零开销多模型流水线
+2. [Unifying Depth and Width Pruning for LLMs via Binary Knapsack Optimization](/202608/14/2608.12953v1-unifying-depth-and-width-pruning-for-llms-via-binary-knapsack-optimization)  
    标签：评分：7.0/10、query:edge-llm
-   evidence：面向边缘GPU+NPU异构流水线，解决算子约束和量化不兼容，贴合边缘软硬协同与NPU异构计算主题
-3. [Split-Gate Pooled-Evidence Stochastic-Rollout Scheduling for Timely Progressive Edge Inference](/202608/13/2608.08338v1-split-gate-pooled-evidence-stochastic-rollout-scheduling-for-timely-progressive-edge-inference)  
+   evidence：通过结构化剪枝在预算内压缩LLM，支持边缘端资源高效推理
+3. [Potential Applications of HBF in LLM Serving Systems](/202608/14/2608.13127v1-potential-applications-of-hbf-in-llm-serving-systems)  
+   标签：评分：7.0/10、query:edge-llm
+   evidence：面向LLM服务的HBF容量扩展研究
+4. [Refining Over Resampling: Test-Time Self-Correction for LLM Reasoning](/202608/14/2608.05643v1-refining-over-resampling-test-time-self-correction-for-llm-reasoning)  
    标签：评分：6.0/10、query:edge-llm
-   evidence：面向渐进式边缘推理的GPU调度；与边缘硬件感知调度相关
-4. [AI Query Compilation for Unified and Optimized Execution](/202608/13/2608.10139v1-ai-query-compilation-for-unified-and-optimized-execution)  
+   evidence：无验证器的测试时自我纠正框架，更高效地利用推理计算，与资源受限部署相关
+5. [Thought-Level Beam Search for Reasoning](/202608/14/2608.08020v2-thought-level-beam-search-for-reasoning)  
    标签：评分：6.0/10、query:edge-llm
-   evidence：将LLM推理层与SQL统一编译为张量计算图，实现全局编译器优化与自动切分，加速硬件执行
+   evidence：在硬件预算下进行受约束计算分配的thought级束搜索，提升LLM推理效率
+6. [NAS-Driven Hardware Accelerator Exploration for Edge AI and Quantization Effects on the Pareto Space](/202608/14/2608.13293v1-nas-driven-hardware-accelerator-exploration-for-edge-ai-and-quantization-effects-on-the-pareto-space)  
+   标签：评分：6.0/10、query:edge-llm
+   evidence：面向边缘AI的硬件感知NAS与加速器探索，可迁移至LLM软硬协同设计
 
 
 <div class="dpr-home-promo-card">
