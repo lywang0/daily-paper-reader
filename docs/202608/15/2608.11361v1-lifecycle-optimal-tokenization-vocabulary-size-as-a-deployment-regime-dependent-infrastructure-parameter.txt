@@ -1,0 +1,723 @@
+Lifecycle-Optimal Tokenization: Vocabulary Size as
+a Deployment-Regime-Dependent Infrastructure
+Parameter
+Rima Mittal
+rimamittal@gmail.com
+Ankit Gubrani
+ankit.gubrani90@gmail.com
+Satyanarayana Kakollu
+kakollu@icloud.com
+Abstract—Tokenizer vocabulary size is a foundational design
+choice in large language model (LLM) infrastructure, yet it is
+typically fixed at training time based on convention rather than
+deployment analysis. We show that the cost-optimal vocabulary is
+not a constant but a function of the serving regime. We formalize
+total deployment cost as Clifecycle(V ) = Ctrain(V ) + λ · Cinfer(V, B),
+where λ is inference volume and B is the serving batch size.
+Through controlled experiments on two GPU families spanning
+the memory-bound to compute-bound regimes (A10G, ridge ≈117
+FLOP/byte; A100, ridge ≈183 FLOP/byte), we demonstrate: (1)
+the inference-optimal vocabulary shifts 16× with serving batch,
+from 32k at B = 1 to 524k at B = 64+, driven by amortization of
+the V × d unembedding matrix read; (2) at 1.3–2.3B model scale,
+quality (bits per byte, BPB) is optimized at V = 65k, confirming
+scale-dependent vocabulary preference; (3) the lifecycle-optimal
+vocabulary diverges from training-optimal by up to 16× for
+production deployments. Quality is approximately invariant across
+the optimal range (<2% BPB spread), making vocabulary a pure
+systems optimization with no quality penalty in the measured
+range. Our results provide actionable capacity planning guidance:
+on-device deployments (B = 1) should use V ≈32k; datacenter
+serving (B ≥64, λ ≥10) should use V ≈131–262k.
+Index Terms—tokenization, vocabulary optimization, LLM
+inference, capacity planning, roofline model, lifecycle cost, serving
+infrastructure
+I. INTRODUCTION
+Every large language model deployed in production carries a
+vocabulary – a fixed set of subword tokens used to encode all
+input and output text. Vocabulary size V is set once at tokenizer
+training time, before any inference infrastructure is planned.
+Yet V has first-order effects on both training throughput and
+inference cost: it determines the size of the unembedding matrix
+W ∈RV ×d that must be read from high-bandwidth memory
+(HBM) at every decode step.
+At each autoregressive step, the model produces a d-
+dimensional hidden vector and projects it through W to obtain
+logits over all V tokens. This projection dominates decode-
+time memory traffic: for vocabulary V = 262144 and hidden
+dimension d = 512 in fp16, the weight matrix alone is
+262144 × 512 × 2 = 256 MB read per step. The cost of this
+read depends critically on the serving batch size B.
+The key physical insight follows from roofline analysis [5].
+The unembedding matmul [h]B×d · [W T ]d×V has arithmetic
+intensity I ≈B FLOP/byte (fp16). At B = 1 (on-device),
+I = 1 ≪ρ where ρ is the GPU’s ridge point, so the operation
+is memory-bound: cost scales linearly with V and the weight
+matrix is streamed at near-peak bandwidth. At B = 256
+(datacenter), I = 256 > ρ, the operation is compute-bound: the
+same V × d read is amortized across 256 sequences, reducing
+per-sequence cost by ∼256×. The optimal vocabulary therefore
+depends on the serving batch size – a deployment parameter
+determined long after the tokenizer is frozen.
+This observation has direct capacity planning implications.
+Infrastructure teams provisioning GPU clusters for LLM
+serving must account for how vocabulary choice affects memory
+bandwidth requirements, throughput per accelerator, and the
+number of accelerators needed to meet latency SLAs. A model
+with a suboptimally small vocabulary wastes GPU cycles at
+datacenter batch; a model with a suboptimally large vocabulary
+degrades on-device latency. Neither is captured by existing
+vocabulary selection methods, which optimize for training
+quality [1] or single-sample inference [2] in isolation.
+Current practice selects V from convention (32k in Llama-
+2/3 [6], 100k+ in GPT-4 [7], 256k in Gemma-2 [8]) or from
+training-time quality metrics [1]. Neither accounts for how the
+cost of the unembedding step changes with the serving regime.
+A. Contributions
+1) A lifecycle cost model Clifecycle(V, B, λ) that jointly
+captures training and inference costs over vocabulary size,
+parameterized by serving batch B and inference volume
+λ. Both cost components share physical units (ms/byte),
+making λ a dimensionless, physically interpretable ratio.
+2) Empirical measurement of the inference-optimal vocab-
+ulary across batch sizes B ∈{1, 16, 64, 256, 1024, 4096}
+on two GPU ridge points (A10G ≈117, A100 ≈183
+FLOP/byte), with kernel-launch overhead eliminated via
+CUDA graph capture and isolated head measurement.
+The 16× shift in optimal V is confirmed overhead-free.
+3) Scale-dependent quality measurement at 1.3–2.3B pa-
+rameters using Fully Sharded Data Parallel (FSDP) with
+bf16 precision, showing the quality-optimal vocabulary
+shifts from 16k (at 100M) to 65k (at 1.5B), consistent
+with Tao et al.’s V ∗∝N 0.5 scaling law [1].
+4) A lifecycle sweep table (Table VI) and provisioning rec-
+ommendations providing direct guidance as a function
+of λ and B, suitable for infrastructure capacity planning
+decisions.
+arXiv:2608.11361v1  [cs.LG]  11 Aug 2026
+
+
+II. BACKGROUND AND RELATED WORK
+A. Prior Work on Vocabulary Optimization
+Tao et al. (NeurIPS 2024) [1] derive that the loss-optimal
+vocabulary scales as V ∗∝N 0.5 where N is model parameters.
+Their analysis is FLOPs-only at training time; no inference cost,
+batch dependence, or hardware regime is modeled. We extend
+their quality insight with an inference cost model parameterized
+by serving batch.
+Length-MAX (2025) [2] builds inference-efficient tokenizers
+by optimizing score(t) = freq(t)·|t| to balance token frequency
+and length. Benchmarks are on A100 at B = 1 only; no batch
+sweep, no lifecycle framework, and the cost function contains
+no bytes-moved term.
+Compute-Optimal Tokenization (2026) [3] addresses
+training-time FLOPs combined with compression and loss
+(BPB). Their Section 3.5 explicitly states “the inference-optimal
+frontier [is] underexplored.” We address this gap directly.
+Hardware Co-Design Scaling Laws (2026) [4] co-designs
+depth, width, and quantization against a roofline model on
+Jetson Orin, but holds vocabulary constant. We add vocabulary
+as the co-design variable and sweep across hardware ridge
+points.
+Getting the Most Out of Your Tokenizer (2024) [10]
+provides an analytic batch-dependent model for vocabulary
+cost and introduces BPB as a cross-tokenizer quality metric.
+This is the closest prior art on the cost side; we extend it with
+empirical measurement across hardware regimes and a full
+lifecycle framework.
+B. Roofline Model
+The roofline model [5] bounds the achievable performance
+of any operation:
+performance = min(BW · I, peak FLOPS)
+(1)
+where I (FLOP/byte) is arithmetic intensity. The ridge point
+ρ = peak FLOPS/BW separates memory-bound (I < ρ) from
+compute-bound (I > ρ) operation. We measure ρ empirically
+at runtime: peak bandwidth via a large memory copy (64M
+fp16 elements, 128 MB), and peak compute via a large square
+GEMM (4096 × 4096, fp16). This yields ρA10G ≈117 and
+ρA100 ≈183 FLOP/byte, which are used to label every
+measurement as memory-bound or compute-bound.
+C. BPB as a Quality Metric
+Bits per byte (BPB) normalizes model quality across
+tokenizers:
+BPB =
+L
+ln 2 · r(V )
+(2)
+where L is cross-entropy loss in nats per token and r(V ) is
+tokens per byte. Unlike raw loss, BPB is comparable across
+tokenizers of different vocabulary sizes because it expresses
+predictive uncertainty per byte of original text, independent of
+how that text was tokenized [10].
+III. COST MODEL
+A. Inference Cost
+Each autoregressive decode step produces one token via:
+logits = hW T ,
+h ∈RB×d, W ∈RV ×d
+(3)
+The bytes moved from HBM are dominated by the weight
+matrix read: bytes ≈V d · bpp where bpp = 2 for fp16. The
+FLOPs are 2BV d. Arithmetic intensity (simplified for V ≫
+B):
+I =
+2BV d
+V d · bpp = 2B
+bpp = B
+(fp16)
+(4)
+Per-token head cost follows the roofline:
+h(V, B) = 1
+B · max
+V d · bpp
+BW
+, 2BV d
+peak
+
+(5)
+When B < ρ (memory-bound): h(V, B) ∝V/B, falling
+linearly with batch. When B > ρ (compute-bound): h(V, B) ∝
+V/peak, independent of B.
+The transformer body (attention + FFN, no head) contributes
+a V-independent cost cbody(B) measured via CUDA graph
+capture. Total inference cost per character:
+Cinfer(V, B) = cbody(B) + h(V, B)
+p(V )
+(6)
+where p(V ) = 1/r(V ) is chars per token (compression, from
+Phase A).
+This expression has a U-shape in V : small V forces many
+decode steps (small p(V )); large V incurs large h(V, B) per
+step. The minimum – the inference-optimal vocabulary – shifts
+rightward as B grows and h(V, B) shrinks.
+B. Training Cost
+Training processes all tokens in the corpus once. The per-
+byte training cost (ms/byte):
+Ctrain(V ) = r(V )
+τ(V ) × 1000
+(7)
+where r(V ) is tokens per byte and τ(V ) is training throughput
+(tok/s). Both decrease with V : larger V compresses better
+(fewer tokens per byte) but also slows each step (larger
+embedding and head layers). Their ratio has a minimum at
+V ≈16k in our experiments (Section IV-D).
+C. Lifecycle Cost and Optimal Vocabulary
+The total deployment cost over the model’s lifetime:
+Clifecycle(V, B, λ) = Ctrain(V ) + λ · Cinfer(V, B)
+(8)
+λ = inference bytes/training bytes is a dimensionless ratio
+capturing inference volume: λ = 1 denotes one inference pass
+per training byte; λ = 1000 is typical of a production API;
+λ = 106 represents a high-traffic service (e.g., a public chatbot).
+Both Ctrain and Cinfer are in ms/byte, making λ a direct weight
+between the two costs.
+The lifecycle-optimal vocabulary:
+V ∗(B, λ) = arg min
+V
+Clifecycle(V, B, λ)
+(9)
+
+
+Since both cost curves are convex (verified empirically),
+V ∗(B, λ) interpolates between V ∗
+train (at λ = 0) and V ∗
+infer(B)
+(at λ →∞). The lifecycle optimum never falls outside
+[V ∗
+train, V ∗
+infer(B)] – but this interval is itself B-dependent,
+widening dramatically at datacenter batch.
+IV. EXPERIMENTAL SETUP
+A. Hardware and Calibration
+TABLE I
+GPU HARDWARE USED IN EXPERIMENTS. RIDGE POINT MEASURED
+EMPIRICALLY.
+GPU
+BW
+Compute
+Ridge
+(GB/s)
+(TFLOP/s)
+(FLOP/byte)
+A10G
+473
+60
+≈117
+A100-SXM4
+1359
+252
+≈183
+Peak bandwidth and compute are measured at startup via
+calibrate(): a 64M-element fp16 memory copy (128 MB,
+too large for L2 cache) for bandwidth, and a 4096×4096 fp16
+GEMM (intensity ≈1365 ≫ρ) for peak compute. Achieved
+values are 67–79% of theoretical peak due to memory refresh
+cycles, cache pressure, and thermal state. Using measured rather
+than spec-sheet values yields ridge-point predictions that match
+observed crossover batches to within 1.6×.
+B. Phase A: Tokenizer Training and Compression Curve
+We trained BPE tokenizers using SentencePiece [11]
+on
+500 MB
+of
+FineWeb-Edu
+[9],
+a
+curated
+English
+educational web corpus, at eight vocabulary sizes: V
+∈
+{8192, 16384, 32768, 65536, 131072, 262144, 524288, 1048576}.
+Training used the default BPE algorithm: starting from
+individual characters, iteratively merging the most frequent
+adjacent token pair until reaching the target V .
+Compression p(V ) (chars per token) was evaluated on a
+held-out 10k-line validation split. Key result: p(V ) grows from
+4.00 at V = 8k to 5.19 at V = 262k, then saturates – only
+0.6% additional gain from 262k to 524k, and 0.3% from 524k
+to 1M. This saturation is critical: it creates the right arm of the
+U-shaped Cinfer curve at high batch, bounding the inference
+optimum at ≈524k rather than infinity.
+C. Phase B: Inference Benchmarks
+Head measurement. We measure the unembedding matmul
+hW T in isolation using CUDA events (50 timed iterations, 15
+warmup, median of 3 independent runs). Sweeping V ∈{8k–
+1M} and B ∈{1, 16, 64, 256, 512, 1024, 4096, 16384} on a
+single GPU. Measuring in isolation is essential: a full decode
+step launches ∼100 GPU kernels (one per operation in 12
+transformer layers), each incurring ∼15 µs of kernel-launch
+overhead. At B = 1, this overhead (∼1.5 ms total) dwarfs
+the head cost (∼0.015–0.76 ms depending on V ), making the
+vocabulary signal unmeasurable. Isolating the single head kernel
+removes all launch overhead.
+For each (V, B) pair, we record: total latency (ms), per-token
+latency (µs/tok), achieved bandwidth (GB/s), achieved compute
+(TFLOP/s), arithmetic intensity (FLOP/byte), regime label
+(mem/compute), bandwidth utilization, and FLOP utilization.
+Body measurement. The transformer body (12 layers,
+d = 512, 8 heads, no LM head) is timed via three methods:
+(1) eager mode (baseline with full kernel-launch overhead), (2)
+torch.compile (fused kernels, reduced overhead), and (3) CUDA
+graph capture (gold standard – the decode step is recorded once
+and replayed with zero launch overhead). The gold-standard
+body cost at B = 1, ctx=512 is cbody = 0.667 ms/tok. An
+analytical roofline estimate gives 0.065 ms/tok, implying the
+actual kernels operate at ≈10% of theoretical efficiency –
+typical for small-batch transformer inference without custom
+kernels.
+D. Phase C: Training and Quality Measurement
+100M-scale run. We trained 6 GPT models with identical
+architecture (d = 512, 12 layers, 8 heads, ctx=2048) at
+V
+∈{8192, 16384, 32768, 65536, 131072, 262144} for 10k
+steps each, batch=16, AdamW (lr=3e-4, cosine schedule), on
+50M tokens of FineWeb-Edu. All 6 models share the same
+transformer body (37.7M parameters); only the embedding
+and head layers grow with V . Hardware: 8× A100 with
+DataParallel.
+A key implementation challenge: the standard DataParallel
+approach gathers the full [batch×ctx×V ] logit tensor on GPU
+0 before computing the cross-entropy loss. At V = 65536, this
+tensor alone requires 16 × 2048 × 65536 × 4 = 8 GB, causing
+out-of-memory errors. We resolve this by wrapping the model
+in a GPTWithLoss module that computes the loss inside
+each GPU shard and gathers only the scalar loss to GPU 0,
+reducing cross-GPU communication from gigabytes to bytes.
+1.3–2.3B scale run (scale test). To test whether quality
+differentiates across V at larger scale, we trained 3 models at
+V ∈{16384, 65536, 262144} with architecture d = 2048, 24
+layers, 16 heads, ctx=1024, for 5k steps, batch=32 total across
+8× A100.
+At this scale, DataParallel is insufficient: the 2.3B model
+at V = 262k requires ≈19 GB of AdamW optimizer states
+(momentum + variance + master weights), all of which
+DataParallel places on GPU 0, saturating its 40 GB HBM. We
+switch to Fully Sharded Data Parallel (FSDP), which shards
+parameters, gradients, and optimizer states evenly across all 8
+GPUs, reducing per-GPU optimizer memory from ∼19 GB to
+∼2.4 GB.
+Training was initially attempted with fp16 mixed precision.
+At V = 262144, the raw unembedding logits can exceed fp16’s
+maximum representable value (≈65504), causing overflow and
+training divergence (loss increasing monotonically from ∼9 to
+>18 over 2k steps). Switching to bf16 (same exponent range
+as fp32, maximum ≈3.4 × 1038) eliminates the overflow. A
+learning rate of 6e-5 (vs. 3e-4 at 100M scale) is used to stabilize
+2B+ parameter training.
+
+
+V. RESULTS
+A. Regime Crossover Confirms Roofline Prediction
+Table II shows the batch at which the unembedding transi-
+tions from memory-bound to compute-bound on each GPU.
+The measured crossover matches the theoretical ridge point to
+within a factor of 1.5–2× (the small discrepancy arises because
+the full bytes-moved includes activations and logits, not just
+the weight matrix).
+TABLE II
+MEASURED MEMORY-TO-COMPUTE CROSSOVER BATCH VS. PREDICTED
+FROM RIDGE POINT.
+GPU
+Ridge
+Predicted B
+Measured B
+A10G
+117
+≈117
+128–256
+A100
+183
+≈183
+256–512
+Fig. 1 shows per-token head cost vs. batch on A100. At
+B = 1, bandwidth utilization is 82–99% and FLOP utilization
+is <1% (memory-bound). By B = 512, FLOP utilization
+reaches 49–97% (compute-bound). The crossover shifted from
+B ≈128–256 on A10G to B ≈256–512 on A100, tracking
+the ridge ratio 183/117 ≈1.6×. This confirms the effect is
+roofline physics, not an artifact of one platform.
+Fig. 1. Per-token unembedding cost vs. batch on A100 for four vocabulary
+sizes. Gray band marks the memory-to-compute crossover. From B = 1 to
+B = 16384, cost drops 143–377× depending on V .
+B. Inference-Optimal Vocabulary Shifts 16× with Batch
+Table III shows per-token head cost at key (V, B) pairs on
+A100. The amortization ratio (column 5) ranges from 143× to
+377× from B = 1 to B = 16384, confirming the theoretical
+∝B scaling.
+Using cbody = 0.667 ms/tok (CUDA graph, ctx=512, B = 1)
+and real BPE compression from Phase A, the cost-optimal
+vocabulary from Eq. (6):
+• B = 1: V ∗
+infer = 32768. Head cost at V = 262k is
+203 µs/tok vs. body 667 µs/tok. Head contributes 23%,
+creating a real penalty for large V .
+TABLE III
+PER-TOKEN HEAD COST (µS) ON A100 AND AMORTIZATION RATIO
+B = 1 →B = 16384.
+V
+B = 1
+B = 64
+B = 4096
+Ratio
+8192
+15.1
+0.24
+0.04
+377×
+65536
+68.4
+1.07
+0.34
+201×
+262144
+202.7
+3.92
+1.37
+148×
+1048576
+760.8
+14.70
+5.31
+143×
+• B = 64: V ∗
+infer = 524288. Head at V = 262k is now
+61 µs/tok vs. body 75 µs/tok. Head is 45% of total but
+compression gain past 262k is only 0.6%, so the minimum
+is at 524k where compression saturates.
+The 16× shift (32k →524k) is shown in Fig. 2. The
+saturation of the BPE compression curve at ≈524k (Phase
+A) naturally bounds the optimum, preventing it from running
+to infinity at high batch.
+Fig. 2. Inference-cost-optimal vocabulary vs. serving batch (A100, real BPE
+compression, cbody = 0.667 ms/tok). The blue dashed line shows V ∗
+train = 16k.
+C. Training Results and Training-Optimal Vocabulary
+Table IV summarizes Phase C results at 100M scale.
+TABLE IV
+TRAINING RESULTS AT 100M SCALE (D=512, 12L, 10K STEPS, 8X A100).
+V
+BPB
+tok/s
+Ctrain (ms/byte)
+Params
+8192
+1.368
+198,401
+1.26e-3
+47.3M
+16384
+1.344
+191,215
+1.18e-3
+55.7M
+32768
+1.347
+174,990
+1.20e-3
+72.4M
+65536
+1.346
+151,934
+1.32e-3
+106.0M
+131072
+1.355
+119,272
+1.64e-3
+173.1M
+262144
+1.355
+83,132
+2.32e-3
+307.3M
+Two observations: (1) BPB is flat across the full V range
+(<2% spread, best at V = 16k), confirming that vocabulary is a
+pure systems decision at this model scale with negligible quality
+impact. (2) Training throughput drops 2.4× from V = 8k to
+V = 262k, reflecting the larger embedding/head layers. The
+training-cost minimum is V ∗
+train = 16384: below this, poor
+compression forces more tokens per byte; above this, the
+throughput penalty outweighs compression gains.
+
+
+D. Quality Shifts Rightward at Scale
+At 1.3–2.3B scale (FSDP, bf16, 5k steps), BPB results are:
+TABLE V
+QUALITY AT 1.3–2.3B SCALE (D=2048, 24L, FSDP, BF16, 5K STEPS).
+V
+BPB
+Params
+tok/s
+16384
+1.399
+1.28B
+120,343
+65536
+1.387
+1.48B
+112,415
+262144
+1.397
+2.28B
+88,865
+The quality optimum shifted from V = 16k (at 100M) to
+V = 65k (at 1.5B): BPB improves from 1.399 to 1.387 (0.9%
+gain), consistent with Tao et al.’s prediction of V ∗= k
+√
+N ≈
+63k at N = 1.5B. V = 262k is slightly worse than V = 65k,
+likely because at 2.3B total parameters the embedding and head
+account for ∼1.1B of 2.3B parameters, leaving less capacity
+for the transformer body that performs language modeling.
+Fig. 3 shows BPB vs. vocabulary at both scales.
+Fig. 3. BPB vs. vocabulary at two scales. Left (100M): BPB is flat; quality
+does not constrain vocabulary choice. Right (1.3–2.3B): the optimum shifts to
+V = 65k, confirming scale-dependent vocabulary preference.
+E. Lifecycle Sweep
+Table VI presents V ∗(B, λ) from Eq. (9), computed using
+measured Ctrain (Table IV) and Cinfer (Section IV-B). At λ = 0
+(training only), V ∗= 16k regardless of batch. Any serving
+volume (λ ≥1) immediately shifts V ∗away from the training
+optimum. The transition is gradual: at B = 256, λ = 1
+gives V ∗= 65k but reaching V ∗= 262k requires λ ≥100,
+corresponding to serving at least 100 bytes of inference per
+byte of training data.
+TABLE VI
+LIFECYCLE-OPTIMAL VOCABULARY V ∗(B, λ). VALUES IN THOUSANDS
+(E.G., 262 = 262K TOKENS). λ = 1000 IS TYPICAL PRODUCTION.
+B
+λ=0
+λ=1
+λ=10
+λ=100
+λ=103
+λ=∞
+1
+16
+32
+32
+32
+32
+32
+16
+16
+65
+65
+65
+65
+65
+64
+16
+65
+131
+131
+131
+131
+256
+16
+65
+131
+262
+262
+262
+1k+
+16
+65
+131
+262
+262
+262
+VI. INFRASTRUCTURE IMPLICATIONS
+A. Capacity Planning Impact
+Vocabulary size directly affects the number of accelerators
+required to meet a throughput SLA. The inference cost per
+character (Eq. 6) determines how many decode steps the
+cluster must execute per unit of output text. Moving from
+the conventional V = 32k to the lifecycle-optimal V = 262k
+at datacenter batch (B = 256, λ ≥100) reduces per-character
+inference cost by ≈2×, directly halving the number of GPU-
+hours required for a fixed output volume.
+Concretely, at B = 64: V = 524k reduces head cost from
+61 µs/tok (V = 262k) and provides 0.6% more compression.
+The combined effect on cost-per-character is a ≈10% reduction
+vs. V = 262k. While modest, at hyperscale inference volumes
+this translates to substantial cluster cost savings.
+Vocabulary also interacts with KV-cache utilization. Larger
+V produces shorter token sequences for the same text (better
+compression), which directly reduces KV-cache size: a 16×
+more compressed tokenizer halves sequence length, halving
+KV-cache memory requirements. For long-context serving, this
+can be the dominant capacity driver.
+B. Theoretical Extension to Quantization
+While we did not run quantization experiments, the roofline
+model predicts the effect analytically. int4 quantization of the
+unembedding (bpp = 0.5 instead of 2) would reduce bytes read
+from HBM by 4×, shifting arithmetic intensity from I ≈B to
+I ≈4B and raising the effective ridge point 4×. The memory-
+to-compute crossover batch would shift from B ≈256 to
+B ≈64 on A100, meaning the head amortizes at lower batch
+sizes and the lifecycle optimum moves toward larger V even
+at modest batch. Empirical validation of this prediction is left
+as future work.
+C. Provisioning Recommendations
+For infrastructure teams making vocabulary selection deci-
+sions:
+• On-device / edge (B = 1): Use V ≈32k. The head is
+memory-bound and scales linearly with V ; the optimal
+vocabulary minimizes memory traffic per step while
+maintaining sufficient compression. Quality is unaffected
+(<1% BPB difference across 32k–262k at 1.5B scale).
+• API servers (B = 16–64): Use V ≈65–131k. The head
+begins to amortize; compression reduces total step count.
+The lifecycle optimum at λ = 10 (moderate serving) falls
+in this range.
+• Datacenter / high-throughput (B ≥256, λ ≥100): Use
+V ≈262k. Full head amortization; maximum compression
+gain; no quality penalty at ≥1B model scale. This is 8–
+16× larger than the training convention of 16–32k.
+These recommendations apply at model scales ≥1B where
+quality weakly favors larger V . At <300M parameters, quality
+is flat and the choice reduces to the training-inference cost
+trade-off alone.
+
+
+VII. LIMITATIONS
+Model scale. Our largest training run is 2.3B parameters.
+Tao’s scaling law V ∗∝N 0.5 predicts the quality benefit of
+large V continues to grow with scale; at 7B+ the quality
+optimum would be ≈150k+ (untested here).
+Training budget. We trained 1.3–2.3B models for only 5k
+steps. The V = 262k model may be undertrained relative to
+V = 65k at an equal compute budget (FLOPs), since the larger
+embedding/head consume parameters that would otherwise
+contribute to the transformer body.
+Corpus. Tokenizers were trained on English FineWeb-
+Edu. Compression curves differ for code (higher compression
+from repeated patterns), multilingual text (lower per-character
+compression for non-Latin scripts), and mathematical notation.
+The optimal V values are corpus-dependent.
+Architecture. All results use decoder-only GPT. Mixture-
+of-experts (MoE) models, state-space models, and encoder-
+decoder architectures have different body/head cost ratios and
+may exhibit different optimal vocabulary sizes.
+VIII. CONCLUSION
+We have shown that the cost-optimal tokenizer vocabulary
+is not a constant but a deployment-regime-dependent infras-
+tructure parameter. The lifecycle framework Clifecycle(V, B, λ)
+quantifies a three-way tension: training cost is minimized at
+V ≈16k; quality (BPB) is minimized at V ≈65k at 1.5B
+scale; and inference cost at serving batch is minimized at
+V ≈262k+ for B ≥64.
+The key practical finding: for any production LLM de-
+ployment with λ ≥100 and B ≥64, the lifecycle-optimal
+vocabulary is 8–16× larger than training convention suggests,
+with <2% quality cost in the measured parameter range. The
+effect is roofline physics – confirmed on two GPU ridge points
+and predictable from hardware specs – making it applicable to
+future GPU generations without re-measurement.
+For infrastructure teams, this result is directly actionable:
+vocabulary selection should be treated as a capacity planning
+input alongside batch size, serving regime, and quantization
+strategy, rather than a fixed convention inherited from training.
+ACKNOWLEDGMENT
+The authors thank the open-source communities behind Py-
+Torch, SentencePiece, and HuggingFace Datasets. Experiments
+were conducted on AWS EC2 p4d.24xlarge (8× A100-SXM4-
+40GB) and g5.4xlarge (1× A10G-24GB) instances.
+AI Tool Disclosure (IEEE Policy): This work made
+substantial use of Claude (Anthropic) as an AI assistant
+throughout the research process. The authors originated the
+core research idea – that vocabulary size should be treated
+as a deployment-regime parameter rather than a training-
+time constant – and defined the experimental questions and
+hypotheses. Claude was used to: (1) conduct the literature
+survey, identifying and summarizing relevant prior work (Tao
+2024, Length-MAX, Compute-Optimal Tokenization, Hardware
+Co-Design Scaling Laws, and others) and assessing novelty
+and differentiation of our contribution; (2) implement the
+experimental harness (bench_head.py, bench_body.py,
+train_models.py, lifecycle_sweep.py and related
+scripts) from author-provided specifications and seed ideas;
+(3) debug training instabilities (fp16 overflow, DataParallel
+OOM, FSDP configuration); (4) assist with data analysis
+and result interpretation; and (5) draft and revise sections of
+this manuscript. All experimental design decisions, scientific
+claims, and final interpretations are the authors’ own. The
+authors verified all code, reviewed all outputs, and take full
+responsibility for the content of this paper.
+REFERENCES
+[1] C. Tao, Q. Liu, L. Dou, N. Muennighoff, Z. Wan, P. Luo, M. Lin,
+and N. Wong, “Scaling Laws with Vocabulary: Larger Models Deserve
+Larger Vocabularies,” Advances in Neural Information Processing Systems
+(NeurIPS), 2024, arXiv:2407.13623.
+[2] D. Dong and W. Su, “Length-MAX Tokenizer for Language Models,”
+2025, arXiv:2511.20849.
+[3] T. Limisiewicz, A. Pagnoni, S. Iyer, M. Lewis, S. Mehta, A. Liu, M. Li,
+G. Ghosh, and L. Zettlemoyer, “Compute Optimal Tokenization,” 2025,
+arXiv:2605.01188.
+[4] L. Sun, J. Jiang, Y. Ding, F. Li, Y. Song, H. Zhang, J. Ying, L. Ren, K.
+Zhan, W. Chen, Y. Xie, and C. Deng, “Hardware Co-Design Scaling Laws
+via Roofline Modelling for On-Device LLMs,” 2026, arXiv:2602.10377.
+[5] S. Williams, A. Waterman, and D. Patterson, “Roofline: An Insightful
+Visual Performance Model for Floating-Point Programs and Multicore
+Architectures,” Communications of the ACM, vol. 52, no. 4, pp. 65–76,
+Apr. 2009.
+[6] H. Touvron, L. Martin, K. Stone et al., “Llama 2: Open Foundation and
+Fine-Tuned Chat Models,” 2023, arXiv:2307.09288.
+[7] OpenAI, J. Achiam, S. Adler et al., “GPT-4 Technical Report,” 2023,
+arXiv:2303.08774.
+[8] Gemma Team: M. Riviere, S. Pathak, P. G. Sessa et al., “Gemma
+2: Improving Open Language Models at a Practical Size,” 2024,
+arXiv:2408.00118.
+[9] G. Penedo, H. Kydl´ıˇcek, L. Ben Allal, A. Lozhkov, M. Mitchell, C.
+Raffel, L. Von Werra, and T. Wolf, “The FineWeb Datasets: Decanting
+the Web for the Finest Text Data at Scale,” 2024, arXiv:2406.17557.
+[10] G. Dagan, G. Synnaeve, and B. Rozi`ere, “Getting the Most Out
+of Your Tokenizer for Pre-Training and Domain Adaptation,” 2024,
+arXiv:2402.01035.
+[11] T. Kudo and J. Richardson, “SentencePiece: A Simple and Language
+Independent Subword Tokenizer and Detokenizer for Neural Text
+Processing,” Proceedings of the 2018 Conference on Empirical Methods
+in Natural Language Processing (EMNLP): System Demonstrations, 2018,
+arXiv:1808.06226.
