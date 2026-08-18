@@ -6,47 +6,73 @@
 </div>
 
 ## 每次日报
-- 最新运行日期：2026-08-17
-- 运行时间：2026-08-17 20:31:26 UTC
+- 最新运行日期：2026-08-18
+- 运行时间：2026-08-18 21:04:41 UTC
 - 运行状态：成功
-- 本次总论文数：9
-- 精读区：5
-- 速读区：4
+- 本次总论文数：17
+- 精读区：7
+- 速读区：10
 
 ### 今日简报（AI）
-今日聚焦LLM服务架构优化，精读MoE近存计算与HBF应用两篇高分论文。最值得关注的是《MoE Expert Execution in Disaggregated LLM Serving with a High-Bandwidth ReRAM Near-Memory Architecture》（9.0分），展示高带宽ReRAM近存如何加速MoE推理；《Potential Applications of HBF in LLM Serving Systems》（8.0分）亦值得一读。建议后续关注异构内存与分层调度结合的低延迟推理方案。
-- 详情：[/202608/17/README](/202608/17/README)
+今日聚焦边缘设备端MoE推理优化，共17篇论文，精读7篇、速读10篇。  
+最值得看的是两篇满分工作：S2-MoE实现高效自推测解码，FreeToken提出带宽自适应执行机制。  
+建议优先精读这两篇，并速读ExactMoE的W4A16内存优化与EcoVLA的实时能耗协同方案。
+- 详情：[/202608/18/README](/202608/18/README)
 
 ### 精读区论文标签
-1. [MoE Expert Execution in Disaggregated LLM Serving with a High-Bandwidth ReRAM Near-Memory Architecture](/202608/17/2608.13962v1-moe-expert-execution-in-disaggregated-llm-serving-with-a-high-bandwidth-reram-near-memory-architecture)  
+1. [S2-MoE: Enabling Efficient Self-Speculative Decoding for Mixture-of-Experts on Edge Devices](/202608/18/2608.15018v1-s2-moe-enabling-efficient-self-speculative-decoding-for-mixture-of-experts-on-edge-devices)  
+   标签：评分：10.0/10、query:edge-llm
+   evidence：面向边缘设备MoE推理的高效自推测解码，解决内存与带宽约束
+2. [FreeToken: Efficient Edge-Native MoE Serving with Bandwidth-Adaptive Execution](/202608/18/2608.16157v1-freetoken-efficient-edge-native-moe-serving-with-bandwidth-adaptive-execution)  
+   标签：评分：10.0/10、query:edge-llm
+   evidence：边缘原生MoE服务系统，协同设计模型布局、专家驻留、CPU-GPU执行与内存管理
+3. [P-PAS: Prefill-Pressure Adaptive Scheduling for Long-Context LLM Serving](/202608/18/2608.15171v1-p-pas-prefill-pressure-adaptive-scheduling-for-long-context-llm-serving)  
    标签：评分：9.0/10、query:edge-llm
-   evidence：面向MoE LLM服务加速的ReRAM近内存架构
-2. [Potential Applications of HBF in LLM Serving Systems](/202608/17/2608.13127v2-potential-applications-of-hbf-in-llm-serving-systems)  
-   标签：评分：8.0/10、query:edge-llm
-   evidence：高带宽闪存扩展LLM服务系统存储容量
-3. [Joint Optimization of Memory and Computing Frequency for Energy-Efficient DNN Inference](/202608/17/2608.13863v1-joint-optimization-of-memory-and-computing-frequency-for-energy-efficient-dnn-inference)  
-   标签：评分：8.0/10、query:edge-llm
-   evidence：联合优化内存与计算频率提升移动端DNN推理能效，可迁移至边缘LLM推理
-4. [Exploring High-Bandwidth Flash for Modern LLM Inference: Opportunities and Challenges](/202608/17/2608.13868v1-exploring-high-bandwidth-flash-for-modern-llm-inference-opportunities-and-challenges)  
-   标签：评分：8.0/10、query:edge-llm
-   evidence：研究高带宽闪存在LLM服务系统中扩展内存容量、提升批大小与吞吐的潜力与挑战
-5. [Beyond Capacity: Scalable MoE LLM Inference via High-Bandwidth Flash with Direct GPU and HBM Paths](/202608/17/2608.14333v1-beyond-capacity-scalable-moe-llm-inference-via-high-bandwidth-flash-with-direct-gpu-and-hbm-paths)  
-   标签：评分：8.0/10、query:edge-llm
-   evidence：利用高带宽闪存与GPU/HBM直连路径进行MoE LLM推断的硬件感知加速
+   evidence：面向长上下文LLM服务的自适应调度策略，基于预填充压力调整调度预算
+4. [FluxBin: Flexible LUT-based Ultra-low-bit LLM Inference by Algorithm-Kernel Synergy](/202608/18/2608.15602v1-fluxbin-flexible-lut-based-ultra-low-bit-llm-inference-by-algorithm-kernel-synergy)  
+   标签：评分：9.0/10、query:edge-llm
+   evidence：面向超低比特LLM推理的算法-内核协同设计，结合LUT与CUDA内核
+5. [Large Models for Small Devices: Recent Advances and Empirical Analysis of Edge AI Deployment](/202608/18/2608.15693v1-large-models-for-small-devices-recent-advances-and-empirical-analysis-of-edge-ai-deployment)  
+   标签：评分：9.0/10、query:edge-llm
+   evidence：在树莓派等边缘平台上实证部署压缩后的语言与图像模型
+6. [Beyond Binary Priorities: Multi-Tier SLA Scheduling for Large Language Model Serving](/202608/18/2608.16336v1-beyond-binary-priorities-multi-tier-sla-scheduling-for-large-language-model-serving)  
+   标签：评分：9.0/10、query:edge-llm
+   evidence：直接面向大语言模型服务框架，扩展Llumnix调度器以支持多优先级SLA分级调度。
+7. [Pallas: A Proactive KV Cache Migration Framework for LLM Inference in AI-RAN](/202608/18/2608.16477v1-pallas-a-proactive-kv-cache-migration-framework-for-llm-inference-in-ai-ran)  
+   标签：评分：9.0/10、query:edge-llm
+   evidence：面向AI-RAN边缘场景的LLM推理KV缓存主动迁移框架，提升服务连续性与时延表现
 
 ### 速读区论文标签
-1. [Achieving Near-Zero-Overhead Multi-Model Hierarchical Classification in Real-Time Detection Pipelines](/202608/17/2608.11770v1-achieving-near-zero-overhead-multi-model-hierarchical-classification-in-real-time-detection-pipelines)  
+1. [LOCAL: Enabling Learning On-device Contiguously for Agent LLMs](/202608/18/2608.15241v1-local-enabling-learning-on-device-contiguously-for-agent-llms)  
+   标签：评分：8.0/10、query:edge-llm
+   evidence：设备端单GPU运行时，管理适配器与KV缓存
+2. [Every Expert Counts: ExactMoE for Memory-Efficient W4A16 Inference](/202608/18/2608.15383v1-every-expert-counts-exactmoe-for-memory-efficient-w4a16-inference)  
+   标签：评分：8.0/10、query:edge-llm
+   evidence：通过4比特量化、MARLIN内核和GPU缓存实现W4A16 MoE推理的内存高效硬件感知推理
+3. [EcoVLA: Energy-Efficient Device-Edge Co-Inference for Vision-Language-Action Models under Real-Time Constraints](/202608/18/2608.15502v1-ecovla-energy-efficient-device-edge-co-inference-for-vision-language-action-models-under-real-time-constraints)  
+   标签：评分：8.0/10、query:edge-llm
+   evidence：设备-边缘协同推理框架，实现能效优化的边缘模型部署
+4. [FlashQuant: Sparse-Dense Fusion for Memory-Efficient Outlier-Aware LLM Inference](/202608/18/2608.15531v1-flashquant-sparse-dense-fusion-for-memory-efficient-outlier-aware-llm-inference)  
+   标签：评分：8.0/10、query:edge-llm
+   evidence：提出稀疏-稠密融合的内核实现低比特异常感知LLM推理，属于硬件感知的推理加速方法。
+5. [SchurQuant: Groupwise Discrete Optimization for Layer-Wise LLM Quantization](/202608/18/2608.15567v1-schurquant-groupwise-discrete-optimization-for-layer-wise-llm-quantization)  
+   标签：评分：8.0/10、query:edge-llm
+   evidence：量化方法支持在资源受限设备上高效部署LLM
+6. [Achieving Near-Zero-Overhead Multi-Model Hierarchical Classification in Real-Time Detection Pipelines](/202608/18/2608.11770v1-achieving-near-zero-overhead-multi-model-hierarchical-classification-in-real-time-detection-pipelines)  
    标签：评分：7.0/10、query:edge-llm
-   evidence：边缘SoC中NPU/DLA异构执行、量化与算子约束，与边缘LLM加速器软硬协同主题相关
-2. [CoRun: Padding is Simple and Efficient for Deterministic LLM Inference](/202608/17/2608.14376v1-corun-padding-is-simple-and-efficient-for-deterministic-llm-inference)  
+   evidence：边缘SoC上GPU与NPU/DLA并发执行，异构计算用于多模型推理
+7. [From LLM Inference to Agentic Workloads: Characterization and Implications for Serving Systems](/202608/18/2608.15127v1-from-llm-inference-to-agentic-workloads-characterization-and-implications-for-serving-systems)  
    标签：评分：7.0/10、query:edge-llm
-   evidence：基于位置不变内核调度的高效确定性LLM推理
-3. [User-Assisted Collaborative Distributed Inference for Efficient QoS-Aware Autoscaling](/202608/17/2608.11840v1-user-assisted-collaborative-distributed-inference-for-efficient-qos-aware-autoscaling)  
+   evidence：面向智能体负载的LLM服务系统特征分析与启示
+8. [When Entropy Is Not Enough: Reclaiming Lost Semantics in LLM Output Length Prediction](/202608/18/2608.15592v1-when-entropy-is-not-enough-reclaiming-lost-semantics-in-llm-output-length-prediction)  
+   标签：评分：7.0/10、query:edge-llm
+   evidence：通过考虑语义的输出长度预测来减少padding浪费，支撑长度感知调度，属于服务框架优化。
+9. [Dynamic Multi-Byte Prediction With Hierarchical Language Models](/202608/18/2608.15454v1-dynamic-multi-byte-prediction-with-hierarchical-language-models)  
    标签：评分：6.0/10、query:edge-llm
-   evidence：面向AI推理服务的用户协同分布式推理与QoS感知自动伸缩
-4. [The Integer Alibi: Localizing Cross-Kernel Divergence in INT8-Quantized LLM Inference](/202608/17/2608.13756v1-the-integer-alibi-localizing-cross-kernel-divergence-in-int8-quantized-llm-inference)  
+   evidence：并行字节预测，加速LLM推理
+10. [Algorithm-Architecture Co-Design for Efficient VLA Inference via Speculative Inference and Verification](/202608/18/2608.15636v1-algorithm-architecture-co-design-for-efficient-vla-inference-via-speculative-inference-and-verification)  
    标签：评分：6.0/10、query:edge-llm
-   evidence：分析vLLM中INT8量化LLM推理内核差异（CUTLASS与Triton），与硬件感知算子加速相关
+   evidence：面向大模型推理的算法-架构协同设计，通过推测推理与验证提升效率
 
 
 <div class="dpr-home-promo-card">
