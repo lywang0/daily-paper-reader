@@ -6,40 +6,46 @@
 </div>
 
 ## 每次日报
-- 最新运行日期：2026-08-20
-- 运行时间：2026-08-20 20:03:19 UTC
+- 最新运行日期：2026-08-21
+- 运行时间：2026-08-21 20:51:34 UTC
 - 运行状态：成功
-- 本次总论文数：6
+- 本次总论文数：8
 - 精读区：3
-- 速读区：3
+- 速读区：5
 
 ### 今日简报（AI）
-今日聚焦大模型高效推理，6篇论文中精读3篇，重点覆盖MoE边缘部署与注意力加速。
-最值得看两个方向：S2-MoE实现边缘设备自推测解码，FlashAttention针对可扩展向量架构优化。
-建议普通读者优先关注边缘端MoE推理的能效提升，以及注意力机制在非GPU硬件上的加速思路。
-- 详情：[/202608/20/README](/202608/20/README)
+今日论文涉及异构芯片设计与视觉语言模型加速，重点在动态负载与推理优化。  
+精读推荐：HYDRA框架针对异构芯粒设计，聚类与token去噪方法提升VLM速度与鲁棒性。  
+下一步可优先了解HYDRA的架构思路，并关注PTXBench以追踪GPU内核优化方向。
+- 详情：[/202608/21/README](/202608/21/README)
 
 ### 精读区论文标签
-1. [S2-MoE: Enabling Efficient Self-Speculative Decoding for Mixture-of-Experts on Edge Devices](/202608/20/2608.15018v2-s2-moe-enabling-efficient-self-speculative-decoding-for-mixture-of-experts-on-edge-devices)  
+1. [HYDRA: A Heterogeneous Chiplet DSE Framework for Serving Dynamic Hybrid LLM Workloads](/202608/21/2608.19395v1-hydra-a-heterogeneous-chiplet-dse-framework-for-serving-dynamic-hybrid-llm-workloads)  
    标签：评分：9.0/10、query:edge-llm
-   evidence：面向边缘设备MoE推理的自推测解码，直接应对内存与带宽约束。
-2. [FlashAttention for Scalable Vector Architectures](/202608/20/2608.18656v1-flashattention-for-scalable-vector-architectures)  
-   标签：评分：9.0/10、query:edge-llm
-   evidence：面向CPU向量架构的硬件感知FlashAttention，加速SLM推理
-3. [Pre-Compiled Pipeline Shards for Distributed LLM Inference on Intel AI PC Fleets](/202608/20/2608.19147v1-pre-compiled-pipeline-shards-for-distributed-llm-inference-on-intel-ai-pc-fleets)  
-   标签：评分：9.0/10、query:edge-llm
-   evidence：在边缘AI PC上通过预编译OpenVINO分片实现流水线并行的LLM分布式推理
+   evidence：面向混合LLM服务的异构chiplet软硬协同设计框架
+2. [Clustering and Token Denoising for Faster and More Robust VLMs](/202608/21/2608.19285v1-clustering-and-token-denoising-for-faster-and-more-robust-vlms)  
+   标签：评分：8.0/10、query:edge-llm
+   evidence：面向端侧部署的免训练Token剪枝方法，降低VLM计算负担
+3. [From Retrieved Context to Runtime Control: Adaptive Compression for Edge-based RAG](/202608/21/2608.19535v1-from-retrieved-context-to-runtime-control-adaptive-compression-for-edge-based-rag)  
+   标签：评分：8.0/10、query:edge-llm
+   evidence：面向边缘RAG的自适应上下文压缩，在边缘SoC上根据设备实时状态降低时延与能耗
 
 ### 速读区论文标签
-1. [Collective Communication for Distributed LLM Systems: Planning, Runtime Adaptation, and Computation Coordination](/202608/20/2608.15118v1-collective-communication-for-distributed-llm-systems-planning-runtime-adaptation-and-computation-coordination)  
+1. [PTXBench: Benchmark and Adapt LLMs for GPU Kernel Optimization with Architecture-specific PTX](/202608/21/2608.17379v2-ptxbench-benchmark-and-adapt-llms-for-gpu-kernel-optimization-with-architecture-specific-ptx)  
    标签：评分：7.0/10、query:edge-llm
-   evidence：面向分布式LLM系统的拓扑感知集合通信与运行时自适应
-2. [Cacheable by Design? Training Mixture-of-Experts Routers for Locality Against the Edge Memory-Bandwidth Wall: A Pre-Registered Negative Result with a Systems Measurement Study](/202608/20/2608.18261v1-cacheable-by-design-training-mixture-of-experts-routers-for-locality-against-the-edge-memory-bandwidth-wall-a-pre-registered-negative-result-with-a-systems-measurement-study)  
+   evidence：评估并微调LLM生成面向H100/B200架构的PTX核，用于GEMM和注意力计算的硬件感知GPU算子优化
+2. [FlashPrefill V2: Block-Sparse Prefill Attention for Long-Context LLM Serving](/202608/21/2608.19758v1-flashprefill-v2-block-sparse-prefill-attention-for-long-context-llm-serving)  
    标签：评分：7.0/10、query:edge-llm
-   evidence：针对边缘MoE服务的内存带宽墙测量研究
-3. [Efficient INT8 Inference of Small NLP Models on Server CPUs with PyTorch Native Stack](/202608/20/2608.18182v1-efficient-int8-inference-of-small-nlp-models-on-server-cpus-with-pytorch-native-stack)  
+   evidence：面向长上下文LLM服务实用化的块稀疏预填充注意力优化
+3. [Nexus: Structured Synergy for Efficient Text-to-Image Generation using Rectified Flow Model](/202608/21/2608.16104v1-nexus-structured-synergy-for-efficient-text-to-image-generation-using-rectified-flow-model)  
    标签：评分：6.0/10、query:edge-llm
-   evidence：面向CPU的NLP模型推理INT8量化与硬件感知内核优化
+   evidence：面向边缘部署的生成模型效率优化，其方法可迁移到LLM推理
+4. [ReCache: Efficient KV Cache Reuse and Compression for Tool-Augmented LLM Agents](/202608/21/2608.19662v1-recache-efficient-kv-cache-reuse-and-compression-for-tool-augmented-llm-agents)  
+   标签：评分：6.0/10、query:edge-llm
+   evidence：通过KV缓存复用与压缩降低推理资源开销
+5. [Learning how to Forget: Fine-tuning for Long-Context Sparse Attention](/202608/21/2608.19920v1-learning-how-to-forget-fine-tuning-for-long-context-sparse-attention)  
+   标签：评分：6.0/10、query:edge-llm
+   evidence：针对长上下文LLM推理的高效稀疏注意力微调与算子内核实现，可迁移用于降低推理显存与计算开销，但并非面向边缘场景。
 
 
 <div class="dpr-home-promo-card">
