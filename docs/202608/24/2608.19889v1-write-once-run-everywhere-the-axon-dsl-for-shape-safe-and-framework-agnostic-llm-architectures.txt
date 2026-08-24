@@ -1,0 +1,746 @@
+Title: Write Once, Run Everywhere: The Axon DSL for Shape-Safe and Framework-Agnostic LLM Architectures
+
+URL Source: https://arxiv.org/pdf/2608.19889v1
+
+Published Time: Fri, 21 Aug 2026 00:45:01 GMT
+
+Number of Pages: 28
+
+Markdown Content:
+## Write Once, Run Everywhere: The Axon DSL for Shape-Safe and Framework-Agnostic LLM Architectures 
+
+Jacob Nielsen, Danial Namazifard, Lukas Galke Poech, Peter Schneider-Kamp 
+
+University of Southern Denmark Campusvej 55, 5230 Odense, Denmark jacn@imada.sdu.dk 
+
+Abstract 
+
+The entire ecosystem of open-source language models effec-tively relies on a single platform. What if this platform was forced to shut down tomorrow? Implementing and maintain-ing efficient model definitions and translating them between different training and inference regimes is a resource-heavy task that severely limits model efficiency and portability, hin-dering both scaling and deployment. Here, we present Axon, a strongly typed domain-specific language with Haskell-like syntax, that enables a write-once, run everywhere paradigm 
+
+for LLM architectures. By basing collaboration on a language specification rather than a specific framework’s vision, Axon fosters open cooperation and empowers researchers to imple-ment highly specialized architectures without giving up opti-mization infrastructure or accepting deployment lock-in. Axon allows for concise, auditable specifications that can be auto-matically compiled to standalone implementations for lead-ing frameworks: PyTorch, PyTorch with Triton, JAX, MLX and vLLM. In 467 inference benchmarking experiments on models ranging from 135M to 32B parameters, we demon-strate median speedups of 7% on PyTorch, 12% on PyTorch with Triton, 91% on JAX, and 107% on MLX, compared to the reference implementations from Transformers. When de-ployed as native vLLM architectures with PagedAttention and KV-cache, Axon models achieve a 58% median speedup over Transformers implementations. 
+
+Introduction 
+
+In 1972/73, Dennis Ritchie created the C programming lan-guage (Ritchie 1973) which – uniquely at the time – com-bined the hardware access of low-level programming lan-guages with the portability and syntax of high-level lan-guages. Undoubtedly, the C language has revolutionized how we program computers. The current situation in LLM devel-opment is reminiscent of the pre-C era. Some frameworks enable high levels of abstraction, such as the Transformers library (Wolf et al. 2020), while others are closer to hardware, such as CUDA kernels (Nickolls et al. 2008) or FlashAtten-tion implementations (Dao et al. 2022). The de-facto stan-dard implementations of LLM architectures are currently determined by rigid, monolithic platforms, most notably the Hugging Face Hub 1, which prioritize the ease of sharing models and model definitions over efficiency. 
+
+> 1
+
+https://huggingface.co 
+
+Figure 1: Write-once, run everywhere. Axon DSL compiles axon definitions ( .axon ) to standalone model definitions for PyTorch, JAX, MLX and vLLM. All that is needed is a standard safetensors checkpoint. This discrepancy between architectural transparency and execution efficiency creates a high barrier to porting models between software backends and hardware platforms: porting implementations between backends, such as PyTorch (Ansel et al. 2024), JAX (Bradbury et al. 2018), and MLX (Hannun et al. 2023), is error-prone and non-trivial, creating technical debt (Sculley et al. 2015). Modeling code is hidden in a vast ecosystem of glue code and pipeline jungles connecting frameworks and hardware backends, freezing a system to the peculiarities of a specific package and making architectural improvements or backend transitions prohibitively expensive. Most current optimiza-tion efforts, constrained by this dependency chain, patch ex-isting frameworks – leading to implementation drift (Sculley et al. 2015), where backend-specific optimizations are lost or omitted for compatibility with general framework conven-tions, and forcing researchers and practitioners to choose be-tween (a) suboptimal performance or (b) redundantly rewrit-ing implementations for every backend and hardware. Ex-arXiv:2608.19889v1 [cs.AI] 20 Aug 2026 acerbating this issue, the efforts of most practitioners and researchers lie in the hands of a few private companies, lead-ing to undesirable centralization of power (Ahmed, Wahed, and Thompson 2023; Widder, Whittaker, and West 2024). Here, we present Axon (Figure 1), a compact, strongly typed functional domain-specific language (DSL) that al-lows for minimal, standalone model definitions, and thereby reduces the dependency chains and abstraction debt (Scul-ley et al. 2015) that characterize monolithic frameworks: Axon targets model families rather than hand-written model-specific implementations per backend, per hardware: lexical names, symbolic dimensions, parameter paths, optional con-figuration defaults, control-flow structure, and precise tensor types. Furthermore, Axon removes a major source of train-ing/serving skew identified by Breck et al. (2017) as one of the most critical yet least-frequently implemented tests for production readiness. Axon further mitigates the fast-integration debt (Ehsani et al. 2026) inherent in rapid LLM adoption and empowers researchers to implement and share specialized architectures without sacrificing optimization in-frastructure. While manual porting between backends often leads to implementation drift – where optimizations for one frame-work are omitted or lost in another – Axon’s write-once, run everywhere paradigm facilitates integrity across the entire model lifecycle. By formalizing the model specification as an auditable and unit-testable artifact, Axon directly supports the ML Test Score criteria for reproducibility and ensures that architectures are inherently ready for diverse production en-vironments (Breck et al. 2017). Moreover, Axon enables a seamless generation of optimized implementations for both training and inference, currently targeting PyTorch, PyTorch with Triton, JAX, MLX, and vLLM, within a single com-piler pipeline. Axon’s compiler preserves the integrity of the symbolic dimensions and control-flow structures. In sum, Axon contributes to democratizing high-performance AI, empowering smaller entities to achieve competitive throughput while enabling large-scale operators to optimize hardware utilization and reduce their environ-mental footprint. Our contributions are as follows: 
+
+• A strongly-typed domain-specific language, Axon, for au-thoring backend-agnostic neural (language) models for cross-backend materializations. 
+
+• A compiler pipeline for seamless compilations of opti-mized standalone implementations for over 204 models spanning 60 families. 
+
+• Benchmarks of these checkpoints across five backends displaying improved or at least competitive results in terms of throughput, while maintaining top-1 token parity across backends. 
+
+• A deployment path to multiple backends based on a check-point and the Axon model definition. 
+
+Related Work 
+
+The ecosystem for optimizing deep neural networks spans high-level API abstractions to low-level hardware primi-tives. We broadly categorize existing work into five layers: (i) deep learning backends, (ii) intermediate representations, (iii) compilers and optimizers, (iv) kernel generation, and (v) specialized inference frameworks. 
+
+Deep Learning Backends. At the highest level, we have well known backends such as PyTorch (Ansel et al. 2024), TensorFlow (Abadi et al. 2015), and JAX (Bradbury et al. 2018) providing the tensor operations from which model definitions and their execution are built with the backward 
+
+pass typically derived automatically. While PyTorch and Ten-sorFlow mainly rely on eager execution, the industry has shifted towards just-in-time (JIT) compilations for perfor-mance. More recently, specialized backends, such as Tiny-grad (Hotz and contributors 2020) and MLX (Hannun et al. 2023), emphasize minimalism and hardware-specific opti-mizations to reduce overhead often introduced by the general-purpose frameworks. 
+
+Intermediate Representations (IR). To map high level abstractions to hardware-specific code, IR frameworks main-tain a structured representation of computational graphs. ONNX (Bai et al. 2019) serves as a cross-platform standard for model exchanges, while MLIR (Multi-level IR) (Lattner et al. 2021) and LLVM (Lattner and Adve 2004) provide mod-ular infrastructure for dialect-specific optimizations. Sta-bleHLO (OpenXLA Community 2023) bridges JAX and TensorFlow, lowering high-level operations into a represen-tation that compilers can efficiently optimize. IREE (IREE Authors 2019) extends this with an end-to-end pipeline from MLIR to executable code across diverse devices. 
+
+Compilers and Optimizers. Once represented in an IR, compilers optimize the graph through techniques such as operator fusion, memory planning, and constant folding. Ac-celerated Linear Algebra (XLA) (Sabne 2020) does this for JAX and TensorFlow, while the torchinductor is the primary backend for PyTorch 2.0 (Ansel et al. 2024). Hard-ware specific optimizers like NVIDIA’s TensorRT (NVIDIA 2026) and Intel’s OpenVINO (Intel Corporation 2026) max-imize throughput for specific chipsets. Apache TVM (Chen et al. 2018) provides general-purpose automated optimiza-tion, leveraging machine learning to find efficient operator implementations. 
+
+Kernel Generation. The lowest level of optimization hap-pens at the kernel level, where mathematical operations are mapped to hardware threads/warps in a tensorized formula-tion. Native libraries, such as NVIDIA’s CUTLASS (Kerr et al. 2017) and cuDNN (Chetlur et al. 2014), and the cross-platform oneDNN (oneDNN Contributors 2017), provide highly tuned primitives. A fast-growing trend towards higher-level, programmable kernel generation has followed: Tri-ton (Tillet, Kung, and Cox 2019) compiles high-level Python to efficient GPU kernels, DITRON targets distribution-aware kernels (Zheng et al. 2026), and Mojo 2 bridges Python’s us-ability with the performance of C++ and CUDA. LLMs now also power this space, e.g. as part of the AutoKernel project 3.
+
+> 2https://mojolang.org/docs/
+> 3https://github.com/rightnow-ai/autokernel
+
+Specialized Inference Frameworks. Specialized infer-ence frameworks wrap prior layers of optimization for de-ployments and serving. vLLM increases serving through-put through PagedAttention, a virtual-memory-inspired KV-cache manager (Kwon et al. 2023). For Apple Silicon, emerg-ing projects like MLX-vLLM (Barrios 2025) and Rapid MLX (Chai 2026) adapt these high-performance serving techniques to the MLX ecosystem. 
+
+Summary. A common thread across these five layers is that each is specialized to a particular software or hardware stack. Backends expose framework-specific model (tensor) APIs. IRs define machine-exchange formats rather than authoring languages, compilers optimize within a single stack, kernel generation targets specific hardware, and inference frame-works serve one runtime. Portability across stacks at any level is achieved by manually re-expressing implementations. Axon occupies a complementary layer above these: a human-authored, strongly typed specification language with sym-bolic dimensions, from which a single Graph IR is lowered to standalone native implementations for PyTorch, Triton-accelerated PyTorch, JAX, MLX, and vLLM. By enforcing one Graph IR contract consumed by every backend, Axon en-sures that a definition-level optimization cannot be present in one framework’s port yet silently omitted in another. 
+
+The Axon Language 
+
+Axon is a compact functional language for describing neural networks independently of any particular implementation or runtime backend, producing standalone model definitions. A more detailed description of the language including Backus-Naur form is provided in the technical supplement. 
+
+Values. The first-class domain objects in Axon include ten-sors, symbolic dimensions, and paths into checkpoint state-dicts and configurations. The language is intentionally de-signed to describe the mathematical structure of the neural network rather than the mechanics of a specific implementa-tion in a particular language or backend. 
+
+Types. The tensor types carry shapes comprised of sym-bolic dimensions. A type such as x :: Tensor[B,S,D] 
+
+states that a value x is a tensor BxSxD , representing a batch of sequences of hidden-state vectors. Symbolic dimensions are part of the static semantics, participating in type check-ing, primitive typing rules, and the Graph IR metadata. As a consequence, Axon definitions can express reusable shape relationships without hard-coding checkpoint-specific sizes. Symbolic dimensions can operate as values in expressions, reducing the retrieval of the sequence length of a tensor x
+
+from an expression such as x.shape[ -2] to simply S.
+
+Syntax. Axon’s syntax is Haskell-inspired. Definitions use signatures, arrow types, optional parameters, pipes, and a do-style statement form. As an example, consider a pre-norm attention sub-layer, in which the same normalized hidden state h is passed as query, key, and value, and @ln indicates that the RMS-norm parameters live under the current scope’s  
+
+> ln
+
+key in the checkpoint’s state-dict.                       
+
+> block :: Tensor[B,S,D] -> ?Tensor[B,K] -> Tensor[B,S,D] block xattn_mask =do
+> h<-NN.rmsnorm @ln xa<-Attention.attention hhhattn_mask
+> return x+a
+
+Scoped parameter paths are one of several surface conve-niences that will be normalized before flattening during com-pilation. 
+
+Functional semantics. Semantically, Axon definitions are functions over explicit or implicit arguments, configuration lookups, and parameter-path reads. A bind statement names the values produced by an expression. Except for ternary branch expressions, all expressions are eager, i.e., an argu-ment is evaluated before the callee receives it as a value. 
+
+Model paths. Model parameters and config values are accessed through values of type Path . Relative path val-ues are denoted using “ @”: NN.rmsnorm @ln from our example refers to a path scoped by the current lex-ical context. Absolute paths are denoted using “@@ ”:  
+
+> NN.rmsnorm @@ ’layers.{i}.attn.ln’
+
+refers to check-point locations directly, with i being instantiated from the runtime context. Whenever possible, relative paths are nor-malized into absolute paths by the compiler. 
+
+Reusable libraries. Primitive Axon operations, such as the tensor operation _where or parameter retrieval _param ,are implemented as internal definitions prefixed by an un-derscore. They are exposed through lightweight wrappers as part of reusable library modules, such as NN , Tensor ,
+
+> Attention
+
+, Masking , MoE , Cache , and Positions . In ad-dition to exposing primitive operations, these modules define reusable higher-level generic model-independent operations such as Attention.attention and Cache.prepare .
+
+Semantic core. The full Axon DSL language offers expres-siveness through library imports, default arguments, nested expressions, path scoping, operation pipes, and other syn-tactic sugar. Full Axon DSL can be desugared to a small semantic core where library references, default arguments, and paths are resolved, and nested expressions are flattened and fully typed, at the subexpression level. This semantic core remains valid Axon DSL but has a one-to-one corre-spondence to Axon’s Graph IR. 
+
+The Axon Compiler 
+
+The Axon compiler comprises three main phases: (1) desug-aring of full Axon DSL into its semantic core; (2) optimiza-tion at the Graph IR level; and (3) lowering of the Graph IR to backend-specific code. In the technical supplement, we walk an exemplary small definition through all phases. 
+
+Phase 1: Desugaring. The Axon DSL is defined by an EBNF grammar that is operationalized using Lark (Lark Contributors 2026). The parser transforms valid Axon DSL into an abstract syntax tree (Axon AST), which serves as the representation for Phase 1 and can be dumped to Axon DSL and reparsed. Every desugaring stage of Phase 1 receives an Axon AST and outputs an Axon AST, typically guar-anteeing additional properties: (a) the resolver stage inlines library definitions imported and referenced, guaranteeing a closure property stating that all non-primitive operations are expressed as definitions in the AST; (b) the flattening stage flattens nested expressions, guaranteeing a flatness property stating that definitions consist of a flat sequence of opera-tions; (c) the type checker stage infers types from type sig-natures, type ascriptions, and the type rules of primitive op-erations, guaranteeing a consistently typed Axon AST. The desugaring phase also contains dead code elimination, con-stant folding, and other straightforward code normalizations. 
+
+Phase 2: Graph optimizations. The closed flat typed Axon AST can be viewed as an instance of a static single as-signment (SSA) graph (Cytron et al. 1991). In this phase, the Axon compiler converts this semantic core to the Graph IR, which is then iteratively optimized using a number of stages: 
+
+(a) definition inlining replaces wrapper definitions and other low-complexity definitions by integrating their sequence of operations into their call sites, enabling, for example, the inlining of primitive wrapper definitions; (b) generic graph rewriting replaces known patterns of operations by equiva-lent patterns of operations based on matching of primitive operational provenance, enabling, for example, the replace-ment of loops iterating over experts in an MoE by a more ef-ficient stacked-experts formulation; and (c) backend-specific graph rewriting replaces known patterns of operations by backend-specific primitives, enabling, for example, the use of optimized attention implementations and kernels. 
+
+Phase 3: Lowering. The optimized Graph IR contains def-initions as assignment sequences, calls to definitions, and generic and backend-specific primitive operations. The low-ering phase is backend-specific and transpiles the Graph IR into one of the currently targeted backends: PyTorch, Triton-accelerated PyTorch, MLX, JAX, and vLLM. Each of the separate code generators needs to be able to implement the control flow and the primitive operators represented by the Graph IR. In addition, the code generators also need to imple-ment forward and generate methods. To achieve com-petitive performance, compilation-oriented backends typi-cally supply scaffolding that ensures static cache allocations. 
+
+Results 
+
+We now present a series of results from our Axon-derived models across PyTorch, JAX, MLX and vLLM backends. The results will establish that Axon-derived models yield performance parity, and often outperform implementations in existing frameworks. We further show that Axon-derived models yield near-identical training behavior. All figures can be found in larger size in the technical supplement. 
+
+Experimental Setup MLX backend experiments on < 1B
+
+models were executed on Apple Silicon M3 Max, 36GB RAM with MLX 0.32.0 . We enabled compilation and allowed a max generation length of 256 tokens. PyTorch, Triton-enhanced PyTorch, JAX and vLLM experiments were conducted on an NVIDIA B200 GPU with 180 GB HBM3, using PyTorch 2.11.0 , Triton 3.6.0 , JAX 0.10.2 , and Transformers 5.10.0.dev0 . Models that can natively be compiled without errors and all Axon models are compiled. All models ran with 1 generation-warmup step, 3 repeti-tions, and a max generation length of 128 tokens. During Transformers vs Axon Throughput (tok/s)   
+
+> log-log throughput scatter; above diagonal means Axon is faster (higher tok/s) 10 10 100 100 1.0k 1.0k parity 2x 4x 8x
+
+Transformers tok/s Axon tok/s BlackMamba-2.8B PowerMoE-3b BlackMamba-2.8B granite-3.3-2b-base granite-3.1-2b-base BlackMamba-2.8B gemma-3-270m-it granite-3.2-2b-instruct granite-3.3-2b-instruct glm-edge-1.5b-chat SmolLM2-1.7B Phi-4-mini-reasoning Phi-4-mini-instruct SmolLM3-3B gemma-3-270m glm-edge-4b-chat SmolLM-1.7B Phi-3-mini-128k-instruct SmolLM2-360M-Instruct SmolLM-360M SmolLM2-135M Phi-3-mini-4k-instruct gemma-3-1b-it Pleias-RAG-350M EXAONE-4.0-1.2B gemma-4-E2B gemma-3-1b-pt Pleias-Pico Pleias-RAG-1B SmolLM2-360M Pleias-Nano mamba-2.8b-hf granite-3.1-2b-instruct OLMo-2-0425-1B starcoder2-3b SmolLM3-3B-Base gpt2-xl SmolLM2-135M-Instruct gemma-4-E4B SmolLM-135M Pleias-3b-Preview gemma-4-E2B-it SmolLM2-1.7B-Instruct gemma-4-E4B-it bloom-3b bloom-1b7 HRM-Text-1B granite-3.2-2b-instruct PowerMoE-3b Phi-4-mini-instruct Pleias-Nano gemma-3-4b-pt Qwen2.5-0.5B SmolLM3-3B opt-1.3b gpt2-large gemma-4-E4B gpt2-medium gpt2 PowerMoE-3b falcon-rw-1b gemma-2-2b-it falcon-rw-1b falcon-rw-1b gemma-3-4b-it SmolLM2-135M-Instruct gemma-3-270m falcon-rw-1b gemma-3-4b-pt gemma-3-1b-it gemma-3-270m-it AI21-Jamba-Reasoning-3B gemma-3-4b-it gemma-3-1b-pt gemma-2-2b xglm-564M xglm-2.9B Pleias-Pico Pleias-Nano gemma-2-2b-it Pleias-Nano AI21-Jamba-Reasoning-3B gemma-2-2b bloom-1b1 Pleias-RAG-1B Pleias-Nano gemma-4-E4B Pleias-Pico SmolLM2-135M-Instruct SmolLM-360M-Instruct SmolLM-360M-Instruct OLMo-2-0425-1B SmolLM-360M xglm-2.9B SmolLM-135M SmolLM2-135M xglm-564M falcon-rw-1b SmolLM-360M xglm-1.7B mamba-2.8b-hf Pleias-RAG-350M SmolLM-135M-Instruct Pleias-3b-Preview falcon-rw-1b SmolLM-135M-Instruct SmolLM-135M SmolLM2-360M SmolLM2-360M SmolLM2-360M-Instruct opt-1.3b xglm-1.7B SmolLM3-3B SmolLM2-360M-Instruct OLMo-2-0425-1B SmolLM2-135M SmolLM3-3B-Base EXAONE-4.0-1.2B SmolLM3-3B Pleias-RAG-350M SmolLM3-3B-Base SmolLM-1.7B-Instruct SmolLM-1.7B gpt2 SmolLM2-1.7B-Instruct SmolLM-1.7B SmolLM2-1.7B Pleias-RAG-1B opt-1.3b granite-3.1-2b-instruct gpt2 EXAONE-4.0-1.2B mamba-2.8b-hf gpt2 gemma-4-E4B glm-edge-1.5b-chat granite-3.2-2b-instruct gemma-4-E4B-it SmolLM-1.7B-Instruct granite-3.3-2b-instruct gemma-4-E2B SmolLM2-1.7B Qwen2.5-0.5B Phi-4-mini-instruct granite-3.1-2b-base Qwen2.5-0.5B SmolLM2-1.7B-Instruct SmolLM2-1.7B granite-3.3-2b-base granite-3.1-2b-instruct granite-3.3-2b-instruct granite-3.3-2b-base Phi-4-mini-reasoning Phi-4-mini-instruct AI21-Jamba-Reasoning-3B glm-edge-4b-chat HRM-Text-1B SmolLM3-3B Phi-4-mini-reasoning granite-3.1-2b-base gemma-4-E2B-it gpt2-large granite-3.2-2b-instruct Phi-4-mini-instruct gpt2 gpt2 Pleias-Nano bloomz-3b SmolLM-135M-Instruct glm-edge-1.5b-chat SmolLM2-1.7B granite-3.2-2b-instruct glm-edge-4b-chat SmolLM2-1.7B gemma-4-E4B Pleias-3b-Preview HRM-Text-1B SmolLM3-3B gpt2-medium bloom-560m gpt2-xl OLMoE-1B-7B-0924 gemma-3-270m bloomz-1b1 gpt2-large gemma-3-270m-it gemma-4-E4B gemma-2-2b bloomz-3b bloom-560m bloomz-1b1 gemma-4-E2B gpt2-xl bloom-1b7 Phi-4-mini-instruct bloom-1b1 gemma-4-E2B-it bloom-1b1 OLMoE-1B-7B-0924 gemma-3-1b-it bloom-1b7 gemma-3-4b-it gemma-3-4b-pt gemma-3-1b-pt starcoder2-3b gemma-4-E4B-it gemma-2-2b-it gpt2-medium bloom-3b starcoder2-3b bloom-3b granite-3.2-2b-instruct OLMoE-1B-7B-0924 Phi-3-mini-4k-instruct Phi-3-mini-4k-instruct Phi-3-mini-128k-instruct Phi-3-mini-128k-instruct SmolLM-1.7B-Instruct SmolLM-360M-Instruct bloom-560m xglm-1.7B bloomz-3b xglm-2.9B bloomz-1b1 xglm-564M 
+
+> Backend (fill)
+> PyTorch Triton JAX
+> Dtype (ring)
+> bfloat16 float32
+
+Figure 2: Autoregressive generation performance with decoder-only models with up to 4B parameters. Log-log plot where the diagonal line indicates equal performance. Points above the parity line indicate Axon is faster, color-fill denotes backends and border-line denotes dtype. these experiments we exercise the generate() method in the models. Both the Axon-compiled model and the Transformers baseline use torch.compile and equiva-lent JIT compilations for Axon using the -compile-axon ,
+
+-compile-hf , -optimize-graph flags. The primary precision is bfloat16 , with float32 fallback for pairs that fail top-1 token parity with the Transformers baseline. 
+
+Measures On generation benchmarks, throughput is calcu-lated from per-run log output as generated tokens /wall time, where generated tokens is the actual number of tokens pro-duced before the end-of-sequence token, rather than the max-imum generation length cap. All comparisons use a runtime ratio ρ = tAxon /t Transformers where tAxon and tTransformers are the wall-clock times for the Axon-derived model and the refer-ence (Transformers) implementation under identical inputs, precision, and compilation settings. A value ρ < 1 indicates that Axon is faster, while ρ = 1 represents parity. 
+
+Sub-4B Models 
+
+We benchmark 91 checkpoints spanning 71 Axon model defi-nitions up to 4B parameters, across 26+ architecture families including GPT, Llama, Mistral, Qwen, Gemma, SmolLM, T5, BART, BERT, and Mamba – measured across three back-ends (PyTorch, Triton, JAX). Of these, 68 are decoder-only language models tested via autoregressive generation (Fig-ure 2), and 23 are encoder-only or encoder-decoder (seq2seq) models tested via forward passes (Table 2 and plots in the technical supplement). Each autoregressive generation produces at least 8 tokens across the 225 checkpoints (200 BF16, 25 FP32), with a me-dian of 123 tokens, where 91% generated at least 100 tokens. Nine checkpoints failed BF16 top-1 token parity due to pre-cision noise and were re-run in FP32, achieving 100% top-1 token parity across all 303 checkpoints. Forward benchmarks Table 1: Per-backend comparison of Axon’s autoregres-sive generation performance with decoder-only models 
+
+against PyTorch, Triton, and JAX. “Axon ≤ 1×” = count (and %) of checkpoints where Axon is faster than Transform-ers. “Axon > 1×” = count (%) of checkpoints where Axon is slower. Median and mean report runtime ratio (lower means Axon is faster). Backend Checkpoints Axon ≤ 1× Axon > 1× Median ratio Mean ratio 
+
+<4B 
+
+PyTorch 76 48 (63%) 28 (37%) 0.903 0.925 Triton 75 60 (80%) 15 (20%) 0.843 0.878 JAX 74 64 (86%) 10 (14%) 0.481 1.122 
+
+<4B total 225 172 (76%) 53 (24%) 0.804 0.974 4–32B 
+
+PyTorch 87 55 (63%) 32 (37%) 0.987 0.980 Triton 87 67 (77%) 20 (23%) 0.924 0.931 JAX 68 55 (81%) 13 (19%) 0.589 0.981 
+
+4–32B total 242 177 (73%) 65 (27%) 0.908 0.963 
+
+Table 2: Per-backend comparison of Axon’s Forward performance with Encoder-Only and Encoder-Decoder Models against PyTorch, Triton, and JAX backends. “Axon 
+
+≤ 1×” = count (and %) of checkpoints where Axon is faster than Transformers. “Axon > 1×” = count (%) of checkpoints where Axon is slower. Median and mean report runtime ratio (lower means Axon is faster). Backend Checkpoints Axon ≤ 1× Axon > 1× Median ratio Mean ratio 
+
+≤4B 
+
+PyTorch 26 15 (58%) 11 (42%) 0.883 1.786 Triton 26 9 (35%) 17 (65%) 1.332 2.169 JAX 26 7 (27%) 19 (73%) 1.079 1.260 
+
+≤4B total 78 31 (40%) 47 (60%) 1.084 1.738 4–32B 
+
+PyTorch 20 13 (65%) 7 (35%) 0.990 1.506 Triton 20 8 (40%) 12 (60%) 1.133 1.546 JAX 14 0 (0%) 14 (100%) 3.747 3.356 
+
+4–32B total 54 21 (39%) 33 (61%) 1.175 2.001 
+
+are reported in wall-time (ms), as mean of 3 repeated mea-surements excl. a warm-up pass, covering 78 checkpoints across 23 encoder/seq2seq families (69 BF16, 9 FP32). Autoregressive Axon-derived models are comparable or faster than Transformers for 76% of the 225 checkpoints, with a median speed ratio of 0.804 × and a mean of 0.974 ×—a typical Axon model is 24% faster. We report a per-backend breakdown in Table 1. Most checkpoints run on all three backends; a small number did not complete on every back-end, yielding 76 PyTorch, 75 Triton, and 74 JAX generate checkpoints (bloomz-560m generated fewer than 5 tokens and was excluded; BlackMamba-2.8B did not complete on JAX). JAX achieves the best overall generate throughput with a median of 0.481 × and 86% at or below parity, though it also has the highest variance with a mean of 1.122 ×, driven by outliers on small BLOOM and XGLM models. Triton is the most consistent with 80% at or below parity and a mean of 
+
+0.878 ×. PyTorch is competitive but has more outliers above 
+
+1×. For encoder-only and encoder-decoder models (Table 2), performance is generally weaker, particularly for the T5 and 
+
+mT5 encoder-decoder models. The worst forward outliers are t5-small on Triton ( 9.2×), t5-base on PyTorch ( 4.1×), and Axon vs. Transformers: Generation Throughput (32B) 
+
+log-log throughput scatter; above diagonal means Axon is faster (higher tok/s) 1.0 1.0 10 10 100 100 1.0k 1.0k parity 2x 4x 8x Transformers tok/s Axon tok/s deepseek-moe-16b-chat deepseek-moe-16b-chat deepseek-moe-16b-base deepseek-moe-16b-base deepseek-moe-16b-chat deepseek-moe-16b-base DeepSeek-V2-Lite DeepSeek-Coder-V2-Lite-Instruct gpt-j-6b GLM-4-9B-0414 GLM-Z1-9B-0414 granite-3.1-8b-base Meta-Llama-3-8B Ministral-3-14B-Base-2512 Mistral-7B-v0.1 Llama-3.1-8B-Instruct granite-3.1-8b-instruct Phi-3-medium-4k-instruct Ministral-3-8B-Base-2512 Mistral-7B-Instruct-v0.2 Llama-3.1-8B OLMo-2-1124-13B Meta-Llama-3-8B-Instruct Phi-3-medium-128k-instruct DeepSeek-V2-Lite-Chat Mathstral-7B-v0.1 Mistral-7B-Instruct-v0.3 Qwen2.5-14B-Instruct Mistral-Nemo-Base-2407 Mistral-7B-v0.3 Mistral-7B-Instruct-v0.1 bloom-7b1 Ministral-8B-Instruct-2410 Qwen2.5-14B Qwen2.5-Coder-14B starcoder2-7b pythia-6.9b Olmo-3-1025-7B Flex-public-7B-1T Olmo-3-7B-Think DeepSeek-Coder-V2-Lite-Base Mistral-7B-Instruct-v0.2 gemma-3-27b-pt granite-3.3-8b-instruct Flex-public-7B-1T gemma-3-12b-it gemma-2-9b-it Llama-3.1-8B gemma-3-27b-it gemma-3-12b-pt Ministral-8B-Instruct-2410 pythia-12b starcoder2-15b gemma-2-9b Flex-math-2x7B-1T Flex-code-2x7B-1T OLMo-2-1124-7B Flex-pes2o-2x7B-1T Mistral-7B-Instruct-v0.2 GLM-Z1-9B-0414 Mistral-7B-Instruct-v0.2 Mistral-Nemo-Base-2407 Mistral-Nemo-Base-2407 Codestral-22B-v0.1 Meta-Llama-3-8B-Instruct Flex-reddit-2x7B-1T Flex-creative-2x7B-1T Ministral-8B-Instruct-2410 Mistral-7B-Instruct-v0.1 granite-3.1-8b-instruct Mathstral-7B-v0.1 gemma-7b-it Codestral-22B-v0.1 GLM-4-9B-0414 Flex-public-7B-1T Flex-creative-2x7B-1T gemma-4-31B OLMo-2-1124-7B Flex-news-2x7B-1T Mathstral-7B-v0.1 opt-6.7b gemma-7b gemma-4-31B-it Mistral-7B-v0.3 granite-3.2-8b-instruct granite-3.1-8b-base opt-6.7b xglm-7.5B granite-3.1-8b-instruct Meta-Llama-3-8B Magistral-Small-2509 Mistral-7B-v0.3 Mistral-7B-Instruct-v0.1 Flex-math-2x7B-1T Mistral-7B-Instruct-v0.3 GLM-4-9B-0414 Flex-news-2x7B-1T opt-6.7b OLMo-2-1124-13B Flex-reddit-2x7B-1T Qwen3-14B Flex-code-2x7B-1T Devstral-Small-2507 Meta-Llama-3-8B gpt-j-6b dfm-decoder-open-v0-7b-pt Qwen2.5-Coder-14B Llama-3.1-8B-Instruct Flex-creative-2x7B-1T Mistral-7B-v0.1 Mistral-7B-v0.1 OLMo-2-1124-13B gemma-3-12b-it Mistral-7B-Instruct-v0.3 gemma-3-12b-pt gemma-3-27b-pt gpt-j-6b granite-3.1-8b-base Llama-3.1-8B gemma-3-27b-it Qwen2.5-14B granite-3.3-8b-base Flex-reddit-2x7B-1T granite-3.2-8b-instruct Qwen2.5-14B-Instruct Flex-pes2o-2x7B-1T GLM-Z1-9B-0414 gemma-4-31B granite-3.3-8b-instruct Devstral-Small-2507 gemma-4-31B-it Llama-3.1-8B-Instruct gemma-2-27b-it Qwen2.5-14B gemma-2-27b xglm-7.5B Flex-news-2x7B-1T gemma-7b-it granite-3.3-8b-base Meta-Llama-3-8B Qwen2.5-14B-Instruct gemma-7b opt-13b Flex-pes2o-2x7B-1T Flex-math-2x7B-1T Flex-code-2x7B-1T gemma-7b-it gemma-7b Qwen2.5-Coder-14B Magistral-Small-2509 Ministral-8B-Instruct-2410 Apertus-8B-Instruct-2509 Mistral-7B-Instruct-v0.2 Devstral-Small-2507 granite-3.2-8b-instruct Apertus-8B-2509 OLMo-2-1124-7B Codestral-22B-v0.1 Magistral-Small-2509 Meta-Llama-3-8B-Instruct opt-13b opt-13b gemma-7b-it Devstral-Small-2507 Ministral-8B-Instruct-2410 gemma-4-31B-it xglm-4.5B gpt-neox-20b dfm-decoder-open-v0-7b-pt Meta-Llama-3-8B comma-v0.1-1t gemma-7b bloom-7b1 gemma-4-31B Mistral-7B-Instruct-v0.2 gpt-oss-20b gpt-neox-20b granite-3.3-8b-instruct Codestral-22B-v0.1 Olmo-3-7B-Instruct Magistral-Small-2509 xglm-4.5B Olmo-3-1025-7B gemma-2-27b-it Apertus-8B-Instruct-2509 gemma-3-27b-it gemma-3-27b-pt gemma-2-27b Apertus-8B-2509 comma-v0.1-1t pythia-6.9b gemma-4-31B-it gemma-4-31B Qwen3-14B Olmo-3-7B-Think gemma-3-27b-it gpt-oss-20b gpt-neox-20b Apertus-8B-2509 gemma-2-9b gemma-2-9b-it Apertus-8B-Instruct-2509 starcoder2-15b Olmo-3-7B-Think Olmo-3-1025-7B Olmo-3-1025-7B gemma-2-9b-it bloom-7b1 pythia-6.9b pythia-12b pythia-12b gemma-3-12b-it gemma-3-27b-pt Olmo-3-7B-Think gemma-3-12b-pt gpt-neox-20b starcoder2-7b starcoder2-7b starcoder2-15b gemma-2-9b Olmo-3-7B-Instruct dfm-decoder-open-v0-7b-pt Olmo-3-7B-Think Olmo-3-1025-7B Phi-3-medium-4k-instruct Ministral-3-8B-Base-2512 Ministral-3-14B-Base-2512 comma-v0.1-1t Phi-3-medium-4k-instruct Ministral-3-14B-Base-2512 Olmo-3-7B-Instruct Ministral-3-8B-Base-2512 Phi-3-medium-128k-instruct Olmo-3-7B-Think Olmo-3-1025-7B Phi-3-medium-128k-instruct Qwen3-14B gemma-7b gemma-7b-it granite-3.3-8b-base xglm-4.5B xglm-7.5B 
+
+Backend (fill) 
+
+PyTorch Triton JAX 
+
+Dtype (ring) 
+
+bfloat16 float32 
+
+Figure 3: Benchmarking Autoregressive models between 4B
+
+and 32 B models. Log-log plot where the diagonal parity line indicates equal performance. Generally, Axon produces comparable or superior throughput on the bigger models. mt5-large on Triton ( 3.7×). PyTorch is the best forward back-end with 58% at or below parity and a median of 0.883 ×,while Triton and JAX struggle with the short forward pass. 
+
+Models between 4B and 32 B
+
+We benchmark 93 checkpoints spanning 47 Axon model def-initions between 4B and 32B parameters, yielding 242 gener-ate checkpoints (205 BF16, 37 FP32; Figure 3, Table 1) and 54 forward-pass checkpoints (Table 2, figure in technical sup-plement). Most checkpoints run on all three backends; JAX coverage is narrower at 68 generate checkpoints, as some models exceeding 20B parameters did not complete due to memory constraints – we only benchmarked models fitting within a single GPU. Each generate run produced at least 8 tokens, with a median of 122 tokens, where 94% generated at least 100 tokens. 16 pairs failed BF16 top-1 parity across nine unique checkpoints, of which eleven were fixed by FP32. 
+
+Flex-code-2x7B-1T (JAX), Flex-news-2x7B-1T 
+
+(all backends), and Gemma-7b (JAX) did not meet the top-1 token parity criterion for all tested prompts. Forward bench-marks cover 54 checkpoints across 9 seq2seq families, re-ported in wall-time (ms) as the mean of 3 repeated measure-ments excluding 1 warm-up pass. In Figure 3, Axon is at or below Transformers’ latency for 73% of checkpoints with a median speed of 0.908 × and a mean of 0.963 ×. We report a per-backend breakdown for generative models in Table 1. JAX achieves the best gener-ation throughput with a median of 0.589 × and 81% at or below parity, though with higher variance than in the ≤4B tier. Triton is the most consistent at 77% at or below parity. PyTorch is competitive with 63% at or below parity. No-tably, DeepSeek-MoE (16B) runs 7–14 × faster across Axon backends, vastly outperforming Transformers’ imple-mentation. The worst generate outliers are concentrated on JAX for XGLM models: xglm-7.5B and xglm-4.5B .vLLM Native Generation: Axon vs Transformers (HF) 
+
+log-log throughput scatter (tok/s); above diagonal = Axon faster | Native vLLM PagedAttention + KV cache vs HF Transformers 10 10 100 100 1.0k 1.0k parity 2x 4x 8x Transformers tok/s (HF) Axon tok/s (vLLM native)  PowerMoE-3b gpt-oss-20b OLMoE-1B-7B-0924 gpt-j-6b gemma-2-9b Ministral-3-14B-Base-2512 Ministral-3-8B-Base-2512 glm-edge-4b-chat GLM-4-9B-0414 glm-edge-1.5b-chat gemma-2-27b OLMo-2-1124-13B Qwen3-14B Phi-3-medium-128k-instruct Ministral-8B-Instruct-2410 codegen-350M-mono helium-1-preview-2b Qwen2.5-Coder-14B Qwen2.5-14B OLMo-2-1124-7B EXAONE-4.0-1.2B Phi-3-medium-4k-instruct Mistral-7B-v0.1 Phi-4-mini-instruct Mistral-Nemo-Base-2407 OLMo-2-0425-1B Olmo-3-1025-7B gemma-7b Llama-3.1-8B Mistral-7B-v0.3 SmolLM3-3B SmolLM2-360M granite-3.1-2b-instruct SmolLM-360M Mistral-7B-Instruct-v0.2 Pleias-Pico SmolLM-135M Meta-Llama-3-8B comma-v0.1-1t Qwen2.5-0.5B Pleias-RAG-1B SmolLM-1.7B Codestral-22B-v0.1 Pleias-Nano Phi-3-mini-128k-instruct granite-3.3-8b-instruct granite-3.3-2b-instruct Apertus-8B-2509 granite-3.1-8b-base granite-3.3-2b-base Pleias-3b-Preview SmolLM2-1.7B Phi-3-mini-4k-instruct granite-3.1-2b-base Pleias-RAG-350M granite-3.1-8b-instruct Devstral-Small-2507 gpt-neox-20b xglm-2.9B gemma-2-2b falcon-rw-1b starcoder2-15b xglm-1.7B xglm-4.5B pythia-12b bloomz-7b1 phi-1_5 Phi-4-mini-reasoning bloom-7b1 stablelm-2-1_6b starcoder2-7b bloom-1b7 bloom-1b1 pythia-6.9b opt-13b bloom-3b gemma-3-27b starcoder2-3b xglm-564M gemma-3-12b bloom-560m gemma-3-4b gemma-3-1b opt-1.3b gemma-3-270m opt-6.7b gpt2 xglm-7.5B Figure 4: vLLM: Axon (vLLM native) vs. Transformers gen-eration throughput on 88 checkpoints. Points above the parity line indicate Axon is faster. 74% fall above. Table 3: Autoregressive generation comparison of Axon (vLLM native) against Transformers. “Axon ≤ 1×” = num-ber (and %) of checkpoints where Axon is faster than Trans-formers. “Axon > 1×” = number (and %) of checkpoints where Axon is slower than Transformers. Median and mean report Axon-to-Transformers runtime ratio (lower is faster). Model size Checkpoints Axon ≤ 1× Axon > 1× Median ratio Mean ratio Small ( ≤4B) 54 38 (70%) 16 (30%) 0.656 1.430 Large (4B–32B) 34 27 (79%) 7 (21%) 0.609 2.889 
+
+Total 88 65 (74%) 23 (26%) 0.631 1.994 
+
+Forward performance is weak across all backends, par-ticularly for large encoder-decoder models like T5-11B ,
+
+MT5-XXL , t5gemma where the encoder forward path has high kernel launch overhead. JAX is universally slower on forward (100% above parity, median 3.747 ×). PyTorch is the best forward backend with 65% at or below parity and a median of 0.990 ×.
+
+vLLM 
+
+In Figure 4 and Table 3, we report on Axon derived native vLLM models. We test 88 checkpoint-backend pairs cover-ing models from 135 M to 30 B parameters. Axon-compiled vLLM is faster than HF Transformers in 65 of 88 cases (74%), with a median runtime ratio of 0.631. At the median, Axon completes generation in 63% of the time taken by HF Transformers ( 1.6× speedup). 
+
+MLX 
+
+In Figure 5, we report the ratios between Axon and Trans-formers for the MLX backend (MPS). All 21 models have 
+
+100% parity in FP32, but 5 models have mismatches in BF16: bloom-560m , smollm-135m , smollm2-135m ,
+
+mt5-small , mt5-base . Axon is at or below Transform-ers’ latency for 94 .4% of the 126 checkpoints, with a me-dian runtime ratio of 0.483 × and a mean of 0.544 × (Ta-HF vs Axon Throughput (tok/s)  
+
+> MLX: Axon vs. Transformers (HuggingFace) on Apple Silicon 10 10 100 100 1.0k 1.0k parity 2x 4x 8x
+
+HF tok/s Axon tok/s Monad Monad SmolLM2-135M xglm-564M SmolLM-135M gemma-3-270m SmolLM-135M gemma-3-270m SmolLM2-135M Baguettotron OCRonos-Vintage OCRonos-Vintage Baguettotron gpt2 gpt2 xglm-564M SmolLM2-360M mt5-small SmolLM-360M SmolLM2-360M t5-small Qwen2.5-0.5B Pleias-Pico Pleias-RAG-350M Pleias-Pico opus-mt-en-de t5-small Qwen2.5-0.5B opus-mt-en-de bart-base Pleias-RAG-350M t5gemma-2-270m-270m t5-base mt5-small bloom-560m t5gemma-2-270m-270m SmolLM-360M bloom-560m bart-base t5-base mt5-base mt5-base 
+
+> Task (stroke)
+> causal_lm seq2seq_lm unknown
+> Dtype (fill)
+> bfloat16 float32
+
+Figure 5: MLX. Benchmarking conventional HF models against Axon derived standalone model definitions. Axon yields some considerable speed-ups across the board. Table 4: Breakdown of Axon performance by precision, model type, and sequence length. “Axon ≤ 1×” = number (and %) of checkpoints where Axon is faster than Transform-ers. “Axon > 1×” = number (and %) of checkpoints where Axon is slower than Transformers. Median and mean report Axon-to-Transformers runtime ratio (lower = Axon is faster). Group Points Axon ≤ 1× Axon > 1× Median ratio Mean ratio BF16 63 61 (97%) 2 (3%) 0.423 0.500 FP32 63 58 (92%) 5 (8%) 0.503 0.588 causal_lm 84 82 (98%) 2 (2%) 0.390 0.437 seq2seq_lm 42 37 (88%) 5 (12%) 0.574 0.752 len=64 42 42 (100%) 0 (0%) 0.417 0.448 len=128 42 39 (93%) 3 (7%) 0.483 0.525 len=256 42 38 (90%) 4 (10%) 0.494 0.652 
+
+Total 126 119 (95%) 7 (5%) 0.483 0.544 
+
+ble 4). The decoder-only models achieve the best throughput with 98% at or below parity. The fast forward path using MLX’s fast module with Metal kernels gives Monad and 
+
+Gemma3-270M the largest speedups, at roughly 4.5× faster. We see that performance narrows at longer contexts. 
+
+Training with Axon Derived Models. 
+
+We conducted experiments on the PyTorch backend, compar-ing with the Transformer’s implementation as a reference. We experiment with Gemma-3 270M on the ArXiv Summariza-tion dataset 4, because it is a well known task. The experi-ments are carried out on an NVIDIA RTX A6000 GPU, with a batch size of 4 and a learning rate of 1e − 4. We report the loss curve for 2000 steps in the technical supplement. We compiled both models with torch.compile with 61s and 42s first step time for Axon and Transformers models, respectively, but with average step-time on 120 .3ms for Axon 
+
+4https://huggingface.co/datasets/ccdv/arxiv-summarization against 133 .0ms for Transformers, making Axon 9.6% faster. Both models had a final loss of 2.506 , with a numerical in-stability of 3.74 × 10 −4. The only modification on the Axon-derived PyTorch model was enabling requires_grad .
+
+Discussion 
+
+The C language resolved a tension between hardware access and portability by fixing a single specification that compilers could lower to many machines. Axon targets an analogous situation in LLM development, where architectural trans-parency and dependency chains are locked inside mono-lithic frameworks. Across five runtime backends, we have demonstrated the potential of the Axon language under the “write once, run everywhere”-principle: a single specifica-tion achieves competitive execution times on over 204 model checkpoints across 60 model families. Moreover, across 225 autoregressive checkpoints up to 4B and 242 checkpoints between 4B and 32B, Axon-derived models are as fast or faster than the Transformers baseline for 
+
+76% and 73% of the checkpoints, with median runtime ratios of 0.804 × and 0.908 ×, respectively. On the MLX backend on Apple Silicon, Axon reaches 94 .4% at or below parity in inference latency, median of 0.483 × (twice as fast) over 126 checkpoints. These numbers indicate that a single .axon 
+
+definition is competitive across five software runtimes and two hardware vendors. We achieve top-1 token parity on almost all models, though some required an FP32 fallback. Axon-derived models gen-erally provide comparable or better performance across back-ends, though some remain slightly slower than the baseline. We believe future maturing of the compiler, especially the lowering mechanisms, will close this gap. We suspect kernel-launch overhead dominates the relatively short generation time for these slower models. See technical supplement. 
+
+Portability and Shape Safety. A single Axon definition yields successful results across four backends from one Graph IR contract. Because all four backends are generated from one shared IR rather than maintained as independent handwritten ports, a definition-level optimization cannot be omitted in one framework’s implementation while present in another. Remaining differences are pushed down to backend-specific lowering and kernel execution. The shape safety promised by Axon’s strong type system is not directly mea-sured by the throughput benchmarks, but the results are evi-dence of it: top-1 token parity across backends with distinct tensor libraries and kernel implementations is only possible because symbolic dimensions and the tensor-type contract are preserved end-to-end. From surface Axon through the Graph IR to each backend, a shape mismatch rejected by the typechecker never reaches execution. 
+
+Axon for Training. We demonstrate a training scheme for Axon-derived models: a model derived to PyTorch exhibits the same training behavior as the corresponding Transform-ers implementation. Already on a 270M model the Axon model yielded roughly 10% faster step-times. We expect the impact to be larger on bigger models, and leave this for future work. Axon therefore supports both training and inference from the same Graph IR contract, making it possible to train on one backend and serve on another. 
+
+Limitations. This work has several limitations: Although Axon operates on tensor level and facilitates arbitrary neural network architectures, our experiments are currently limited to language models. The main autoregressive and forward benchmarks are done on a single GPU type. MLX results are likewise on a single Apple Silicon configuration. Hardware variance is therefore not characterized. Some checkpoints re-quired the FP32 fallback to meet top-1 token parity, indicat-ing room to improve code generation for specific operations. Forward performance is weak across backends particularly for large encoder-decoder models, calling for future work. We present no ablation isolating the AST and Graph IR op-timization passes, making it hard to attribute speed-ups to specific compiler stages. Lastly, we have experimented with using LLM-based coding assistants to convert Transformers model definitions to Axon; we carefully verified functional validity, though the code structure and maintainability of a few of the LLM-generated Axon definitions could be im-proved. Nevertheless, we regard it as promising that LLMs are able to generate functionally valid code in our newly proposed Axon language. 
+
+Practical Impact. LLMs are usually formulated as a mix-ture of Python modules and classes, checkpoint-specific con-figuration conventions and tensor state dictionaries. Axon changes that, enabling a platform for open collaboration with easily hackable, inspectable implementations free of depen-dency chains controlled by a framework’s vision. This en-ables both cross-platform and platform-specific optimization in the search for maximum performance per Watt and per byte of VRAM. We hope this better democratizes and secures the community’s contributions than the current state, learning and applying important lessons from the history of computer science and the story of the C language. 
+
+Conclusion 
+
+We have introduced the Axon DSL, demonstrating that shape-safe, framework-agnostic compilation from Axon defi-nitions to standalone implementations is a viable path toward open cooperation and greater freedom for researchers and practitioners. Axon achieves better or competitive throughput on most models across PyTorch, Triton-enhanced PyTorch, JAX, MLX, and vLLM backends. 
+
+Future Work This work opens several directions: (i) na-tively distributed tensors for finer control over communica-tion, (ii) third-party kernel injection from projects such as Unsloth 5 and Liger-kernel 6 as opt-in graph optimizations, and (iii) additional backends such as Vulkan and CoreML, extending write-once, run-everywhere reach to edge devices. 
+
+References 
+
+Abadi, M.; Agarwal, A.; Barham, P.; Brevdo, E.; Chen, Z.; Citro, C.; Corrado, G. S.; Davis, A.; Dean, J.; Devin, M.; 
+
+> 5https://github.com/unslothai/unsloth
+> 6https://github.com/linkedin/Liger-Kernel
+
+Ghemawat, S.; Goodfellow, I.; Harp, A.; Irving, G.; Isard, M.; Jozefowicz, R.; Jia, Y.; Kaiser, L.; Kudlur, M.; Levenberg, J.; Mané, D.; Schuster, M.; Monga, R.; Moore, S.; Murray, D.; Olah, C.; Shlens, J.; Steiner, B.; Sutskever, I.; Talwar, K.; Tucker, P.; Vanhoucke, V.; Vasudevan, V.; Viégas, F.; Vinyals, O.; Warden, P.; Wattenberg, M.; Wicke, M.; Yu, Y.; and Zheng, X. 2015. TensorFlow, Large-scale machine learning on heterogeneous systems. Ahmed, N.; Wahed, M.; and Thompson, N. C. 2023. The Growing Influence of Industry in AI Research. Science ,379(6635): 884–886. Ansel, J.; Yang, E.; He, H.; Gimelshein, N.; Jain, A.; Vozne-sensky, M.; Bao, B.; Bell, P.; Berard, D.; Burovski, E.; et al. 2024. Pytorch 2: Faster machine learning through dynamic python bytecode transformation and graph compilation. In 
+
+Proceedings of the 29th ACM international conference on architectural support for programming languages and oper-ating systems, volume 2 , 929–947. Bai, J.; Lu, F.; Zhang, K.; et al. 2019. ONNX: Open Neural Network Exchange. https://github.com/onnx/onnx. Barrios, W. 2025. vllm-mlx: Apple Silicon MLX Backend for vLLM. https://github.com/waybarrios/vllm-mlx. Bradbury, J.; Frostig, R.; Hawkins, P.; Johnson, M. J.; Katariya, Y.; Leary, C.; Maclaurin, D.; Necula, G.; Paszke, A.; VanderPlas, J.; Wanderman-Milne, S.; and Zhang, Q. 2018. JAX: composable transformations of Python+NumPy programs. Breck, E.; Cai, S.; Nielsen, E.; Salib, M.; and Sculley, D. 2017. The ML test score: A rubric for ML production readi-ness and technical debt reduction. In 2017 IEEE interna-tional conference on big data (big data) , 1123–1132. IEEE. Chai, R. 2026. Rapid-MLX: The fastest local AI engine for Apple Silicon. https://github.com/raullenchai/Rapid-MLX. Chen, T.; Moreau, T.; Jiang, Z.; Zheng, L.; Yan, E.; Shen, H.; Cowan, M.; Wang, L.; Hu, Y.; Ceze, L.; et al. 2018. {TVM }:An automated {End-to-End } optimizing compiler for deep learning. In 13th USENIX symposium on operating systems design and implementation (OSDI 18) , 578–594. Chetlur, S.; Woolley, C.; Vandermersch, P.; Cohen, J.; Tran, J.; Catanzaro, B.; and Shelhamer, E. 2014. cudnn: Efficient primitives for deep learning. arXiv preprint arXiv:1410.0759 .Cytron, R.; Ferrante, J.; Rosen, B. K.; Wegman, M. N.; and Zadeck, F. K. 1991. Efficiently Computing Static Sin-gle Assignment Form and the Control Dependence Graph. 
+
+ACM Transactions on Programming Languages and Systems ,13(4): 451–490. Dao, T.; Fu, D.; Ermon, S.; Rudra, A.; and Ré, C. 2022. Flashattention: Fast and memory-efficient exact attention with io-awareness. Advances in neural information process-ing systems , 35: 16344–16359. Ehsani, R.; Rawal, S.; Cai, Y.; and Chatterjee, P. 2026. Faster Code, Deeper Debt? A Multivocal Literature Review on Technical Debt and Its Early Signs in LLM-Assisted Software Development. ACM Transactions on Software Engineering and Methodology .Hannun, A.; Digani, J.; Katharopoulos, A.; and Collobert, R. 2023. MLX: Efficient and flexible machine learning on Apple silicon. Hotz, G.; and contributors. 2020. tinygrad: A simple and powerful neural network framework. Intel Corporation. 2026. Intel Distribution of Open-VINO Toolkit. https://www.intel.com/content/www/us/en/ developer/tools/openvino-toolkit/overview.html. Accessed: 2026-07-11. IREE Authors. 2019. IREE: Intermediate Representation Ex-ecution Environment. https://github.com/iree-org/iree. Ac-cessed: 2026-07-20. Kerr, A.; Merrill, D.; Demouth, J.; Tran, J.; and NVIDIA CUTLASS Contributors. 2017. CUTLASS: CUDA Tem-plates for Linear Algebra Subroutines. https://github.com/ NVIDIA/cutlass. Accessed: 2026-07-20. Kwon, W.; Li, Z.; Zhuang, S.; Sheng, Y.; Zheng, L.; Yu, C. H.; Gonzalez, J.; Zhang, H.; and Stoica, I. 2023. Efficient memory management for large language model serving with pagedattention. In Proceedings of the 29th symposium on operating systems principles , 611–626. Lark Contributors. 2026. Lark Documentation. https://lark-parser.readthedocs.io/. Accessed: 2026-07-29. Lattner, C.; and Adve, V. 2004. LLVM: a compilation frame-work for lifelong program analysis & transformation. In In-ternational Symposium on Code Generation and Optimiza-tion, 2004. CGO 2004. , 75–86. Lattner, C.; Amini, M.; Bondhugula, U.; Cohen, A.; Davis, A.; Pienaar, J.; Riddle, R.; Shpeisman, T.; Vasilache, N.; and Zinenko, O. 2021. MLIR: Scaling Compiler Infrastructure for Domain Specific Computation. In 2021 IEEE/ACM Inter-national Symposium on Code Generation and Optimization (CGO) , 2–14. Nickolls, J.; Buck, I.; Garland, M.; and Skadron, K. 2008. Scalable Parallel Programming with CUDA. ACM Queue ,6(2): 40–53. NVIDIA. 2026. NVIDIA TensorRT. https://developer. nvidia.com/tensorrt. Version 11. oneDNN Contributors. 2017. oneDNN: oneAPI Deep Neural Network Library. https://github.com/uxlfoundation/ oneDNN. Accessed: 2026-07-20. OpenXLA Community. 2023. StableHLO: Backward Com-patible ML Compute Opset Inspired by HLO/MHLO. https: //github.com/openxla/stablehlo. Accessed: 2026-07-20. Ritchie, D. M. 1973. C reference manual. Unpublished memorandum, Bell Telephone Laboratories .Sabne, A. 2020. XLA : Compiling Machine Learning for Peak Performance. Sculley, D.; Holt, G.; Golovin, D.; Davydov, E.; Phillips, T.; Ebner, D.; Chaudhary, V.; Young, M.; Crespo, J.-F.; and Den-nison, D. 2015. Hidden technical debt in machine learning systems. Advances in neural information processing systems ,28. Tillet, P.; Kung, H. T.; and Cox, D. 2019. Triton: An Inter-mediate Language and Compiler for Tiled Neural Network Computations. In MAPL .Widder, D. G.; Whittaker, M.; and West, S. M. 2024. Why ‘open’AI systems are actually closed, and why this matters. 
+
+Nature , 635(8040): 827–833. Wolf, T.; Debut, L.; Sanh, V.; Chaumond, J.; Delangue, C.; Moi, A.; Cistac, P.; Rault, T.; Louf, R.; Funtowicz, M.; Davi-son, J.; Shleifer, S.; von Platen, P.; Ma, C.; Jernite, Y.; Plu, J.; Xu, C.; Scao, T. L.; Gugger, S.; Drame, M.; Lhoest, Q.; and Rush, A. M. 2020. Transformers: State-of-the-Art Natural Language Processing. In Proceedings of the 2020 Confer-ence on Empirical Methods in Natural Language Process-ing: System Demonstrations , 38–45. Online: Association for Computational Linguistics. Zheng, S.; Zheng, X.; Sun, H.; Hou, Q.; Bao, W.; Li, S.; Du-anmu, H.; Fang, J.; Xue, C.; Huang, C.; et al. 2026. DITRON: Distributed Multi-level Tiling Compiler for Parallel Tensor Programs. In Forty-third International Conference on Ma-chine Learning .
+
+Technical Supplement 
+
+Terminology 
+
+Throughout the paper we distinguish three levels of granu-larity. An Axon module is a single .axon source file with a number of Axon definitions, typically describing a model family or a model for a particular checkpoint, for example 
+
+generic-llama3.axon . A checkpoint is one set of pre-trained weights that a definition can be materialized against, for example meta-llama/Llama-3.2-1B ; a single def-inition typically covers several checkpoints, which it declares through a CHECKPOINTS pragma. A benchmark run is one measurement of one checkpoint on one backend at one precision, and, for the MLX experiments, at one generation length. Because each checkpoint is measured on several back-ends, the per-backend counts reported in the tables exceed the number of distinct checkpoints. 
+
+Extended Results 
+
+This section reproduces the encoder-only and encoder– decoder benchmarks, which are summarized in the main text, and provides full-width versions of the remaining benchmark in Figures 8, 9, 10, 11, 12, and 13. 
+
+The Axon Language 
+
+Design principles. The Axon DSL was designed according to five main design principles. 1. Tensors and shapes are first-class citizens : Neural models and other components of state-of-the-art models resolve around the manipulation of tensors, i.e., potentially multi-dimensional arrays of values. We implemented tensors and their shapes as first-class citizens through a build-in tensor type and a dimension type, that acts both as symbolic dimension of a tensor shape in the type signature and as a referencable value in the executable part of the definition. 2. Expressive but intuitive syntax : Axon definitions should be expressive enough to be concise and intuitive enough to be readable. To this end, we adopted a Haskell-inspired syntax with do-style command sequences and pipe oper-ators as intuitive surface representations of single-static assignment functional programs over tensors. 3. Clear denotational and operational semantics : A clear denotational and operational semantics allows to deter-mine statically and dynamically what code means and how it will behave. We chose functional definitions as these rule out side effects and avoid hard-to-follow or-thogonal and multi-layered abstractions common in many ML frameworks and backends. 4. Backend-agnostic primitive operations : The primitive op-erations should be backend-agnostic in the sense that most or all of them should be implementable for all the ac-tual and potentially targetted backends. To this end, we avoided the use of primitive operations that only exist in one backend. The naming of the primitive operations does follow PyTorch naming in many instances simply because we assume this to be what most ML developers are at least somewhat acquainted with. 5. Balanced abstraction level : The abstract level should be balanced in the sense that modules remain relatively con-cise and high-level enough to understand but simulta-neously are based on low-level primitive operations that can efficiently be implemented when lowering to back-end code. We achieved this to mostly through refactoring similar code in reusable built-in libraries that hide the low-level operations from typical use of the high-level concepts such as attention or positional embeddings. 
+
+Implementation principles. The implementation of the Axon DSL follows three implementation principles. 1. Stable reusable IRs : All stages of the first phase of the compiler operate on the same canonical Axon AST, i.e., the representation of parsed, resolved, normalized, flat-tened, and typed programs differs only by invariants and metadata of the Axon AST rather than having different representations at each stage. Any Axon AST can be se-rialized as an Axon module. All stages of the second phase operate on the same canon-ical Graph IR, i.e., rwrites and optimizations applied at the graph level operate within the semantic closure of the Graph IR. Any Graph IR can be serialized as an Axon module. 2. Stage-local contracts : Each stage owns a narrow contract, allowing validators and round-trip tests to target individ-ual compiler properties. For example, name resolution should not infer tensor types. As an invariant, each stage should be stable under round-trips, i.e., serializing the results of a compiler stage, reparsing the resulting Axon module, and running it through the preceding stages should result in an iden-tical Axon AST or Graph IR. This invariant is tested by serializing this IR and comparing it to the original serial-ization. 3. Limited model-specific code in shared modules : All op-erations needed to implement a model including highly model-specific quirks should be defined as Axon defini-tions in the respective Axon module. If an Axon definition can be reused by different modules, it can be promoted to a shared Axon module, either placed locally or as part of the built-in libraries. 
+
+Built-In Libraries 
+
+Axon includes built-in libraries, which consist of Axon modules that cover the operations needed by most modern LLM architectures. Authors simply import reusable Axon definitions for standard layers, tensor manipulation, mathe-matics, masking, positions, caching, activations, state-space opertions, and mixture-of-expert logic. As these built-ins are themselves written in Axon, they are inspectable, type checked, and lowered through the same compiler pipeline as user-authored code. To be precise, the definitions form these built-in Axon modules are resolved and integrated into the main Axon module in the resolve stage such that later stages see a self-contained Axon module. 
+
+Standards layers, parameter, and configuration modules. 
+
+The most central built-in modules are NN , Params , and 
+
+Config . NN provides parameterized neural-network layers such as embedding , linear , layernorm , and rmsnorm .
+
+Params exposes explicit checkpoint reads, while Config 
+
+provides typed access to configuration values. Listing 1 shows the typical authoring style. Listing 1: Core built-ins for layers, parameters, and configu-ration.                            
+
+> import Config
+> import NN
+> import Params (param) embed_block @tok :: Tensor[B,S] -> Tensor[B,S,D] embed_block ids =do
+> hidden_dim <-Config.dim @@ hidden_size x<-NN.embedding @tok ids dim =hidden_dim scale <-param @ln.weight x<-NN.rmsnorm @ln x
+> return x*scale
+
+Listing 1 illustrates the division of labor: configuration is read through Config , checkpoint tensors through Params ,and backend-agnostic layers through NN .
+
+Tensor and math primitives. Lower-level tensor and scalar functionality lives in Tensor and Math . These mod-ules provide reshaping, slicing, matrix multiplication, broad-casting, comparison, reductions, and elementary scalar func-tions. Listing 2 shows a small helper built directly from these primitives. Listing 2: Tensor and math built-ins.                          
+
+> import Math (sqrt)
+> import Tensor scale_heads :: Tensor[B,H,S,HD] -> Tensor[B,H,S,HD] scale_heads x=do
+> factor <-1.0 /sqrt HD y<-Tensor.reshape xshape =[B, H, S, HD]
+> return y*factor
+
+Listing 2 is minimal, but the same modules also pro-vide frequently used operators such as Tensor.transpose ,
+
+Tensor.concat , Tensor.slice , Tensor.softmax ,
+
+Tensor.where , Math.exp , and Math.clamp .
+
+Attention and masking. Transformer-specific definitions are packaged in Attention and Masking . These built-in modules cover head reshaping, grouped-QKV splitting, scaled dot-product attention, additive masking, grouped-query attention, and causal or bidirectional mask construc-tion. Listing 3 shows the standard self-attention pattern. Listing 3: Attention and masking built-ins.                                      
+
+> import Attention
+> import Masking self_attend :: Tensor[B,S,D] -> ?Tensor[B,K] ->
+> ,→Tensor[B,S,D] self_attend xattn_mask =do
+> q<-Attention.reshape_heads xheads =Hk<-Attention.reshape_heads xheads =Hv<-Attention.reshape_heads xheads =Hkeep <-Masking.causal_mask qkpadding_mask =attn_mask y<-Attention.attention qkvkeep
+> return Attention.merge_heads y
+
+Listing 3 is representative of authored transformer code: model definitions express the architecture-level flow, while the builtin library packages the tensor mechanics behind typed interfaces. 
+
+Positions and cache management. Autoregressive decod-ing depends on two additional builtin families. Positions 
+
+computes position ids and rotary or relative-position ingre-dients, while Cache manages null-safe key-value caching across decode steps. Listing 4 shows the common prepara-tion pattern. Listing 4: Position and cache built-ins for decoding.                                    
+
+> import Cache
+> import Positions decode_prep :: Tensor[B,S] -> ?Cache[B,H,T,C,DH] -> ?
+> ,→Tensor[B,K] -> ?Bool ->
+> (Tensor[B,S], Tensor[B,S], ?Cache[B,H,T,C,DH]) decode_prep ids past attn_mask use_cache =do
+> work_cache <-Cache.prepare past use_cache Spast_len <-Cache.past_length past pos <-Positions.position_ids ids attn_mask
+> ,→past_length =past_len
+> return ids, pos, work_cache
+
+Listing 4 captures the intended split: Positions supplies index structure, Cache threads state, and the backend only executes the lowered tensor program. There are two Cache built-in modules, the default one, which represents the the dynamic cache state as a growing list of pairs of tensors, and a static one, which pre-allocates a statically-sized cache. Both Cache built-in modules share the same interface, such that switching simply requires selecting the static overlay. Depending on the target framework, this selection defaults to dynamic vs static for Pytorch vs JAX/MLX but can be overriden. 
+
+Activations and specialized modules. Beyond the core layers, Axon ships higher-level reusable libraries for com-mon model families. Activations provides functions such as gelu , silu , and swiglu . MoE provides routing and grouped expert helpers for mixture-of-experts models, and 
+
+SSM provides Mamba-style state-space building blocks. List-ing 5 gives two representative calls. Listing 5: Activation and specialized built-ins.                 
+
+> import Activations (silu)
+> import MoE activate x=silu xroute_tokens @gate :: Tensor[B,S,D] ->
+> ,→(Tensor[B,S,TOPK], IdxTensor[B,S,TOPK]) route_tokens x=
+> MoE.softmax_topk_router @gate xtop_k =TOPK
+
+Listing 5 shows the two ends of the spectrum: small reusable nonlinearities and larger architecture-specific helpers. The builtin boundary is therefore not limited to prim-itive operations; it also captures recurring structural patterns that should remain backend-independent. Taken together, these modules form Axon’s standard au-thoring surface. They keep model definitions concise and declarative, while still exposing enough structure for the com-piler to typecheck, normalize, flatten, optimize, and lower the program through the shared AST and Graph IRs. 
+
+Top-level declarations. An Axon module is a sequence of top-level items: definitions, global bindings, imports, ex-ports, pragmas, and type aliases. Definitions may carry sig-natures, optional parameters, and scoped path parameters. Listing 6: Top-level declarations, imports, exports, and a scoped definition.                                  
+
+> import NN
+> import Act (swiglu)
+> export block Pair
+> type Pair[T] =(T, T) hidden_dim <-768 block @attn :: Tensor[B,S,D] -> ?Tensor[B,K] ->
+> ,→Tensor[B,S,D] block xattn_mask =do
+> h<-NN.rmsnorm @ln xa<-Attention.attention hhhattn_mask
+> return x+a
+
+Listing 6 groups the top-level forms that appear in ordinary authored Axon files. The first three lines show namespace import, member import, and export. The type alias introduces a reusable type constructor. The global binding defines a top-level constant expression. The definition itself combines a signature, an optional argument marked with ?, and a relative parameter scope @attn .
+
+Binding, return, and do blocks. The basic statement form is single-assignment binding with <-. A do block sequences binds and ends in an explicit return or yield .Listing 7: Bindings and explicit return in a do block.                      
+
+> pair_sum :: Tensor[B,D] -> Tensor[B,D] -> (Tensor[B,D],
+> ,→Tensor[B,D]) pair_sum xy=do
+> s<-x+yd<-x-y
+> return s, d
+
+Listing 7 shows the canonical block form. The same sur-face form also supports inline sequences separated by semi-colons: Listing 8: Inline do sequences.               
+
+> identity x=do return xcache_step x=do h<-NN.rmsnorm @ln x; return h
+
+Conditionals. Axon provides both statement-level and expression-level conditionals, as well as ternary shorthand. Statement-level conditionals branch between two do suites, while expression-level conditionals and ternaries produce values. Listing 9: Expression-level and statement-level conditionals.                              
+
+> normalize_or_skip xuse_norm =if use_norm then NN.rmsnorm @ln xelse xmask_or_null mask use_mask =
+> use_mask ?mask :null
+> choose_path xuse_skip =do if use_skip then do return x
+> else do
+> y<-NN.rmsnorm @ln x
+> return y
+
+Listing 9 places the three conditional forms side by side. Only the taken branch of a ternary or if/then/else ex-pression is evaluated. This is the one place where Axon is not eager. 
+
+Function application and composition. Calls are written in bare-argument style, optionally with keyword arguments. The language also exposes forward piping and monadic bind as first-class composition operators. Listing 10: Bare calls, pipes, keyword arguments, and monadic bind.                      
+
+> mlp x=NN.linear @up x|> Act.swiglu |> NN.linear @down mlp_kw x=NN.linear @proj xbias =true
+> mlp_bind x=
+> NN.linear @up x>>= \h -> Act.swiglu h
+
+Listing 10 shows the main composition idioms. Nested calls, pipes, lambda definitions, and binds are interchange-able surface styles for the same underlying dataflow. Pipes are often the clearest notation for feed-forward sublayers, while >>= binds are convenient when an intermediate value must be named inside an expression. 
+
+Loops, carried state, and yielded values. The for form iterates over explicit ranges. It supports optional lexical scop-ing via @.. ., explicit steps, and carried values. A loop may appear as a statement or as a binding-producing form. Listing 11: Ranges, carried values, and scoped for loops.                                
+
+> sum_to n=do
+> total <-for i<-[0 .. n) carry (total) do
+> next <-total +i
+> yield next return total states <-for@ layers i<-[0 .. L) step= 1carry (cache) do
+> layer <-Cache.index cache i
+> yield layer
+
+Listing 11 illustrates both looping forms. The first example updates a carried accumulator. The second shows the scoped form for@ layers , which binds the loop body under an additional lexical path prefix. 
+
+Scoped parameter binding. The scope form introduces a lexical parameter path and binds the result of the nested sequence. This keeps reusable helper definitions independent of hard-coded checkpoint paths. Listing 12: Scoped parameter binding with scope .                    
+
+> attn_out <-scope@ attn do
+> q<-NN.linear @q_proj xk<-NN.linear @k_proj xv<-NN.linear @v_proj xy<-Attention.attention qkvattn_mask
+> return NN.linear @o_proj y
+
+Listing 12 shows how a local lexical scope rewrites relative parameter paths. Inside the scope, relative paths such as @
+
+,→ q_proj or @o_proj resolve against the enclosing @attn 
+
+prefix before lowering. 
+
+Values, paths, and type ascription. Expressions include names, literals, lists, tuples, parenthesized expressions, arith-metic, comparisons, Boolean connectives, and explicit type ascriptions. Listing 13: Values, paths, comparisons, and type ascription.                             
+
+> spec ids =do
+> dims <-[B, S, D] pair <-(ids, ids) abs_path <-@@ model.embed_tokens rel_path <-@mlp.c_fc same <-ids == ids typed <-(ids :: Tensor[B,S])
+> return dims, pair, abs_path, rel_path, same, typed
+
+Listing 13 collects the basic value forms. At the type level, Axon supports optional types, tuple types, list types, tensor types with symbolic dimensions, and symbolic-dimension arithmetic such as Tensor[B,S,H +Hd] . Together these forms cover the full surface language accepted by the gram-mar while keeping authored model definitions compact and auditable. 
+
+Extended Backus-Naur Grammar We provide the Backus-Naur form in Figure 14, for Axon’s surface syntax as a readable specification of the language accepted by the compiler. 
+
+Axon Compiler Phases 
+
+The Axon compiler comprises three main phases: (1) desug-aring of full Axon DSL into its semantic core; (2) optimiza-tion at the Graph IR level; and (3) lowering of the Graph IR to backend-specific code. In the technical supplement, we walk an exemplary small definition through all phases. 
+
+Phase 1: Desugaring. The Axon DSL is defined by an EBNF grammar that is operationalized using Lark (Lark Contributors 2026). The parser transforms valid Axon DSL into an abstract syntax tree (Axon AST), which serves as the representation for Phase 1 and can be dumped to Axon DSL and reparsed. Every desugaring stage of Phase 1 receives an Axon AST and outputs an Axon AST, typically guar-anteeing additional properties: (a) the resolver stage inlines library definitions imported and referenced, guaranteeing a closure property stating that all non-primitive operations are expressed as definitions in the AST; (b) the flattening stage flattens nested expressions, guaranteeing a flatness property stating that definitions consist of a flat sequence of opera-tions; (c) the type checker stage infers types from type sig-natures, type ascriptions, and the type rules of primitive op-erations, guaranteeing a consistently typed Axon AST. The desugaring phase also contains dead code elimination, con-stant folding, and other straightforward code normalizations. 
+
+Phase 2: Graph optimizations. The closed flat typed Axon AST can be viewed as an instance of a static single assignment (SSA) graph. In this phase, the Axon compiler converts this semantic core to the Graph IR, which is then iter-atively optimized using a number of stages: (a) definition in-lining replaces wrapper definitions and other low-complexity definitions by integrating their sequence of operations into their call sites, enabling, for example, the inlining of primi-tive wrapper definitions; (b) generic graph rewriting replaces known patterns of operations by equivalent patterns of opera-tions based on matching of primitive operational provenance, enabling, for example, the replacement of loops iterating over experts in an MoE by a more efficient stacked-experts for-mulation; and (c) backend-specific graph rewriting replaces known patterns of operations by backend-specific primitives, enabling, for example, the use of optimized attention imple-mentations and kernels. 
+
+Phase 3: Lowering. The optimized Graph IR contains def-initions as assignment sequences, calls to definitions, and generic and backend-specific primitive operations. The low-ering phase is backend-specific and transpiles the Graph IR into one of the currently targeted backends: PyTorch, Triton-accelerated PyTorch, MLX, JAX, and vLLM. Each of the separate code generators needs to be able to implement the control flow and the primitive operators represented by the Graph IR. In addition, the code generators also need to imple-ment forward and generate methods. To achieve com-petitive performance, compilation-oriented backends typi-cally supply scaffolding that ensures static cache allocations. 
+
+Axon Compiler Stages 
+
+Table 5 lists each stage of the three phases of the Axon com-piler together with the representation it operates on and the invariant it establishes. As is conventional, the first invari-ant is monotonicity of structure: later compiler stages should remove ambiguity and add metadata but should not throw away semantic information or re-interpret the program. The second invariant is backend isolation: backend implemen-tations may choose different tensor libraries and primitive implementations, but they must consume the same Graph IR contract. If a backend requires weaker validation or model-family-specific dispatch to run, the issue belongs within the backend implementation. 
+
+Running Example 
+
+In this section we walk a small Axon fragment through the main compiler stages. The example is intentionally smaller than a full transformer block, but exercises the same mech-anisms: path sugar, defaulted keyword arguments, tensor shapes, nested calls, and typed graph lowering. 
+
+Surface Axon. A reusable projection can be written in a concise functional form:                 
+
+> project :: Tensor[B,S,D] -> Tensor[B,S,O] project x=do
+> y<-Tensor.reshape xshape =[B, S, D]
+> |> NN.linear @proj dim =O
+> return y
+
+This surface program contains a pipe, callee-attached path sugar @proj , a shape expression, and omitted default ar-guments such as bias =true from the library definition of 
+
+NN.linear .
+
+Normalize and elaborate. Normalization removes the pipe syntax and path sugar by turning them into ordinary call structure. Elaboration then fills in the default parameters declared by the callee signature.               
+
+> project x=do
+> y<-NN.linear @proj (Tensor.reshape xshape =[B, S,
+> ,→D]) dim =Obias =true return y
+
+The point is not that all defaults must be textually present in the surface program. The invariant is that downstream stages see a call surface whose positional, keyword, and path arguments are unambiguous. 
+
+Flatten. Flattening preserves eager evaluation order by in-troducing explicit binds and making paths absolute or tem-plated absolute values:                     
+
+> project :: Tensor[B,S,D] -> Tensor[B,S,O] project x=do
+> _v1 <-Tensor.reshape xshape =[B, S, D] y<-NN.linear @@ proj _v1 dim =Obias =true return y
+
+The flat program has no pipe expression, no nested call used as an argument, and no callee path sugar. This is the Axon AST form expected by the typechecker and trivally translated into the Graph IR. 
+
+Typecheck. Typecheck annotates every expression with type, arity, and tensor-dimension metadata. The same flat program can be read as:                           
+
+> _v1 <-(Tensor.reshape (x :: Tensor[B,S,D]) shape =([B, S, D] :: List[Dim]) ::
+> ,→Tensor[B,S,D]) y<-(NN.linear (@@ proj :: Path) (_v1 :: Tensor[B,S,D]) dim =(O :: Dim) bias =(true :: Bool) ::
+> ,→Tensor[B,S,O])
+
+What matters is not the rendered punctuation, but that the shape relation between Tensor[B,S,D] and 
+
+Tensor[B,S,O] is explicit before lowering. 
+
+Graph IR. Lowering turns each flat bind into a typed graph node. A representation of the graph module for project is given in Figure 6, which might be schematically represented as follows:                   
+
+> module project(x :Tensor[B,S,D]) -> Tensor[B,S,O] n1 =call Tensor.reshape( x, shape =[B,S,D]) -> Tensor[B,S,D] n2 =call NN.linear( path =@@ proj, x=n1, dim =O, bias =true )
+> -> Tensor[B,S,O]
+> return n2
+
+Graph Optimizations. As already introduced in the de-scription of Phase 2, the graph optimizations rewrite, replace, or join module graphs at the Graph IR level. An exhaustive list would be beyond the scope of this appendix. 
+
+Backend. The Torch, Triton, MLX, JAX, and vLLM code generators and their runtime implementations are based on the Graph IR and therefore share the same typed generic primitive operations, path values, and output types, which defines the cross-backend interface at the lower levels of the Axon compiler pipeline. The only differences are backend-specific primitive operations. 
+
+A Complete Model Definition 
+
+Figure 7 gives the complete Axon module GPT-2. The en-tire model, including the layer stack, is expressed in these Axon definitions and the Axon definitions of the built-in modules uses. The PyTorch, Triton, JAX, MLX, and vLLM implementations benchmarked in this paper are all gener-ated from these Axon definitions together with a standard 
+
+safetensors or PyTorch checkpoint. 
+
+Python Overhead: Axon vs. Transformers 
+
+We profile autoregressive generation (max. 128 tokens) on two models: Qwen/Qwen2.5-0.5B (0.67B parameters, 24 lay-ers) and PleIAs/Pleias-3b-Preview (3.8B, 22 layers) to in-vestigate the Python dispatch overhead that Axon’s codegen eliminates. Both models were selected because they achieved 
+
+> 1.0× speedup on both the PyTorch and JAX backends in a 91-checkpoint benchmark, naturally representing subjects of interest for further analysis. All configurations run on the same underlying frame-work. Axon’s torch code generator emits standard Py-Torch code that calls the same torch._C._nn.linear ,
+
+scaled_dot_product_attention , and CUDA kernels as HuggingFace’s Transformers. Axon’s jax code generator emits standard JAX code compiled by XLA. The speedup therefore cannot come from better kernels. Hence, it comes from how the code is structured at the Python layer. Table 6 reports wall-clock time and GPU idle per-centage for each configuration. GPU active time is mea-sured via torch.profiler (CPU+CUDA activities), which sums self_device_time_total across all CUDA kernel events. GPU idle is wall-clock time minus GPU active time. For the JAX backend, GPU idle is reported as 0.0%. This is a property of JAX’s asynchronous dispatch model. JAX enqueues operations on the accelerator without blocking Python, returning jax.Array futures 7. Python code runs 
+
+> 7
+
+https://docs.jax.dev/en/latest/async_dispatch.html Table 5: Axon Compiler Phase and Stage with Invariants Phase Representation Primary invariant Parse one-file AST Syntactic structure and explicit MAIN pragma insertion Load loaded AST set Imports and builtins located without rewriting semantics Materialize one-file AST Optional checkpoint/config specialization for generic models Resolve/validate-closed closed AST No unresolved imports or names; unreachable definitions pruned from MAIN Normalize normalized AST Call syntax, pipes, path sugar, and zero-arg call/name distinctions made explicit Elaborate/validate-elaborated elaborated AST Default arguments filled and call arguments positionalized Flatten/validate-flat flat AST Explicit evaluation order; flat calls and binds accepted by type-check and Graph IR lowering Typecheck/validate-typed Typed flat AST expression types, arities, dimensions, and primitive rules applied to a fixpoint Optimize-ast typed flat AST Optional conservative AST cleanup with retype/validation Graph lowering/validation Graph IR Typed graph modules, multi-output nodes, structured paths, con-straints, and metadata Optimize-graph/validation Graph IR Optional graph cleanup, specialization, backend-neutral rewrites, and opt-in backend intrinsics Backend generated/runtime code Executable tensor program consuming the validated Graph IR contract Table 6: Wall-clock time and GPU idle for autoregressive generation (112 tokens for Qwen 0.5B, 96 for Pleias 3.8B). “—” indicates the metric is not directly measurable: JAX has no torch.profiler equivalent for per-kernel timing, and GPU active/idle is a synchronous-execution concept that does not apply to JAX’s async dispatch model. Qwen2.5-0.5B (0.67B) Pleias-3b-Preview (3.8B) Metric Transformers Axon-Torch Axon-JAX Transformers Axon-Torch Axon-JAX Wall-clock (ms) 1380 1185 541 1091 1071 1160 Speedup vs Transformers 1.0 × 0.86 × 0.39 × 1.0 × 0.98 × 1.07 ×
+
+GPU active (ms) 373 370 — 557 561 —GPU idle (ms) 1007 815 — 534 510 —GPU idle % 73.0% 68.8% 0.0% 48.9% 47.6% 0.0% CUDA kernels 129,189 120,987 — 101,935 104,123 —ahead of the GPU, so the device always has queued work and never idles waiting for dispatch. This is not a measurement artifact, JAX simply has no concept of GPU idle between kernel launches because there is no synchronous gap be-tween them. We verified that wall-clock measurements use  
+
+> jnp.block_until_ready()
+
+to ensure the GPU has com-pleted all queued work before recording the end time. Table 7 reports total Python function calls and cProfile cu-mulative time. Python call counts are measured by cProfile 
+
+in a separate profiling pass (after the wall-clock pass) to avoid profiler overhead interference. JAX’s cProfile time on Pleias 3.8B (1.16 s) exceeds Tranformer’s (0.87 s) de-spite having 77% fewer calls. The remaining calls include expensive JAX runtime primitives ( apply_primitive for 
+
+> broadcast
+
+/full operations) that dominate this model size. The comparison is fair by construction: Axon’s  
+
+> torch
+
+code generator emits PyTorch code that calls the same torch._C._nn.linear ,
+
+> scaled_dot_product_attention
+
+, and CUDA ker-nels as HuggingFace’s Transformers. Both produce identical token sequences ( 100% top-1 parity). The speedup comes entirely from the Python layer above the kernels. 
+
+The Price of Transformers. Transformers implements each model as a nested hierarchy of nn.Module subclasses. Every __call__ goes through PyTorch’s dispatch chain (__call__ → _wrapped_call_impl → _call_impl 
+
+→ forward ), costing 3 Python function calls per mod-ule per step per layer. For Qwen2.5-0.5B (24 layers, ∼13 modules/layer), this is 35,616 wrapper calls per gen-erate pass. On top of this, Transformers’s generate() 
+
+loop adds per-step prepare_inputs_for_generation ,a LogitsProcessorList chain (float32 cast + clone), and a stopping-criteria check. 
+
+Advantages of Axon. Axon’s compiler pipeline (resolve 
+
+→ normalize → elaborate → typecheck → lower → graph optimize → emit) flattens the module hierarchy into a sin-gle inline function: model.forward() → _def_qwen2() Table 7: Python function call counts and cProfile cumulative time. “—” indicates the category does not apply: JAX fuses all per-op dispatches into a single XLA compilation per step, so individual F.linear and SDPA calls do not exist as Python-level dispatches. Qwen2.5-0.5B (0.67B) Pleias-3b-Preview (3.8B) Metric Transformers Axon-Torch Axon-JAX Transformers Axon-Torch Axon-JAX Total Python calls 455,769 508,390 137,805 359,909 330,929 82,210 
+
+Calls vs Transformers 1.0 × 1.12 × 0.30 × 1.0 × 0.92 × 0.23 ×
+
+cProfile time (s) 1.13 0.95 0.54 0.87 0.78 1.16 
+
+Per-op dispatch (Python calls per generate pass):  
+
+> nn.Module.__call__
+
+35,616 0 0 28,032 0 0 
+
+> F.linear
+
+18,928 18,928 — 14,880 14,880 — 
+
+> SDPA
+
+2,688 2,688 — 2,112 2,112 — 
+
+> rope_apply
+
+0 5,376 — 0 4,224 — 
+
+> forward
+
+(jit dispatch) — — 112 — — 96  
+
+> xTensor[B,S,D] n1 :Tensor.reshape
+
+out: _v1 Tensor[B,S,D] n2 : NN.linear 
+
+out: yTensor[B,S,O]    
+
+> return yTensor[B,S,O] shape =[B,S,D] path =@@ proj dim =O, bias =true
+
+Figure 6: Graph IR view of the running example. Blue denotes typed graph values, orange operation nodes, and green structured operands and attributes. Paths, literals, and shape lists are structured operands, not strings that backends must parse. (one flat function, zero module wrappers). Weight access changes from attribute chains through  
+
+> nn.Module.__getattr__
+
+to direct dict lookups (_param("layers.0.self_attn.q_proj.weight") ). The generate loop drops from 6 Python phases to 4(no logits processor, no prepare_inputs ). Table 7confirms: the GPU-op call counts (F.linear , SDPA )are identical between Transformers and Axon-Torch, but  
+
+> nn.Module.__call__
+
+drops from 35,616 to 0. 
+
+Comparison to JAX. Axon’s jax code generator applies the same flattening but jax.jit fuses all per-op Python dispatches into a single XLA compilation per step. The 18,928 F.linear calls and 2,688 SDPA calls that exist as separate Python dispatches in both Transformers and Axon-Torch become zero Python calls, they are compiled into one fused XLA kernel. Combined with JAX’s async dis-patch, which lets Python run ahead of the GPU (0% GPU idle), this achieves 2.55 × speedup on the 0.5B model. How-ever, the per-step host synchronization for EOS checking (jax.device_get ) scales with GPU compute time, causing JAX’s advantage to diminish on larger models. 
+
+Why this generalizes. The overhead Trans-formers Library pays is structural, not model-specific: nn.Module.__call__ dispatch scales with num_layers × modules_per_layer. Logits pro-cessing happens every step regardless of model.  
+
+> prepare_inputs_for_generation
+
+is a Python ab-straction every model passes through. Axon’s codegen eliminates these for any model. The compiler flattens the hierarchy at compile time, so the generated code never pays the nn.Module dispatch tax. This is why the speedup is consistent across architectures (Qwen, Mistral, Llama, Bloom, Pleias) and scales with decode steps (generate is faster; forward is not, because a single pass amortizes the overhead). 
+
+Full-width versions of the main-text figures. 
+
+Figures 8–11 reproduce the remaining benchmark figures from the main text at full page width. 
+
+Encoder-only and encoder–decoder models. Figure 12 shows the performance comparison for encoder-only and encoder-decoder models up to 4B. Figure 13 shows the per-formance comparison for encoder-only and encoder-decoder models between 4B and 32 B.Figure 14 shows a loss curve comparison on Gemma 3 270M between Transformer’s implementation and an Axon-derived PyTorch model. The important insight here is not the quality of the training but the identical training behaviour with the two curves perfectly overlaid on each other. Figure 7: Complete Axon definition of GPT-2. 
+
+{-# CHECKPOINTS ["openai -community /gpt2", "openai -community /gpt2 -medium", 
+
+,→ "openai -community /gpt2 -large", "openai -community /gpt2 -xl"] #-}{-# TASK "causal_lm" #-}
+
+import Activations (gelu_new) 
+
+import Attention (attention, merge_heads, reshape_heads) 
+
+import Masking (Mask, causal_mask_for_input, mask_for_input, mask_length_for_input) 
+
+import Positions (position_ids) 
+
+import Cache 
+
+import Config 
+
+import NN 
+
+import Tensor CONTEXT_SIZE <- (Config.dim @@ n_positions default =1024 :: Dim) MODEL_DIM <- (Config.dim @@ n_embd default =768 :: Dim) NUM_LAYERS <- (Config.dim @@ n_layer default =12 :: Dim) NUM_HEADS <- (Config.dim @@ n_head default =12 :: Dim) VOCAB_SIZE <- (Config.dim @@ vocab_size default =52057 :: Dim) gpt2_block :: Tensor[B,S,D] -> Tensor[B,1,S,K] -> ?CacheLayer[B,H,P,CONTEXT_SIZE,DH] -> 
+
+,→ (Tensor[B,S,D], ?CacheLayer[B,H,K,CONTEXT_SIZE,DH]) gpt2_block x mask past_kv = do 
+
+x1 <- NN.layernorm @ln_1 xa, new_kv <- scope@ attn do 
+
+q_lin, k_lin, v_lin <- Tensor.chunk (NN.linear @c_attn x1 dim =(3 * MODEL_DIM) bias =true 
+
+,→ transpose =true ) parts =3q <- reshape_heads q_lin heads =NUM_HEADS k <- reshape_heads k_lin heads =NUM_HEADS v <- reshape_heads v_lin heads =NUM_HEADS k, v, new_kv <- Cache.update past_kv k va <- attention q k v mask |> merge_heads |> NN.linear @c_proj dim =MODEL_DIM bias =true 
+
+,→ transpose =true return a, new_kv x <- x + ax3 <- NN.layernorm @ln_2 xm <- scope@ mlp do return NN.linear @c_fc x3 dim =(4 * MODEL_DIM) bias =true transpose =true |> gelu_new |> 
+
+,→ NN.linear @c_proj dim =MODEL_DIM bias =true transpose =true return x + m, new_kv gpt2 :: Tensor.TokenIds[B,S] -> ?Mask[B,K,CONTEXT_SIZE] -> ?
+
+,→ Cache[B,NUM_HEADS,P,CONTEXT_SIZE,MODEL_DIM / NUM_HEADS] -> ?Bool -> (Tensor[B,S,V], ?
+
+,→ Cache[B,NUM_HEADS,K,CONTEXT_SIZE,MODEL_DIM / NUM_HEADS]) gpt2 input_ids attn_mask past_kv use_cache = do 
+
+tok <- NN.embedding @wte input_ids dim =MODEL_DIM past_len <- Cache.past_length past_kv attn_mask <- mask_for_input input_ids attn_mask CONTEXT_SIZE pos <- position_ids input_ids attn_mask =attn_mask past_length =past_len pad_fill =1 |> 
+
+,→ NN.embedding @wpe x <- tok + pos key_len <- mask_length_for_input input_ids attn_mask past_len mask <- causal_mask_for_input input_ids key_len padding_mask =attn_mask window =CONTEXT_SIZE work_kv <- Cache.prepare past_kv use_cache CONTEXT_SIZE read_kv <- Cache.read past_kv work_kv x, work_kv <- for@ h i <- [0 .. NUM_LAYERS) carry (x, work_kv) do 
+
+past_i <- Cache.index read_kv ix, new_i <- gpt2_block x mask past_i work_kv <- Cache.append work_kv new_i 
+
+yield x, work_kv new_length <- past_len + Swork_kv <- Cache.finish work_kv new_length new_kv <- (use_cache ? work_kv : null )logits <- NN.layernorm @ln_f x |> NN.linear @wte 
+
+return logits, new_kv Transformers vs Axon Throughput (tok/s) 
+
+log-log throughput scatter; above diagonal means Axon is faster (higher tok/s) 10 10 100 100 1.0k 1.0k parity 2x 4x 8x Transformers tok/s Axon tok/s BlackMamba-2.8B PowerMoE-3b BlackMamba-2.8B granite-3.3-2b-base granite-3.1-2b-base BlackMamba-2.8B gemma-3-270m-it granite-3.2-2b-instruct granite-3.3-2b-instruct glm-edge-1.5b-chat SmolLM2-1.7B Phi-4-mini-reasoning Phi-4-mini-instruct SmolLM3-3B gemma-3-270m glm-edge-4b-chat SmolLM-1.7B Phi-3-mini-128k-instruct SmolLM2-360M-Instruct SmolLM-360M SmolLM2-135M Phi-3-mini-4k-instruct gemma-3-1b-it Pleias-RAG-350M EXAONE-4.0-1.2B gemma-4-E2B gemma-3-1b-pt Pleias-Pico Pleias-RAG-1B SmolLM2-360M Pleias-Nano mamba-2.8b-hf granite-3.1-2b-instruct OLMo-2-0425-1B starcoder2-3b SmolLM3-3B-Base gpt2-xl SmolLM2-135M-Instruct gemma-4-E4B SmolLM-135M Pleias-3b-Preview gemma-4-E2B-it SmolLM2-1.7B-Instruct gemma-4-E4B-it bloom-3b bloom-1b7 HRM-Text-1B granite-3.2-2b-instruct PowerMoE-3b Phi-4-mini-instruct Pleias-Nano gemma-3-4b-pt Qwen2.5-0.5B SmolLM3-3B opt-1.3b gpt2-large gemma-4-E4B gpt2-medium gpt2 PowerMoE-3b falcon-rw-1b gemma-2-2b-it falcon-rw-1b falcon-rw-1b gemma-3-4b-it SmolLM2-135M-Instruct gemma-3-270m falcon-rw-1b gemma-3-4b-pt gemma-3-1b-it gemma-3-270m-it AI21-Jamba-Reasoning-3B gemma-3-4b-it gemma-3-1b-pt gemma-2-2b xglm-564M xglm-2.9B Pleias-Pico Pleias-Nano gemma-2-2b-it Pleias-Nano AI21-Jamba-Reasoning-3B gemma-2-2b bloom-1b1 Pleias-RAG-1B Pleias-Nano gemma-4-E4B Pleias-Pico SmolLM2-135M-Instruct SmolLM-360M-Instruct SmolLM-360M-Instruct OLMo-2-0425-1B SmolLM-360M xglm-2.9B SmolLM-135M SmolLM2-135M xglm-564M falcon-rw-1b SmolLM-360M xglm-1.7B mamba-2.8b-hf Pleias-RAG-350M SmolLM-135M-Instruct Pleias-3b-Preview falcon-rw-1b SmolLM-135M-Instruct SmolLM-135M SmolLM2-360M SmolLM2-360M SmolLM2-360M-Instruct opt-1.3b xglm-1.7B SmolLM3-3B SmolLM2-360M-Instruct OLMo-2-0425-1B SmolLM2-135M SmolLM3-3B-Base EXAONE-4.0-1.2B SmolLM3-3B Pleias-RAG-350M SmolLM3-3B-Base SmolLM-1.7B-Instruct SmolLM-1.7B gpt2 SmolLM2-1.7B-Instruct SmolLM-1.7B SmolLM2-1.7B Pleias-RAG-1B opt-1.3b granite-3.1-2b-instruct gpt2 EXAONE-4.0-1.2B mamba-2.8b-hf gpt2 gemma-4-E4B glm-edge-1.5b-chat granite-3.2-2b-instruct gemma-4-E4B-it SmolLM-1.7B-Instruct granite-3.3-2b-instruct gemma-4-E2B SmolLM2-1.7B Qwen2.5-0.5B Phi-4-mini-instruct granite-3.1-2b-base Qwen2.5-0.5B SmolLM2-1.7B-Instruct SmolLM2-1.7B granite-3.3-2b-base granite-3.1-2b-instruct granite-3.3-2b-instruct granite-3.3-2b-base Phi-4-mini-reasoning Phi-4-mini-instruct AI21-Jamba-Reasoning-3B glm-edge-4b-chat HRM-Text-1B SmolLM3-3B Phi-4-mini-reasoning granite-3.1-2b-base gemma-4-E2B-it gpt2-large granite-3.2-2b-instruct Phi-4-mini-instruct gpt2 gpt2 Pleias-Nano bloomz-3b SmolLM-135M-Instruct glm-edge-1.5b-chat SmolLM2-1.7B granite-3.2-2b-instruct glm-edge-4b-chat SmolLM2-1.7B gemma-4-E4B Pleias-3b-Preview HRM-Text-1B SmolLM3-3B gpt2-medium bloom-560m gpt2-xl OLMoE-1B-7B-0924 gemma-3-270m bloomz-1b1 gpt2-large gemma-3-270m-it gemma-4-E4B gemma-2-2b bloomz-3b bloom-560m bloomz-1b1 gemma-4-E2B gpt2-xl bloom-1b7 Phi-4-mini-instruct bloom-1b1 gemma-4-E2B-it bloom-1b1 OLMoE-1B-7B-0924 gemma-3-1b-it bloom-1b7 gemma-3-4b-it gemma-3-4b-pt gemma-3-1b-pt starcoder2-3b gemma-4-E4B-it gemma-2-2b-it gpt2-medium bloom-3b starcoder2-3b bloom-3b granite-3.2-2b-instruct OLMoE-1B-7B-0924 Phi-3-mini-4k-instruct Phi-3-mini-4k-instruct Phi-3-mini-128k-instruct Phi-3-mini-128k-instruct SmolLM-1.7B-Instruct SmolLM-360M-Instruct bloom-560m xglm-1.7B bloomz-3b xglm-2.9B bloomz-1b1 xglm-564M 
+
+Backend (fill) 
+
+PyTorch Triton JAX 
+
+Dtype (ring) 
+
+bfloat16 float32 Figure 8: Autoregressive generation performance with decoder-only models with up to 4B parameters. Log-log plot where the diagonal line indicates equal performance. Points above the parity line indicate Axon is faster, color-fill denotes backends and border-line denotes dtype. Axon vs. Transformers: Generation Throughput (32B) 
+
+log-log throughput scatter; above diagonal means Axon is faster (higher tok/s) 1.0 1.0 10 10 100 100 1.0k 1.0k parity 2x 4x 8x Transformers tok/s Axon tok/s deepseek-moe-16b-chat deepseek-moe-16b-chat deepseek-moe-16b-base deepseek-moe-16b-base deepseek-moe-16b-chat deepseek-moe-16b-base DeepSeek-V2-Lite DeepSeek-Coder-V2-Lite-Instruct gpt-j-6b GLM-4-9B-0414 GLM-Z1-9B-0414 granite-3.1-8b-base Meta-Llama-3-8B Ministral-3-14B-Base-2512 Mistral-7B-v0.1 Llama-3.1-8B-Instruct granite-3.1-8b-instruct Phi-3-medium-4k-instruct Ministral-3-8B-Base-2512 Mistral-7B-Instruct-v0.2 Llama-3.1-8B OLMo-2-1124-13B Meta-Llama-3-8B-Instruct Phi-3-medium-128k-instruct DeepSeek-V2-Lite-Chat Mathstral-7B-v0.1 Mistral-7B-Instruct-v0.3 Qwen2.5-14B-Instruct Mistral-Nemo-Base-2407 Mistral-7B-v0.3 Mistral-7B-Instruct-v0.1 bloom-7b1 Ministral-8B-Instruct-2410 Qwen2.5-14B Qwen2.5-Coder-14B starcoder2-7b pythia-6.9b Olmo-3-1025-7B Flex-public-7B-1T Olmo-3-7B-Think DeepSeek-Coder-V2-Lite-Base Mistral-7B-Instruct-v0.2 gemma-3-27b-pt granite-3.3-8b-instruct Flex-public-7B-1T gemma-3-12b-it gemma-2-9b-it Llama-3.1-8B gemma-3-27b-it gemma-3-12b-pt Ministral-8B-Instruct-2410 pythia-12b starcoder2-15b gemma-2-9b Flex-math-2x7B-1T Flex-code-2x7B-1T OLMo-2-1124-7B Flex-pes2o-2x7B-1T Mistral-7B-Instruct-v0.2 GLM-Z1-9B-0414 Mistral-7B-Instruct-v0.2 Mistral-Nemo-Base-2407 Mistral-Nemo-Base-2407 Codestral-22B-v0.1 Meta-Llama-3-8B-Instruct Flex-reddit-2x7B-1T Flex-creative-2x7B-1T Ministral-8B-Instruct-2410 Mistral-7B-Instruct-v0.1 granite-3.1-8b-instruct Mathstral-7B-v0.1 gemma-7b-it Codestral-22B-v0.1 GLM-4-9B-0414 Flex-public-7B-1T Flex-creative-2x7B-1T gemma-4-31B OLMo-2-1124-7B Flex-news-2x7B-1T Mathstral-7B-v0.1 opt-6.7b gemma-7b gemma-4-31B-it Mistral-7B-v0.3 granite-3.2-8b-instruct granite-3.1-8b-base opt-6.7b xglm-7.5B granite-3.1-8b-instruct Meta-Llama-3-8B Magistral-Small-2509 Mistral-7B-v0.3 Mistral-7B-Instruct-v0.1 Flex-math-2x7B-1T Mistral-7B-Instruct-v0.3 GLM-4-9B-0414 Flex-news-2x7B-1T opt-6.7b OLMo-2-1124-13B Flex-reddit-2x7B-1T Qwen3-14B Flex-code-2x7B-1T Devstral-Small-2507 Meta-Llama-3-8B gpt-j-6b dfm-decoder-open-v0-7b-pt Qwen2.5-Coder-14B Llama-3.1-8B-Instruct Flex-creative-2x7B-1T Mistral-7B-v0.1 Mistral-7B-v0.1 OLMo-2-1124-13B gemma-3-12b-it Mistral-7B-Instruct-v0.3 gemma-3-12b-pt gemma-3-27b-pt gpt-j-6b granite-3.1-8b-base Llama-3.1-8B gemma-3-27b-it Qwen2.5-14B granite-3.3-8b-base Flex-reddit-2x7B-1T granite-3.2-8b-instruct Qwen2.5-14B-Instruct Flex-pes2o-2x7B-1T GLM-Z1-9B-0414 gemma-4-31B granite-3.3-8b-instruct Devstral-Small-2507 gemma-4-31B-it Llama-3.1-8B-Instruct gemma-2-27b-it Qwen2.5-14B gemma-2-27b xglm-7.5B Flex-news-2x7B-1T gemma-7b-it granite-3.3-8b-base Meta-Llama-3-8B Qwen2.5-14B-Instruct gemma-7b opt-13b Flex-pes2o-2x7B-1T Flex-math-2x7B-1T Flex-code-2x7B-1T gemma-7b-it gemma-7b Qwen2.5-Coder-14B Magistral-Small-2509 Ministral-8B-Instruct-2410 Apertus-8B-Instruct-2509 Mistral-7B-Instruct-v0.2 Devstral-Small-2507 granite-3.2-8b-instruct Apertus-8B-2509 OLMo-2-1124-7B Codestral-22B-v0.1 Magistral-Small-2509 Meta-Llama-3-8B-Instruct opt-13b opt-13b gemma-7b-it Devstral-Small-2507 Ministral-8B-Instruct-2410 gemma-4-31B-it xglm-4.5B gpt-neox-20b dfm-decoder-open-v0-7b-pt Meta-Llama-3-8B comma-v0.1-1t gemma-7b bloom-7b1 gemma-4-31B Mistral-7B-Instruct-v0.2 gpt-oss-20b gpt-neox-20b granite-3.3-8b-instruct Codestral-22B-v0.1 Olmo-3-7B-Instruct Magistral-Small-2509 xglm-4.5B Olmo-3-1025-7B gemma-2-27b-it Apertus-8B-Instruct-2509 gemma-3-27b-it gemma-3-27b-pt gemma-2-27b Apertus-8B-2509 comma-v0.1-1t pythia-6.9b gemma-4-31B-it gemma-4-31B Qwen3-14B Olmo-3-7B-Think gemma-3-27b-it gpt-oss-20b gpt-neox-20b Apertus-8B-2509 gemma-2-9b gemma-2-9b-it Apertus-8B-Instruct-2509 starcoder2-15b Olmo-3-7B-Think Olmo-3-1025-7B Olmo-3-1025-7B gemma-2-9b-it bloom-7b1 pythia-6.9b pythia-12b pythia-12b gemma-3-12b-it gemma-3-27b-pt Olmo-3-7B-Think gemma-3-12b-pt gpt-neox-20b starcoder2-7b starcoder2-7b starcoder2-15b gemma-2-9b Olmo-3-7B-Instruct dfm-decoder-open-v0-7b-pt Olmo-3-7B-Think Olmo-3-1025-7B Phi-3-medium-4k-instruct Ministral-3-8B-Base-2512 Ministral-3-14B-Base-2512 comma-v0.1-1t Phi-3-medium-4k-instruct Ministral-3-14B-Base-2512 Olmo-3-7B-Instruct Ministral-3-8B-Base-2512 Phi-3-medium-128k-instruct Olmo-3-7B-Think Olmo-3-1025-7B Phi-3-medium-128k-instruct Qwen3-14B gemma-7b gemma-7b-it granite-3.3-8b-base xglm-4.5B xglm-7.5B 
+
+Backend (fill) 
+
+PyTorch Triton JAX 
+
+Dtype (ring) 
+
+bfloat16 float32 Figure 9: Benchmarking Autoregressive models between 4B and 32 B models. Log-log plot where the diagonal parity line indicates equal performance. Generally, Axon produces comparable or superior throughput on the bigger models. vLLM Native Generation: Axon vs Transformers (HF) 
+
+log-log throughput scatter (tok/s); above diagonal = Axon faster | Native vLLM PagedAttention + KV cache vs HF Transformers 10 10 100 100 1.0k 1.0k parity 2x 4x 8x Transformers tok/s (HF) Axon tok/s (vLLM native)  PowerMoE-3b gpt-oss-20b OLMoE-1B-7B-0924 gpt-j-6b gemma-2-9b Ministral-3-14B-Base-2512 Ministral-3-8B-Base-2512 glm-edge-4b-chat GLM-4-9B-0414 glm-edge-1.5b-chat gemma-2-27b OLMo-2-1124-13B Qwen3-14B Phi-3-medium-128k-instruct Ministral-8B-Instruct-2410 codegen-350M-mono helium-1-preview-2b Qwen2.5-Coder-14B Qwen2.5-14B OLMo-2-1124-7B EXAONE-4.0-1.2B Phi-3-medium-4k-instruct Mistral-7B-v0.1 Phi-4-mini-instruct Mistral-Nemo-Base-2407 OLMo-2-0425-1B Olmo-3-1025-7B gemma-7b Llama-3.1-8B Mistral-7B-v0.3 SmolLM3-3B SmolLM2-360M granite-3.1-2b-instruct SmolLM-360M Mistral-7B-Instruct-v0.2 Pleias-Pico SmolLM-135M Meta-Llama-3-8B comma-v0.1-1t Qwen2.5-0.5B Pleias-RAG-1B SmolLM-1.7B Codestral-22B-v0.1 Pleias-Nano Phi-3-mini-128k-instruct granite-3.3-8b-instruct granite-3.3-2b-instruct Apertus-8B-2509 granite-3.1-8b-base granite-3.3-2b-base Pleias-3b-Preview SmolLM2-1.7B Phi-3-mini-4k-instruct granite-3.1-2b-base Pleias-RAG-350M granite-3.1-8b-instruct Devstral-Small-2507 gpt-neox-20b xglm-2.9B gemma-2-2b falcon-rw-1b starcoder2-15b xglm-1.7B xglm-4.5B pythia-12b bloomz-7b1 phi-1_5 Phi-4-mini-reasoning bloom-7b1 stablelm-2-1_6b starcoder2-7b bloom-1b7 bloom-1b1 pythia-6.9b opt-13b bloom-3b gemma-3-27b starcoder2-3b xglm-564M gemma-3-12b bloom-560m gemma-3-4b gemma-3-1b opt-1.3b gemma-3-270m opt-6.7b gpt2 xglm-7.5B Figure 10: vLLM: Axon (vLLM native) vs. Transformers generation throughput on 88 checkpoints. Points above the parity line indicate Axon is faster. 74% fall above. HF vs Axon Throughput (tok/s) 
+
+MLX: Axon vs. Transformers (HuggingFace) on Apple Silicon 10 10 100 100 1.0k 1.0k parity 2x 4x 8x HF tok/s Axon tok/s Monad Monad SmolLM2-135M xglm-564M SmolLM-135M gemma-3-270m SmolLM-135M gemma-3-270m SmolLM2-135M Baguettotron OCRonos-Vintage OCRonos-Vintage Baguettotron gpt2 gpt2 xglm-564M SmolLM2-360M mt5-small SmolLM-360M SmolLM2-360M t5-small Qwen2.5-0.5B Pleias-Pico Pleias-RAG-350M Pleias-Pico opus-mt-en-de t5-small Qwen2.5-0.5B opus-mt-en-de bart-base Pleias-RAG-350M t5gemma-2-270m-270m t5-base mt5-small bloom-560m t5gemma-2-270m-270m SmolLM-360M bloom-560m bart-base t5-base mt5-base mt5-base 
+
+Task (stroke) 
+
+causal_lm seq2seq_lm unknown 
+
+Dtype (fill) 
+
+bfloat16 float32 Figure 11: MLX. Benchmarking conventional Transformers models against Axon derived standalone model definitions. Axon yields some considerable speed-ups across the board. Transformers vs Axon Throughput 
+
+log-log wall-time scatter; below diagonal means Axon is faster (lower ms) 0.100 0.100 1.0 1.0 10 10 100 100 parity 2x 4x 8x Transformers wall time (ms) Axon wall time (ms) longformer-base-4096 longformer-base-4096 longformer-base-4096 bert-base-uncased distilbert-base-uncased xlm-roberta-base distilroberta-base roberta-base t5-3b roberta-large xlm-roberta-large bert-base-uncased camembert-large roberta-large distilroberta-base bart-base opus-mt-en-de opus-mt-en-de roberta-base albert-base-v2 distilbert-base-uncased camembert-large mbart-large-50-many-to-many-mmt t5-base camembert-base xlm-roberta-base bert-base-uncased electra-base-generator mbart-large-50-many-to-many-mmt roberta-large electra-base-generator mt5-large bart-base deberta-v3-xsmall opus-mt-en-de t5-small deberta-v3-xsmall t5-large camembert-base mt5-base albert-base-v2 albert-base-v2 camembert-base camembert-large roberta-base mt5-small mt5-base t5-3b electra-base-generator bart-base distilroberta-base t5-3b xlm-roberta-large distilbert-base-uncased t5-3b xlm-roberta-large xlm-roberta-base mt5-base mbart-large-50-many-to-many-mmt t5-3b deberta-v3-xsmall deberta-v3-xsmall t5-small t5-3b mt5-base t5-large mt5-small mt5-large t5-base deberta-v3-xsmall mt5-base deberta-v3-xsmall t5-large mt5-small mt5-large mt5-base t5-base t5-small 
+
+Backend (fill) 
+
+PyTorch Triton JAX 
+
+Dtype (ring) 
+
+bfloat16 float32 Figure 12: Benchmarking Encoder-only and Encoder–Decoder up to 4B models. Log-log plot where the diagonal parity line indicates equal performance. Here, we see the majority of the points in the vicinity below the parity line. Axon vs. Transformers: Forward Pass (32B) 
+
+log-log wall-time scatter; below diagonal means Axon is faster (lower ms) 1.0 1.0 10 10 100 100 parity 2x 4x 8x Transformers wall time (ms) Axon wall time (ms) t5gemma-9b-2b-prefixlm-it t5gemma-9b-2b-prefixlm-it t5gemma-xl-xl-prefixlm t5gemma-xl-xl-prefixlm t5gemma-2-4b-4b t5gemma-2-4b-4b t5gemma-2-4b-4b t5gemma-2-4b-4b t5gemma-9b-9b-prefixlm t5gemma-9b-9b-prefixlm-it t5gemma-9b-9b-prefixlm-it t5gemma-9b-9b-prefixlm t5gemma-9b-9b-prefixlm t5gemma-9b-9b-prefixlm t5gemma-9b-9b-prefixlm t5gemma-xl-xl-prefixlm t5gemma-xl-xl-prefixlm t5gemma-9b-2b-prefixlm t5gemma-9b-2b-prefixlm t5gemma-9b-9b-prefixlm-it t5gemma-9b-9b-prefixlm-it t5gemma-9b-9b-prefixlm-it t5gemma-9b-9b-prefixlm-it t5gemma-9b-2b-prefixlm t5gemma-9b-2b-prefixlm t5gemma-9b-9b-prefixlm t5gemma-9b-2b-prefixlm-it t5gemma-9b-2b-prefixlm-it t5gemma-xl-xl-prefixlm-it t5gemma-xl-xl-prefixlm-it t5gemma-xl-xl-prefixlm-it t5gemma-xl-xl-prefixlm-it t5gemma-2-4b-4b t5gemma-2-4b-4b t5gemma-xl-xl-prefixlm t5gemma-xl-xl-prefixlm t5gemma-xl-xl-prefixlm-it t5gemma-xl-xl-prefixlm-it t5-11b t5-11b mt5-xxl mt5-xxl t5-11b t5-11b t5gemma-9b-2b-prefixlm t5gemma-9b-2b-prefixlm t5gemma-9b-2b-prefixlm-it t5gemma-9b-2b-prefixlm-it mt5-xxl mt5-xxl t5-11b t5-11b mt5-xxl mt5-xxl 
+
+Backend (fill) 
+
+PyTorch Triton JAX 
+
+Dtype (ring) 
+
+bfloat16 float32 Figure 13: Benchmarking Encoder-only and Encoder-Decoder between 4B and 32 B models. Log-log plot where the diagonal parity line indicates equal performance. Axon vs. Transformers: Gemma-3 270M Training Loss     
+
+> 2000 steps | bs=4 | seq=512 | bfloat16 | ccdv/arxiv-summarization 2.50 3.00 3.50 4.00 0500 1000 1500 2000
+> 2.506 2.506
+
+Step Loss (CE) Axon Transformers Figure 14: Training of Gemma 3 270M on summarization task for 2000 steps, demonstrating identical training behaviour between conventional Transformers-definition and Axon derived PyTorch model. Note the Axon and Transformers loss curves are on top of each other together. Listing 14: Axon Grammar. 
+
+# Axon Grammar (Current Authoring Form) ## Indentation -sensitive (Python -style INDENT /DEDENT tokens). # " --" starts a comment outside strings. # Newlines are significant; _NL tokens carry indentation context. # The NAME terminal is permissive : it matches qualified identifiers # including ":: ", "@", and "." internally (e.g. ns :: op, mod @path, ns.mod). ## Authoritative source : brainsurgery /synapse /axon /parse /grammar.py # (Lark LALR grammar with custom indentation post -lexer). ## Some parser -only constructs (parallel arg_expr hierarchy, nl_gap /arg_ws # whitespace gaps for multi -line pipe /ternary /if expressions) are omitted # for clarity; see grammar.py for the full Lark grammar. program ::= { top_item NEWLINE } ;top_item ::= definition_decl | global_binding | import_decl | export_decl | pragma | type_alias_decl ;# -- Module definitions --
+
+definition_decl ::= [ signature NEWLINE ] definition ;signature ::= mod_decl ":: " signature_type ;signature_type ::= type_expr { "-> " type_expr } ;definition ::= mod_decl { def_param } "=" expr ;mod_decl ::= module_name { "@" NAME } ;module_name ::= NAME { "." NAME } ;def_param ::= NAME | "?" NAME "=" def_param_simple | "?" NAME "=" "(" expr ")" ;def_param_simple ::= literal | NAME ;# -- Global bindings --
+
+global_binding ::= module_name "<-" expr ;# -- Imports --
+
+import_decl ::= "import" import_item { "," import_item } ;import_item ::= module_name [ import_members ] ;import_members ::= "(" [ NAME { "," NAME } [ "," ] ] ")" | NAME { NAME };# -- Exports --
+
+export_decl ::= "export" export_members ;export_members ::= "(" [ NAME { "," NAME } [ "," ] ] ")" | NAME { NAME };# -- Pragmas --
+
+pragma ::= "{ -#" NAME pragma_value "# -}" ;pragma_value ::= tuple_expr | list_expr | literal ;# -- Type aliases --
+
+type_alias_decl ::= "type" NAME [ type_alias_params ] "=" type_expr ;type_alias_params ::= "[" type_alias_param { "," type_alias_param } "]" ;type_alias_param ::= NAME | ".. " NAME ;# -- Type expressions --
+
+type_expr ::= type_optional ;type_optional ::= "?" type_optional | type_tuple | type_list | type_tensor | type_name ;type_tuple ::= "(" type_expr "," type_expr { "," type_expr } [ "," ] ")" ;type_list ::= "List" "[" type_expr "]" ;type_tensor ::= type_name "[" type_dim_expr { "," type_dim_expr } "]" ;type_name ::= NAME ;type_dim_expr ::= type_dim_term { (" +" | "-") type_dim_term } ;type_dim_term ::= type_dim_factor { (" *" | "/" | "type_dim_factor ::= NUMBER | ".. " type_name | type_name | "(" type_dim_expr ")" ;# -- Statements --
+
+statement ::= for_statement | for_bind_statement | if_statement | scope_bind_statement | return_statement | yield_statement | bind_statement ;for_statement ::= "for " [ for_scope ] NAME "<-" range_expr [ for_step ] [ for_carry ]( "do " suite | bind_expr );for_bind_statement ::= target_list "<-" "for " [ for_scope ] NAME "<-" range_expr [ for_step ] [ for_carry ]( "do " suite | bind_expr );for_scope ::= "@" scoped_name ;for_step ::= "step " "=" expr ;for_carry ::= "carry " "(" target_list ")" ;if_statement ::= "if " expr "then " "do " suite "else " "do " suite ;scope_bind_statement ::= target_list " <-" "scope " scope_ref { scope_bind_kwarg } "do " suite ;scope_bind_kwarg ::= NAME "=" kwarg_value ;scope_ref ::= path_lit | [ "@" ] scoped_name | [ "@" ] STRING ;scoped_name ::= scoped_part { "." scoped_part } ;scoped_part ::= NAME | TEMPLATE_NAME ;return_statement ::= "return " expr_list ;yield_statement ::= "yield " expr_list ;bind_statement ::= target_list "<-" expr ;target_list ::= NAME { "," NAME } ;expr_list ::= expr { "," expr } ;# -- Suites (statement blocks) --
+
+suite ::= inline_suite [ block_suite ]| block_suite ;inline_suite ::= inline_statement { ";" inline_statement } [ ";" ] ;inline_statement ::= return_statement | yield_statement | bind_statement ;block_suite ::= INDENT { statement_line NEWLINE } DEDENT ;statement_line ::= statement { ";" statement } [ ";" ] ;# -- Range expressions --
+
+# [a .. b) half -open : from =a, to =b (default) # (a .. b] open -closed : from =a+1, to =b+1# [a .. b] closed -closed : from =a, to =b+1range_expr ::= range_start expr ".. " expr range_end ;range_start ::= "[" | "(" ;range_end ::= "]" | ")" ;# -- Expression hierarchy --
+
+# Precedence (low to high) :
+
+# ascribe >> bind (>>= ) >> pipe (|> ) >> ternary /if >> or >> and >> cmp # >> add >> mul >> application (bare -call) >> atom ## Multi -line variants of if /ternary (with INDENT /DEDENT around branch # values) and multi -line pipe /bind chains (with nl_gap newlines) are # also accepted; see grammar.py for details. expr ::= expr_core [ ":: " type_expr ] ;expr_core ::= do_expr | bind_expr ;do_expr ::= "do " suite ;bind_expr ::= pipe_expr [ ">>= " lambda_expr ] ;lambda_expr ::= "\" NAME "-> " expr ;pipe_expr ::= ternary_expr { "|> " ternary_expr } ;ternary_expr ::= if_expr | or_expr "?" tuple_value ":" tuple_value | or_expr ;if_expr ::= "if " expr "then " tuple_value "else " tuple_value | or_expr ;or_expr ::= and_expr { "or " and_expr } ;and_expr ::= cmp_expr { "and " cmp_expr } ;cmp_expr ::= add_expr { CMP_OP add_expr } ;add_expr ::= mul_expr { (" +" | "-") mul_expr } ;mul_expr ::= app_expr { (" *" | "/" | "app_expr ::= NAME bare_arg { bare_arg }| atom ;bare_arg ::= NAME "=" arg_expr # keyword argument | arg_expr # positional argument ;# arg_expr mirrors the full expr precedence hierarchy (or/and/ cmp /add /mul /# if/ ternary /do/ ascribe) but excludes bare tuple expressions at the atom # level -- use "(expr)" for parenthesized single -value arguments. # See grammar.py (arg_expr through arg_mul) for the parallel hierarchy. kwarg_value ::= arg_expr ;tuple_value ::= expr { "," expr } [ "," ] ;atom ::= tuple_expr | "(" expr ")" | list_expr | literal | NAME ;tuple_expr ::= "(" expr "," expr { "," expr } [ "," ] ")" ;list_expr ::= "[" [ expr { "," expr } [ "," ] ] "]" ;# -- Literals --
+
+literal ::= NUMBER | "true" | "false" | "null" | STRING | path_lit ;path_lit ::= PATH_LIT ;# -- Terminals --
+
+NAME ::= /[A -Za -z_]( ?: [A -Za -z0 -9_ :@ ]|\.( ?!\.)) */ 
+
+# Greedy : matches ns :: op, mod @path, Act.swiglu as one token. ;TEMPLATE_NAME ::= /\{[A -Za -z_][A -Za -z0 -9_] *\} / ;NUMBER ::= /-? [0 -9] +(\.[0 -9] +)?([eE][ +-]?[0 -9] +)?/ ;STRING ::= /"([^"\\]|\\.) *"|’([^’\\]|\\.) *’/ ;PATH_LIT ::= /@@? 
+
+,→ ’([^’\\]|\\.) *’| @@? ([A -Za -z_][A -Za -z0 -9_] *|[0 -9] +)(\.([A -Za -z_][A -Za -z0 -9_] *|[0 -9] +)) */ 
+
+# @@ abs.path @rel.path @’escaped path’ @@ ’abs escaped’ ;CMP_OP ::= "== " | "!= " | "<= " | ">= " | "<" | ">" ;NEWLINE ::= /(\r ?\n[ \t] *)+/ ;COMMENT ::= /--[^\n] */ ;INDENT ::= /* emitted by indentation post -lexer */ ;DEDENT ::= /* emitted by indentation post -lexer */ ;

@@ -6,26 +6,38 @@
 </div>
 
 ## 每次日报
-- 最新运行日期：2026-08-23
-- 运行时间：2026-08-23 19:09:34 UTC
+- 最新运行日期：2026-08-24
+- 运行时间：2026-08-24 20:43:23 UTC
 - 运行状态：成功
-- 本次总论文数：2
-- 精读区：1
-- 速读区：1
+- 本次总论文数：6
+- 精读区：3
+- 速读区：3
 
 ### 今日简报（AI）
-今日精读2篇论文，聚焦LLM缓存淘汰策略与量化Agent显存稳定性；最值得关注的是缓存策略在不同工作负载下表现差异显著，需结合容量与编码器选择；建议普通读者优先关注缓存效率优化，动手实验前先明确自身负载特征。
-- 详情：[/202608/23/README](/202608/23/README)
+今日推荐阅读聚焦大模型压缩与部署，精读两篇高分开创性工作；最值得关注的是VLM的2.7-bit量化（Llama-Mobile，9.0分）与结构化剪枝补偿方法（COEC，8.0分）。建议优先精读Llama-Mobile，了解如何在极低比特下高效运行视觉语言模型。
+- 详情：[/202608/24/README](/202608/24/README)
 
 ### 精读区论文标签
-1. [Which Eviction Policy Should an LLM Cache Use? A Systematic Study Across Workloads, Capacities, and Encoders](/202608/23/2608.20280v1-which-eviction-policy-should-an-llm-cache-use-a-systematic-study-across-workloads-capacities-and-encoders)  
+1. [Llama-Mobile: Efficient 2.7-Bit Quantization of VLMs](/202608/24/2608.21134v1-llama-mobile-efficient-27-bit-quantization-of-vlms)  
+   标签：评分：9.0/10、query:edge-llm
+   evidence：面向资源受限设备的移动端VLM 2.7比特量化与Arm CPU高效推理
+2. [COEC: Calibrated Orthogonal-Equivalence Compensation for Structured Pruning of Large Language Models](/202608/24/2608.21142v1-coec-calibrated-orthogonal-equivalence-compensation-for-structured-pruning-of-large-language-models)  
    标签：评分：8.0/10、query:edge-llm
-   evidence：面向 LLM 服务系统的缓存驱逐策略系统性研究
+   evidence：面向LLM减支与推理成本降低的无训练结构化剪枝补偿
+3. [SPICE: Speculative Prefetching with Low-Rank Expert Surrogates and Heterogeneous Orchestration for MoE Inference Acceleration](/202608/24/2608.21240v1-spice-speculative-prefetching-with-low-rank-expert-surrogates-and-heterogeneous-orchestration-for-moe-inference-acceleration)  
+   标签：评分：8.0/10、query:edge-llm
+   evidence：面向MoE推理的CPU-GPU异构编排与推测式预取，契合异构计算运行时主题
 
 ### 速读区论文标签
-1. [Anatomy of a Quantized Agent: VRAM Stability and Forecasting in Code-Synthesis Agentic Workloads](/202608/23/2608.15117v1-anatomy-of-a-quantized-agent-vram-stability-and-forecasting-in-code-synthesis-agentic-workloads)  
+1. [Bern2Edge: A Neurosymbolic Compiler for Edge Deployment via Bernstein Polynomial Networks](/202608/24/2608.20497v1-bern2edge-a-neurosymbolic-compiler-for-edge-deployment-via-bernstein-polynomial-networks)  
    标签：评分：7.0/10、query:edge-llm
-   evidence：量化LLM推理的峰值VRAM预测分析，用于内存感知调度
+   evidence：基于编译器的边缘部署与伯恩斯坦多项式高效硬件表示，契合软硬件协同设计
+2. [Jacobian-guided Noise Injection for Quantization Robustness in Large Language Models](/202608/24/2608.20988v1-jacobian-guided-noise-injection-for-quantization-robustness-in-large-language-models)  
+   标签：评分：7.0/10、query:edge-llm
+   evidence：面向量化鲁棒性的训练策略，支持低比特LLM部署
+3. [Write Once, Run Everywhere: The Axon DSL for Shape-Safe and Framework-Agnostic LLM Architectures](/202608/24/2608.19889v1-write-once-run-everywhere-the-axon-dsl-for-shape-safe-and-framework-agnostic-llm-architectures)  
+   标签：评分：6.0/10、query:edge-llm
+   evidence：面向LLM架构的框架无关DSL，支持跨serving框架的可移植性
 
 
 <div class="dpr-home-promo-card">
