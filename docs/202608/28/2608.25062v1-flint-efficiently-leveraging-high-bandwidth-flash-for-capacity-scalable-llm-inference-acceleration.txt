@@ -1,0 +1,640 @@
+Title: FLINT: Efficiently Leveraging High Bandwidth Flash for Capacity-Scalable LLM Inference Acceleration
+
+URL Source: https://arxiv.org/pdf/2608.25062v1
+
+Published Time: Thu, 27 Aug 2026 00:08:15 GMT
+
+Number of Pages: 13
+
+Markdown Content:
+# FLINT: Efficiently Leveraging High Bandwidth Flash for Capacity-Scalable LLM Inference Acceleration 
+
+*Geraldo F. Oliveira † *Arash Tavakkol † Xiangyu Zhu † Ahmet Caner Yüzügüler †
+
+Vamanan Arulchelvan † Lukas Cavigelli † Renzo Andri † Mohammad Sadrosadati †
+
+Jia Xinglei ‡ Onur Mutlu § Zhou Ke ∇ Shai Bergman † Ji Zhang ‡† Huawei Technologies Switzerland AG ‡ Huawei Technologies Co., Ltd. § ETH Zürich ∇ HUST 
+
+Large language model (LLM) inference is increasingly con-strained by accelerator memory capacity rather than com-pute throughput. This constraint is especially acute in single-accelerator and small-node inference systems, where limited on-package memory capacity restricts the size of deployable models. High bandwidth flash (HBF) is an emerging 3D-stacked NAND flash technology that provides multi-terabyte near-accelerator capacity, making it a promising capacity tier for storing LLM weights. However, existing HBF-based proposals face three adop-tion challenges: they (i) rely on coarse-grained static prefetching for LLM weights aiming to hide the μs -level read latency of the NAND flash device while maximizing HBF’s read through-put, (ii) expose NAND flash management tasks (e.g., refresh operations) to the accelerator-visible critical inference path, and (iii) miss optimization opportunities to specialize and optimize the flash-management mechanisms to the workload behavior. Our goal is to design an efficient HBF substrate that integrates HBF as a memory-capacity tier alongside high bandwidth mem-ory (HBM) while addressing these three challenges. To this end, we propose FLINT (flash inference tier), a workload-driven HBF substrate for capacity-scalable LLM inference. FLINT introduces three mechanisms: (i) a hardware burst-buffer controller that 
+
+dynamically coalesces and pipelines HBF reads aiming to utilize existing NAND flash buffers while sustaining high HBF band-width, (ii) a phantom-plane refresh mechanism, which removes refresh from the critical inference path by moving refresh-related NAND flash operations outside the read foreground back via low-cost resource duplication, and (iii) a read-only flash translation layer (FTL) , which replaces solid-state drive (SSD)-class support for arbitrary writes with a compact table that translates logical weight bursts to physical HBF locations. We evaluate FLINT across dense and mixture-of-experts (MoE) LLM inference models. Our evaluation shows that FLINT im-proves decode throughput by 1,205 ×, 2.2 ×, and 6.2 ×, and re-duces energy consumption by 408 ×, 1.1 ×, and 6.8 × that of an SSD-equipped GPU system, an HBM-only GPU system, and a prior hybrid HBM+HBF GPU system, respectively. FLINT meets a 50 ms time per output token (TPOT) service-level objective (SLO) with 3.1× fewer GPU packages than the HBM-only GPU system. FLINT adds small area cost to an HBF die (3.1 %) and HBF base die (3.9 mm 2 at 7 nm). 
+
+> *Geraldo F. Oliveira and Arash Tavakkol are co-primary authors.
+
+1. Introduction 
+
+The progress of large language models (LLMs) [1–7] is increas-ingly shaped by a widening mismatch between model size and accelerator memory capacity [8–11]. On the algorithmic side, parameter counts have grown from hundreds of millions in early transformer-based models [1, 12] to hundreds of bil-lions and, most recently, trillions in frontier models such as Qwen3-235B-A22B [13] (235 B total parameters), Llama-4 Mav-erick [14] (400 B), Llama 3.1-405B [4] (405 B), DeepSeek-V3 [7] (671 B), Kimi K2 [15] (1 T), and DeepSeek V4 [6] (1.6 T). At inference time, this parameter growth becomes a memory-capacity problem , since serving a model requires keeping its weights resident near the accelerator, and weight capacity scales with parameter count. For example, in 16-bit brain floating-point (BF16) precision [16], model weights require two bytes per parameter, so weights alone require on-package storage capacity of roughly 1.3 TB for DeepSeek-V3 and 810 GB for Llama 3.1-405B. Recent frontier models cut the storage cost of each parameter by shipping in narrow bit-width data for-mats, such as the 8-bit floating-point (FP8) [17] weights of Llama-4 Maverick and Kimi K2, or mixed data formats, such as the FP8 weights with 4-bit floating-point (FP4) [18] experts in DeepSeek-V4-Pro. However, narrow bit-width data formats do not remove the capacity requirement: Kimi K2 still requires 1.0 TB of weights at its native precision, and DeepSeek-V4-Pro still requires 795 GB, before accounting for KV (key–value) cache, activations, and runtime metadata. On the hardware side, the required storage for weight pa-rameters alone significantly exceeds the on-package memory capacity of recent high-end GPUs [19–21], which provide only 80–192 GB of on-package memory capacity, often via multi-ple high bandwidth memory (HBM) [22, 23] stacks per GPU package [19–21]. Consequently, deploying frontier-scale LLMs often requires partitioning a model across multiple accelera-tors [10, 24–27], increasing deployment cost and introducing interconnect-induced bottlenecks when partial states must be communicated across devices [10, 28, 29]. In large-batch data-center serving, the workload exploits the arithmetic through-put and memory bandwidth that the added accelerator pack-ages supply for increased performance, and together they hold the model’s weights through tensor, pipeline, or expert paral-lelism [24, 28, 29]. However, in small-batch single-accelerator and small-node inference settings, such as edge servers, work-stations, laptops, and mobile-class systems, adding many accel-
+
+1arXiv:2608.25062v1 [cs.AR] 25 Aug 2026 erator packages solely for model capacity is often physically and commercially impractical [30–32], even when a single ac-celerator package could potentially provide enough arithmetic and memory throughput for deployment. To address the memory-capacity wall, memory vendors [33, 34] and recent academic proposals [35–39] have explored emerging memory technologies as a near-accelerator ca-pacity tier. A prominent example is high bandwidth flash (HBF) [33, 34], which stacks dense 3D NAND flash dies in an HBM [22, 23, 40]-form-factor to provide multi-terabyte ca-pacity per stack with TB/s-class memory bandwidth. A com-mon approach to integrating HBF into the accelerator mem-ory subsystem uses die-to-die (D2D) links [41] to daisy-chain HBF with HBM, which allows expanding on-package capacity while preserving accelerator pin count and simplifying mem-ory controller integration [34–36]. In this organization, LLM weights are preloaded into HBF before inference, allowing HBM to remain available for latency-critical and dynamically generated state, such as the KV cache and intermediate acti-vations that otherwise could incur high write latency over-heads and endurance concerns to the HBF memory tier [42]. Thus, HBF effectively serves as a read-only , on-package mem-ory capacity tier for model parameters, making it especially compelling for reducing capacity-driven accelerator count in single-accelerator and small-node inference systems. Since HBF is built from NAND flash rather than DRAM, its read la-tency is expected to be microsecond-scale [34–36], roughly one to two orders of magnitude higher than HBM [23]. To hide this latency and allow HBF to reach read bandwidth on par with HBM, prior designs [34–36] exploit inter-layer weight prefetch-ing [43] alongside plane-level parallelism [44–46]: while the accelerator computes the current layer using weight blocks already placed in an SRAM staging buffer in the HBM base die, compiler- or programmer-directed prefetching commands move coarse-grained weight blocks belonging to the next layer from HBF into the SRAM staging buffer via a single coordinated multiple-plane flash read operation that collectively returns megabytes’ worth of weight data (i.e., a burst ). Subsequent accelerator requests for model weights, which are forwarded to HBF as fine-grained cache misses from the accelerator’s last-level cache (LLC), can then be served from the staging buffer rather than directly from HBF, hiding raw NAND flash access latency. In principle, this allows the accelerator to approach HBM-side peak memory throughput when the staging buffer is sized to cover the latency–bandwidth product implied by Little’s law [47] and when prefetches arrive timely. Although HBF offers a promising path to expand near-accelerator memory capacity for LLM inference, existing HBF proposals [34–36] either oversimplify or leave unresolved several challenges. First, prior designs [34–36] rely on ex-plicit SRAM staging buffers and static coarse-grained compiler-emitted prefetch hints to hide HBF read latency. Our analysis (§3) shows that this approach leaves two inefficiencies. ( i) The dedicated SRAM staging buffer introduces avoidable area over-head, because HBF already contains per-plane page and cache buffers that can collectively stage weight blocks. ( ii ) Static coarse-grained compiler-emitted prefetch hints cannot reliably align HBF burst issue with the fine-grained cache line demand stream, since the HBF burst consumption order depends on runtime behavior coming from both the application (such as mixture-of-experts (MoE) expert routing, token-dependent at-tention reuse) and the hardware (such as accelerator-side cache line request interleaving), which static layer-ahead prefetch hints cannot fully predict. Second, prior works [34–36] largely leave refresh management unspecified. Although HBF is used as a read-only weight tier, 3D NAND flash still requires main-tenance operations to mitigate retention loss [48–52] and read-disturb [48, 51–54]. Since in HBF, a refresh operation can take five orders of magnitude longer than an HBM accesses [23, 51], scheduling them on the accelerator’s critical request path can stall inference for the duration of the operation. Third, there are missed opportunities to specialize and optimize the flash-management layer to the workload access behavior in order to improve its efficiency and reduce its complexity. Conventional solid-state drive (SSD) flash translation layer (FTL) [51, 55–63] is designed for general-purpose storage, where out-of-place up-dates, garbage collection, and wear leveling are needed to sup-port arbitrary writes. However, these mechanisms are poorly matched to LLM inference, because weights are written once before inference and never updated. Our goal is to design an efficient HBF substrate for LLM in-ference that integrates HBF as a near-accelerator capacity tier alongside HBM, while addressing the adoption challenges iden-tified above. To this end, we propose FLINT (flash inference tier), a workload-driven HBF substrate. The key idea of FLINT is to drive the HBF substrate from the dynamic read access stream the accelerator actually produces, rather than from a 
+
+static compile-time prediction. During runtime, the accelerator issues many fine-grained HBF read requests that arrive out-of-order but concentrate on a small number of weight blocks. From that, FLINT dynamically reconstructs a coarse-grained burst request by ordering and coalescing fine-grained read requests; thus, multiple fine-grained requests are serviced with 
+
+one coordinated multi-plane NAND page-read latency. FLINT applies the same principle to read-disturb mitigation and to address translation via three mechanisms. First, FLINT replaces compiler-driven prefetching with a hardware burst-buffer controller co-located with the HBF base die. Because LLM inference accesses weights through pre-dictable burst-granularity sweeps, the burst-buffer controller serves cache line requests to the active burst and proactively is-sues an HBF request to the next burst identified by a lookahead window before the active burst finishes draining. This keeps the HBF channel continuously occupied. While the current burst streams to the accelerators, FLINT has already issued the next burst request to HBF, because it times that request from the progress of the active burst rather than from a pro-gram point fixed at compile time. By moving burst timing into hardware, FLINT provides two main benefits. It ( i) eliminates compiler-inserted prefetch directives and keeps the HBF tier 2transparent to existing inference kernels and software stacks; and ( ii ) removes the need for a dedicated SRAM staging buffer, since the page and cache buffers already present inside each HBF die collectively provide enough buffering for two in-flight bursts. Second, FLINT introduces phantom-plane refresh , a continu-ous refresh mechanism that exploits the read-only nature of LLM weight access. Each HBF die is provisioned with N +1 
+
+physical planes for an N -plane application address space. At any moment, exactly one of the N +1 physical planes is offline and plays the role of phantom plane , while the remaining N
+
+planes serve read requests at full bandwidth. When a block on a live plane A reaches its read-disturb threshold, the phantom-plane refresh controller forks the block’s contents from the foreground read path and programs an error correction code (ECC)-corrected copy into a free block of the phantom plane, using P ’s independent program circuitry and avoiding con-tention with the reads on A. Since flash programming opera-tions are only executed in P , such operations (which dominate a refresh’s cost) never occupy a plane that is serving decode reads. Third, FLINT adopts a simplified, read-only FTL design 
+
+matched to the regularity of LLM weight access. Because each HBF access fetches a full burst, address translation is main-tained at burst granularity rather than page granularity. For a 512 GB Gen-1 HBF stack with 2 MB bursts, this requires only 256 K entries, 512 × fewer than a conventional page-level SSD FTL [51, 55], because one burst entry replaces the 512 page entries it fetches in parallel. The resulting FTL reduces to a burst translation table, a block-granular relocation table, and one read counter per block, together 1.8 MB per stack, which replaces the large, latency-sensitive metadata path of an SSD-class FTL with a compact, constant-time structure that fits in the HBF base die. We evaluate FLINT on six production LLMs: five MoE models (DeepSeek-V3 [7], DeepSeek-V4-Pro [6], Qwen3-235B-A22B [13], Llama-4 Maverick [14], and Kimi K2 [15]) and one dense model (Llama-3.1-405B [4]). We compare FLINT against three baselines: ( i) HBM+SSD , a single-GPU system that spills model weights to fast off-package SSDs once they exceed HBM capacity; ( ii ) HBM-only , a multi-GPU system that shards the model across enough GPU packages to keep all weights in aggregate HBM; and ( iii ) H3 [34], a prior HBM+HBF design that relies on an HBM-side staging buffer and compiler-emitted layer-ahead prefetch hints. Our results show that FLINT ( i) sus-tains 6.2× higher effective HBF throughput than prior HBF designs; ( ii ) improves decode throughput by 1,205 ×, 2.2×, and 
+
+6.2×, and reduces energy consumption by 408 ×, 1.1×, and 
+
+6.8× that of an SSD-equipped GPU system, an HBM-only GPU system, and a prior hybrid HBM+HBF system, respectively; (iii ) meets a 50 ms time per output token (TPOT) service-level objective (SLO) with 3.1× fewer GPU packages than the HBM-only GPU system (up to 8×); and ( iv ) incurs small area cost to an HBF die ( 3.1 % ) and HBF base die (3.9 mm 2 at 7 nm). We make the following key contributions: • We identify three key adoption challenges for HBF-tiered LLM inference: coarse-grained static prefetching underuti-lizes the HBF channel, on-channel refresh oversubscribes the foreground read path, and SSD-class FTLs overprovision metadata and write-path hardware for read-only weights. • We propose FLINT, a workload-driven HBF substrate that co-designs three mechanisms around the regularity of LLM weight access: ( i) a hardware burst-buffer controller that uses the page and cache buffers already inside each HBF die in-stead of a dedicated SRAM staging buffer, ( ii ) phantom-plane refresh that keeps refresh off the decode critical path, and (iii ) a read-only FTL , which replaces SSD-class support for arbitrary writes with compact logical-to-physical address translation for HBF-resident weight bursts. • We evaluate FLINT on dense and MoE models, showing that FLINT increases decode throughput and reduces energy consumption. 
+
+2. Background 
+
+HBF-Enabled System. Recent HBF proposals [33–36] in-tegrate NAND flash memory [64] directly into the accelera-tor memory subsystem. Fig. 1 shows a representative HBF-enabled package, where xPUs, HBM stacks [22, 23, 40], and HBF stacks [33–36] are co-packaged on a silicon interposer. Each HBM stack vertically bonds 12–16 DRAM dies over a logic-bearing base die , providing 24–36 GB of capacity and 1.2– 2 TB/s of memory bandwidth per stack [23]. HBF follows a similar form factor, stacking NAND flash dies (e.g., 16) over an HBF base die to provide 512–1024 GB of capacity and 1.6– 2 TB/s of aggregate NAND bandwidth per stack [33, 34]. In both memories, thousands of through-silicon vias (TSVs) and 
+
+μbumps connect the memory dies to the base die. The base dies implement the control and interconnect logic needed to com-pose these two memories. The HBM base die contains DRAM channel controllers, refresh and ECC logic, HBM PHYs, and a D2D PHY [41] toward the xPU. Following current HBF litera-ture [34, 35, 42], the HBF base die contains the flash controller, which we model as comprising the FTL [51, 55], NAND com-mand sequencer, NAND ECC engine, and a D2D PHY toward the HBM base die. Thus, the xPU connects to HBM through one D2D link [41], while HBM connects to HBF through an-other, daisy-chaining both tiers behind a single xPU-facing shoreline budget [34]. xPU D2D D2D D2D D2D DRAM die DRAM die DRAM die DRAM die silicon interposer 
+
+> TSV μbump
+> base die high bandwidth flash high bandwidth memory flash die flash die flash die flash die
+> Figure 1: Overview of an HBF-enabled xPU package.
+
+This physical integration increases memory capacity in the xPU package, but making flash usable as an xPU memory tier 3also requires hiding NAND latency and preserving a familiar memory interface. Therefore, current proposals [34–36] expose HBM and HBF as a unified physical address space, with HBF accessed transparently through the HBM base die [34–36]. To support this model, the HBM base die adds three mechanisms. First, an address decoder partitions the address space into ( i) an HBM-resident region for latency-sensitive and write-mostly state, such as KV cache, activations, and runtime metadata, and (ii ) an HBF-resident region for read-only inference state, such as LLM weights preloaded into HBF at deployment time. The address decoder routes each xPU request (in the form of fine-grained LLC misses in a graphics processing unit (GPU)-based system) either to local HBM banks or through the HBM →HBF D2D link, to the HBF stack. Second, a latency-hiding buffer 
+
+(LHB) [34], implemented as megabyte-scale SRAM in the HBM base die, stages prefetched weight blocks from HBF. This buffer hides NAND page-read latency, which is in the microsecond range [34, 35] and two to three orders of magnitude longer than an HBM access [23]. Third, a prefetch controller consumes compiler- or programmer-emitted prefetch directives [43] and refills the LHB over the HBM →HBF D2D link. 
+
+HBF Organization. A 3D NAND flash subsystem is organized as a hierarchy of components, as Fig. 2 illustrates. An HBF stack (Fig. 1) contains multiple (e.g., 16) flash dies [33, 34]. Each 
+
+flash die (Fig. 2a) integrates tens (e.g., 32) of flash planes around a central TSV array that propagates command, address, and data signals through the die stack [35, 36]. A flash plane 
+
+(Fig. 2b) consists of hundreds (e.g., 256) of NAND flash blocks 
+
+and two small SRAM structures in the peripheral CMOS layer: the page buffer and the cache buffer [51]. The page buffer latches the page currently being sensed or programmed, while the cache buffer holds the previous sensed page. A NAND flash block (Fig. 2c) is the smallest erase unit and is organized as a 3D array of NAND strings . A NAND string is a vertical column of hundreds (e.g., 256) of flash cells along a bitline. The string connects through a string-select transistor to a bitline (BL) at the top and to a common source line at the bottom. Multiple (e.g., 4) NAND strings share each bitline through their respective string-select transistors, allowing each block to contain thousands of pages (e.g., 1024 pages). Flash cells in the same horizontal layer share a wordline (WL); together with the intersecting bitlines and the selected string, a wordline forms one page (Fig. 2, highlighted), the smallest read and program unit. With this organization, an HBF stack with 16 dies, 32 planes per die, 256–512 blocks per plane, 1024 pages per block, and 4 kB pages provides 512–1024 GB of single-level cell (SLC) (i.e., one bit per flash cell with two threshold-voltage levels) capacity per module, spanning current HBF Gen-1 and upcoming Gen-2 design points [33, 36]. 
+
+NAND Flash Operation. A flash cell stores one or more bits as charge trapped in the charge-trap layer surrounding its channel. NAND flash supports three primitive operations: 
+
+page read , page program , and block erase [51]. First, a page read 
+
+senses the threshold voltage of every flash cell on a selected wordline and transfers the data to the page buffer. Operating …cache buffer page buffer  
+
+> peripheral circuitry
+> plane #0 plane #1 plane #2 plane #3 plane #4 plane #5 plane …plane
+> i
+> (a) flash die (b) plane & peripherals
+> WL1 WL2 WLm …
+> (c) NAND flash block
+> BL1 BL2 …BLn
+> NAND string flash cell page
+> TSV blk#2 blk#1 addr. dec. cmd inter. I/O
+> Cu-pads
+> Figure 2: Overview of a NAND flash die organization.
+
+flash cells as SLC requires a single sense operation per read and yields a page-read latency tR of 1–2 μs in modern SLC NAND [33, 35, 65, 66]. Second, a page program injects charge into the cells of a selected wordline, transitioning them from the erased state to a programmed state. A programmed page 
+
+cannot be overwritten without first erasing its block. A page program takes approximately 50 μs. Third, a block erase re-moves trapped charge from every cell in a block, returning the block to the erased state, and is the only way to clear pro-grammed cells. A block erase takes approximately 3 ms [51]. 
+
+Read Disturbance in Flash. Repeated operations and time gradually shift flash cell threshold voltages, eventually causing read errors [48]. Two mechanisms dominate this drift. First, 
+
+read-disturb accumulates over many reads to the same block, because each read biases all non-selected wordlines to a high pass-through voltage [53]. Second, retention loss accumulates over time as trapped charge slowly leaks from the cells [49]. To bound the resulting bit-error rate, the flash controller peri-odically performs refresh : it reads a block, ECC-corrects any errors, reprograms the corrected data to a fresh location, and erases the stale block. Refreshing one SLC block costs one block erase, approximately 3 ms, plus one program per page, e.g., 1024 pages at approximately 50 μs each, for a total of about 55 ms [48, 51]. For SLC NAND, a block must be refreshed after roughly 10 5–10 6 reads to that block due to read-disturb, or after several years due to retention loss [51, 52]. 
+
+3. Motivation 
+
+In this section, we first highlight the opportunities that an HBF-equipped system provides for capacity-bound inference regimes. Second, we identify three major shortcomings of prior HBF architectures for LLM inference: ( i) static prefetching underutilizes the HBF channel; ( ii ) refresh competes with fore-ground reads and can saturate the HBF channel; and ( iii ) SSD-class FTLs retain unnecessary write-path machinery and over-provisioned metadata for a read-mostly inference workload. 
+
+3.1. The Case for HBF as a Capacity Weight Tier 
+
+Limitations of Capacity-Forced Scaled-Out Inference. We observe that a capacity-driven LLM inference deployment leads to communication, synchronization, and load imbalance over-heads. Fig. 3 (top) decomposes per-token time for the minimal-fit deployment (i.e., the minimal number of GPU packages 4required to store the model weights in their target data pre-cision), with a context size of 128K tokens and varying batch sizes ( bsz ∈ { 1, 4, 16 , 64 }) for six different LLMs (i.e., Llama-4 Maverick [14] with four B200 GPU packages, Qwen3-235B-A22B [13] with four B200 GPU packages, DeepSeek-V4-Pro [6] with six B200 GPU packages, Llama-3.1-405B [4] with eight B200 GPU packages, Kimi K2 [15] with six B200 GPU packages, and DeepSeek-V3 [7] with eight B200 GPU packages); see §5 for our experimental methodology. We split the per-token time into communication, synchronization, memory, and com-pute. Fig. 3 (bottom) shows how evenly the memory traffic of a decode step is spread over the GPU packages: each cell reports how far, in percent, one package’s memory-bandwidth utilization is above or below the average memory traffic. We make three observations. 050 100 Llama4-Maverick Qwen3 DSv4-Pro                                                                                                                                                                     
+
+> 1416 64 050 100 Llama3.1
+> 1416 64
+> Kimi-K2
+> 1416 64
+> DSv3
+> 0123
+> 1416 64
+> +50 -17 -17 -17 +27 -9 -8 -10 +16 -5 -6 -4 +8 0-3 -4
+> Llama4-Maverick
+> 0123
+> +2 +2 -3 -2 +2 +2 0-4 00+1 -2 0000
+> Qwen3
+> 012345
+> +9 -2 +1 -4 -1 -2 +7 -2 -2 -1 -1 -1 +4 -2 +1 0-1 -3 +3 +1 +1 -2 -1 -2
+> DSv4-Pro
+> 01234567
+> 1416 64
+> 00000000000000000000000000000000
+> Llama3.1
+> 012345
+> +18 -2 -3 -3 -4 -6 +22 +14 -12 -5 -10 -9 +6 +4 +5 +6 -11 -10 +3 +2 +1 +1 -3 -4
+> Kimi-K2
+> 01234567
+> +33 +7 -5 -3 -8 -5 -6 -13 +14 +9 -4 +2 -4 -7 -3 -6 +10 +5 +1 0-1 -4 -7 -4 +5 +1 00-1 -1 -2 -2
+> DSv3
+> −60 −40 −20 020 40 60
+> Utilization Deviation (%)
+> Over Under
+> Exec. Time Breakdown (%) Batch Size GPU Package ID Batch Size
+> Communication Synchronization Memory Compute Infeasible
+
+Figure 3: Cost of a minimum-fit HBM-only deployment at 128K tokens of context for various batch sizes: (top) execution time breakdown, (bottom) memory traffic imbalance. 
+
+First, inter-package communication and synchronization together account for 52 % to 85 % of per-token time at small batch sizes ( bsz = 1 to 4), and still 22 % to 61 % by bsz = 64 .Second, a significant portion of the execution time is spent waiting at the layer barrier (51 % to 79 % of per-token time at bsz = 1 to 4) since the physical inter-package communi-cation is rarely blocking (only 0.4 % to 9.7 % of inter-package communication blocks computation). The primary reason for the high synchronization overhead is expert routing imbalance .The busiest GPU package reads 1.4 × to 4 × the routed-expert weight bytes of the mean package over that range, falling to 1.1 × by bsz = 64 , because one token routes to at most 8 of a model’s 128–384 experts and therefore cannot load every GPU package evenly, while a larger batch routes enough tokens to reach and fill all of them. The GPU packages that finish early hold at the barrier until the busiest one arrives. Third, accelerator compute occupies only 0.1 % to 1.9 % of per-token time at bsz = 1 to 4), rising to 5.9 % by bsz = 64 .
+
+Lifting Capacity-Forced Scale-Out. To isolate what the capacity constraint alone costs, we compare the minimum-fit deployment against a capacity-lifted oracle, the same HBM-only system with the weight-capacity constraint waived, so that weights and KV cache always fit within a single GPU package. In this model, GPU packages are replicated only for the sake for higher memory and compute throughput. Fig. 4 reports the GPU packages each system needs to serve different LLM inference models within a 50 ms TPOT SLO. We make three observations. First, at bsz = 1 the oracle serves every MoE model within the SLO on a single GPU package, while the minimum-fit deployment holds four to eight, so the capacity constraint overprovisions GPU packages by 4.6× on average. Second, the overprovisioning shrinks as the batch grows but does not vanish ( 1.9× overprovisioning for bsz = 64 ). Third, dense Llama 3.1-405B provides a different trend, only saving 
+
+2× GPU packages at bsz = 1 and providing no savings at 
+
+bsz = 64 (128 packages in both systems), because reading every weight once per token demands the aggregate bandwidth of many packages. 1416 64 256                 
+
+> Llama4
+> 44441114
+> N= 4
+> Qwen3
+> 4416 64 12832
+> N= 4
+> DSv4-Pro
+> 66661146
+> N= 6
+> 1416 64 1416 64 256
+> Llama3.1
+> 8832 128 4832 128
+> N= 8
+> 1416 64
+> Kimi-K2
+> 6624 96 12416
+> N= 6
+> 1416 64
+> DSv3
+> 8832 128 12832
+> N= 8
+> GPU Packages @ 50 ms TPOT SLO
+> Batch Size
+> HBM-Only Min-Fit (Capacity Constrained) HBM-Only Oracle (Unconstrained)
+
+Figure 4: GPU packages needed to hold the model and meet the 50 ms TPOT SLO at a context size of 128K tokens. 
+
+3.2. Limitations of State-of-the-Art HBF-Based Sys-tems 
+
+Static Prefetch Underutilizes the HBF Channel. An HBF read operation begins with a NAND flash page sensing, which takes tR ns (e.g., 1–2 μs) and returns a few kilobytes of data (e.g., a 4 kB page) per plane. To approach the HBM channel’s TB/s-class bandwidth, the HBF controller must amortize this fixed page read latency across many planes: for example, a co-ordinated sense at the same (block, page) coordinate across all 512 planes of an HBF stack returns one 2 MB burst in one tR.This burst size matches the channel bandwidth-delay product, BDP = 1 TB /s × tR = 2 MB , and is therefore the minimum 
+
+granularity needed to sustain peak read HBF bandwidth. Prior HBF designs [34–36] adopt this BDP-sized operating point by provisioning two staging-buffer slots: one burst drains to the GPU while the next burst is in flight from HBF. These slots are filled using compiler-emitted, per-layer prefetch hints for model weights [43], with the goal of hiding NAND flash page-read latency from the GPU. To measure how a static controller uses the HBF channel, we run the prior-art H 3 design [34], which prefetches bursts one layer ahead in compile-time or-der, and classify every fetched byte from HBF as consumed by the GPU or wasted. Fig. 5(a) shows the wasted fraction 5of H 3’s burst traffic at a context size of 128K tokens, across 
+
+bsz ∈ { 1, 4, 16 , 64 }, and panels (b) and (c) trace the waste to its root cause. We make three observations. 025 50 75 100         
+
+> (a) Wasted HBF Traffic (%)
+> 0123
+> (b) Speedup with Oracle-Prefetch
+> Llama4 Qwen3 DSv4-Pro Llama3.1 Kimi-K2 DSv3 10 −3
+> 0.1 110
+> (c) Time to Re-Demand (× Layer Time)  static hints: thrash static hints: too late
+> bsz 1 bsz 4 bsz 16 bsz 64
+
+Figure 5: HBF channel usage under the static H 3 prefetcher. 
+
+First, the waste is large for every architecture. The MoE mod-els waste 86 % to 96 % of the traffic at every batch size. Second, the waste is not a prefetch coverage problem. Fig. 5(b) grants H3 an oracle prefetcher, a hint for every candidate burst is-sued at the same layer-ahead timing. Perfect coverage changes serving-batch throughput by at most 3 % ( 0.90 × to 1.03 × at 
+
+bsz = 16 to 64 across all six models), recovers 2.0× to 2.8× on three MoE models only at batch 1, and strictly hurts DeepSeek-V3 at every batch ( 0.83 × to 0.92 ×), because the full-coverage stream evicts live bursts to make room for prefetched ones. Third, we observe that a re-fetch either happens due to prefetch hints being too late or due to thrashing of the data in the stag-ing buffer, as Fig. 5(c) shows. In the figure, for every re-fetched burst, we measure the time from its eviction to its next demand, as a multiple of one layer’s execution time; a value of 1 means the burst was demanded again exactly one layer’s time after leaving the buffer, which is also the maximum head start a layer-ahead hint can have, so the dashed line at 1 marks the 
+
+earliest any static hint can act. Re-fetches in the lower region return sooner than that, so a hint arrives structurally too late .We note that at bsz = 1 , the entire distribution sits in the too late region in every model, with median return times of 0.12 ×
+
+to 0.45 × the layer time. Re-fetches in the upper region, which dominate at bsz = 64 , leave time for a prefetch hint to act, but the per-layer active set then exceeds the staging buffer capac-ity, so the re-issued prefetch thrashes the buffer by evicting other live bursts. 
+
+On-Channel Refresh Saturates the HBF Channel. A naïve HBF controller would refresh blocks on the same channel used by foreground reads, which is prohibitively expensive. A single block refresh costs one block erase plus one program per page: 
+
+trefresh = tERASE + 1024 × tPROG = 54 .2 ms at tERASE = 3 ms 
+
+and tPROG = 50 μs. Reading the block’s 1024 pages out before the erase adds up to 1024 × tR on top, which we conservatively omit. This is more than four orders of magnitude longer than a single page read and stalls all foreground reads to the refreshed block’s plane for the full duration. We quantify this refresh pressure under the H 3 baseline. Each flash block tolerates a conservative SLC read-disturb threshold of Ndisturb = 10 6 page reads [34, 51] before it must refresh. Intuitively, refresh opera-tions can be triggered by at least two mechanisms: ( i) in-place burst refresh , where all per-block read counters are initialized together, and all always-on blocks reach their refresh thresh-old on the same token; ( ii ) in-place distributed refresh , where per-block read counters are initialized spread apart, allowing the steady refresh stream to be interleaved with foreground reads. Fig. 6 shows the resulting refresh-induced stall per de-code step for the six LLMs at bsz = 1 and a context length of 128K tokens. We make two observations. First, in-place burst refresh stalls the HBF channel for 26 s to 22 min whenever the accumulated refreshes are due, because the aligned read counters bring thousands of blocks due simultaneously, and each block refresh operation occupies the channel for 54.2 ms. Second, in-place distributed refresh improves over burst by spreading the refresh work over the time dimension. However, the steady refresh stream still inserts 0.7 s of refresh service into every decode step on average (0.09 s to 1.8 s). Llama4 Qwen3 DSv4-Pro Llama3.1 Kimi-K2 DSv3 GMean   
+
+> 0.1 s 1 s 10 s 1 min 5 min 30 min Refresh-Induced Stall per Decode Step
+> In-Place Burst (Tail) In-Place Burst (Average) In-Place Distributed
+
+Figure 6: Refresh-induced stall per decode step. 
+
+SSD-Class FTL Overprovisions the Read Path. A conven-tional SSD FTL [51, 55] is designed for arbitrary host writes. Therefore, it includes hardware units for out-of-place updates, garbage collection, wear leveling, free-block allocation, and crash consistency. However, these mechanisms are unneces-sary for an HBF serving as a weight tier for LLM inference, where model weights are programmed once at deployment time and remain read-only during inference. Table 1 summa-rizes the major SSD-class FTL components, their approximate cost at the HBF Gen-1 SLC design point, and whether they serve the read or write path. Five of the nine components are write-only and provide no benefit for read-only weight access. The remaining read-side components either become much smaller under burst-granular translation or move off the foreground path. This motivates an HBF FTL specialized for read-only, burst-granular access rather than a direct import of SSD-class write-path machinery. 
+
+Table 1: Major SSD-class FTL components. 
+
+> Page-level L2P (1 GB DRAM) ECC engine (< 1 mm 2)Refresh sched. (counters) Bad-block map (KB table) Garbage coll. (5–30 % BW) Wear leveling (P/E ctrs.) Out-of-pl. buf. (MB SRAM) Erase-blk. alloc. (KB table) Write journal (MB SRAM)
+
+Read path ✓ ✓ ✓ ✓
+
+Write path ✓ ✓ ✓ ✓ ✓ ✓ ✓ ✓ ✓
+
+64. FLINT Overview 
+
+FLINT is a workload-driven HBF substrate whose goal is to sustain HBM-side memory throughput for LLM inference at low hardware and software overhead. The key idea of FLINT is to drive the HBF access path from the dynamic read stream the accelerator actually produces, rather than from a static 
+
+compile-time prediction, exploiting the burst-granular, read-only nature of weight access. FLINT realizes this idea with three mechanisms: ( i) a hardware burst-buffer controller (§4.1); (ii ) phantom-plane refresh (§4.2); and ( iii ) read-only FTL (§4.3). 
+
+4.1. Burst-Buffer Controller 
+
+The burst-buffer controller is a hardware unit in the HBF base die that converts the accelerator’s fine-grained cache line read stream into coarse-grained, plane-parallel HBF bursts. Its goal is to keep the HBF datapath continuously occupied without requiring an HBM-side SRAM staging buffer or prefetch hints. Fig. 7 shows the three main components of the burst-buffer controller. First, the cache request queue ( 1 in Fig. 7) buffers cache line read requests to HBF-resident weights after the HBM base die’s address decoder redirects them to the HBF base die. Second, the cl-to-page mapping table ( 2 ) groups queued cache line requests by their target (page, block) pair, using the burst-granular translation maintained by the read-only FTL (§4.3). The cl-to-page mapping table bridges the granularity mismatch between accelerator cache line requests and the NAND flash page-read primitive, since a single page-read op-eration can serve multiple cache lines that reside in the same physical page. Third, the burst scheduler ( 3 ) selects the next 
+
+(page, block) coordinate from the cl-to-page mapping table 
+
+using a predefined access-scheduling policy, e.g., first-ready, first-come-first-served [67, 68], and issues it as a burst , i.e., a plane-parallel page read at the same (page, block) coordi-nate across every plane of every flash die. cl #9 cl #32 cl #46 cl #3 cl #25 cl #4   
+
+> cache req. queue cl→page mapping
+> pg#0; blk#0 cl #3,cl #4, cl #9 pg#0; blk#1 cl #25, cl#32, cl #46
+> burst-buffer ctrl.
+> scheduling alg.
+> hbf base die
+> plane#0 plane#1 page b. page b. cache b. cache b. blk#1 blk#1 blk#0 blk#0
+> flash die
+> cl #9 cl #32 cl #46 cl #3 cl #25 cl #4
+> cache req. queue cl→page mapping
+> pg#0; blk#0 cl #3,cl #4, cl #9 pg#0; blk#1 cl #25, cl#32, cl #46
+> burst-buffer ctrl.
+> scheduling alg.
+> burst#0 pg#0;blk#0
+> hbf base die
+> plane#0 plane#1
+> flash die
+> cl #9 cl #32 cl #46 cl #3 cl #25 cl #4
+> cache req. queue cl→page mapping
+> pg#0; blk#0 cl #3,cl #4, cl #9 pg#0; blk#1 cl #25, cl#32, cl #46
+> burst-buffer ctrl.
+> scheduling alg.
+> burst#0 pg#0;blk#0 burst#1 pg#0;blk#1
+> hbf base die
+> plane#0 plane#1
+> flash die 12345678
+> step 1 step 2 step 3
+
+Figure 7: Overview of FLINT burst-buffer controller. 
+
+The burst-buffer controller operates in three main steps, as shown in Fig. 7. In the first step, cache line requests (from the accelerator) enter the cache request queue ( 1 ) and are grouped in the cl-to-page mapping table ( 2 ) according to their target 
+
+(page, block) pair. In the example, six pending cache line requests collapse into two page-level groups, (pg#0, blk#0) 
+
+and (pg#0, blk#1) , each covering three requests. In the sec-ond step, the burst scheduler dequeues the first page-level group (following the pre-defined scheduling algorithm) and issues it as burst#0 , targeting (pg#0, blk#0) ( 3 ). Each plane activates blk#0 and senses pg#0 in parallel ( 4 ), paying one NAND flash page-read latency to fill its page buffer with the plane-resident slice of burst#0 ( 5 ). In the third step, while 
+
+burst#0 drains from the page buffers to the HBM base die over the D2D link and then to the accelerator, the scheduler is-sues burst#1 , targeting (pg#0, blk#1) ( 6 ). Each plane senses 
+
+blk#1 ’s pg#0 in parallel ( 7 ); the new data fills the page buffer, while burst#0 ’s data moves into the cache buffer and contin-ues draining ( 8 ). Because the page and cache buffers are dis-tinct per-plane latches, the NAND flash sense for the next burst overlaps with the I/O drain of the current burst. In steady state, the controller presents one complete burst to the HBM base die every drain interval, rather than every page-read latency plus drain interval. This is the timing condition required to reach peak HBF read bandwidth. The pipeline is self-sustaining: the cl-to-page mapping table observes the pending request stream, and the scheduler can issue the next burst as soon as the current burst moves from the page buffers to the cache buffers. Thus, FLINT exploits the existing per-plane page and cache buffers in HBF to hide NAND page-read latency without compiler-inserted prefetches or a dedicated SRAM latency-hiding buffer. 
+
+4.2. Phantom-Plane Refresh 
+
+Phantom-plane refresh is a background-maintenance mecha-nism that removes NAND flash refresh from the accelerator-visible read path. The mechanism provisions one additional physical flash plane per flash die and uses it as a rotating 
+
+phantom-plane . At any time, N logical planes serve foreground flash reads (from the accelerator), while the extra phantom-plane absorbs refresh traffic in the background. Each block carries a read counter that trips at the read-disturb threshold, with trip-points staggered so that blocks fall due as a steady trickle rather than a storm (Sec. 3); a due block of the current source plane receives an ECC-corrected copy, page by page, into a free block of the phantom-plane. Once a block’s copy completes, the phantom-plane refresh controller remaps that block in a block-granular relocation table, erases the vacated block, and returns it to the free-block pool. The vacated blocks of the source plane accumulate into the next phantom-plane, so the phantom role rotates round-robin through the physi-cal planes and every plane is reprogrammed once every N +1 
+
+rotation periods Trot .Fig. 8 shows the four new hardware structures that com-pose the phantom-plane refresh controller (plus the standard ECC engine). First, the per-block refresh state holds one read counter per block, which triggers refresh at the staggered dis-turb threshold, and the block-granular relocation table with its free-block pool, which records the physical block backing each logical block. The controller updates the relocation table one block at a time as copies complete, so every foreground read 7observes a consistent, single-cycle mapping. A small logical-to-physical (l2p) plane map records which physical plane currently holds the phantom role and masks it from the read stripe. Sec-ond, the migration bitmap tracks which (block, page) en-tries of the source plane have already been copied into the phantom-plane per-rotation. The migration bitmap is required because LLM inference rereads hot weight pages many times within a rotation period, while each page must be programmed into the phantom-plane only once. Without avoiding duplica-tion, the refresh path would try to program a page at every read, causing either an overflow over the refresh path or back-pressure foreground reads due to the mismatch between page read and programming throughput. 1 Third, a program queue 
+
+decouples bitmap admission from NAND flash programming. It accepts ECC-corrected first-occurrence pages from foreground reads and scrubber reads, and drains the deduplicated stream into the phantom-plane at the slower per-plane program rate. Fourth, the scrubber provides cold-page coverage. Foreground reads opportunistically migrate hot pages into the phantom-plane, but they may not touch every (block, page) entry of the source plane within a rotation period. Therefore, the scrubber scans the migration bitmap for entries whose bits remain clear and issues low-priority reads to those pages. The returned pages are ECC-corrected, inserted into the program queue, and programmed into the phantom-plane. migration bitmap     
+
+> phantom-plane refresh ctrl.
+> scrubber
+> hbf base die
+> (A1) live plane#0 blk#0 phantom plane (P) blk#0
+> flash die
+> ECC engine l2p plane map program queue pg#0, blk#0
+> page id [0,0] blk id logical physical #0 #0 phantom #1
+> 123465
+> Figure 8: Phantom-plane refresh controller.
+
+A phantom-plane rotation period proceeds in four main steps. First, the phantom-plane refresh controller selects one live source plane, e.g., A1, and one phantom plane, P ( 1 in Fig. 8). When a foreground request reads a page from A1, the sensed data reaches the HBF base die and passes through the ECC engine ( 2 ). The corrected codeword then forks, and one copy returns to the accelerator as the normal read response, while the other enters the refresh path. Second, the migration bitmap is consulted using the page’s (block, page) index ( 3 ). If the bit is clear, the controller sets it and enqueues the corrected page for programming into the program queue ( 4 ); if the bit is already set, the refresh copy is dropped because that page has already been migrated during the current rota-tion. Third, before the completion of the rotation period, the background scrubber walks the migration bitmap and issues low-priority reads for entries whose bits remain clear ( 5 ); the scrubber thereby also guarantees that the pass completes, and the data stays error-free, even when the system is idle, and         
+
+> 1Per plane, an SLC read path can deliver roughly 4 KB /2μs≈2 GB /s,whereas the program path absorbs only 4 KB /50 μs≈80 MB /s.
+
+no HBF reads arrive. Fourth, when all bitmap entries are set, 
+
+P contains a complete ECC-correct copy of A1 ( 6 ). As each block’s bitmap entries fill, the controller remaps that block in the block-granular relocation table to its fresh copy in P ,erases the vacated block, and returns it to the free-block pool; when all of A1’s blocks have migrated, the drained plane’s blocks form the pool for the next rotation and A1 becomes the next phantom-plane (not shown). The per-plane program throughput sets the rotation step, 
+
+Trot ≥ Cplane /BW prog = 12 .5 s , so a full pass over all N +1 
+
+planes completes in about seven minutes, four orders of magni-tude inside the SLC retention margin that cold blocks require. Hot blocks instead refresh on their counters’ schedule, and their worst measured demand of 0.86 GB/s per stack (Sec. 3) fits inside the 1.28 GB/s that the sixteen phantom-planes program. 
+
+4.3. Read-Only FTL Design 
+
+FLINT uses a read-only FTL to translate each logical LLM weight-burst request into the physical HBF (block, page) 
+
+coordinate read by the burst-buffer controller. Concretely, FLINT employs a single burst translation table in the HBF base die. Each entry maps a logical burst index to a physi-cal (block, page) coordinate. With 2 MB bursts on a 512 GB stack, the table contains 256 K entries and occupies about 1 MB of base-die SRAM, several orders of magnitude smaller than a page-granular FTL. The table is populated once from the compiler-emitted weight layout during model load and remains constant throughout inference. Thus, every foreground access performs a single-cycle SRAM lookup and obtains the physical coordinate used by the burst-buffer controller to issue the cor-responding plane-parallel read. The responsibilities normally handled by a full FTL are either unnecessary or moved off the foreground path. Out-of-place updates and garbage collection can be avoided because weights are not modified during infer-ence. Wear leveling is provided implicitly by phantom-plane refresh (§4.2), which rotates the phantom role and reprograms planes uniformly over time. The temporary exclusion of the current phantom plane is handled by the logical-to-physical plane map maintained by the refresh controller. 
+
+4.4. Write Path: Model Load and Persistence 
+
+Model Load and Address Striping. The runtime writes the model once at deployment time using a fixed mapping function that places each 2 MB burst in the physical layout expected by the burst-buffer controller. The layout ensures that one burst can be fetched by a single plane parallel NAND sense. An HBF Gen-1 SLC stack with capacity C = 512 GB 
+
+and burst size B = 2 MB contains Nburst = C/B = 2 18 
+
+bursts. Each burst is striped across all D×P = 16 ×32 = 512 
+
+planes P of the HBF stack with D dies, one 4 kB slice per plane. For burst index b ∈ [0 , N burst ) and Npg/blk = 1024 
+
+pages per block, the common physical coordinate is block( b) = 
+
+⌊b/N pg/blk ⌋ and page( b) = b mod Npg/blk . Slice s ∈ [0 , 512) of the burst is placed at this same (block, page) coordinate in die( s) = ⌊s/P ⌋ and plane( s) = s mod P . Thus, each logical burst maps to one physical (block, page) coordinate 8that is shared across all 512 planes, while the slice-to-plane assignment is implicit. The burst translation table (§4.3) stores only the compact (block, page) coordinate for each logical burst index. 
+
+Power-Loss Recovery. Although HBF is non-volatile, FLINT does not rely on preserving resident weights across an un-planned power loss. The outage duration is unbounded, and guaranteeing correctness after arbitrary retention drift would require persistent refresh state, read-disturb counters, and recovery metadata. Maintaining this state would reintro-duce write-path support that FLINT deliberately keeps off the foreground inference path. Instead, FLINT treats every power-up as a clean installation (which we estimate as taking 
+
+terase + treload ≈ 6.7 min ). 
+
+5. Methodology 
+
+We evaluate FLINT with an in-house trace-driven simulator that models the five tiers a weight read crosses, namely the streaming multiprocessorss (SMs), the on-die L2 cache, HBM, the staging buffers, and HBF. It consumes a per-SM stream of compute, memory, communication, and synchronization events produced by the WSE workload model [69]. In multi-package configurations, it charges every transfer that crosses a GPU package boundary and stalls each GPU package at a layer barrier until its peers arrive, so the multi-package baselines pay their interconnect and synchronization costs. We calibrate our HBM model against Ramulator 2.0 [70], driving it with the address streams from our LLM inference traces spanning four batch sizes and four context lengths. We observe from Ramula-tor that the sustained-to-peak HBM bandwidth is 67.8–69.9 % and does not vary with model, batch size, or context length. We faithfully model a B200-class accelerator [21], deriving arith-metic from the tensor shapes the trace carries and executing it at the product of peak throughput and a machine-utilization factor. Resolving arithmetic analytically and spending fidelity on the memory system is the same approach that recent aca-demic LLM-inference simulators take [71]. Our energy model charges memory and inter-GPU traffic per bit while GPU arith-metic is computed per operated byte. Table 2 lists our system parameters. 
+
+Workloads. We evaluate FLINT on six production LLMs, in-cluding five MoE models, namely DeepSeek-V3 [7], DeepSeek-V4-Pro [6], Qwen3-235B-A22B [13], Llama-4 Maverick [14], and Kimi K2 [15], and a dense model, Llama 3.1-405B [4]. Each model runs at its native data precision. We generate full-model decode traces with the WSE workload generator [69] at four batch sizes, bsz ∈ { 1, 4, 16 , 64 }, and four context lengths, 
+
+{2, 8, 32 , 128 } K tokens. We report results at the largest evalu-ated context length, otherwise specified. We capture routed-expert distributions for our five MoE models from a real GPU deployment serving MMLU [72] prompts, and drive every MoE trace with the measured distributions. 
+
+Baselines. We compare FLINT against three deployments. (i) HBM+SSD keeps one GPU and spills weights to an NVMe 
+
+Table 2: Simulated system configuration.                               
+
+> GPU B200 (Blackwell) [21]; 148 SMs at 2.5 GHz; 11 000 fp16 MACs/SM/cycle; MFU 0.5; L2 126 MB at 21 TB/s
+> HBM3e 192 GB, 8×1 TB /sstacks [23]; calibrated 0.70 sustained/peak; row hit/miss 70/105 ns; 20 GB KV reserve
+> HBF Gen-1 SLC [33, 34]; 4 TB, 8×(512 GB, 1 TB/s) stacks; 16 dies/stack, 32 planes/die, 256 blocks/plane, 1024 ×4 kB
+> pages/block; tR/t PROG /t ERASE = 2 μs/50 μs/3 ms
+> Reliability read-disturb 1 × 10 6senses/block; 1 × 10 5P/E cycles/block;
+> >1yr end-of-life retention; in-place block refresh 54.2 ms over 512 planes/stack
+> Staging LHB 2 MB/slot, 5000-cycle min. residency; 2 MB burst (512 page-senses); weights block-striped across stacks; D2D 1 TB/s/stack [41]
+> Interconnect NVLink, 18 ×450 GB /sper direction per GPU; 800 ns/hop; per-layer barrier convergence
+> SSD PCIe Gen5 ×4 [55]; 14 GB/s; 40 μs read
+> Energy GPU 1000 W TDP / 400 W sync spin / 100 W idle; ALU 0.32 pJ/B [71]; LHB leakage 50 mW; per bit: HBM 4, HBF read 20 (swept 10–25), HBF program 100, D2D 1, NVLink 1.3 [71], SSD 100 pJ/bit
+
+SSD once they exceed the package’s 192 GB of HBM. ( ii ) HBM-only holds the whole model in aggregate HBM with no HBF tier, sharded across the fewest packages that hold the weights alone; where the KV cache exceeds the memory capacity a package has left, we annotate the cell as capacity-infeasible 
+
+rather than re-sharding it. ( iii ) H3 [34] keeps one GPU package and stages bursts in two LHB slots with FIFO eviction, issued from compiler-emitted layer-ahead hints. We emit a prefetch hint only where a compiler could know the address before the gating layer runs. 
+
+6. Evaluation 
+
+6.1. LLM Inference Analysis 
+
+HBF Bandwidth. Fig. 9 shows the attained HBF bandwidth, decomposed into useful and re-fetched traffic (left y-axis, bars), and the re-fetch share of all HBF traffic (right y-axis, lines) for H3 and FLINT across six models and batch sizes {1, 4, 16 , 64 }
+
+at 128K context. We make three observations. First, FLINT con-verts the HBF channel into useful weight bandwidth, because it holds each fetched burst in the HBF’s page and cache buffers until the GPUs drain it. FLINT consumes 90–97 % of the HBF traffic it fetches and sustains 1.9–3.6 TB/s of useful bandwidth on the MoE models, 4.0×–14 .3× the useful bandwidth of H 3
+
+(6.2× on average across all six models). Second, H 3 moves 
+
+1.2×–1.5× more raw HBF bytes than FLINT yet re-fetches 80– 95 % of them on the MoE models, because expert-weight bursts leave its LHB before every consuming GPU reads them, so the controller reads the same NAND pages again. Third, dense Llama 3.1-405B is the boundary case: each decode token reads every weight exactly once in layer order, so H 3’s re-fetch share falls to 27 % and both controllers deliver the same 2.6 TB/s of useful bandwidth. 91 4 16 64 GMean                         
+
+> 0488 TB/s peak
+> Llama4-Maverick
+> 1416 64 GMean
+> Qwen3
+> 1416 64 GMean
+> DSv4-Pro
+> 1416 64 GMean
+> 048
+> Llama3.1
+> 1416 64 GMean
+> Kimi-K2
+> 1416 64 GMean
+> DSv3
+> 050 100
+> 050 100
+> Attained HBF Bandwidth (TB/s)
+> Re-Fetch (%) Batch Size
+> H3Useful FLINT Useful H3Waste FLINT Waste H3Re-Fetch FLINT Re-Fetch
+
+Figure 9: Attained HBF bandwidth (left y-axis, bars) and re-fetch percentage (right y-axis, lines) for H 3 and FLINT. 
+
+Performance Analysis. Fig. 10 shows per-GPU decode throughput for five configurations across six models and batch sizes {1, 4, 16 , 64 } at 128K context, normalized to the HBM-only baseline. Hatched bars mark batches whose KV cache no 
+
+longer fits the min-fit HBM-only configuration. We make four observations. First, FLINT achieves 1.5×–3.1× the per-GPU decode throughput of HBM-only ( 2.2× across all six models; up to 3.7× at bsz =1 ), because in the HBM-only baseline, the slowest GPU package dictates execution time: we observe that GPUs spend 74–85 % of decode time waiting at layer barriers at bsz =1 . In contrast, FLINT serves the same model from a single package with no cross-GPU synchronization. At larger batch sizes, the HBM-only baseline can amortize such synchro-nization overheads (synchronization drops to 22 % at bsz =64 ), which narrows the performance gap with FLINT. However, at 128K context length, the aggregate capacity of the min-fit deployment fails to hold both weights and KV cache for sev-eral models (i.e., Qwen3, Llama3.1, Kimi-K2, and DSv3), which would force the adoption of more GPU packages. Second, FLINT achieves 4.0×–14 .3× the per-GPU decode through-put of H 3 on the MoE models ( 6.2× on average across all six models), matching the useful-HBF-bandwidth ratios of Fig. 9. Third, read-disturb refresh does not change FLINT’s perfor-mance: FLINT with phantom-plane refresh (FLINT +R) deliv-ers throughput identical to FLINT in every (model , bsz ) cell. Fourth, HBM+SSD is two to three orders of magnitude slower per GPU than every on-package-memory configuration ( 396 ×–
+
+885 × below the HBM-only baseline on average). 1 4 16 64 GMean                         
+
+> 10 −3
+> 10 −1
+> 10 1
+> 414 ×
+> 359 ×
+> 405 ×
+> 407 ×
+> 396 ×
+> 2.8 ×
+> Llama4-Maverick
+> 1416 64 GMean
+> 662 ×
+> 1,066 ×
+> 1,146 ×
+> 920 ×
+> 840 ×
+> 1.9 ×
+> Qwen3
+> 1416 64 GMean
+> 427 ×
+> 808 ×
+> 1,252 ×
+> 1,419 ×
+> 885 ×
+> 1.9 ×
+> DSv4-Pro
+> 1416 64 GMean
+> 10 −3
+> 10 −1
+> 10 1
+> 503 ×
+> 424 ×
+> 266 ×
+> 115 ×
+> 462 ×
+> 1.5 ×
+> Llama3.1
+> 1416 64 GMean
+> 532 ×
+> 793 ×
+> 1,082 ×
+> 1,024 ×
+> 649 ×
+> 2.4 ×
+> Kimi-K2
+> 1416 64 GMean
+> 421 ×
+> 692 ×
+> 893 ×
+> 836 ×
+> 540 ×
+> 3.1 ×
+> DSv3
+> Per-GPU Decode Tokens/s (Normalized to HBM-only)
+> Batch Size
+> HBM+SSD HBM-only H3FLINT FLINT+R
+
+Figure 10: Per-GPU decode throughput. 
+
+Energy Analysis. Fig. 11 shows the per-token decode energy of five configurations, normalized to the HBM-only baseline. We make five observations. First, FLINT consumes 0.72 ×–
+
+0.90 × the energy per-token of the HBM-only baseline, on average across the five MoE models. This happens because the HBM-only baseline spends 17–64 % of its energy busy-waiting at layer barriers of multiple GPU packages, while FLINT avoids that by operating within a single package. The energy sav-ing is largest at bsz =1 , where FLINT consumes only 0.45 ×–
+
+0.73 × the HBM-only energy per-token (a 2.2× reduction on DeepSeek-V4-Pro), and decreases at larger batch sizes as the HBM-only baseline amortizes its barrier waits over more to-kens. Second, we observe an energy increase at the dense Llama model of 1.64 × that of HBM-only execution. This hap-pens because FLINT re-streams every weight from HBF at a higher per-bit read energy than the HBM-only baseline. Third, refresh (i.e., FLINT+R) adds at most 0.31 % of refresh program energy. Fourth, against H 3, FLINT reduces energy by 4.2×–
+
+15 .7× on the MoE models ( 1.2× on dense Llama), because H3’s high re-fetched HBF traffic (Fig. 9) increases ( i) overall HBF-side energy consumption for extra NAND read operations, and ( ii ) GPU cycles due to longer waits for weight traffic from HBF. Fifth, HBM+SSD is far more energy-intensive than every on-package-memory configuration, consuming 215 ×–692 ×
+
+the HBM-only energy (on average). 1 4 16 64 GMean                         
+
+> 14
+> Llama4-Maverick
+> 271 ×
+> 283 ×
+> 307 ×
+> 294 ×
+> 288 ×
+> 1416 64 GMean
+> Qwen3
+> 487 ×
+> 830 ×
+> 905 ×
+> 709 ×
+> 636 ×
+> 9.7 ×
+> 18.2 ×
+> 20.4 ×
+> 15.8 ×
+> 13.3 ×
+> 1416 64 GMean
+> 14
+> DSv4-Pro
+> 299 ×
+> 627 ×
+> 1,051 ×
+> 1,162 ×
+> 692 ×
+> 12.9 ×
+> 22.6 ×
+> 25.7 ×
+> 14.1 ×
+> 1416 64 GMean
+> Llama3.1
+> 233 ×
+> 198 ×
+> 130 ×
+> 59.2 ×
+> 215 ×
+> 1416 64 GMean
+> 14
+> Kimi-K2
+> 356 ×
+> 609 ×
+> 782 ×
+> 686 ×
+> 465 ×
+> 6.8 ×
+> 12.7 ×
+> 16.7 ×
+> 14.8 ×
+> 9.3 ×
+> 1416 64 GMean
+> DSv3
+> 262 ×
+> 458 ×
+> 550 ×
+> 455 ×
+> 346 ×
+> 7.3 ×
+> 9.1 ×
+> 7.7 ×
+> Per-Token Decode Energy (Normalized to HBM-only)
+> Batch Size
+> HBM+SSD HBM-only H3FLINT FLINT+R
+
+Figure 11: Per-token decode energy. 
+
+Capacity Scaling. Fig. 12 evaluates how many GPU packages each system needs to serve LLM decode at 128K context size. We evaluate four deployment options: ( i) HBM min-fit shards the model across the N GPU packages whose combined HBM holds the weights, and replicates that shard until the replicas meet the target SLO; ( ii ) the capacity-lifted oracle removes the HBM capacity constraint and serves both weights and KV cache from HBM at any GPU-package count; ( iii ) H 3 and (iv ) FLINT place the weights on HBF and shard across any measured GPU-package count. For every deployment option and total batch size, we scale the GPU-package count until the deployment meets the 50 ms TPOT SLO. We make three observations. First, FLINT follows the capacity-lifted oracle across the measured range and surpasses it on every model at 
+
+bsz =1 on a single GPU package, and on DSv3 from four GPU packages onward. FLINT surpasses the capacity-lifted oracle 10 because the oracle serves weight and reads from the same HBM channel, while FLINT streams weights over the otherwise-idle HBF channel in parallel with the HBM KV reads and serializes only at the D2D links. Second, at bsz ={1, 4}, FLINT serves five of the six models with one or two GPU packages. At 
+
+bsz =1 , a single FLINT GPU package serves each of the five MoE models within the SLO, while the HBM min-fit needs four to eight GPU packages only to hold the weights. At bsz =4 ,one FLINT GPU package still suffices for four of the five MoE models, and two for Qwen3. Dense Llama needs four FLINT GPU packages at bsz =1 and eight at bsz =4 . Third, at bsz =64 ,FLINT needs fewer GPU packages than the HBM min-fit on four of the six models (2 vs. 4 on Maverick, 32 vs. 64 on Qwen3, 16 vs. 96 on Kimi-K2, and 16 vs. 128 on DSv3), for the same reason it follows the capacity-lifted oracle. Dense Llama ties at 128 GPU packages, because its throughput, not its weight capacity, sets the GPU-package count. The single configuration where FLINT needs more GPU packages than the HBM min-fit is DSv4-Pro at bsz =64 , where FLINT’s best shard misses the SLO by 0.7 ms (50.7 vs. 50 ms) and the hard threshold forces 16 replicated GPU packages against the min-fit’s six. 1 4 16 64 10 1                                             
+
+> Llama4
+> N= 4
+> 1416 64 10 1
+> 10 2
+> 10 3
+> Qwen3
+> N= 4
+> 1416 64 10 2
+> DSv4-Pro
+> N= 6
+> 1416 64 10 2
+> 10 3
+> 10 4Llama3.1
+> N= 8
+> 1416 64 10 1
+> 10 2
+> 10 3
+> Kimi-K2
+> N= 6
+> 1416 64 10 1
+> 10 2
+> 10 3
+> DSv3
+> N= 8
+> 1864 512
+> Llama4 Qwen3 DSv4-Pro
+> 1416 64 GMean
+> 1864 512
+> Llama3.1
+> 1416 64 GMean
+> Kimi-K2
+> 1416 64 GMean
+> DSv3
+> Per-User TPOT (ms)
+> GPU Packages
+> GPU Packages @ 50 ms TPOT SLO
+> Total Batch Size
+> FLINT HBM-Only Oracle 50 ms TPOT SLO bsz 1 bsz 4 bsz 16 bsz 64 HBM-Only Min-Fit HBM-Only Oracle H3FLINT Cannot Meet SLO
+
+Figure 12: Capacity scaling at 128K context size. (top) Per-user TPOT vs. GPU packages, FLINT (blue) against the capacity-lifted HBM oracle (yellow). (bottom) GPU packages needed to serve a total decode batch within the SLO; dashed lines mark the HBM min-fit GPU-package count N .
+
+6.2. HBF Refresh & Lifetime Analysis 
+
+Refresh Execution Cost. Fig. 13 shows the impact of HBF refresh on LLM decode throughput for three refresh mecha-nisms: ( i) in-place burst refresh , ( ii ) in-place distributed refresh ,and ( iii ) FLINT’s off-path phantom-plane refresh. We use a 128K context size and bsz =1 . We make three observations. First, FLINT’s off-path refresh execution incurs no refresh over-head: FLINT matches the decode throughput of a refresh-free operation, since the target refresh block is erase-and-program outside the foreground read stream. Second, in-place refresh costs 20 × on average ( 13 ×–24 × across models), because a plane is a serial resource and every in-place refresh blocks one of the 32 serving planes for 54 ms, about 5,000 read slots. Third, in-place burst refresh concentrates its cost in one to-ken, since the counters are initialized together, thousands of blocks come due at the same time, and decode stalls 3,700 ×
+
+on average ( 303 ×–6,771 ×) at the token where their refreshes land, while the average over the whole refresh period is 4.8×
+
+(1.2×–8.5×). Llama4 Qwen3 DSv4-Pro Llama3.1 Kimi-K2 DSv3 GMean    
+
+> 110 10 2
+> 10 3
+> 10 4
+> Slowdown over Refresh-Free FLINT
+> In-Place Burst (Tail) In-Place Burst (Average) In-Place Distributed Phantom-Plane
+
+Figure 13: Decode throughput overhead due to read-disturb-induced refresh operations. 
+
+Lifetime. Fig. 14 shows how long an always-on weight block (one that decode reads every token) survives under each model’s 128K context size at bsz =1 (left y-axis) and the cor-responding lifetime at a 50-tok/s decode rate. Since vendors have not yet published an HBF endurance figure, we sweep the P/E budget from the commodity-SLC floor of 10 5 cycles to a projected 10 7. We make two observations. First, FLINT’s refresh mechanism significantly increases device lifetime. A block that corrupts within 25 seconds without refresh survives an average of ( i) 29 days of continuous decode at 10 5 P/E cycles (7–33 days on the MoE models and 1.0 year on dense Llama), (ii ) 0.8 years at 10 6 (71 days–9.7 years), and ( iii ) 8.0 years at a projected 10 7 (2.0–96.9 years). Second, by reducing re-fetching, FLINT’s burst-buffer controller contributes to an increase in de-vice lifetime. Since popular experts concentrate flash reads, we observe that the most-read block refreshes 1.1×–7.9× more often than the average one and wears out sooner. FLINT’s coa-lescing bounds the skew read distribution, because efficiently merging duplicate page requests leads to the most popular block to be read at most about once per token. Llama4 Qwen3 DSv4-Pro Llama3.1 Kimi-K2 DSv3 GMean       
+
+> 10 3
+> 10 5
+> 10 7
+> 10 9
+> 10 11
+> Total Decode Tokens
+> 6 s 7 d 71 d 2.0 yr 29 s 33 d 0.9 yr 9.0 yr 12 s 14 d 141 d 3.9 yr 5 min 1.0 yr 9.7 yr 96.9 yr 16 s 18 d 184 d 5.0 yr 25 s 29 d 0.8 yr 8.0 yr 25 s 29 d 0.8 yr 8.0 yr
+> 1 min 1 h 1 d 1 mo 1 yr 10 yr 100 yr
+> Lifetime @ 50 tok/s
+> No Refresh (block corrupts) +R, P/E 10 5+R, P/E 10 6+R, P/E 10 7
+
+Figure 14: Total decode tokens FLINT serves before the always-on block wears out, per SLC P/E budget (left y-axis), and the corresponding lifetime at a 50-tok/s decode rate (right y-axis). 
+
+6.3. Area Analysis 
+
+We estimate FLINT’s area overhead in two parts: additional storage inside each HBF die, and additional control/storage 11 structures in the HBF base die. We model all added SRAM structures with CACTI [73, 74] at 22 nm, the smallest valid SRAM node in CACTI 7, and project to 7 nm by dividing by the area-scaling factor reported by [75]. We estimate syn-thesized control logic from comparable memory-controller designs scaled to the same node. We quote per-structure areas at 22 nm, where CACTI models them, and report totals at the projected 7 nm node. Table 3 breaks down FLINT’s area cost. 
+
+Table 3: FLINT area overhead. 
+
+Structure (size) Area 
+
+HBF die: phantom-plane, 1 plane per die +3 .1% 
+
+HBF base die (mm 2 at 22 nm): Burst translation table (1 MB) 1.29 Cache-request queue + cl-to-page map (256 kB) 0.35 Migration bitmaps ( 16 ×32 kB ) 0.71 Program queues ( 16 ×0.5 MB ) 10.5 Read counters + relocation table (0.83 MB) 1.15 Synthesized control logic <0.3 
+
+Total (3.9 mm 2 at 7 nm) 14.3 
+
+Page-level FTL table (512 MB), for reference 180 at 7 nm 
+
+7. Related Work 
+
+To our knowledge, FLINT is the first HBF substrate that sustains high HBF bandwidth on the LLM decode critical path without a dedicated HBM-side SRAM staging buffer or compiler-emitted prefetch hints. FLINT co-designs a runtime-aware burst-buffer controller, phantom-plane refresh, and a burst-granular read-only FTL for immutable LLM weight ac-cess. In this section, we contrast FLINT with prior work along two themes. 
+
+HBF-Based Systems. Prior HBF-based systems for LLM infer-ence [34–37] commonly employ ( i) an HBM-side SRAM staging buffer that holds prefetched weight bursts, and ( ii ) compiler- or programmer-emitted hints fill this buffer at layer boundaries. Our analysis shows that this organization cannot saturate the HBF channel bandwidth, since static issue memory request order does not reliably match the runtime memory access order under MoE routing and attention reuse. Other HBF-related works [38, 39] are orthogonal to FLINT. MemExplorer [39] explores heterogeneous memory systems that include HBF as one possible capacity tier but does not propose new HBF control mechanisms. FLINT provides such a mechanism and raises the attainable bandwidth of the HBF tier toward the HBF bandwidth channel ceiling assumed by [39]. Lincoln [38] tar-gets LPDDR-interfaced compute-enabled flash and near-flash compute. In contrast, FLINT targets HBF attached through the HBM-side D2D link, requires no in-flash compute, and ob-tains its bandwidth from plane-parallel burst staging through unmodified NAND flash dies. 
+
+Non-Volatile Memory for LLM Inference. Several prior works [28, 30–32, 76, 77] integrate non-volatile memory into deep neural network (DNN) and LLM inference systems at sev-eral layers of the stack. FLINT differs from these systems in three ways: ( i) the non-volatile tier is on-package HBF reached through the HBM-side D2D link rather than off-package stor-age; compute remains on the GPU rather than moving into the storage device; and ( ii ) the storage-class FTL is replaced with a burst-granular read-only translation table on the HBF base die, eliminating OS-mediated page faults, page-granular meta-data, and write-path machinery from the foreground inference path. 
+
+8. Conclusion 
+
+We introduce FLINT, a workload-driven HBF substrate that specializes the HBF access path for the burst-granular, read-only behavior of LLM inference weights through three mech-anisms: a hardware burst-buffer controller that stages bursts in the buffers already inside each HBF die, phantom-plane re-fresh that keeps NAND maintenance off the foreground read path, and a read-only FTL that reduces address translation to a compact burst-granular table. We conclude that workload-specialized HBF control turns on-package flash into a practical capacity tier for frontier LLM inference. 
+
+References 
+
+[1] A. Vaswani, N. Shazeer et al. , “Attention Is All You Need,” in NeurIPS , 2017. [2] T. B. Brown, B. Mann et al. , “Language Models Are Few-Shot Learners,” NeurIPS ,2020. [3] OpenAI, “GPT-4 Technical Report,” arXiv:2303.08774 [cs.CL], 2023. [4] A. Dubey, A. Jauhri et al. , “The Llama 3 Herd of Models,” arXiv:2407.21783 [cs.AI], 2024. [5] J. Kaplan, S. McCandlish et al. , “Scaling Laws for Neural Language Models,” arXiv:2001.08361 [cs.LG], 2020. [6] DeepSeek-AI, “DeepSeek-V4: Towards Highly Efficient Million-Token Context Intelligence,” DeepSeek-AI, Tech. Rep., 2026. [Online]. Available: https://huggingface. co/deepseek-ai/DeepSeek-V4-Pro/blob/main/DeepSeek_V4.pdf [7] A. Liu, B. Feng et al. , “Deepseek-V3 Technical Report,” arXiv:2412.19437 [cs.CL], 2024. [8] A. Gholami, Z. Yao et al. , “AI and Memory Wall,” IEEE Micro , 2024. [9] J. Sevilla, L. Heim et al. , “Compute Trends Across Three Eras of Machine Learning,” in IJCNN , 2022. [10] R. Pope, S. Douglas et al. , “Efficiently Scaling Transformer Inference,” in MLSys , 2023. [11] W. Kwon, Z. Li et al. , “Efficient Memory Management for Large Language Model Serving with PagedAttention,” in SOSP , 2023. [12] J. Devlin, M.-W. Chang et al. , “BERT: Pre-Training of Deep Bidirectional Transformers for Language Understanding,” in NAACL-HLT , 2019. [13] S. Bai, Y. Cai et al. , “Qwen3-VL Technical Report,” arXiv:2511.21631 [cs.CV], 2025. [14] Meta, AI, “The Llama 4 Herd: The Beginning of a New Era of Natively Multimodal AI Innovation,” https://ai.meta.com/blog/llama-4-multimodal-intelligence/, 2025. [15] K. Team, Y. Bai et al. , “Kimi K2: Open Agentic Intelligence,” arXiv:2507.20534 [cs.LG], 2025. [16] N. P. Jouppi, D. H. Yoon et al. , “A Domain-Specific Supercomputer for Training Deep Neural Networks,” CACM , 2020. [17] P. Micikevicius, D. Stosic et al. , “FP8 Formats for Deep Learning,” arXiv:2209.05433 [cs.LG], 2022. [18] B. D. Rouhani, R. Zhao et al. , “Microscaling Data Formats for Deep Learning,” arXiv:2310.10537 [cs.LG], 2023. [19] NVIDIA, “NVIDIA A100 Tensor Core GPU Architecture,” 2022. [Online]. Available: https://www.nvidia.com/content/dam/en-zz/Solutions/Data-Center/a100/ pdf/nvidia-a100-datasheet-us-nvidia-1758950-r4-web.pdf [20] NVIDIA, “NVIDIA H100 Tensor Core GPU Architecture,” 2023. [Online]. Available: https://resources.nvidia.com/en-us-tensor-core/gtc22-whitepaper-hopper [21] NVIDIA, “NVIDIA Blackwell Architecture Technical Brief,” 2025. [Online]. Available: https://resources.nvidia.com/en-us-blackwell-architecture/blackwell-architecture-technical-brief [22] J. Kim and Y. Kim, “HBM: Memory Solution for Bandwidth-Hungry Processors,” in 
+
+HCS , 2014. [23] JEDEC, “High Bandwidth Memory (HBM) DRAM Standard,” 2022. [24] M. Shoeybi, M. Patwary et al. , “Megatron-LM: Training Multi-Billion Parameter Language Models Using Model Parallelism,” arXiv:1909.08053 [cs.CL], 2019. [25] Y. Huang, Y. Cheng et al. , “Gpipe: Efficient Training of Giant Neural Networks using Pipeline Parallelism,” NeurIPS , 2019. [26] W. Fedus, B. Zoph, and N. Shazeer, “Switch Transformers: Scaling to Trillion Param-eter Models with Simple and Efficient Sparsity,” JMLR , 2022. [27] D. Lepikhin, H. Lee et al. , “GShard: Scaling Giant Models with Conditional Compu-tation and Automatic Sharding,” arXiv:2006.16668 [cs.CL], 2020. [28] R. Y. Aminabadi, S. Rajbhandari et al. , “DeepSpeed Inference: Enabling Efficient Inference of Transformer Models at Unprecedented Scale,” in SC , 2022. 
+
+12 [29] G.-I. Yu, J. S. Jeong et al. , “Orca: A Distributed Serving System for Transformer-Based Generative Models,” in OSDI , 2022. [30] K. Alizadeh, S. I. Mirzadeh et al. , “LLM in a Flash: Efficient Large Language Model Inference with Limited Memory,” in ACL) , 2024. [31] Z. Xue, Y. Song et al. , “PowerInfer-2: Fast Large Language Model Inference on a Smartphone,” arXiv:2406.06282 [cs.LG], 2024. [32] Y. Sheng, L. Zheng et al. , “FlexGen: High-Throughput Generative Inference of Large Language Models with a Single GPU,” in ICML , 2023. [33] SanDisk, “Memory-Centric AI: SanDisk’s High Bandwidth Flash Will Redefine AI Infrastructure,” 2025. [Online]. Avail-able: https://www.sandisk.com/company/newsroom/blogs/2025/memory-centric-AI-sandisks-high-bandwidth-flash-will-redefine-ai-infrastructure [34] M. Ha, E. Kim, and H. Kim, “H 3 : Hybrid Architecture Using High Bandwidth Memory and High Bandwidth Flash for Cost-Efficient LLM Inference,” CAL , 2026. [35] H. S. Suh, “Design of GPU-HBM-HBF Architecture for Long Context Large Language Model Inference Considering Workload and Signal/Power Integrity,” Presentation, TeraByte Interconnection and Package Laboratory, KAIST, 2026. [36] J. Kim, “HBF Technology, Workload Analysis and Roadmap,” Presentation, TeraByte Interconnection and Package Laboratory, KAIST, 2026. [37] P.-K. Hsu, W. Xu et al. , “HAVEN: High-Bandwidth Flash Augmented Vec-tor Engine for Large-Scale Approximate Nearest-Neighbor Search Acceleration,” arXiv:2603.01175 [cs.AR], 2026. [38] W. Sun, M. Gao et al. , “Lincoln: Real-Time 50˜ 100B LLM Inference on Consumer Devices with LPDDR-Interfaced, Compute-Enabled Flash Memory,” in HPCA , 2025. [39] H. Wu, Z. Cao et al. , “MemExplorer: Navigating the Heterogeneous Memory Design Space for Agentic Inference NPUs,” arXiv:2604.16007 [cs.AR], 2026. [40] D. Lee, S. Ghose et al. , “Simultaneous Multi-Layer Access: Improving 3D-Stacked Memory Bandwidth at Low Cost,” ACM TACO , 2016. [41] D. D. Sharma and T. Coughlin, “Universal Chiplet Interconnect Express: An Open Industry Standard for Memory and Storage Applications,” Computer , 2024. [42] D. Son, Y. Park et al. , “Exploring High-Bandwidth Flash for Modern LLM Inference: Opportunities and Challenges,” CAL , 2026. [43] A. C. Yüzügüler, J. Zhuang, and L. Cavigelli, “PRESERVE: Prefetching Model Weights and KV-Cache in Distributed LLM Serving,” arXiv:2501.08192 [cs.AI], 2025. [44] A. R. Abdurrab, T. Xie, and W. Wang, “DLOOP: A Flash Translation Layer Exploiting Plane-Level Parallelism,” in IPDPS , 2013. [45] C. Gao, L. Shi et al. , “Parallel All the Time: Plane Level Parallelism Exploration for High Performance SSDs,” in MSST , 2019. [46] C. Gao, L. Shi et al. , “Boosting the Performance of SSDs via Fully Exploiting the Plane Level Parallelism,” TPDS , 2020. [47] J. D. Little, “A Proof for the Queuing Formula: L= λ W,” Operations Research , 1961. [48] Y. Luo, S. Ghose et al. , “Improving 3D NAND Flash Memory Lifetime by Tolerating Early Retention Loss and Process Variation,” in SIGMETRICS , 2018. [49] Y. Cai, Y. Luo et al. , “Data Retention in MLC NAND Flash Memory: Characterization, Optimization, and Recovery,” in HPCA , 2015. [50] Y. Cai, G. Yalcin et al. , “Error Analysis and Retention-Aware Error Management for NAND Flash Memory,” Intel Technology Journal , 2013. [51] Y. Cai, S. Ghose et al. , “Error Characterization, Mitigation, and Recovery in Flash-Memory-Based Solid-State Drives,” Proc. IEEE , 2017. [52] Y. Cai, S. Ghose et al. , “Reliability Issues in Flash-Memory-Based Solid-State Drives: Experimental Analysis, Mitigation, Recovery,” in Inside Solid State Drives (SSDs) .Springer, 2018. [53] Y. Cai, Y. Luo et al. , “Read Disturb Errors in MLC NAND Flash Memory: Characteri-zation, Mitigation, and Recovery,” in DSN , 2015. [54] T. Parnell, N. Papandreou et al. , “Modelling of the Threshold Voltage Distributions of Sub-20nm NAND Flash Memory,” in GLOBECOM , 2014. [55] A. Tavakkol, J. Gómez-Luna et al. , “ {MQSim }: A Framework for Enabling Realistic Studies of Modern {Multi-Queue }{ SSD } Devices,” in FAST , 2018. [56] M. Kim, J. Park et al. , “Evanesco: Architectural Support for Efficient Data Sanitization in Modern Flash-Based Storage Systems,” in ASPLOS , 2020. [57] N. Mansouri Ghiasi, J. Park et al. , “GenStore: A High-Performance In-Storage Pro-cessing System for Genome Sequence Analysis,” in ASPLOS , 2022. [58] E. Gal and S. Toledo, “Algorithms and Data Structures for Flash Memories,” CSUR ,2005. [59] A. Ban, “Flash File System,” U.S. Patent 54,044,85A, 1993. [60] Intel Corporation, “Flash Translation Layer,” Application Note AP-684, 1998. [61] N. M. Ghiasi, M. Sadrosadati et al. , “MegIS: High-Performance, Energy-Efficient, and Low-Cost Metagenomic Analysis with In-Storage Processing,” in ISCA , 2024. [62] M. Soysal, K. Koliogeorgi et al. , “MARS: Processing-in-Memory Acceleration of Raw Signal Genome Analysis Inside the Storage Subsystem,” in ICS , 2025. [63] K. Chen, R. Nadig et al. , “REIS: A High-Performance and Energy-Efficient Retrieval System with In-Storage Processing,” in ISCA , 2025. [64] R. Bez, E. Camerlenghi et al. , “Introduction to Flash Memory,” Proc. IEEE , 2003. [65] T. Shiozawa, H. Kajihara et al. , “Emerging Usage and Evaluation of Low Latency FLASH,” in IMW , 2020. [66] W. Cheong, C. Yoon et al. , “A Flash Memory Controller for 15 μs Ultra-Low-Latency SSD Using High-Speed 3D NAND Flash with 3 μs Read Time,” in ISSCC , 2018. [67] S. Rixner, W. J. Dally et al. , “Memory Access Scheduling,” in ISCA , 2000. [68] W. K. Zuravleff and T. Robinson, “Controller for a Synchronous DRAM that Maxi-mizes Throughput by Allowing Memory Requests and Commands to be Issued Out of Order,” U.S. Patent 56,300,96A, 1997. [69] HUAWEI Computing Systems Lab, “WSE Workload Generator,” https://github.com/ huawei-csl/wse-workload-generator. [70] H. Luo, Y. C. Tuğrul et al. , “Ramulator 2.0: A Modern, Modular, and Extensible DRAM Simulator,” CAL , 2023. [71] J. Park, J. Choi et al. , “AttAcc! Unleashing the Power of PIM for Batched Transformer-based Generative Model Inference,” in ASPLOS , 2024. [72] D. Hendrycks, C. Burns et al. , “Measuring Massive Multitask Language Understand-ing,” arXiv:2009.03300 [cs.CY], 2020. [73] P. Shivakumar and N. P. Jouppi, “CACTI 3.0: An Integrated Cache Timing, Power, and Area Model,” Compaq Computer Corporation, Tech. Rep. 2001/2, 2001. [74] N. Muralimanohar, R. Balasubramonian, and N. Jouppi, “Optimizing NUCA Orga-nizations and Wiring Alternatives for Large Caches with CACTI 6.0,” in MICRO ,2007. [75] A. Stillmaker and B. Baas, “Scaling Equations for the Accurate Prediction of CMOS Device Performance from 180 Nm to 7 Nm,” Integration , 2017. [76] T. Wang, R. Fan et al. , “Ripple: Accelerating LLM Inference on Smartphones with Correlation-Aware Neuron Management,” arXiv:2410.19274 [cs.LG], 2024. [77] F. Jia, Z. Wu et al. , “Scaling Up On-Device LLMs via Active-Weight Swapping Between DRAM and Flash,” arXiv:2504.08378 [cs.LG], 2025. 
+
+13
