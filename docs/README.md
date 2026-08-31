@@ -6,41 +6,41 @@
 </div>
 
 ## 每次日报
-- 最新运行日期：2026-08-30
-- 运行时间：2026-08-30 23:02:11 UTC
+- 最新运行日期：2026-08-31
+- 运行时间：2026-08-31 23:59:40 UTC
 - 运行状态：成功
 - 本次总论文数：7
-- 精读区：2
-- 速读区：5
+- 精读区：4
+- 速读区：3
 
 ### 今日简报（AI）
-今日精读2篇、速读5篇，聚焦LLM推理效率与模型压缩优化。最值得关注的是面向CPU的自回归解码架构设计，以及考虑速度-质量权衡的量化重要性指标。建议普通读者优先了解量化与稀疏化技术，以在部署中平衡性能与成本。
-- 详情：[/202608/30/README](/202608/30/README)
+今日精读聚焦大模型量化：两篇高分论文分别提出注意力混合精度量化与层位宽分配方法，均获8.0分。速读覆盖神经网络性能预测、推理早退策略及GPU能耗分析。建议关注量化技术在注意力机制上的落地，以平衡推理速度与质量。
+- 详情：[/202608/31/README](/202608/31/README)
 
 ### 精读区论文标签
-1. [Pipeline-Native Transformers: Co-Designing Model Architecture and CPU Inference for Bandwidth-Efficient Autoregressive Decode](/202608/30/2608.23841v1-pipeline-native-transformers-co-designing-model-architecture-and-cpu-inference-for-bandwidth-efficient-autoregressive-decode)  
-   标签：评分：9.0/10、query:edge-llm
-   evidence：协同设计模型架构与CPU推理运行时，实现带宽高效解码
-2. [A Layer Importance Metric for Quantization Accounting for the Speed-Quality Trade-off in Autoregressive Models](/202608/30/2608.26926v1-a-layer-importance-metric-for-quantization-accounting-for-the-speed-quality-trade-off-in-autoregressive-models)  
-   标签：评分：9.0/10、query:edge-llm
-   evidence：面向自回归模型的硬件感知层重要性量化度量
+1. [HyQuant: Hybrid-Precision Quantization for LLM Attention](/202608/31/2608.27875v1-hyquant-hybrid-precision-quantization-for-llm-attention)  
+   标签：评分：8.0/10、query:edge-llm
+   evidence：面向LLM注意力模块的混合精度量化，在精度与效率间取得平衡，是硬件感知加速的关键技术
+2. [A Method for Layer Bit-Width Allocation in LLM Quantization via Performance Maximization Under a Quality-Degradation Constraint](/202608/31/2608.28003v1-a-method-for-layer-bit-width-allocation-in-llm-quantization-via-performance-maximization-under-a-quality-degradation-constraint)  
+   标签：评分：8.0/10、query:edge-llm
+   evidence：在TensorRT-LLM中实现LLM量化层位宽分配，在质量约束下最大化延迟降低
+3. [AI Hardware Accelerators for Large Language Models: Architectures and the Memory Wall](/202608/31/2608.28048v1-ai-hardware-accelerators-for-large-language-models-architectures-and-the-memory-wall)  
+   标签：评分：8.0/10、query:edge-llm
+   evidence：面向LLM的AI硬件加速器综述，涉及存储墙与边缘部署
+4. [H-Scale: Hessian-Guided Scale Refinement for NVFP4 Sub-Byte LLM Inference](/202608/31/2608.28113v1-h-scale-hessian-guided-scale-refinement-for-nvfp4-sub-byte-llm-inference)  
+   标签：评分：8.0/10、query:edge-llm
+   evidence：面向Blackwell硬件NVFP4格式的LLM推理量化缩放宽细化
 
 ### 速读区论文标签
-1. [Compression Trinity: Exploring Sparsity, Quantization, and Low-Rank Approximations for LLM Compression](/202608/30/2608.24070v1-compression-trinity-exploring-sparsity-quantization-and-low-rank-approximations-for-llm-compression)  
-   标签：评分：7.0/10、query:edge-llm
-   evidence：联合稀疏、量化与低秩近似压缩大模型，降低计算与内存开销
-2. [Giga-Embeddings: Mixture-of-Experts Encoders for High-Throughput Text Embeddings](/202608/30/2608.23806v1-giga-embeddings-mixture-of-experts-encoders-for-high-throughput-text-embeddings)  
+1. [Node-wise Feature Encoding for Neural Performance Prediction](/202608/31/2608.27794v1-node-wise-feature-encoding-for-neural-performance-prediction)  
    标签：评分：6.0/10、query:edge-llm
-   evidence：专家混合编码器在vLLM上实现高吞吐，属于LLM服务框架相关
-3. [DataKernelBench: Can LLMs Optimize Database Queries on GPUs?](/202608/30/2608.25061v1-datakernelbench-can-llms-optimize-database-queries-on-gpus)  
+   evidence：面向边缘的节点级特征编码用于延迟和能耗预测，支持硬件软件协同设计，但非LLM专用
+2. [SABER: Stability-Aware Early Exit for LLM Reasoning via Adversarial Branch Probing](/202608/31/2608.27963v1-saber-stability-aware-early-exit-for-llm-reasoning-via-adversarial-branch-probing)  
    标签：评分：6.0/10、query:edge-llm
-   evidence：利用LLM进行CUDA/Triton算子优化，属于硬件感知加速方法
-4. [DataKernelBench: Can LLMs Optimize Database Queries on GPUs?](/202608/30/2608.25061v2-datakernelbench-can-llms-optimize-database-queries-on-gpus)  
+   evidence：无需训练的早期退出机制降低LLM推理开销
+3. [Characterization of Request and Token Energy Costs for LLM Inference Workloads on GPU Platforms](/202608/31/2608.28044v1-characterization-of-request-and-token-energy-costs-for-llm-inference-workloads-on-gpu-platforms)  
    标签：评分：6.0/10、query:edge-llm
-   evidence：面向异构数据库算子的LLM内核生成与优化
-5. [Reflection Steering: Disentangling Reflection from Reasoning in Activation Space for Token-Efficient Inference](/202608/30/2608.25542v1-reflection-steering-disentangling-reflection-from-reasoning-in-activation-space-for-token-efficient-inference)  
-   标签：评分：6.0/10、query:edge-llm
-   evidence：通过引导反思激活实现令牌高效的LLM推理
+   evidence：面向GPU平台LLM推理工作负载的分解能耗模型
 
 
 <div class="dpr-home-promo-card">
