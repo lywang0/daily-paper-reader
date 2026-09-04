@@ -1,0 +1,856 @@
+Title: LeanStream: A Speculate-and-Refine Streaming Framework for Efficient on-Device LLM Inference
+
+URL Source: https://arxiv.org/pdf/2609.03079v1
+
+Published Time: Fri, 04 Sep 2026 00:08:15 GMT
+
+Number of Pages: 16
+
+Markdown Content:
+# LeanStream: A Speculate-and-Refine Streaming Framework for Efficient on-Device LLM Inference 
+
+# Renyuan Liu 1, Yuyang Leng 1, Kaiyan Liu 1, Yuzhou Zhong 1, Shaohan Hu 2, Chun-Fu (Richard) Chen 2, Peijun Zhao 2, Heechul Yun 3, Shuochao Yao 1
+
+> 1
+
+George Mason University 2Global Technology Applied Research, JPMorganChase 3University of Kansas rliu23,yleng2,kliu23,yzhong9@gmu.edu, shaohan.hu,richard.cf.chen,peijun.zhao@jpmchase.com heechul.yun@ku.edu, shuochao@gmu.edu 
+
+## Abstract 
+
+On-device LLM inference is attractive for privacy and respon-siveness, but remains challenging on mobile and embedded devices because model weights far exceed available DRAM. Prior systems exploit activation sparsity and offload weights to SSD or flash storage, but face a fundamental systems trade-off: accurate sparse execution decisions require the latest context, whereas efficient computation–I/O overlap requires early prediction. As a result, existing designs either serialize execution or incur redundant weight fetches, extra compu-tation, and large cache overheads. We present LeanStream, a streaming speculate-and-refine framework for efficient on-device LLM inference. LeanStream progressively refines computation, loading, and cache-retention priorities using partial GPU results, enabling fine-grained overlap between GPU execution and storage I/O. We implement LeanStream on both mobile and embedded platforms. Compared with prior on-device LLM inference systems, LeanStream reduces memory usage by 4.8 ×–7.5 × at the best throughput achieved by prior work, while further improving token generation throughput by 1.6 ×–2.1 ×.
+
+## CCS Concepts 
+
+• Computing methodologies → Machine learning ; • 
+
+Software and its engineering ;
+
+## Keywords 
+
+Mobile Computing, On-device Inference 
+
+ACM Reference Format: 
+
+Renyuan Liu 1, Yuyang Leng 1, Kaiyan Liu 1, Yuzhou Zhong 1, Shao-han Hu 2, Chun-Fu (Richard) Chen 2, Peijun Zhao 2, Heechul Yun 3,Shuochao Yao 1 . 2026. LeanStream: A Speculate-and-Refine Stream-ing Framework for Efficient on-Device LLM Inference. In The 32nd 
+
+> This work is licensed under a Creative Commons Attribution 4.0 Interna-tional License.
+> MobiCom ’26, Austin, TX, USA
+> © 2026 Copyright held by the owner/author(s). ACM ISBN 979-8-4007-2505-0/26/10 https://doi.org/10.1145/3795866.3844470
+
+Annual International Conference on Mobile Computing and Network-ing (MobiCom ’26), October 26–30, 2026, Austin, TX, USA. ACM, New York, NY, USA, 16 pages. https://doi.org/10.1145/3795866.3844470 
+
+## 1 Introduction 
+
+The recent rise of Large Language Models (LLMs) has drawn significant attention. Increasing privacy and security require-ments, together with the increasing availability of everyday personal computing devices, have created strong demand for on-device LLM inference. Yet this remains challenging on mobile platforms due to their limited memory and compute capacity. To overcome this challenge, recent work has pro-posed storing model weights on SSDs or flash memory and dynamically activating and executing only the relevant sub-models [1–3]. By exploiting the widespread activation spar-sity observed across a wide range of, if not all, LLMs [4–6], these approaches can dynamically identify the active weight sub-matrices, load them from storage into device memory, and compute only the necessary portions on demand. Compared with loading and executing the full weights, ex-ploiting dynamic activation sparsity can, in principle, reduce memory and computation costs by up to 80% [4–6]. However, realizing these theoretical gains in practice creates a funda-mental tension with system-level optimizations. To make accurate decisions about which weight blocks or sub-models should be loaded and executed, the predictor ideally relies on the most recent context, namely the output of the preceding layer. Yet this dependence on fully updated context limits opportunities for optimizations such as I/O prefetching and pipelining [7–10], leading to substantial I/O stalls. To mitigate this bottleneck, many systems adopt layer-wise speculative I/O fetching [1–4], where activation pat-terns are predicted using inputs available before the current layer finishes. This enables weight transfers to overlap with the computation of the preceding layer, thereby hiding part of the I/O latency. However, because such speculation does not use the latest context, it often produces less accurate activation predictions, causing the system to load unneces-sary weight sub-matrices and execute more sub-models than required. Some systems further mitigate I/O latency by in-troducing in-memory weight caches [1, 3]. Yet the challenge arXiv:2609.03079v1 [cs.LG] 2 Sep 2026 MobiCom ’26, October 26–30, 2026, Austin, TX, USA R. Liu et al. (d) time (c) time (b) time                                            
+
+> Data_Ready_Flg Predictor-Driven Context Update GPU Compute I/O Fetch Cached Weight
+> 1
+> kk-th Priority
+> 234512345
+> I/O GPU
+> preceding layer
+> 1754317543
+> I/O GPU
+> 9292
+> preceding layer preceding layer
+> 7415368
+> I/O GPU
+> 92749215368In-Memroy Cache 10 15 72I/O GPU
+> 41536In-Memroy Cache
+> 12345
+> ......
+> (a) time
+
+Figure 1: Challenges in on-device LLM inference with activation sparsity. (a) Full-context prediction achieves high accuracy but forces serialized compute and I/O. (b) Layer-wise speculative fetching overlaps I/O with compute, but incurs prediction errors and redundant I/O. (c) Speculation with caching reduces I/O stalls, but still introduces memory redundancy and extra compu-tation. (d) Our streaming speculate-and-refine pipeline progressively updates context for finer-grained com-pute–I/O coordination. 
+
+remains similar: the most informative features for deciding which weight sub-matrices to retain and execute are often still being produced within the ongoing computation kernel. Without accurate predictive guidance for cache retention and execution prioritization, these designs can lead to sub-stantial memory redundancy (e.g., around 3 GB for cached weights and predictive models for a 7B LLM) and significant computational overhead (e.g., more than 3 × the computation required under the ideal activation pattern) [1, 3]. Therefore, instead of forcing a choice between "waiting for the latest context to generate the most accurate and effi-cient computation and I/O decisions" and "performing long-horizon prediction to prioritize future computation and data movement", our key insight is to unify the two. We always begin with an initial prediction based on the most up-to-date information available, and then continuously refine compu-tation prioritization and data loading/retention decisions in a fine-grained streaming manner. Concretely, while the GPU is still processing the preceding layer, the system leverages partial intermediate results to progressively refine specu-lative data-loading and execution priorities, continuously updating I/O requests to reduce redundancy. At the same time, the I/O subsystem streams the required weights in fine-grained blocks, enabling the GPU to start executing the highest-priority available sub-models as soon as compute resources are free, instead of waiting for the entire sparse weight set of a layer to arrive. However, implementing the proposed streaming frame-work raises several non-trivial challenges. First, the speculate-and-refine design requires frequent coordination between heterogeneous processors on mobile and embed-ded SoCs, with the CPU handling activation-sparsity pre-diction and I/O while the GPU performs computation. Ex-isting synchronization mechanisms, such as global barri-ers (e.g., cudaDeviceSynchronize in CUDA or clFinish 
+
+in OpenCL), incur prohibitive overhead when used at high frequency. Event-based primitives (e.g., cudaEvent_t or 
+
+cl_event ) reduce this overhead, but they provide only uni-directional notification from the co-processor to the CPU host. This limitation prevents the host from exerting real-time, bidirectional control over prioritized GPU execution based on dynamic I/O progress. In addition, because these primitives operate at kernel granularity, they often require manual kernel partitioning, which further increases kernel launch overhead and overall system cost. More importantly, although finer-grained inter-processor communication can improve activation-pattern prediction accuracy and reduce idle time, overly frequent coordination sacrifices hardware parallelism and introduces additional overhead. The system therefore must determine an appropri-ate coordination frequency. Yet this choice cannot be fixed offline, because I/O latency is non-deterministic and varies with runtime factors such as cache miss behavior. As a re-sult, execution time across the streaming pipeline becomes unpredictable, making adaptive online control essential. The second challenge is to efficiently leverage GPU inter-mediate results to predict dynamic activation patterns and their relative importance. In contrast to prior methods that make predictions at kernel granularity, our approach oper-ates at a much higher coordination frequency, significantly tightening the latency budget for prediction. If this process is not sufficiently efficient, prediction latency can itself be-come a bottleneck, undermining the gains from frequent inter-device coordination. This makes a lightweight, high-performance predictive model critical for system control, so that decision-making can keep pace with the high-rate speculate-and-refine stream. To address these fundamental bottlenecks, we propose 
+
+LeanStream , a streaming speculate-and-refine framework for efficient on-device LLM inference. LeanStream bridges the gap between context-aware prediction and system-level efficiency by enabling computation and data-movement de-cisions to be made progressively rather than monolithically. LeanStream starts from an initial prediction using the fresh-est available context, then continuously updates computation priorities and data loading/retention decisions as interme-diate results are produced. This design enables fine-grained LeanStream MobiCom ’26, October 26–30, 2026, Austin, TX, USA Layer N MLP Layer N+1 Attention Layer N+1 MLP 
+
+> Residual Stream
+> One-shot prediction for layer N+1 MLP neurons Layer N MLP Layer N+1 Attention Layer N+1 MLP
+> Residual Stream
+> LeanStream’s refinement prediction for layer N+1 MLP neurons (a) (b)
+> Add Predict
+
+Figure 2: Dependency chain of one-shot prediction and LeanStream’s partial-feature refinement. (a) Existing layer-wise predictors use the residual state entering 
+
+MLP 𝑛 to make a fixed single prediction for the neu-ron priorities of MLP 𝑛 +1. (b) LeanStream executes MLP 𝑛 
+
+in priority-ordered stages. As each stage completes, its output is accumulated with the residual state to form an increasingly complete partial residual feature, which is used to refine the neuron priorities of MLP 𝑛 +1.
+
+overlap among I/O and GPU computation, thereby reducing redundant data movement, minimizing processor idle time, and improving end-to-end inference efficiency on resource-constrained mobile and embedded platforms. 
+
+Fine-Grained Streaming Control . To support high-frequency information exchange, we design a lightweight communication and data-management framework that minimizes coordination overhead between GPU execution and CPU-side control and I/O. The framework reduces both synchronization overhead and metadata traffic, enabling high-grained streaming without incurring additional stalls. We also rigorously analyze the trade-off introduced by frequent coordination and design an adaptive online controller to manage it. By dynamically adjusting the synchronization frequency at runtime, the controller maintains an effective balance between prediction accuracy and hardware parallelism, thereby maximizing end-to-end system throughput. 
+
+Lightweight System Control with Stacked Learnable Hash-ing . We design a lightweight control mechanism based on stacked learnable hashing for low-latency, memory-efficient prediction under fine-grained streaming execution. Com-pared with conventional shallow-MLP controllers, stacked learnable hashing offers high expressive capacity with sub-stantially lower runtime and memory overhead. By relying on efficient bitwise operations, in-register table lookups, and compact output representations, it minimizes prediction la-tency while preserving strong modeling power. At the same time, it remains fully compatible with standard supervised learning and can be trained end-to-end with backpropaga-tion. This makes it an effective control primitive for high-rate speculate-and-refine execution. We evaluate LeanStream on three LLMs: Mistral-7B [11], Llama2-7B [12], and Qwen2.5-7B [13], across two embedded platforms, NVIDIA Jetson AGX Orin and Jetson AGX Xavier, and one mobile platform, the OnePlus 13. Compared with state-of-the-art LLM inference systems [1, 3, 4], LeanStream reduces memory usage by 4.8 × to 7.5 × at the best through-put achieved by prior work, and further improves token generation throughput by 1.6 × to 2.1 ×.In summary, this paper makes the following contributions: 
+
+• We present LeanStream , a streaming speculate-and-refine framework for efficient on-device LLM inference. 
+
+• We introduce a fine-grained streaming control design with adaptive online coordination across CPU, GPU, and I/O to reduce stalls while preserving hardware parallelism. 
+
+• We propose stacked learnable hashing , a lightweight predic-tive mechanism for fast system control under tight latency and memory budgets. 
+
+• We implement and evaluate LeanStream on mobile and embedded platforms, showing substantial gains in resource utilization and inference efficiency over prior approaches. 
+
+## 2 Motivation & Related Work 2.1 Challenges of on-Device LLM Inference 
+
+Deploying LLMs on edge and mobile devices is fundamen-tally limited by the gap between model size and available DRAM. In practice, this constraint is even more severe be-cause the operating system and active applications already occupy a substantial fraction of device memory. Prior work has explored various techniques to improve the efficiency and deployability of learning systems on mobile devices [14– 20]. To address the more direct challenge of model weights ex-ceeding available DRAM, a common approach is therefore to place model weights on SSDs and fetch them on demand [1– 4, 6]. Most modern LLMs use decoder-only Transformers, where feed-forward networks (FFNs) dominate model size. In recent Group Query Attention models [21], FFNs account for roughly 80% of parameters in Llama3-8B, Qwen2-7B, and Mistral-7B. Dynamic sparsity exploits matrix-vector-dominated token generation and the many zero-valued or near-zero elements produced by ReLU-family [2, 4, 22] and SwiGLU [3, 6, 23] activations. Exploiting these sparsity pat-terns at different levels [6] can skip around 80% of unneces-sary computation and reduce data movement with negligible accuracy loss [3, 6]. Moreover, activation magnitudes indicate the relative priority of loading and computing corresponding weight sub-matrices. Yet translating this opportunity into end-to-end system gains remains challenging. Figure 1 illustrates the core systems tension in sparse on-device LLM inference. In Figure 1(a), full-context prediction provides the most accurate activation decisions but serializes GPU computation and I/O, leaving hardware underutilized. Figure 1(b) instead predicts the next layer before the current layer finishes, overlapping I/O with computation at the cost of lower prediction accuracy, redundant weight fetching, and MobiCom ’26, October 26–30, 2026, Austin, TX, USA R. Liu et al. 0.0 1.0 2.0 1 2 4 8 16  
+
+> Number of Sync. Execution time (ms)  Original Compute Split Overhead Sync Overhead
+> time
+> Calc. IO
+> layer n layer n+1 layer n+1
+
+(a) (b) 
+
+Figure 3: Synchronization overhead analysis. (a) Ex-isting synchronization primitives introduce execution stalls under frequent coordination. (b) Increasing syn-chronization frequency significantly raises the GPU execution time of a Mistral-7B MLP layer with 80% sparsity on Jetson AGX Orin. 
+
+extra computation. Adding an in-memory cache in Figure 1(c) mitigates I/O stalls but still incurs memory and computation redundancy because decisions rely on incomplete context. LeanStream, shown in Figure 1(d), avoids this trade-off by progressively refining computation, loading, and cache-retention priorities as intermediate results become available. This enables fine-grained compute–I/O coordination while reducing redundant data movement and computation. Figure 2 illustrates partial-feature refinement. Let x𝑛 de-note the residual state before MLP 𝑛 . Prior approaches use 
+
+x𝑛 for a one-shot prediction of the neuron and weight priorities of MLP 𝑛 +1. LeanStream instead partitions MLP 𝑛 
+
+into 𝐾 stages and loads and computes them in descending predicted-priority order. Let h𝑛 be the input to MLP 𝑛 , and let W(𝑘 )
+
+> 𝑛, gate
+
+, W(𝑘 )
+
+> 𝑛, up
+
+, and W(𝑘 ) 
+
+> 𝑛, down
+
+denote the gate-, up-, and down-projection weight slices of stage 𝑘 . Its partial output is 
+
+Δm(𝑘 ) 
+
+> 𝑛
+
+=
+
+h
+
+SiLU 
+
+
+
+h𝑛 W(𝑘 )
+
+> 𝑛, gate
+
+
+
+⊙
+
+
+
+h𝑛 W(𝑘 )
+
+> 𝑛, up
+
+i 
+
+W(𝑘 )
+
+> 𝑛, down
+
+. (1) After the first 𝑗 stages, LeanStream forms the updated pre-diction feature as 
+
+ex( 𝑗 ) 
+
+> 𝑛
+
+= x𝑛 +
+
+> 𝑗
+
+∑︁ 
+
+> 𝑘 =1
+
+Δm(𝑘 ) 
+
+> 𝑛
+
+. (2) Each ex( 𝑗 ) 
+
+> 𝑛
+
+refines the weight priorities of MLP 𝑛 +1 before MLP 𝑛 completes. Priority-ordered execution makes informa-tive partial outputs available earlier, improving subsequent prediction refinement. Realizing this design requires high-frequency coordina-tion between GPU computation and I/O, but existing synchro-nization mechanisms ( cudaDeviceSynchronize in CUDA or clFinish in OpenCL) are too expensive at that granu-larity. As shown in Figure 3(b), increasing synchronization frequency sharply increases the execution time of a Mistral-7B MLP layer with 80% sparsity on Jetson AGX Orin. This overhead comes from both the synchronization primitive itself and the kernel-fragmentation cost of splitting mono-lithic kernels into smaller schedulable units. These results motivate a custom low-overhead communication runtime for fine-grained speculate-and-refine execution. Layer Index Prompt Index Cache Miss Ratio per Layer Cache Miss Ratio per Prompt          
+
+> 0.1 0.2 0.3 010 20 30 010 20 30 40 50 00.1 0.2 0.3 0
+> (a) (b)
+
+Figure 4: Cache miss dynamics in Mistral-7B under a 50% weight-cache budget. (a) Cache miss rates vary sig-nificantly across layers. (b) Cache miss rates for Layer 0 also fluctuate across prompts. This variability across layers and inputs makes offline profiling unreliable and motivates adaptive online coordination. 
+
+## 2.2 The Inefficiency of Static Coordination 
+
+To further optimize hardware efficiency, a common design objective is to fine-tune the execution schedule to maximize the overlap between weight loading and GPU computation. This involves identifying the optimal coordination points where the system can interleave I/O requests with compute kernels without introducing significant stalls [24–28]. However, the effectiveness of offline scheduling fundamen-tally depends on workload determinism, an assumption that does not hold for sparse LLM inference. As shown in Figure 4, our measurements reveal substantial runtime variability that makes static profiling ineffective. Figure 4(a) shows strong spatial heterogeneity in Mistral-7B: even when 50% of the model weights are pinned in DRAM, cache miss rates still vary significantly across layers. Figure 4(b) further shows pronounced temporal variation within a single layer across different prompts, driven by the input-dependent nature of activation patterns. This variability causes the timing rela-tionship between I/O fetching and GPU computation to shift continuously at runtime. As a result, an offline schedule can quickly become suboptimal when actual cache miss behavior deviates from the profiled average, leading to either hard-ware underutilization or excessive I/O stalls. These observa-tions show that effective coordination cannot rely solely on precomputed schedules. Instead, LeanStream adopts an adap-tive online strategy that dynamically adjusts coordination frequency based on real-time execution feedback. 
+
+## 2.3 Prediction Overhead 
+
+LeanStream converts intermediate GPU results into weight-priority and cache-eviction decisions to guide load-ing, computation, and retention. On mobile heterogeneous platforms, this control is typically performed on the CPU to keep the GPU dedicated to execution. However, Table 1 shows that a state-of-the-art two-layer MLP predictor on the Jetson AGX Orin CPU can take longer than the sparse GPU MLP computation. Moreover, its cost grows linearly with finer-grained coordination. Thus, conventional neural predictors cannot keep pace with high-frequency streaming, motivating a substantially lower-latency learnable control mechanism. LeanStream MobiCom ’26, October 26–30, 2026, Austin, TX, USA 
+
+Table 1: GPU Computation vs. Prediction Overhead. CPU predictor follows the two-layer MLP design in state-of-the-art works [2, 4]. Latency is measured on Jetson AGX Orin for Mistral-7B with 80% sparsity.                        
+
+> Split GPU Time Pred. Time Overhead
+> (𝑁 )(𝑇 𝑔𝑝𝑢 )(𝑁 ×𝑇 𝑝𝑟𝑒𝑑 )Ratio
+> 1 (Original) 1.13 ms 1.41 ms 1.25 ×
+> 21.26 ms 2.82 ms 2.24 ×
+> 41.52 ms 5.64 ms 3.71 ×
+> 82.01 ms 11.28 ms 5.61 ×
+
+## 3 LeanStream Design 3.1 Overview 
+
+Efficient on-device LLM execution requires fully utilizing GPU computation, DRAM, and SSD bandwidth under tight resource constraints. LeanStream achieves this through a fine-grained communication substrate that supports high-frequency coordination across heterogeneous system com-ponents. As illustrated in Figure 5, LeanStream decouples computation from the rigid layer-by-layer I/O schedule used in prior sparse execution pipelines. Partial GPU results are continuously fed into the predictor to identify and repriori-tize the most important weights for the next layer, allowing the storage subsystem to refine its fetch decisions on the fly. In the opposite direction, once any subset of required weights is loaded, the GPU immediately begins executing the corresponding partial computation instead of waiting for the entire layer’s weights to arrive. This bidirectional coordination overlaps computation and I/O more effectively, reducing stalls and improving end-to-end throughput. We introduce the thread-block level fine-grained synchro-nization method and the streaming control strategy in Sec-tion 3.2. Next, we propose lightweight system control by proposing a stacked learnable hashing method in Section 3.3. 
+
+## 3.2 Fine-Grained Streaming Control 
+
+To reduce redundancy and idle time, LLM inference should decouple GPU computation from I/O dependencies through fine-grained, context-aware coordination. Conventional ap-proaches rely on kernel partitioning and global device syn-chronization, which incur substantial overhead. We propose a thread-block level communication mecha-nism that is both non-blocking and asymmetric. This method leverages the unified DRAM memory architecture of SoCs to enable direct inter-device coordination without kernel splitting. In Section 3.2.1, we define the primitives for this thread-block level communication. Section 3.2.2 analyzes the overhead associated with LLM execution under this com-munication model. Finally, Section 3.2.3 presents a strategy for dynamically adjusting the communication frequency to optimize the overall LLM inference stream. 
+
+3.2.1 Lightweight Coordination Primitives. time 
+
+> Calc. IO Compute layer n Compute layer n+1 Fetch weight layer n+1
+
+... ... 
+
+> Lightweight Hash Predictor
+> § 3.3 System Control with Stacked Leanable Hashing
+> Adaptive Partial Model Execution Adaptive Context Update
+> § 3.2 Fine-Grained Streaming Control
+> Fetched Weights Pending Weights Selected Weights Unselected Weights
+
+GPU DRAM SSD  
+
+> Partial Model Execution
+> Cache
+> SM 0 SM 1
+> Data Priority Eviction Priority
+> Partial GPU Results
+> Execution Priority
+
+Figure 5: The overview of LeanStream Framework. 
+
+To achieve coordination that is context-aware rather than strictly bound to the execution of a specific GPU kernel, we must intervene within the kernel itself, enabling the internal scheduling of the kernel to interact with external information. Furthermore, we seek a flexible communication mechanism that avoids the mutual waiting inherent in global device-level synchronization. This approach does not require strictly peer-to-peer or symmetric information exchange. For example, the I/O unit is not mandated to respond to every individual GPU instruction and is permitted to react to multiple GPU signals simultaneously. By allowing such decoupled interactions, the LLM inference stream becomes more flexible and the mutual interference between devices is minimized. To address this issue, we propose a thread-block level com-munication mechanism that is non-blocking, asymmetric, and fine-grained. As illustrated in Figure 6, we leverage the unified memory architecture of the SoC, which allows the GPU and CPU to access the same data simultaneously. We in-sert flag checks before the execution of a GPU block to verify whether the corresponding I/O block has been loaded by the CPU. Furthermore, once a block completes its computation, it updates a flag while writing its partial results back to DRAM. This design allows the GPU to utilize already loaded weights for computation while the I/O unit concurrently loads the remaining data for the current layer, ensuring that the trans-fer between the GPU and I/O blocks remains asynchronous as shown in Figure 6 (a). Similarly, during I/O idle cycles, the CPU can verify completed computation results. If multiple GPU thread blocks have finished their tasks, the CPU can ag-gregate these results to predict and update the I/O selection. As shown in Figure 6 (b), the CPU operates asynchronously with GPU computation and can process multiple GPU results within a single update cycle. As illustrated in Algorithm 1, our mechanism enables a fine-grained, asynchronous flow by embedding synchroniza-tion logic directly within GPU thread-blocks. In this model, each block’s "leader thread" performs a non-blocking check on gpu_rd_flg . If the required weights are pre-loaded in MobiCom ’26, October 26–30, 2026, Austin, TX, USA R. Liu et al. Calc. I/O       
+
+> Result Flag Layer N Weight
+> Compute Layer N Loading Layer N weights
+> GPU CPU DRAM Result Flag
+> Compute Layer N Loading Layer N+1 weights
+> GPU CPU DRAM
+> I/O I/O Calc.
+> Layer N+1 Weight
+> Calc. Pred. Calc. I/O Calc. Pred. NNNNNN+1
+> (a) (b)
+
+Figure 6: Thread-block–level, non-blocking, asymmet-ric coordination mechanism for LLM streaming. (a) GPU thread-blocks perform non-blocking checks on fine-grained flags to consume weights that may have been pre-loaded into DRAM, decoupling weight arrival from compute execution. (b) The CPU asynchronously monitors completed thread-blocks and aggregates mul-tiple partial results to update I/O selection, supporting an asymmetric mapping where one CPU update re-sponds to an arbitrary number of GPU signals. 
+
+DRAM, the block immediately initiates computation, by-passing device synchronization stalls. Upon completion, the block writes back partial results and signals its status via 
+
+gpu_wr_flg , maintaining kernel persistence while providing the CPU with real-time state visibility. The I/O worker oper-ates in a complementary fashion by monitoring io_rd_flg 
+
+for pending prediction tasks. To maintain internal consis-tency, a pthread_barrier synchronizes worker lanes be-fore and after parallel I/O submissions. Within each worker, 
+
+lane 0 manages global atomic flags and triggers sibling threads via a local group_go variable for efficient submis-sion. Once asynchronous I/O events complete, the worker updates io_wr_flg to release waiting GPU blocks. Crucially, the relationship between gpu_wr_flg and 
+
+io_rd_flg is not necessarily a one-to-one mapping, reflect-ing the non-symmetric nature of our coordination substrate. To maximize throughput, the system allows for a many-to-one correspondence where multiple completed gpu_wr_flg 
+
+signals can be aggregated into a single io_rd_flg update for a collective I/O prediction. Conversely, a single I/O com-pletion signal may resolve the dependencies for multiple GPU thread-blocks simultaneously. This flexibility allows the communication frequencies of computation and I/O to differ, further decoupling the execution progress of individ-ual hardware units. 
+
+3.2.2 Analysis of Coordination Overheads. 
+
+While our fine-grained coordination primitive makes speculate-and-refine execution possible, prioritized loading and computation introduce additional overhead. In this sec-tion, we analyze how these mechanisms affect both I/O and computation, and use the resulting insights to motivate the coordination-scheduling design in the next section. Prioritizing weight fetching based on real-time importance scores inherently disrupts the sequential access patterns of 
+
+Algorithm 1: Lightweight Coordination Mechanism 
+
+Input: Atomic flags gpu_rd_flg , gpu_wr_flg , io_rd_flg ,
+
+io_wr_flg , group G, layer L, iteration N
+
+Output: Synchronized execution across GPU compute and libaio workers  
+
+> 1
+
+Function GPU_Kernel(layer_id, group_id)  
+
+> 2
+
+if get_local_id(0) == 0 then  
+
+> 3
+
+while 
+
+atomic_load(gpu_rd_flg[layer_id][group_id]) 
+
+≠ ready do  
+
+> 4
+
+spin_wait() ; 
+
+> 5
+
+barrier(CLK_GLOBAL_MEM_FENCE) ; 
+
+> 6
+
+/* Execute sparse computation kernels */ ; 
+
+> 7
+
+barrier(CLK_GLOBAL_MEM_FENCE) ; 
+
+> 8
+
+if get_local_id(0) == 0 then  
+
+> 9
+
+atomic_store(gpu_wr_flg[layer_id][group_id], 1) ; 
+
+> 10
+
+Function I/O_Worker(layer_id, group_id, lane_id)  
+
+> 11
+
+for it ← 0 to N do  
+
+> 12
+
+pthread_barrier_wait(&iter_start_barrier) ;
+
+if lane_id == 0 then  
+
+> 13
+
+while 
+
+atomic_load(io_rd_flg[layer_id][group_id]) 
+
+≠ it do  
+
+> 14
+
+spin_wait() ; 
+
+> 15
+
+group_go[group_id] ← 1;  
+
+> 16
+
+else  
+
+> 17
+
+while group_go[group_id] == 0 do  
+
+> 18
+
+spin_wait() ; 
+
+> 19
+
+io_submit(ctx, BLK_PER_THR, cbs) ; 
+
+> 20
+
+if lane_id == 0 then  
+
+> 21
+
+atomic_store(io_wr_flg[layer_id][group_id], 1) ; 
+
+> 22
+
+group_go[group_id] ← 0;  
+
+> 23
+
+pthread_barrier_wait(&iter_end_barrier) ;
+
+both storage and computation. This is because the scheduler issues I/O requests according to predicted activation mag-nitudes rather than the physical layout of weights on disk. As a result, out-of-order data movement can increase the number of I/O operations, reduce effective I/O block size, and degrade storage-bandwidth utilization [29–31]. It also com-plicates the downstream computation pipeline. To mitigate these overheads, we develop two specialized strategies. 
+
+1. I/O Placement with Co-Activated Neurons. To mitigate the bandwidth loss caused by more frequent I/O requests and smaller transfer sizes, we optimize the physical placement of weight matrices according to neuron co-activation patterns. While prior work has noted similar effects [1, 3], existing methods largely rely on pairwise co-activation statistics and LeanStream MobiCom ’26, October 26–30, 2026, Austin, TX, USA Calc. I/O  
+
+> TGPU nTGPU n-1
+> Offline q❲ n
+> q❳ n
+> ... ...
+> q❴ n
+> ϕ❲ n
+> ϕ❳ n
+> ϕ❴ n
+> q❲ n+1
+> q❳ n+1
+> ... ...
+> q❴ n+1
+> ϕ❲ n+1
+> ϕ❳ n+1
+> ϕ❴ n+1
+
+q qϕ ϕOnline    
+
+> Layer n Layer n+1
+> qn: Quantized remaining-load weight at GPU completion of MLP n-1
+> ϕn: Coordination Plan of MLP n Online query State transition LUT
+> nnn+1 n+1
+> Interval I Interval II
+
+Figure 7: The Streaming Control Strategy. 
+
+thus miss the higher-order structure required for segment-level I/O placement. We address this by formulating I/O grouping as a distribu-tional representation learning problem over neuron activa-tion contexts, inspired by word embedding and contrastive representation learning [32–34]. Instead of using heuristic grouping rules, we learn a neuron embedding space for I/O-aware organization in sparse inference. The offline embed-ding procedure is simple: neurons that co-activate are treated as positive pairs, while neurons that do not co-activate are treated as negative pairs. For a neuron 𝑛 with learnable em-bedding 𝑍 𝑛 , we sample a positive neuron 𝑛 + and a negative neuron 𝑛 − with learnable embeddings 𝑍 𝑛 + and 𝑍 𝑛 − , respec-tively. The objective minimizes the distance between 𝑍 𝑛 and 
+
+𝑍 𝑛 + while maximizing the distance to 𝑍 𝑛 − , as follows: 
+
+L = min    
+
+> {𝑍 𝑛 ,𝑍 𝑛 +,𝑍 𝑛 −}
+
+log (𝜎 (− 𝑍 𝑇 𝑛 · 𝑍 𝑛 + )) + log (𝜎 (𝑍 𝑇 𝑛 · 𝑍 𝑛 − )) 
+
+where 𝜎 (·) is a sigmoid function. The learned embeddings capture higher-order co-activation structure automatically, after which standard clustering can be used to organize neu-rons for I/O-aware placement. In practice, we group three weights into a block for Qwen2.5-7B and two weights into a block for Mistral-7B and Llama2-7B. These settings are used as the default configuration in our experiments. 
+
+2. Permutation-Invariant Execution. On the computation side, out-of-order weight arrival would normally require complex indexing logic or dynamic kernel reconstruction [35, 36]. LeanStream avoids this overhead by exploiting the per-mutation invariance of the MLP hidden dimension. For a standard SwiGLU layer, let ℎ𝜎 ( 𝑗 ) be the 𝑗 -th hidden neuron computed under permutation 𝜎 :
+
+ℎ[𝜎 ( 𝑗 ) ] = SiLU (𝑋 (𝑊 1)[:,𝜎 ( 𝑗 ) ] ) · ( 𝑋 (𝑊 𝑔𝑎𝑡𝑒 )[:,𝜎 ( 𝑗 ) ] )
+
+The output at coordinate 𝑚 is the sum over these neurons: ˆ𝑌 [:,𝑚 ] =
+
+> 𝑘
+
+∑︁ 
+
+> 𝑗 =1
+
+ℎ[𝜎 ( 𝑗 ) ] (𝑊 2)[𝜎 ( 𝑗 ),𝑚 ] =
+
+> 𝑘
+
+∑︁ 
+
+> 𝑡 =1
+
+ℎ[𝑡 ] (𝑊 2)[𝑡,𝑚 ] = 𝑌 [:,𝑚 ]
+
+This property allows LeanStream to treat out-of-order weights as a logically contiguous dense matrix. Because the SwiGLU output is computed as a sum over hidden neurons, it is invariant to the internal ordering of those neurons. As a result, the order in which weights arrive from storage can be used directly as the GPU execution order. The system simply appends arriving weight blocks into a contiguous memory buffer in arrival order, without any re-indexing or data reshuffling. This enables the GPU to execute high-performance dense kernels on the subset of neurons cur-rently available. 
+
+3.2.3 Fine-Grained Streaming Control Strategy. 
+
+Runtime variations in sparse prediction and cache misses make a fixed streaming schedule ineffective, while the co-ordination decision for the current layer affects subsequent-layer execution. LeanStream therefore formulates stream-ing coordination as a finite-horizon stochastic predictive-control problem. Following the receding-horizon principle of MPC [37], LeanStream optimizes from the currently ob-served state and applies only the current-layer coordination plan. Future cache and sparse-prediction behavior is repre-sented by profiled probability distributions and incorporated through stochastic MPC [38]. Solving this optimization on-line at every layer boundary would be expensive. Inspired by explicit MPC [39], LeanStream synthesizes the state-feedback policy offline and materializes it as a lookup table. 
+
+1. State and coordination plan. At 𝑇 𝐺𝑃𝑈 𝑛 −1 , let 𝑅 𝑛 denote the selected weight volume of layer 𝑛 that remains to be loaded. The controller state is 𝑞 𝑛 = 𝑄 (𝑅 𝑛 ), where 𝑄 (·) quantizes the remaining-load volume to a finite set of controller states. LeanStream divides GPU computation and I/O into logical stages and assigns each stage a communication frequency, 
+
+𝝓 𝑛 =
+
+
+
+𝝎 𝐺 𝑛 , 𝝎 IO 
+
+> 𝑛
+
+
+
+∈ Φ𝑛 (𝑞 𝑛 ). (3) These frequencies determine the communication points that partition GPU and I/O into runtime segments. Lower fre-quencies create larger segments and reduce coordination overhead. However, coarse GPU segments can force the GPU to wait until a larger weight chunk is loaded before proceed-ing, while coarse I/O segments delay the incorporation of refined GPU predictions. Higher frequencies allow the GPU to start computation earlier and the I/O to incorporate re-fined GPU predictions sooner, but incur greater coordination overhead. LeanStream selects 𝝓 𝑛 to balance these trade-offs. 
+
+2. Execution model and stochastic state transition. Given the controller state 𝑞 𝑛 at 𝑇 𝐺𝑃𝑈 𝑛 −1 and a candidate coordination plan 
+
+𝝓 , we derive the next state 𝑞 𝑛 +1 at 𝑇 𝐺𝑃𝑈 𝑛 from the execution between the two time points and the resulting remaining I/O workload. We divide this execution into two intervals. Interval I ends when the remaining layer-𝑛 I/O completes. In-terval II ends when the layer-𝑛 GPU computation completes. During Interval I, layer-𝑛 I/O does not depend on GPU progress because its final prediction has already been deter-mined at 𝑇 𝐺𝑃𝑈 𝑛 −1 . Thus, its duration is modeled as ¯ 𝑇 I 
+
+> 𝑛
+
+(𝑞 𝑛 , 𝝎 IO  
+
+> 𝑛
+
+).Each GPU segment can execute only after its required weight volume has been loaded. These dependencies determine the GPU work completed by the end of Interval I, denoted as MobiCom ’26, October 26–30, 2026, Austin, TX, USA R. Liu et al. 
+
+¯𝐶 𝐺, I 
+
+> 𝑛
+
+( ¯𝑇 I
+
+> 𝑛
+
+, 𝑞 𝑛 , 𝝓 𝑛 ). Let 𝐶 𝐺 𝑛 denote the fixed total GPU workload of layer 𝑛 . The residual GPU workload for Interval II is there-fore ¯ 𝐶 𝐺, II  
+
+> 𝑛
+
+= 𝐶 𝐺 𝑛 − ¯𝐶 𝐺, I 
+
+> 𝑛
+
+.At the beginning of Interval II, all weights required by layer-𝑛 computation have been loaded. The GPU therefore executes the residual work without current-layer I/O depen-dencies, with duration ¯ 𝑇 II  
+
+> 𝑛
+
+( ¯𝐶 𝐺, II  
+
+> 𝑛
+
+, 𝝎 𝐺 𝑛 ), including the segmen-tation and communication overhead induced by the GPU coordination frequency. Therefore, the predicted execution time from 𝑇 𝐺𝑃𝑈 𝑛 −1 to 
+
+𝑇 𝐺𝑃𝑈 𝑛 is ¯𝑇 𝑛 (𝑞, 𝝓 ) = ¯𝑇 I 
+
+> 𝑛
+
++ ¯𝑇 II  
+
+> 𝑛
+
+. (4) Given (𝑞 𝑛 , 𝝓 𝑛 ), the current-layer execution time is determin-istic. LeanStream profiles all feasible (𝑞, 𝝓 ) configurations offline and stores the corresponding ¯ 𝑇 I, ¯ 𝑇 II , ¯ 𝐶 𝐺, I, and ¯ 𝐶 𝐺, II .During Interval II, LeanStream prefetches layer-(𝑛 + 1)
+
+weights until 𝑇 𝐺𝑃𝑈 𝑛 . We are interested in the remaining weight volume that still needs to be loaded at this point. How-ever, even for a fixed layer 𝑛 , residual GPU workload ¯ 𝐶 𝐺, II  
+
+> 𝑛
+
+,and coordination plan 𝝓 𝑛 , different prompts can produce different predictions and cache-miss patterns. We therefore model the remaining I/O volume as a conditional distribu-tion: 𝑅 𝑛 +1 ∼ D 𝑛, ¯𝐶 𝐺, II    
+
+> 𝑛 ,𝝓 𝑛
+
+, 𝑞 𝑛 +1 = 𝑄 (𝑅 𝑛 +1), (5) where 𝑅 𝑛 +1 denotes the remaining layer-(𝑛 + 1) weight vol-ume at 𝑇 𝐺𝑃𝑈 𝑛 with respect to the final prediction. In implementation, we quantize ¯ 𝐶 𝐺, II  
+
+> 𝑛
+
+into 16 bins and collect 20 samples for each (𝑛, ¯𝐶 𝐺, II  
+
+> 𝑛
+
+, 𝝓 𝑛 ) configuration. Pro-filing all layers on Jetson AGX Orin takes approximately 90 hours, but this process is performed entirely offline and intro-duces no runtime decision overhead. With the deterministic mapping from (𝑞 𝑛 , 𝝓 𝑛 ) to ¯ 𝐶 𝐺, II  
+
+> 𝑛
+
+, this conditional distribution defines the stochastic state transition from 𝑞 𝑛 to 𝑞 𝑛 +1.
+
+3. Finite-horizon stochastic optimization and explicit policy. 
+
+The conditional distribution above induces a state-action-dependent stochastic transition. For compactness, we denote 
+
+D𝑛 (𝑞, 𝝓 ) ≜ D𝑛, ¯𝐶 𝐺, II    
+
+> 𝑛 ,𝝓 𝒏
+
+, (6) where ¯ 𝐶 𝐺, II  
+
+> 𝑛
+
+is deterministically determined by (𝑞, 𝝓 ).LeanStream minimizes the expected latency over hori-zon 𝐻 using stochastic dynamic programming with Bellman backward recursion [40]: 
+
+𝑉 𝐻 𝑛 (𝑞 ) = min   
+
+> 𝝓 ∈Φ𝑛 (𝑞 )
+
+h ¯𝑇 𝑛 (𝑞, 𝝓 )+ E𝑅 𝑛 +1∼D 𝑛 (𝑞, 𝝓 )
+
+𝑉 𝐻 −1 
+
+> 𝑛 +1
+
+(𝑄 (𝑅 𝑛 +1))  i
+
+,
+
+(7) with 𝑉 0 
+
+> 𝑛
+
+(𝑞 ) = 0. The transition distributions are empirically estimated from 20 profiled samples per configuration. The minimizing action is computed offline and stored as LUT [𝑛, 𝑞 ] = 𝝓 ∗,𝐻 𝑛 (𝑞 ). (8) 
+
+4. Online lookup and application. At 𝑇 𝐺𝑃𝑈 𝑛 −1 , LeanStream measures the realized remaining-load volume and applies 
+
+𝝓 𝑛 = LUT [𝑛, 𝑄 (𝑅 𝑛 )] . (9) Only the current-layer coordination plan is executed. At 
+
+𝑇 𝐺𝑃𝑈 𝑛 , LeanStream observes the new realized remaining-load state and queries the corresponding policy. The prediction horizon then advances by one layer. The stochastic optimiza-tion is performed offline, while runtime control requires only state measurement and table lookup. 
+
+## 3.3 Lightweight System Control with Stacked Learnable Hashing 
+
+Our speculate-and-refine framework requires a lightweight control mechanism that can frequently use partial GPU com-putation results to generate control signals for data and com-putation prioritization. Specifically, it must estimate the rel-ative ordering of activation magnitudes across the relevant weight sub-matrices and sub-computations in activation-sparse LLM inference, so as to guide I/O prefetching, GPU execution, and in-memory cache eviction. As discussed in Section 2.3, conventional neural predictors are poorly suited for this role: they are too slow for high-frequency coordi-nation and too memory-intensive for resource-constrained devices. Prior systems report neural predictors consuming more than 1 GB of memory [2–4]. Locality-Sensitive Hash-ing (LSH) offers an attractive alternative because of its low computational and memory overhead. It has been success-fully applied to approximate nearest-neighbor search [41– 43], large matrix-multiplication approximation [44–47], and even large-scale neural network training [48–50]. Moreover, adaptive hash functions can further reduce LSH query cost in data-dependent or learned hashing settings [51–53]. Our key insight is to view learnable LSH as a differen-tiable indexing-and-lookup-table primitive, where the adap-tive hash function provides a learnable index and the ta-ble stores learnable binary features. This allows learnable LSH to replace standard neural primitives such as a single-layer MLP, but with much lower latency and memory cost. Stacking such LSH layers increases model capacity through successive nonlinear lookups while retaining efficient CPU inference, since the computation is dominated by bitwise op-erations and in-register table accesses [46, 54, 55]. In addition, when cast as a classification problem, the predictor yields compact outputs, requiring only log (𝑛 ) bits for an 𝑛 -way decision space. In contrast to conventional neural-network quantization or binarization [56, 57], our approach goes be-yond reducing arithmetic precision by replacing much of the neural computation itself with learned indexing and lookup. 
+
+3.3.1 Stacked Learnable Hashing. For the 𝑘 -th learnable hashing layer, we denote the input by x𝑘 and the output by y𝑘 . For all layers except the first, the input x𝑘 is a binary representation. Let 𝑓 𝑘 be the hash function associated with LeanStream MobiCom ’26, October 26–30, 2026, Austin, TX, USA 
+
+layer 𝑘 , and let T𝑘 ∈ {± 1}2𝜏 ×𝑑 be a hash table consisting of 2𝜏 buckets, each represented by a learnable 𝑑 -dimensional binary vector. The layer output is then defined as 
+
+y𝑘 = T𝑘 
+
+𝜙 𝜏 
+
+ 𝑓 𝑘 (xk) (10) where 𝜙 𝜏 (·) converts a binary code in {± 1}𝜏 into the corre-sponding integer index in {0, 1, · · · , 2𝜏 − 1}.In LeanStream, we adopt hyperplane hashing [58] to com-pute the hash code. Specifically, 
+
+𝑓 𝑘 (xk) = sign (x𝑘 ⊛ W𝑘 ) (11) where W𝑘 is a learnable matrix of shape 𝑑 × 𝜏 . For all layers except the first, W𝑘 is also binary. Moreover, ⊛ denotes ma-trix multiplication implemented with XNOR and bitcount operations for all layers except the first. Stacked learnable hashing may use either a single layer or multiple layers. Unless otherwise noted, our default con-figuration consists of five hashing layers with 𝜏 = 8 and 
+
+𝑑 = 256. The final output layer is task-dependent. For classi-fication, the design is simple: the last learnable hashing layer outputs a hash index directly, without an additional feature table, and this index is mapped to a class label. For regres-sion, by contrast, the output space is quantized rather than directly cast to integers. We use equal-probability quantiza-tion [59]: we first profile the training labels, remove outliers via percentile-based clipping, determine the effective min 
+
+and max , and estimate the corresponding cumulative dis-tribution function (CDF). We then derive the quantization thresholds from the inverse CDF so that each quantization interval contains approximately the same probability mass. 
+
+3.3.2 End-to-End Differentiable Training. To enable stan-dard end-to-end supervised training with backpropagation, all components of stacked learnable hashing must be made differentiable. For the sign function, we adopt the standard straight-through estimator [56, 60] during the backward pass. Another key component is the lookup operation, which is not naturally differentiable. To address this, we introduce an alternative formulation that exposes a differentiable view of the lookup and enables gradient propagation: 
+
+𝜙 𝜏 
+
+ 𝑓 𝑘 (xk) = arg max 
+
+> 𝑖
+
+ Z[𝑖 ] · 𝑓 𝑘 (x𝑘 ) (12) where Z ∈ {± 1}2𝜏 ×𝜏 is a structured matrix whose 𝑖 -th row satisfies Z[𝑖 ] = 𝜙 −1 (𝑖 ). For example, when 𝜏 = 3, Z is an 8 × 3matrix whose rows enumerate all possible sign patterns, i.e., 
+
+[(− 1, −1, −1); (− 1, −1, +1); (− 1, +1, −1); · · · ; (+ 1, +1, +1)] .We then apply gumbel-softmax [61], a standard differen-tiable relaxation of arg max, to enable end-to-end training. Importantly, the alternative formulation in Eq. (12) is used only during the backward pass for gradient estimation. At inference time, the compact binary representation is used directly, without expanding it into a 2 𝜏 -dim vector. In addition, we treat the final layer differently for classi-fication and regression tasks. For classification, we use the same alternative formulation as in Eq. (12) and optimize it with the softmax cross-entropy loss. For regression, we find that applying binary cross-entropy loss to the quantized bi-nary representation yields better performance, because the binary code itself preserves hierarchical similarity among quantized values. 
+
+3.3.3 Predictive System Control Tasks in LeanStream. 
+
+LeanStream supports two predictive tasks for system control in each LLM block. First, given a partial input feature, it pre-dicts which neurons in the MLP output will be activated. The resulting probabilistic predictions provide a relative priority for loading the corresponding weight sub-matrices and for scheduling the computation of MLP sub-slices. Second, it predicts eviction decisions for elements in the in-memory cache. In the following, we describe the input features and output formats for these two tasks. For neuron-activation prediction, instead of directly feed-ing the partial or fully updated input feature into the pre-dictor, we first apply a PCA-based linear transformation to perform rotational dimensionality reduction while preserv-ing the most representative directions [62]. The projection matrix is easily obtained from SVD, and the reduced fea-ture representation can be computed alongside the original MLP execution by fusing this linear projection into the ex-isting GPU kernel, resulting in negligible overhead. Similar ideas have been adopted in KV-compression systems [63]. In practice, we reduce the input-feature dimension by 70%. For the cache-eviction task, we formulate prediction as a regression problem that estimates the reuse distance of each cache element. Combined with the element’s insertion time, the predicted reuse distance enables the system to determine its eviction priority. As input features, we use the inter-arrival times between consecutive requests to each cache object, a representation that has also been adopted in prior learning-based cache designs [64, 65]. 
+
+## 4 Evaluation 4.1 Experimental Setup 
+
+Models and Devices. We evaluate LeanStream on three LLMs: Mistral-7B [11], Llama2-7B [12], and Qwen2.5-7B [13]. Our testbeds include two embedded platforms, NVIDIA Jet-son AGX Orin and Jetson AGX Xavier, both paired with Sam-sung 980 Pro SSDs, as well as a mobile platform, the OnePlus 13, featuring the Snapdragon 8 Elite chipset and UFS 4.0 flash storage. This setup allows us to assess LeanStream across diverse model architectures and hardware environments. 
+
+Baselines. We compare LeanStream against three primary baselines: DejaVu [4], which predicts and loads the current layer’s weights using information from the previous layer; PowerInfer-2 [3], which combines weight prediction with MobiCom ’26, October 26–30, 2026, Austin, TX, USA R. Liu et al. Jetson AGX Orin     
+
+> Ours PowerInfer2 DejaVu + DejaVu Memory Bound Computation Bound
+> Jetson AGX Xavier
+
+Llama2-7B Mistral-7B Qwen2.5-7B One Plus 13      
+
+> Tokens/s
+> 510 15
+> Memory Budget (GB)
+> 0.5 1.0 1.5 2.0 2.5 3.0
+
+1.6× 5.8×  
+
+> Memory Budget (GB)
+> Tokens/s 510 15
+
+1.6× 4.9×         
+
+> 0.5 1.0 1.5 2.0 510 15 20 Tokens/s 0.5 1.0 1.5 2.0 2.5 3.0
+> Memory Budget (GB)
+
+5.5× 1.9×      
+
+> Tokens/s 4680.5 1.0 1.5 2.0 2.5 3.0
+> Memory Budget (GB)
+
+7.9× 1.7×    
+
+> 0.5 1.0 1.5 2.0
+> Memory Budget (GB)
+> Tokens/s 46810
+
+7.5× 1.6×      
+
+> 0.5 1.0 1.5 2.0 2.5 3.0
+> Memory Budget (GB)
+
+7.9×  
+
+> Tokens/s 46812 10
+
+1.9×      
+
+> Tokens/s 0.5 1.0 1.5 2.0 2.5 3.0
+> Memory Budget (GB)
+> 2.5 5.0 7.5 10.0 12.5
+
+5.5× 2.1×     
+
+> 0.5 1.0 1.5 2.0
+> Memory Budget (GB)
+> Tokens/s
+> 510
+
+5.0× 1.7×      
+
+> Tokens/s
+> 510 15 0.5 1.0 1.5 2.0 2.5 3.0
+> Memory Budget (GB)
+
+4.8× 2.2× 
+
+Figure 8: Throughput comparison under varying memory budgets on the Scrolls-Qasper dataset across different devices and models. Llama2-7B Qwen2.5-7B Mistral-7B Tokens/s         
+
+> 0510 15 650 500 350 650 500 350 400 300 200
+> Memory Budget (MB) Memory Budget (MB) Memory Budget (MB)
+> Qasper TruthfulQA CoQA Qasper TruthfulQA CoQA Qasper TruthfulQA CoQA
+> 0510 15 0510 15
+
+Figure 9: Throughput comparison of our LeanStream under varying memory budgets across different datasets when streaming is memory-bound on Jetson AGX Orin. 
+
+in-memory weight caching to mitigate I/O latency; and De-jaVu+, our enhanced DejaVu variant with an added LRU cache module to support varying memory budgets. 
+
+Datasets. We conduct experiments on three representative generation tasks: long-document question answering with Scrolls-Qasper [66], open-ended factual generation with TruthfulQA [67], and conversational question answering with CoQA [68]. These tasks allow us to evaluate LeanStream across a range of context lengths and output characteristics. 
+
+## 4.2 End-to-end Results 
+
+Overall Performance. As shown in Figure 8, we compare the performance of LeanStream and the baselines on the Scrolls-Qasper dataset across different memory budgets and hardware platforms. The results indicate that LeanStream consistently outperforms all baselines in every tested sce-nario. Even when compared to the optimal configuration of PowerInfer-2, where 50% of the weights are cached in memory, LeanStream achieves up to a 2.2 × improvement in throughput. This performance gap becomes even more significant as the memory budget decreases. Furthermore, LeanStream can reduce the required memory budget by 80% 75% 70%        
+
+> 2.9× 3.4× 3.7×
+> Tokens/s
+> 04812 16
+> 1.6× 2.1× 2.4×
+> 80% 75% 70%
+> Memorry Budget = 2GB Memorry Budget = 3GB Memorry Budget = 1GB
+> 80% 75% 70%
+
+××× ××× ××× 
+
+> Ours PowerInfer2 DejaVu + DejaVu
+
+× Out of Memory            
+
+> Sparsity Sparsity Sparsity
+> 04812 16 04812 16 04812
+> Sparsity Sparsity Sparsity
+> 80% 75% 70% 80% 75% 70% 80% 75% 70%
+
+××× ××× ×××     
+
+> 3.9× 4.7× 5.1×
+> 04812
+> 2.1× 2.7× 3.3×
+> 04812
+> Tokens/s Jetson AGX Orin One Plus 13
+
+Figure 10: End-to-end throughput under different spar-sity levels on Qasper using Mistral-7B. 
+
+as much as 5.9 × while still matching the peak throughput achieved by PowerInfer-2 at its optimal 50% cache setting. The performance characteristics vary according to the hardware capabilities of each platform. The Jetson AGX Orin exhibits a relatively balanced ratio between computation and I/O performance. The Jetson AGX Xavier features an identical SSD to the Orin, which results in excellent I/O ca-pabilities. However, its lower computation power compared to the Orin leads to a lower peak throughput. In contrast, the OnePlus 13 utilizes UFS flash storage, which provides lower I/O bandwidth than the Jetson devices. Consequently, the OnePlus 13 enters an I/O-bound state much earlier as the memory budget decreases. 
+
+Cross-Dataset Analysis. Since different datasets exhibit identical performance during compute-bound periods, Fig-ure 8 presents the overall results using Scrolls-Qasper as a LeanStream MobiCom ’26, October 26–30, 2026, Austin, TX, USA 
+
+Table 2: Performance comparison under different sparsity levels.                                                                                                                         
+
+> Model Method 80% Sparsity 75% Sparsity 70% Sparsity Qasper TruthfulQA CoQA Qasper TruthfulQA CoQA Qasper TruthfulQA CoQA Mistral-7B Original (No sparsity) 23.5 38.9 79.1 23.5 38.9 79.1 23.5 38.9 79.1 DejaVu 22.9 38.5 79.3 23.0 39.2 79.0 23.2 38.5 79.1 PowerInfer2 23.1 37.6 79.1 23.3 38.8 79.2 23.3 39.2 78.9 Ours 22.9 37.4 78.8 23.2 38.9 79.0 23.1 39.1 79.2 Qwen2.5-7B Original (No sparsity) 31.1 47.9 76.3 31.1 47.9 76.3 31.1 47.9 76.3 DejaVu 29.5 46.1 76.1 30.5 47.8 75.3 30.8 48.2 76.1 PowerInfer2 30.3 47.1 76.3 31.2 47.5 76.1 30.5 47.1 76.2 Ours 28.8 45.4 75.7 29.8 47.9 75.9 30.2 47.3 76.6 Llama2-7B Original (No sparsity) 25.4 32.2 77.1 25.4 32.2 77.1 25.4 32.2 77.1 DejaVu 25.1 32.1 77.3 26.1 31.9 77.8 25.1 32.4 77.0 PowerInfer2 24.8 31.9 77.1 25.3 32.3 76.9 25.3 31.8 76.9 Ours 24.6 33.2 76.9 25.1 33.5 77.0 24.6 33.7 76.9
+
+Table 3: Synchronization overhead when partitioning one MLP layer of Mistral-7B on Jetson AGX Orin and OnePlus 13.              
+
+> Device Method Sync. Overhead (ms) MLP 124816 Compute (ms) Orin Device Sync. 0.06 0.13 0.39 0.88 1.48 1.13 Ours 0.01 0.01 0.12 0.31 0.47 OnePlus 13 Device Sync. 0.08 0.19 0.42 0.91 1.85 1.51 Ours 0.03 0.03 0.11 0.25 0.53
+
+representative case. Figure 9 further compares the through-put of the three datasets on Jetson AGX Orin under memory-bound regime. We observe that performance varies signifi-cantly depending on the combination of model and dataset even under the same memory budget. This variation occurs because the effectiveness of the prioritization mechanism in LeanStream depends on the specific activation patterns of different dataset and model combinations, which leads to dif-ferent cache miss ratios. Consequently, these differences in cache efficiency result in distinct performance levels during the I/O-bound phase. In this memory-bound regime, through-put is primarily dominated by cache misses, and the impact of device I/O bandwidth scales proportionally. Since all de-vices exhibit similar performance trends, these results on the Orin platform are representative of the behavior observed on other devices. 
+
+Sparsity and Accuracy Analysis. Table 2 presents the accuracy achieved by LeanStream and the baselines across various target weight sparsity levels for each dataset. The results demonstrate that our approach maintains accuracy levels that are nearly identical to both the original dense models and the various baselines. Figure 10 further illus-trates the performance of various baselines under different memory budgets and sparsity levels for Mistral-7B on the Scrolls-Qasper dataset. As sparsity decreases, the overall throughput of all models declines because lower sparsity necessitates more computation and increases the volume + Prioritized Loading DejaVu + Prioritized Caching + Prioritized Compute    
+
+> Orin
+> Mistral-7B Llama2-7B Qwen2.5-7B 020 10 515 Tokens/s
+> 1.6× 1.4× 2.3× 1.5× 1.4× 2.0× 1.8× 1.4× 2.4×
+> One Plus 13
+> Mistral-7B Llama2-7B Qwen2.5-7B 08412 Tokens/s
+> 1.4× 1.3× 3.4× 2.7× 3.1× 1.3× 1.4× 1.5× 1.4×
+
+Figure 11: Ablation study of prioritization components on Qasper dataset with 20% weight caching budget on Jetson AGX Orin and OnePlus 13. 
+
+of weights that must be loaded. Despite this, LeanStream maintains a performance lead across all tested sparsity levels. Notably, when the memory budget becomes extremely small, LeanStream remains functional while the other baselines fail due to out-of-memory errors. 
+
+## 4.3 Component Impact Study 
+
+4.3.1 Analysis of Synchronization Overhead. Table 3 com-pares the synchronization overhead of our proposed method against traditional device synchronization mechanisms. We evaluate these overheads when partitioning a single MLP layer of Mistral-7B on both the Jetson AGX Orin and the OnePlus 13. The results indicate that the overhead of our method is consistently lower than that of standard device synchronization. As the number of splits increases, our ap-proach does experience an increase in overhead due to re-duced parallelism. However, even when the number of splits reaches 16, our overhead remains less than half of the origi-nal computation time. In contrast, the overhead associated with traditional synchronization methods exceeds the total computation time at that same split level. 
+
+4.3.2 Ablation Study of Prioritization Components. Figure 11 presents an ablation study of the prioritization components on the Qasper dataset, using a cache budget equal to 20% of the model weight size, on Jetson AGX Orin and OnePlus 13. MobiCom ’26, October 26–30, 2026, Austin, TX, USA R. Liu et al. 
+
+Table 4: Cache miss ratio of different memory man-agement schemes for Mistral-7B on Qasper. Memory budget denotes the fraction of model weights that can be held in memory relative to the total model weights.             
+
+> Memory Budget PowerInfer2 LFU LRU Ours 25% 0.56 0.76 0.81 0.11
+> 50% 0.19 0.35 0.39 0.05
+
+Table 5: Throughput comparison on the Qasper work-load with 20% weight caching on Jetson AGX Orin. Fix 
+
+uses a default fixed streaming configuration, Best Static 
+
+uses an offline-searched globally optimal static config-uration of compute and I/O blocks, and Ours applies dynamic streaming control.            
+
+> Throughput (tokens/s) Mistral 7B Llama2-7B Qwen2.5-7B One Shot 6.2 8.9 10.2 Best Static 10.7 11.3 12.9 Ours 16.4 18.3 19.8
+
+Starting from the standard DejaVu implementation, we pro-gressively add prioritized computation, prioritized loading, and prioritized caching. This step-by-step integration allows us to isolate how each component reduces redundant com-putation and I/O. The results show that prioritized caching provides the largest performance gain, with an especially pronounced effect on the mobile platform where I/O band-width is more limited. This improvement is consistent with the low compute-to-memory-access ratio of the LLM decod-ing phase, in which performance is bottlenecked more by weight fetching than by arithmetic throughput. As a result, intelligently prioritizing which weights remain in cache sub-stantially reduces high-latency I/O requests and yields the largest throughput gains. 
+
+4.3.3 Effectiveness of Cache Policies. Table 4 presents the cache miss ratios for various memory management schemes using Mistral-7B on the Qasper dataset across two mem-ory budget configurations. We compare LeanStream against PowerInfer-2 and standard replacement policies including Least Frequently Used (LFU) and Least Recently Used (LRU). The results show that LeanStream achieves a significantly lower cache miss ratio than all other methods. At a 25% mem-ory budget, LeanStream maintains a miss ratio of only 0.11, while the baseline PowerInfer-2 and standard policies such as LRU exhibit much higher miss ratios of 0.56 and 0.81, respec-tively. As the memory budget increases to 50%, LeanStream further reduces the cache miss ratio to 0.05, which repre-sents a nearly fourfold improvement over the PowerInfer-2 baseline. These results indicate that our prioritization mecha-nism is highly effective at identifying and retaining the most critical weights for inference. By minimizing cache misses, 
+
+Table 6: Comparison of model size, latency, and rel-ative loading redundancy among DNN-based, BNN-based, and our Stacked Learnable Hashing predictors on Jetson AGX Orin. DNN F uses the full current con-text, while DNN S uses stale context.                                                         
+
+> Mistral Llama2 Qwen2.5 Size DNN 1.4 GB 1.1 GB 1.8 GB BNN 120 MB 106 MB 130 MB Ours 24 MB 23 MB 23 MB
+> Latency DNN 1.41 ±0.03 ms 1.18 ±0.03 ms 1.49 ±0.04 ms BNN 363 ±8𝜇 s325 ±7𝜇 s371 ±8𝜇 sOurs 92 ±3𝜇 s87 ±2𝜇 s88 ±2𝜇 sRelative Loading Redundancy DNN F000DNN S35% 26% 28% BNN 9% 12% 11% Ours 12% 14% 14%
+
+LeanStream significantly reduces the volume that must be loaded, which directly translates to the higher throughput observed in our end-to-end evaluations. 
+
+4.3.4 Effectiveness of Dynamic Streaming Control. Table 5 compares the throughput on the Qasper workload with 20% weight caching on the Jetson AGX Orin to evaluate our streaming control mechanism. The "One Shot" configuration represents a baseline approach that predicts the weight only once at the input of layer. The "Best Static" configuration uses an offline profile to select a static generally optimized granu-larity for I/O and computation blocks within the stream. The results demonstrate that our dynamic approach consistently outperforms the offline optimal setting. 
+
+4.3.5 Efficiency of Stacked Learnable Hashing. Table 6 evalu-ates our stacked learnable hashing mechanism against tradi-tional DNN-based and BNN-based prediction methods across three key dimensions on the Jetson AGX Orin. The results demonstrate that our hashing approach provides a superior balance of efficiency and performance. In terms of memory footprint, our method achieves a remarkable reduction, re-quiring only approximately 23 MB to 24 MB across all tested models. This represents a significant improvement over the 1.1 GB to 1.8 GB required by DNN predictors and even the 106 MB to 130 MB required by BNN implementations. Furthermore, our approach exhibits the lowest inference latency, processing predictions in under 100 𝜇 s. While BNNs show slightly lower relative loading redundancy in some cases, LeanStream maintains a highly competitive redun-dancy level between 12% and 14%. By drastically lowering both size and latency while maintaining effective weight selection, our stacked learnable hashing ensures a highly efficient prediction pipeline that minimizes resource con-tention on constrained platforms. 
+
+4.3.6 Validation across Refinement Steps. To evaluate pro-gressive refinement, we partition each sparse MLP into eight priority-ordered stages and update the next-layer prediction LeanStream MobiCom ’26, October 26–30, 2026, Austin, TX, USA 0 2/8 4/8 6/8 8/8 78 82 86 90       
+
+> One-shot prediction
+> 0
+> One-shot prediction
+> 55 65 85 95 (a) (b) 2/8 4/8 6/8 8/8 75
+> Top-10% Recall (Priority, Ours) Importance Ratio (Priority, Ours) Top-10% Recall (Non-Priority) Importance Ratio (Non-Priority)
+> Layer 0 Layer 1 Layer 7 Layer 14 Layer 30 Importance Ratio (Priority, Ours)
+
+Figure 12: Progressive prediction refinement for Mistral-7B on CoQA under 80% activation sparsity. LeanStream divides the MLP computation into eight stages and executes them in descending priority order. (a) Top-10% recall and importance ratio averaged across all transformer layers. (b) Per-layer importance ratio for different layers. 0/8 represents the initial one-shot prediction, while 8/8 uses the complete MLP output. 2 GB 64 128 256 64 128 256 010 20 1 GB     
+
+> Input Length
+> 2 GB 1 GB
+> Input Length
+> 0816 64 128 256 64 128 256
+> Orin OnePlus 13 time (s) time (s)
+> Decode Phase for 256 Tokens Prefill Phase
+
+Figure 13: Impact of various input prefill lengths on total inference latency on the Qasper dataset using Mistral-7B on Jetson AGX Orin and OnePlus 13 with a fixed output of 256 tokens. 
+
+after each stage. We report Importance Ratio, the normalized importance captured by the predicted sparse set, and Top-10% Recall. Figure 12(a) shows that both metrics improve with progressive refinement. Compared with an otherwise identical non-priority execution order, Priority ordering pro-vides the largest early-stage gain because high-importance neurons are computed first, while the gap narrows as both or-ders approach the complete sparse MLP output. Figure 12(b) shows the same trend across five representative layers. 
+
+4.3.7 Analysis of Impact of Prefill Phase. Figure 13 illustrates the impact of input prefill length on the total inference la-tency of Mistral-7B on Jetson AGX Orin and OnePlus 13. The results show that prefill overhead is mainly determined by the initial dense weight loading and the corresponding computation. While prefill may involve a large number of 
+
+Table 7: Energy consumption and thermal behavior on Jetson AGX Orin. Mistral-7B on Scrolls-Qasper with 3 GB memory budget. Each system runs continuously for two hours at an ambient temperature of 21 ◦C.             
+
+> System Energy/Token (J) Peak GPU Temp. ( ◦C) Peak CPU Temp. ( ◦C) Thermal Throttling LeanStream 3.9 76 69 No PowerInfer-2 3.5 63 66 No DejaVu 3.7 60 65 No
+
+input tokens, it has a substantially higher compute-to-I/O ratio than decoding. Even for a 256-token prompt followed by 256-token generation, decoding remains the dominant contributor to total inference latency. This suggests that, on edge devices, the sequential and memory-intensive decoding phase is a more critical bottleneck than prompt prefill. 
+
+4.3.8 Energy Consumption and Thermal Behavior. Table 7 reports the energy consumption and thermal behavior dur-ing sustained inference. To eliminate variations caused by DVFS and ensure a fair comparison, we fix the CPU and GPU frequencies at 2201 MHz and 713 MHz, respectively, for all systems. LeanStream consumes slightly more energy per token than PowerInfer-2 and DejaVu because it maintains higher CPU and GPU utilization to overlap computation with weight loading. This also leads to higher peak CPU and GPU temperatures. LeanStream reaches a peak GPU temperature of 76 ◦C, which remains below the 99 ◦C thermal-throttling threshold. None of the evaluated systems experiences ther-mal throttling during the two-hour execution. 
+
+## 5 Conclusion 
+
+We presented LeanStream , a streaming speculate-and-refine framework for on-device LLM inference on resource-constrained mobile and embedded platforms. By progres-sively refining execution, loading, and cache decisions from partial GPU results, LeanStream resolves the tension between accurate context-aware prediction and efficient computation. 
+
+## 6 Disclaimer 
+
+This paper was prepared for informational purposes with contributions from the Global Technology Applied Research center of JPMorgan Chase & Co. (JPMC) and is not a product of its, or its affiliates’, Research Departments. JPMC and its affiliates make no representations or warranties, express or implied, regarding the completeness, accuracy, or reliability of the information herein, and accept no liability for its use or any related outcomes. This document does not constitute investment advice, financial research, or a recommendation or offer to buy or sell any security, financial instrument, product, or service. 
+
+## 7 Acknowledgements 
+
+This work is in part supported by the National Science Foun-dation grants III-2107200, CNS-2038658 and CNS-2038923. MobiCom ’26, October 26–30, 2026, Austin, TX, USA R. Liu et al. 
+
+## References 
+
+[1] Keivan Alizadeh, Seyed Iman Mirzadeh, Dmitry Belenko, S Khatam-ifard, Minsik Cho, Carlo C Del Mundo, Mohammad Rastegari, and Mehrdad Farajtabar. Llm in a flash: Efficient large language model inference with limited memory. In Proceedings of the 62nd Annual Meeting of the Association for Computational Linguistics (Volume 1: Long Papers) , pages 12562–12584, 2024. [2] Yixin Song, Zeyu Mi, Haotong Xie, and Haibo Chen. Powerinfer: Fast large language model serving with a consumer-grade gpu. In 
+
+Proceedings of the ACM SIGOPS 30th Symposium on Operating Systems Principles , pages 590–606, 2024. [3] Zhenliang Xue, Yixin Song, Zeyu Mi, Xinrui Zheng, Yubin Xia, and Haibo Chen. Powerinfer-2: Fast large language model inference on a smartphone. arXiv preprint arXiv:2406.06282 , 2024. [4] Zichang Liu, Jue Wang, Tri Dao, Tianyi Zhou, Binhang Yuan, Zhao Song, Anshumali Shrivastava, Ce Zhang, Yuandong Tian, Christopher Re, et al. Deja vu: Contextual sparsity for efficient llms at inference time. In International Conference on Machine Learning , pages 22137– 22176. PMLR, 2023. [5] James Liu, Pragaash Ponnusamy, Tianle Cai, Han Guo, Yoon Kim, and Ben Athiwaratkun. Training-free activation sparsity in large language models. In The Thirteenth International Conference on Learning Repre-sentations , 2025. URL https://openreview.net/forum?id=dGVZwyq5tV. [6] Marco Federici, Davide Belli, Mart Van Baalen, Amir Jalalirad, Andrii Skliar, Bence Major, Markus Nagel, and Paul Whatmough. Efficient llm inference using dynamic input pruning and cache-aware masking. 
+
+Proceedings of Machine Learning and Systems , 7, 2025. [7] Liwei Guo, Wonkyo Choe, and Felix Xiaozhu Lin. Sti: Turbocharge nlp inference at the edge via elastic pipelining. In Proceedings of the 28th ACM International Conference on Architectural Support for Programming Languages and Operating Systems, Volume 2 , pages 791–803, 2023. [8] Haodong Wang, Qihua Zhou, Zicong Hong, and Song Guo. D2moe: Dual routing and dynamic scheduling for efficient on-device moe-based llm serving. In Proceedings of the 31st Annual International Conference on Mobile Computing and Networking , pages 574–588, 2025. [9] Hongtao Chen, Weiyu Xie, Boxin Zhang, Jingqi Tang, Jiahao Wang, Jianwei Dong, Shaoyuan Chen, Ziwei Yuan, Chen Lin, Chengyu Qiu, et al. Ktransformers: Unleashing the full potential of cpu/gpu hybrid inference for moe models. In Proceedings of the ACM SIGOPS 31st Symposium on Operating Systems Principles , pages 1014–1029, 2025. [10] Junyi Chen, Chuheng Du, Renyuan Liu, Shuochao Yao, Dingtian Yan, Jiang Liao, Shengzhong Liu, Fan Wu, and Guihai Chen. Tokenflow: Responsive llm text streaming serving under request burst via pre-emptive scheduling. In Proceedings of the 21st European Conference on Computer Systems , pages 497–513, 2026. [11] Yihang Jiang, Xiaoyang Li, Guangxu Zhu, Hang Li, Jing Deng, Kaifeng Han, Chao Shen, Qingjiang Shi, and Rui Zhang. 6g non-terrestrial networks enabled low-altitude economy: Opportunities and challenges. 
+
+arXiv preprint arXiv:2311.09047 , 2023. [12] Hugo Touvron, Louis Martin, Kevin Stone, Peter Albert, Amjad Alma-hairi, Yasmine Babaei, Nikolay Bashlykov, Soumya Batra, Prajjwal Bhargava, Shruti Bhosale, et al. Llama 2: Open foundation and fine-tuned chat models. arXiv preprint arXiv:2307.09288 , 2023. [13] An Yang, Anfeng Li, Baosong Yang, Beichen Zhang, Binyuan Hui, Bo Zheng, Bowen Yu, Chang Gao, Chengen Huang, Chenxu Lv, et al. Qwen3 technical report. arXiv preprint arXiv:2505.09388 , 2025. [14] Shuochao Yao, Yiran Zhao, Aston Zhang, Lu Su, and Tarek Abdelzaher. Deepiot: Compressing deep neural network structures for sensing systems with a compressor-critic framework. In Proceedings of the 15th ACM conference on embedded network sensor systems , pages 1–14, 2017. [15] Shuochao Yao, Yiran Zhao, Huajie Shao, ShengZhong Liu, Dongxin Liu, Lu Su, and Tarek Abdelzaher. Fastdeepiot: Towards understanding and optimizing neural network execution time on mobile and embedded devices. In Proceedings of the 16th ACM Conference on Embedded Networked Sensor Systems , pages 278–291, 2018. [16] Renyuan Liu, Yuyang Leng, Shilei Tian, Shaohan Hu, Chun-Fu Chen, and Shuochao Yao. Dynaspa: Exploiting spatial sparsity for efficient dynamic dnn inference on devices. In Proceedings of the 22nd ACM Conference on Embedded Networked Sensor Systems , pages 422–435, 2024. [17] Renyuan Liu, Yuyang Leng, Kaiyan Liu, Shaohan Hu, Chun-Fu Chen, Peijun Zhao, Heechul Yun, and Shuochao Yao. Daf: An efficient end-to-end dynamic activation framework for on-device dnn training. In 
+
+Proceedings of the 23rd Annual International Conference on Mobile Sys-tems, Applications and Services , pages 196–208, 2025. [18] Renyuan Liu, Yuyang Leng, Shilei Tian, Shaohan Hu, Richard Chen, and Shuochao Yao. On-device dynamic dnn inference through spatial sparsity exploitation. GetMobile: Mobile Computing and Communica-tions , 29(3):35–38, 2025. [19] Yuyang Leng, Renyuan Liu, Hongpeng Guo, Songqing Chen, and Shuochao Yao. Scaleflow: Efficient deep vision pipeline with closed-loop scale-adaptive inference. In Proceedings of the 31st ACM Interna-tional Conference on Multimedia , pages 1698–1706, 2023. [20] Yuyang Leng, Renyuan Liu, Shaohan Hu, Peijun Zhao, Chun-Fu Chen, Songqing Chen, and Shuochao Yao. Physical self-supervised learning: Imu sensing without manual labels. In Proceedings of the 24th Annual International Conference on Mobile Systems, Applications and Services ,pages 1011–1025, 2026. [21] Konstantinos I Roumeliotis, Nikolaos D Tselikas, and Dimitrios K Nasiopoulos. Llama 2: Early adopters’ utilization of meta’s new open-source pretrained model. 2023. [22] Chenyang Song, Xu Han, Zhengyan Zhang, Shengding Hu, Xiyu Shi, Kuai Li, Chen Chen, Zhiyuan Liu, Guangli Li, Tao Yang, et al. Prosparse: Introducing and enhancing intrinsic activation sparsity within large language models. In Proceedings of the 31st International Conference on Computational Linguistics , pages 2626–2644, 2025. [23] Zhengyan Zhang, Yankai Lin, Zhiyuan Liu, Peng Li, Maosong Sun, and Jie Zhou. Moefication: Transformer feed-forward layers are mixtures of experts. In Findings of the Association for Computational Linguistics: ACL 2022 , pages 877–890, 2022. [24] Deepak Narayanan, Aaron Harlap, Amar Phanishayee, Vivek Seshadri, Nikhil R Devanur, Gregory R Ganger, Phillip B Gibbons, and Matei Zaharia. Pipedream: Generalized pipeline parallelism for dnn train-ing. In Proceedings of the 27th ACM symposium on operating systems principles , pages 1–15, 2019. [25] Shibo Wang, Jinliang Wei, Amit Sabne, Andy Davis, Berkin Ilbeyi, Blake Hechtman, Dehao Chen, Karthik Srinivasa Murthy, Marcello Maggioni, Qiao Zhang, et al. Overlap communication with dependent computation via decomposition in large deep learning models. In 
+
+Proceedings of the 28th ACM International Conference on Architectural Support for Programming Languages and Operating Systems, Volume 1 ,pages 93–106, 2022. [26] Chang Chen, Xiuhong Li, Qianchao Zhu, Jiangfei Duan, Peng Sun, Xingcheng Zhang, and Chao Yang. Centauri: Enabling efficient sched-uling for communication-computation overlap in large model training via communication partitioning. In Proceedings of the 29th ACM Interna-tional Conference on Architectural Support for Programming Languages and Operating Systems, Volume 3 , pages 178–191, 2024. [27] Jonghyun Bae, Jongsung Lee, Yunho Jin, Sam Son, Shine Kim, Hak-beom Jang, Tae Jun Ham, and Jae W Lee. {FlashNeuron }:{SSD-Enabled } { Large-Batch } training of very deep neural networks. In 
+
+19th USENIX conference on file and storage technologies (FAST 21) , pages LeanStream MobiCom ’26, October 26–30, 2026, Austin, TX, USA 
+
+387–401, 2021. [28] Samyam Rajbhandari, Olatunji Ruwase, Jeff Rasley, Shaden Smith, and Yuxiong He. Zero-infinity: Breaking the gpu memory wall for extreme scale deep learning. In Proceedings of the international conference for high performance computing, networking, storage and analysis , pages 1–14, 2021. [29] Sooman Jeong, Kisung Lee, Seongjin Lee, Seoungbum Son, and Youjip Won. {I/O } stack optimization for smartphones. In 2013 USENIX Annual Technical Conference (USENIX ATC 13) , pages 309–320, 2013. [30] Nitin Agrawal, Vijayan Prabhakaran, Ted Wobber, John D Davis, Mark Manasse, and Rina Panigrahy. Design tradeoffs for {SSD } performance. In 2008 USENIX Annual Technical Conference (USENIX ATC 08) , 2008. [31] Cheng Ji, Li-Pin Chang, Liang Shi, Chao Wu, Qiao Li, and Chun Jason Xue. An empirical study of {File-System } fragmentation in mobile storage systems. In 8th USENIX Workshop on Hot Topics in Storage and File Systems (HotStorage 16) , 2016. [32] Tomas Mikolov, Ilya Sutskever, Kai Chen, Greg S Corrado, and Jeff Dean. Distributed representations of words and phrases and their compositionality. Advances in neural information processing systems ,26, 2013. [33] Jeffrey Pennington, Richard Socher, and Christopher D Manning. Glove: Global vectors for word representation. In Proceedings of the 2014 conference on empirical methods in natural language processing (EMNLP) , pages 1532–1543, 2014. [34] Ruslan Salakhutdinov and Geoff Hinton. Learning a nonlinear em-bedding by preserving class neighbourhood structure. In Artificial intelligence and statistics , pages 412–419. PMLR, 2007. [35] Fredrik Kjolstad, Shoaib Kamil, Stephen Chou, David Lugato, and Saman Amarasinghe. The tensor algebra compiler. Proceedings of the ACM on Programming Languages , 1(OOPSLA):1–29, 2017. [36] Renyuan Liu, Yuyang Leng, Shilei Tian, Shaohan Hu, Chun-Fu Chen, and Shuochao Yao. Dynaspa: Exploiting spatial sparsity for efficient dynamic dnn inference on devices. In Proceedings of the 22nd ACM Conference on Embedded Networked Sensor Systems , pages 422–435, 2024. [37] David Q Mayne, James B Rawlings, Christopher V Rao, and Pierre OM Scokaert. Constrained model predictive control: Stability and optimal-ity. Automatica , 36(6):789–814, 2000. [38] Ali Mesbah. Stochastic model predictive control: An overview and perspectives for future research. IEEE Control Systems Magazine , 36 (6):30–44, 2016. [39] Alberto Bemporad, Manfred Morari, Vivek Dua, and Efstratios N Pis-tikopoulos. The explicit linear quadratic regulator for constrained systems. Automatica , 38(1):3–20, 2002. [40] Lucile Marescot, Guillaume Chapron, Iadine Chadès, Paul L Fackler, Christophe Duchamp, Eric Marboutin, and Olivier Gimenez. Complex decisions made simple: a primer on stochastic dynamic programming. 
+
+Methods in Ecology and Evolution , 4(9):872–884, 2013. [41] Piotr Indyk and Rajeev Motwani. Approximate nearest neighbors: towards removing the curse of dimensionality. In Proceedings of the thirtieth annual ACM symposium on Theory of computing , pages 604– 613, 1998. [42] Aristides Gionis, Piotr Indyk, Rajeev Motwani, et al. Similarity search in high dimensions via hashing. In Vldb , volume 99, pages 518–529, 1999. [43] Jay Yagnik, Dennis Strelow, David A Ross, and Ruei-sung Lin. The power of comparative reasoning. In 2011 International Conference on Computer Vision , pages 2431–2438. IEEE, 2011. [44] Zhanpeng Zeng, Michael Davies, Pranav Pulijala, Karthikeyan Sankar-alingam, and Vikas Singh. Lookupffn: making transformers compute-lite for cpu inference. In International Conference on Machine Learning ,pages 40707–40718. PMLR, 2023. [45] Davis Blalock and John Guttag. Multiplying matrices without multiply-ing. In International Conference on Machine Learning , pages 992–1004. PMLR, 2021. [46] Jianyu Wei, Shijie Cao, Ting Cao, Lingxiao Ma, Lei Wang, Yanyong Zhang, and Mao Yang. T-mac: Cpu renaissance via table lookup for low-bit llm deployment on edge. In Proceedings of the Twentieth European Conference on Computer Systems , pages 278–292, 2025. [47] Xiaohu Tang, Yang Wang, Ting Cao, Li Lyna Zhang, Qi Chen, Deng Cai, Yunxin Liu, and Mao Yang. Lut-nn: Empower efficient neural network inference with centroid learning and table lookup. In Proceedings of the 29th Annual International Conference on Mobile Computing and Networking , pages 1–15, 2023. [48] Ryan Spring and Anshumali Shrivastava. Scalable and sustainable deep learning via randomized hashing. In Proceedings of the 23rd ACM SIGKDD International Conference on Knowledge Discovery and Data Mining , pages 445–454, 2017. [49] Beidi Chen, Tharun Medini, James Farwell, Charlie Tai, Anshumali Shrivastava, et al. Slide: In defense of smart algorithms over hardware acceleration for large-scale deep learning systems. Proceedings of Machine Learning and Systems , 2:291–306, 2020. [50] Beidi Chen, Zichang Liu, Binghui Peng, Zhaozhuo Xu, Jonathan Lingjie Li, Tri Dao, Zhao Song, Anshumali Shrivastava, and Christopher Re. Mongoose: A learnable lsh framework for efficient neural network training. In International Conference on Learning Representations , 2020. [51] Alexandr Andoni and Ilya Razenshteyn. Optimal data-dependent hashing for approximate near neighbors. In Proceedings of the forty-seventh annual ACM symposium on Theory of computing , pages 793–801, 2015. [52] Yihe Dong, Piotr Indyk, Ilya Razenshteyn, and Tal Wagner. Learn-ing space partitions for nearest neighbor search. arXiv preprint arXiv:1901.08544 , 2019. [53] Alexandr Andoni, Piotr Indyk, Thijs Laarhoven, Ilya Razenshteyn, and Ludwig Schmidt. Practical and optimal lsh for angular distance. 
+
+Advances in neural information processing systems , 28, 2015. [54] Davis W Blalock and John V Guttag. Bolt: Accelerated data mining with fast vector compression. In Proceedings of the 23rd ACM SIGKDD International Conference on Knowledge Discovery and Data Mining ,pages 727–735, 2017. [55] Jingdong Wang, Ting Zhang, Nicu Sebe, Heng Tao Shen, et al. A survey on learning to hash. IEEE transactions on pattern analysis and machine intelligence , 40(4):769–790, 2017. [56] Itay Hubara, Matthieu Courbariaux, Daniel Soudry, Ran El-Yaniv, and Yoshua Bengio. Binarized neural networks. Advances in neural infor-mation processing systems , 29, 2016. [57] Guangxuan Xiao, Ji Lin, Mickael Seznec, Hao Wu, Julien Demouth, and Song Han. Smoothquant: Accurate and efficient post-training quantization for large language models. In International conference on machine learning , pages 38087–38099. PMLR, 2023. [58] Moses S Charikar. Similarity estimation techniques from rounding algorithms. In Proceedings of the thiry-fourth annual ACM symposium on Theory of computing , pages 380–388, 2002. [59] Robert M. Gray and David L. Neuhoff. Quantization. IEEE transactions on information theory , 44(6):2325–2383, 2002. [60] Yoshua Bengio, Nicholas Léonard, and Aaron Courville. Estimating or propagating gradients through stochastic neurons for conditional computation. arXiv preprint arXiv:1308.3432 , 2013. [61] Eric Jang, Shixiang Gu, and Ben Poole. Categorical reparameterization with gumbel-softmax. arXiv preprint arXiv:1611.01144 , 2016. [62] Hervé Abdi and Lynne J Williams. Principal component analysis. 
+
+Wiley interdisciplinary reviews: computational statistics , 2(4):433–459, 2010. MobiCom ’26, October 26–30, 2026, Austin, TX, USA R. Liu et al. 
+
+[63] Wonbeom Lee, Jungi Lee, Junghwan Seo, and Jaewoong Sim. 
+
+{InfiniGen }: Efficient generative inference of large language models with dynamic {KV } cache management. In 18th USENIX Symposium on Operating Systems Design and Implementation (OSDI 24) , pages 155–172, 2024. [64] Zhenyu Song, Daniel S Berger, Kai Li, and Wyatt Lloyd. Learning relaxed belady for content distribution network caching. In 17th USENIX Symposium on Networked Systems Design and Implementation (NSDI 20) , pages 529–544, 2020. [65] Juncheng Yang, Ziming Mao, Yao Yue, and KV Rashmi. {GL-Cache }:Group-level learning for efficient and high-performance caching. In 
+
+21st USENIX Conference on File and Storage Technologies (FAST 23) ,pages 115–134, 2023. [66] Uri Shaham, Elad Segal, Maor Ivgi, Avia Efrat, Ori Yoran, Adi Haviv, Ankit Gupta, Wenhan Xiong, Mor Geva, Jonathan Berant, et al. Scrolls: Standardized comparison over long language sequences. In Proceed-ings of the 2022 Conference on Empirical Methods in Natural Language Processing , pages 12007–12021, 2022. [67] Stephanie Lin, Jacob Hilton, and Owain Evans. Truthfulqa: Measuring how models mimic human falsehoods. In Proceedings of the 60th annual meeting of the association for computational linguistics (volume 1: long papers) , pages 3214–3252, 2022. [68] Siva Reddy, Danqi Chen, and Christopher D Manning. Coqa: A conver-sational question answering challenge. Transactions of the Association for Computational Linguistics , 7:249–266, 2019.
