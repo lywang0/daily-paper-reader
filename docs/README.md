@@ -6,32 +6,35 @@
 </div>
 
 ## 每次日报
-- 最新运行日期：2026-09-05
-- 运行时间：2026-09-05 22:11:57 UTC
+- 最新运行日期：2026-09-06
+- 运行时间：2026-09-06 22:19:53 UTC
 - 运行状态：成功
-- 本次总论文数：4
+- 本次总论文数：5
 - 精读区：1
-- 速读区：3
+- 速读区：4
 
 ### 今日简报（AI）
-今日精读1篇、速读3篇，重点聚焦大模型推理优化与检索架构。最值得关注《SCX Router》的零样本模型选择思路（8.0分），以及长文本推测解码的KV缓存压缩方法（7.0分）。若想跟进前沿，建议优先精读这两篇并关注其系统落地细节。
-- 详情：[/202609/05/README](/202609/05/README)
+今日精读聚焦CUDA-Harness，验证了智能体从自然语言自动生成与优化CUDA内核的可行性（8.0分）；速读中TopoCompress与Para-Pipe在长文本压缩和SoC算子并行上各具亮点。建议重点跟进Agentic代码生成方向，并关注图结构压缩对超长上下文推理的实用价值。
+- 详情：[/202609/06/README](/202609/06/README)
 
 ### 精读区论文标签
-1. [SCX Router: Streaming Zero-Shot Model Selection with a Decoder-KV Classifier and a Real-World Task Ontology](/202609/05/2609.02292v1-scx-router-streaming-zero-shot-model-selection-with-a-decoder-kv-classifier-and-a-real-world-task-ontology)  
+1. [CUDA-Harness: Harnessing Agentic CUDA Kernel Generation and Optimization from Natural Language](/202609/06/2609.00058v1-cuda-harness-harnessing-agentic-cuda-kernel-generation-and-optimization-from-natural-language)  
    标签：评分：8.0/10、query:edge-llm
-   evidence：在LLM服务中按任务做零样本端点选择的轻量路由器，平衡速度、成本与质量
+   evidence：以智能体LLM流水线从自然语言生成并硬件感知优化CUDA内核，契合算子加速与软硬协同需求
 
 ### 速读区论文标签
-1. [Strong Drafts Need Compact Memories: Long-Context Speculative Decoding with Compressed KV Cache](/202609/05/2608.30252v1-strong-drafts-need-compact-memories-long-context-speculative-decoding-with-compressed-kv-cache)  
+1. [TopoCompress: Long Context Compression via Graph-Wired Semantic Trajectories](/202609/06/2608.30811v2-topocompress-long-context-compression-via-graph-wired-semantic-trajectories)  
    标签：评分：7.0/10、query:edge-llm
-   evidence：以压缩KV缓存支持强草稿模型的长上下文投机解码，降低延迟与内存，可用于边缘高效推理。
-2. [Multi-Turn LLM Conversations under the Least-Recently-Used Policy: Mean-Field Asymptotics and Hit Ratio Approximation](/202609/05/2609.02027v1-multi-turn-llm-conversations-under-the-least-recently-used-policy-mean-field-asymptotics-and-hit-ratio-approximation)  
+   evidence：免训练且模型无关的长上下文压缩，直接降低推理成本与延迟，可迁移至资源受限部署
+2. [Para-Pipe: Exploiting Hierarchical Operator Parallelism of ML Computational Graphs on SoCs](/202609/06/2609.04168v1-para-pipe-exploiting-hierarchical-operator-parallelism-of-ml-computational-graphs-on-socs)  
+   标签：评分：7.0/10、query:edge-llm
+   evidence：面向边缘异构芯片上ML推理图的算子并行与流水协同调度，属于边缘LLM软硬协同与异构计算的使能方法
+3. [GaLe: memory-efficient Global Approximate and Local Exact features](/202609/06/2609.02689v1-gale-memory-efficient-global-approximate-and-local-exact-features)  
    标签：评分：6.0/10、query:edge-llm
-   evidence：针对LLM服务中多轮会话的KV缓存LRU命中率进行理论分析
-3. [Para-Pipe: Exploiting Hierarchical Operator Parallelism of ML Computational Graphs on SoCs](/202609/05/2609.04168v1-para-pipe-exploiting-hierarchical-operator-parallelism-of-ml-computational-graphs-on-socs)  
+   evidence：面向受限设备、支持注意力机制的内存高效推理方法，可用于边缘资源效率优化
+4. [SGD-KV: Summarization Guided KV Cache Compression](/202609/06/2609.03235v1-sgd-kv-summarization-guided-kv-cache-compression)  
    标签：评分：6.0/10、query:edge-llm
-   evidence：面向边缘异构SoC的算子级并行执行与软硬件协同调度，契合端侧算子加速和异构计算主题
+   evidence：感知注意力头的KV缓存压缩，降低长上下文推理内存占用，可服务于资源受限场景
 
 
 <div class="dpr-home-promo-card">
