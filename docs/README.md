@@ -6,35 +6,41 @@
 </div>
 
 ## 每次日报
-- 最新运行日期：2026-09-06
-- 运行时间：2026-09-06 22:19:53 UTC
+- 最新运行日期：2026-09-07
+- 运行时间：2026-09-07 23:26:01 UTC
 - 运行状态：成功
-- 本次总论文数：5
-- 精读区：1
-- 速读区：4
+- 本次总论文数：7
+- 精读区：2
+- 速读区：5
 
 ### 今日简报（AI）
-今日精读聚焦CUDA-Harness，验证了智能体从自然语言自动生成与优化CUDA内核的可行性（8.0分）；速读中TopoCompress与Para-Pipe在长文本压缩和SoC算子并行上各具亮点。建议重点跟进Agentic代码生成方向，并关注图结构压缩对超长上下文推理的实用价值。
-- 详情：[/202609/06/README](/202609/06/README)
+今日精读聚焦两篇9分论文：FlexPosit提出可调分数精度加速LLM推理，Adaptive Context Parallelism优化生产环境上下文并行。最值得关注的方向是推理精度与并行效率的协同优化。建议普通读者优先了解FlexPosit对推理加速器的灵活精度设计。
+- 详情：[/202609/07/README](/202609/07/README)
 
 ### 精读区论文标签
-1. [CUDA-Harness: Harnessing Agentic CUDA Kernel Generation and Optimization from Natural Language](/202609/06/2609.00058v1-cuda-harness-harnessing-agentic-cuda-kernel-generation-and-optimization-from-natural-language)  
-   标签：评分：8.0/10、query:edge-llm
-   evidence：以智能体LLM流水线从自然语言生成并硬件感知优化CUDA内核，契合算子加速与软硬协同需求
+1. [FlexPosit: Tunable Fractional Precision for LLM Inference Accelerators](/202609/07/2609.04724v1-flexposit-tunable-fractional-precision-for-llm-inference-accelerators)  
+   标签：评分：9.0/10、query:edge-llm
+   evidence：针对LLM推理加速器开展Posit量化与可调精度硬件的协同设计，直接体现软硬协同思想
+2. [Adaptive Context Parallelism for Production LLM Serving](/202609/07/2609.04774v1-adaptive-context-parallelism-for-production-llm-serving)  
+   标签：评分：9.0/10、query:edge-llm
+   evidence：面向生产环境LLM服务的自适应上下文并行服务系统，直接对应LLM服务框架
 
 ### 速读区论文标签
-1. [TopoCompress: Long Context Compression via Graph-Wired Semantic Trajectories](/202609/06/2608.30811v2-topocompress-long-context-compression-via-graph-wired-semantic-trajectories)  
+1. [Para-Pipe: Exploiting Hierarchical Operator Parallelism of ML Computational Graphs on SoCs](/202609/07/2609.04168v1-para-pipe-exploiting-hierarchical-operator-parallelism-of-ml-computational-graphs-on-socs)  
    标签：评分：7.0/10、query:edge-llm
-   evidence：免训练且模型无关的长上下文压缩，直接降低推理成本与延迟，可迁移至资源受限部署
-2. [Para-Pipe: Exploiting Hierarchical Operator Parallelism of ML Computational Graphs on SoCs](/202609/06/2609.04168v1-para-pipe-exploiting-hierarchical-operator-parallelism-of-ml-computational-graphs-on-socs)  
-   标签：评分：7.0/10、query:edge-llm
-   evidence：面向边缘异构芯片上ML推理图的算子并行与流水协同调度，属于边缘LLM软硬协同与异构计算的使能方法
-3. [GaLe: memory-efficient Global Approximate and Local Exact features](/202609/06/2609.02689v1-gale-memory-efficient-global-approximate-and-local-exact-features)  
+   evidence：在异构SoC上利用层级算子并行与流水线协同调度，降低边缘ML推理延迟。
+2. [CRISP: Cliff-awaRe Input-adaptive Sparse Prefilling with Structural-Mass-Motivated Routing](/202609/07/2609.01925v1-crisp-cliff-aware-input-adaptive-sparse-prefilling-with-structural-mass-motivated-routing)  
    标签：评分：6.0/10、query:edge-llm
-   evidence：面向受限设备、支持注意力机制的内存高效推理方法，可用于边缘资源效率优化
-4. [SGD-KV: Summarization Guided KV Cache Compression](/202609/06/2609.03235v1-sgd-kv-summarization-guided-kv-cache-compression)  
+   evidence：从注意力结构直接读取路由的输入自适应稀疏预填充方法，降低长上下文预填充计算量
+3. [Sustainable Edge Vision via Empirically Calibrated DVFS: Eliminating Thermal Throttling on Passively Cooled Hardware](/202609/07/2609.04705v1-sustainable-edge-vision-via-empirically-calibrated-dvfs-eliminating-thermal-throttling-on-passively-cooled-hardware)  
    标签：评分：6.0/10、query:edge-llm
-   evidence：感知注意力头的KV缓存压缩，降低长上下文推理内存占用，可服务于资源受限场景
+   evidence：面向边缘DNN推理的硬件感知DVFS调度消除热降频，可迁移至边缘LLM服务
+4. [Diffusion Language Models for Mobile Edge Agentic AI: Foundations, Applications, and Challenges](/202609/07/2609.04778v1-diffusion-language-models-for-mobile-edge-agentic-ai-foundations-applications-and-challenges)  
+   标签：评分：6.0/10、query:edge-llm
+   evidence：面向移动边缘智能体，以扩散式生成实现并行精化和质量-时延权衡，贴合端侧高效语言模型推断。
+5. [Deep Microcompression: Structured Pruning and Bit-packed Quantization for Microcontrollers](/202609/07/2609.05081v1-deep-microcompression-structured-pruning-and-bit-packed-quantization-for-microcontrollers)  
+   标签：评分：6.0/10、query:edge-llm
+   evidence：面向微控制器的硬件感知剪枝与量化压缩流程，可迁移到边缘LLM压缩
 
 
 <div class="dpr-home-promo-card">
