@@ -6,62 +6,41 @@
 </div>
 
 ## 每次日报
-- 最新运行日期：2026-09-09
-- 运行时间：2026-09-09 22:07:49 UTC
+- 最新运行日期：2026-09-10
+- 运行时间：2026-09-10 21:44:06 UTC
 - 运行状态：成功
-- 本次总论文数：14
-- 精读区：6
-- 速读区：8
+- 本次总论文数：7
+- 精读区：2
+- 速读区：5
 
 ### 今日简报（AI）
-今日14篇论文聚焦大模型推理效率，精读6篇重点围绕KV缓存量化与调度。最值得关注两项高分工作：面向NVM的接口感知KV量化，以及统一模型路由与缓存管理的AI网关框架。建议下一步深入对比MetaKV等压缩方案，评估不同长上下文场景下的精度与成本权衡。
-- 详情：[/202609/09/README](/202609/09/README)
+今日精读2篇、速读5篇，聚焦端侧LLM推理的能效与显存优化。最值得看的是PELM（9.0/10）用推测解码配动态调压调频降低端侧推理功耗，以及AMEND（8.0/10）在GPU-PIM解码中实现非阻塞丢弃。普通读者可先读PELM了解省电思路，再按兴趣扫速读中的小模型工具调用基准。
+- 详情：[/202609/10/README](/202609/10/README)
 
 ### 精读区论文标签
-1. [Interface-Aware KV Cache Quantization for Dense On-Chip NVM in Long-Context LLM Decoding](/202609/09/2609.05764v1-interface-aware-kv-cache-quantization-for-dense-on-chip-nvm-in-long-context-llm-decoding)  
+1. [PELM: Power Efficient On-Device LLM Inference with Speculative Decoding and Dynamic Voltage Frequency Scaling](/202609/10/2609.09662v1-pelm-power-efficient-on-device-llm-inference-with-speculative-decoding-and-dynamic-voltage-frequency-scaling)  
    标签：评分：9.0/10、query:edge-llm
-   evidence：面向片上NVM接口设计KV量化方案，是大语言模型基础设施的软硬协同方法
-2. [Unified AI Gateway: A Framework for Joint Model Routing and KV Cache Management](/202609/09/2609.06940v1-unified-ai-gateway-a-framework-for-joint-model-routing-and-kv-cache-management)  
-   标签：评分：9.0/10、query:edge-llm
-   evidence：提出边缘部署的LLM统一网关，联合模型路由、KV缓存与执行位置调度。
-3. [Hardware-Aware FP4 FlashAttention-4](/202609/09/2609.04105v1-hardware-aware-fp4-flashattention-4)  
+   evidence：面向设备端的LLM推理功耗优化，结合投机解码与动态调压调频
+2. [AMEND: Audited Margins Enable Nonblocking Drops in GPU-PIM LLM Decoding](/202609/10/2609.09823v1-amend-audited-margins-enable-nonblocking-drops-in-gpu-pim-llm-decoding)  
    标签：评分：8.0/10、query:edge-llm
-   evidence：面向LLM推理的硬件感知FP4注意力算子加速
-4. [Toward Sustainable Distributed LLM Inference: A Systems Synthesis and Research Agenda for an Energy-, Carbon-, and Cache-Aware llm-d Control Plane](/202609/09/2609.05565v1-toward-sustainable-distributed-llm-inference-a-systems-synthesis-and-research-agenda-for-an-energy--carbon--and-cache-aware-llm-d-control-plane)  
-   标签：评分：8.0/10、query:edge-llm
-   evidence：面向分布式大模型推理控制平面的系统综述与研究议程，聚焦服务系统的能效与缓存效率
-5. [All for 1-Bit: Towards Genuine 1-Bit Post-Training Quantization for LLMs](/202609/09/2609.06161v1-all-for-1-bit-towards-genuine-1-bit-post-training-quantization-for-llms)  
-   标签：评分：8.0/10、query:edge-llm
-   evidence：真正1比特后训练量化大幅降低存储与内存带宽开销，是资源受限边缘LLM部署的核心支撑技术。
-6. [AutoUVM: Automated Prefetching Framework for LLMs under UVM Oversubscription](/202609/09/2609.06172v1-autouvm-automated-prefetching-framework-for-llms-under-uvm-oversubscription)  
-   标签：评分：8.0/10、query:edge-llm
-   evidence：面向LLM GPU内存超订的UVM自动预取框架，优化页迁移与CPU-GPU数据传输。
+   evidence：面向LLM解码的GPU-PIM硬件感知注意力加速设计
 
 ### 速读区论文标签
-1. [Accuracy is Not Enough: A Divergence-Based Approach to Evaluate Fidelity Loss in Quantized LLMs](/202609/09/2609.07664v1-accuracy-is-not-enough-a-divergence-based-approach-to-evaluate-fidelity-loss-in-quantized-llms)  
-   标签：评分：8.0/10、query:edge-llm
-   evidence：面向内存受限边缘设备量化LLM部署的保真度评估方法
-2. [Deadline-Aware Adaptive Prefill Chunking for Efficient Large Language Model Serving](/202609/09/2609.07883v1-deadline-aware-adaptive-prefill-chunking-for-efficient-large-language-model-serving)  
-   标签：评分：8.0/10、query:edge-llm
-   evidence：截止时间感知的自适应预填充分块调度方法，直接面向连续批处理的LLM服务效率与时延目标。
-3. [MetaKV: Adaptive KV Cache Compression for Constrained LLM Inference](/202609/09/2609.07966v1-metakv-adaptive-kv-cache-compression-for-constrained-llm-inference)  
-   标签：评分：8.0/10、query:edge-llm
-   evidence：基于用户指定延迟与峰值内存预算选择KV压缩配置，面向受资源约束的推理场景
-4. [A Measurement Study of LLM Inference Trade-offs Across Edge Continuum Hardware](/202609/09/2609.08307v1-a-measurement-study-of-llm-inference-trade-offs-across-edge-continuum-hardware)  
-   标签：评分：8.0/10、query:edge-llm
-   evidence：对Jetson等边缘设备上的LLM延迟、能耗与模型体积进行受控测量。
-5. [Signed Rescue Routing: Harm-Aware Cascades for Efficient LLM Inference](/202609/09/2609.07786v1-signed-rescue-routing-harm-aware-cascades-for-efficient-llm-inference)  
+1. [Beyond Fluent Generation: A CPU Reliability Benchmark for MCP-Style Tool Calling in Sub-2B Small Language Models for Edge Deployment](/202609/10/2609.07370v1-beyond-fluent-generation-a-cpu-reliability-benchmark-for-mcp-style-tool-calling-in-sub-2b-small-language-models-for-edge-deployment)  
    标签：评分：7.0/10、query:edge-llm
-   evidence：面向高效LLM推理的有预算小-大模型路由方法，可集成到服务系统
-6. [Do Dynamic Routers Need Memory? HeRo: History-Aware Routing for Efficient LLM Inference](/202609/09/2609.08189v1-do-dynamic-routers-need-memory-hero-history-aware-routing-for-efficient-llm-inference)  
-   标签：评分：7.0/10、query:edge-llm
-   evidence：通过历史感知动态层路由减少LLM推理开销，可提升资源受限端的推理效率。
-7. [Train Overcomplete, Deploy Compact: Scaling Recovery Capacity for Structured LLM Pruning](/202609/09/2609.06974v1-train-overcomplete-deploy-compact-scaling-recovery-capacity-for-structured-llm-pruning)  
+   evidence：面向边缘单板机端侧小模型的CPU可靠性基准
+2. [Debias-SparseGPT: Bias-Aware Pruning for Large Language Models](/202609/10/2609.02496v1-debias-sparsegpt-bias-aware-pruning-for-large-language-models)  
    标签：评分：6.0/10、query:edge-llm
-   evidence：通过结构化剪枝与过参数化恢复降低LLM部署资源开销
-8. [FastE: Readout-Triggered Token Compression for LLM Embedding Inference](/202609/09/2609.08407v1-faste-readout-triggered-token-compression-for-llm-embedding-inference)  
+   evidence：面向LLM高效部署与加速的剪枝方法
+3. [DFlow: Enabling Verifier Information Flow in Block Diffusion Speculative Decoding](/202609/10/2609.06498v1-dflow-enabling-verifier-information-flow-in-block-diffusion-speculative-decoding)  
    标签：评分：6.0/10、query:edge-llm
-   evidence：面向LLM嵌入模型的无训练令牌压缩，显著降低推理计算负担，适合移植到资源受限的边缘场景
+   evidence：投机解码中的信息复用以提升大模型推理效率
+4. [Accuracy is Not Enough: A Divergence-Based Approach to Evaluate Fidelity Loss in Quantized LLMs](/202609/10/2609.07664v2-accuracy-is-not-enough-a-divergence-based-approach-to-evaluate-fidelity-loss-in-quantized-llms)  
+   标签：评分：6.0/10、query:edge-llm
+   evidence：面向边缘大模型部署的量化评估
+5. [Scaling Post-Training Ternarisation to Qwen3-8B Capability Retention, Reproduction, Lossless Packing, and Packed Execution](/202609/10/2609.09240v1-scaling-post-training-ternarisation-to-qwen3-8b-capability-retention-reproduction-lossless-packing-and-packed-execution)  
+   标签：评分：6.0/10、query:edge-llm
+   evidence：面向高效LLM推理的超低位宽量化、打包与打包执行
 
 
 <div class="dpr-home-promo-card">
