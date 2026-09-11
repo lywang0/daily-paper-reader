@@ -6,41 +6,32 @@
 </div>
 
 ## 每次日报
-- 最新运行日期：2026-09-10
-- 运行时间：2026-09-10 21:44:06 UTC
+- 最新运行日期：2026-09-11
+- 运行时间：2026-09-11 22:05:36 UTC
 - 运行状态：成功
-- 本次总论文数：7
-- 精读区：2
-- 速读区：5
+- 本次总论文数：4
+- 精读区：1
+- 速读区：3
 
 ### 今日简报（AI）
-今日精读2篇、速读5篇，聚焦端侧LLM推理的能效与显存优化。最值得看的是PELM（9.0/10）用推测解码配动态调压调频降低端侧推理功耗，以及AMEND（8.0/10）在GPU-PIM解码中实现非阻塞丢弃。普通读者可先读PELM了解省电思路，再按兴趣扫速读中的小模型工具调用基准。
-- 详情：[/202609/10/README](/202609/10/README)
+2026-09-11 日报精选4篇LLM推理与服务工作，精读EMMI多模态边缘推理优化（9.0分），速览ExaServe、PATTON、MoE缓存路由三项系统方案。最值得关注的是边缘多模态推理的融合表示压缩，以及超算级与PIM硬件上的大模型服务落地。普通读者可优先看EMMI了解端侧多模态如何省通信，再按兴趣扫读速读三篇把握服务系统趋势。
+- 详情：[/202609/11/README](/202609/11/README)
 
 ### 精读区论文标签
-1. [PELM: Power Efficient On-Device LLM Inference with Speculative Decoding and Dynamic Voltage Frequency Scaling](/202609/10/2609.09662v1-pelm-power-efficient-on-device-llm-inference-with-speculative-decoding-and-dynamic-voltage-frequency-scaling)  
+1. [EMMI: Edge Multi-Modal Intelligence for Communication-Efficient MLLM Inference via Fused Representation Compression](/202609/11/2609.11058v1-emmi-edge-multi-modal-intelligence-for-communication-efficient-mllm-inference-via-fused-representation-compression)  
    标签：评分：9.0/10、query:edge-llm
-   evidence：面向设备端的LLM推理功耗优化，结合投机解码与动态调压调频
-2. [AMEND: Audited Margins Enable Nonblocking Drops in GPU-PIM LLM Decoding](/202609/10/2609.09823v1-amend-audited-margins-enable-nonblocking-drops-in-gpu-pim-llm-decoding)  
-   标签：评分：8.0/10、query:edge-llm
-   evidence：面向LLM解码的GPU-PIM硬件感知注意力加速设计
+   evidence：通过紧凑融合表示实现通信高效的边缘多模态大模型推理
 
 ### 速读区论文标签
-1. [Beyond Fluent Generation: A CPU Reliability Benchmark for MCP-Style Tool Calling in Sub-2B Small Language Models for Edge Deployment](/202609/10/2609.07370v1-beyond-fluent-generation-a-cpu-reliability-benchmark-for-mcp-style-tool-calling-in-sub-2b-small-language-models-for-edge-deployment)  
+1. [ExaServe: Large-Scale LLM Serving on Exascale HPC Systems](/202609/11/2609.10812v1-exaserve-large-scale-llm-serving-on-exascale-hpc-systems)  
    标签：评分：7.0/10、query:edge-llm
-   evidence：面向边缘单板机端侧小模型的CPU可靠性基准
-2. [Debias-SparseGPT: Bias-Aware Pruning for Large Language Models](/202609/10/2609.02496v1-debias-sparsegpt-bias-aware-pruning-for-large-language-models)  
+   evidence：面向超算系统的可复现大规模LLM服务框架部署
+2. [PATTON: Enabling Commodity PIM for Production LLM Serving](/202609/11/2609.11392v1-patton-enabling-commodity-pim-for-production-llm-serving)  
+   标签：评分：7.0/10、query:edge-llm
+   evidence：面向生产级LLM服务的存内计算KV缓存生命周期运行时
+3. [Cache-Aware Joint Router Adaptation for Memory-Efficient MoE Inference](/202609/11/2609.04895v2-cache-aware-joint-router-adaptation-for-memory-efficient-moe-inference)  
    标签：评分：6.0/10、query:edge-llm
-   evidence：面向LLM高效部署与加速的剪枝方法
-3. [DFlow: Enabling Verifier Information Flow in Block Diffusion Speculative Decoding](/202609/10/2609.06498v1-dflow-enabling-verifier-information-flow-in-block-diffusion-speculative-decoding)  
-   标签：评分：6.0/10、query:edge-llm
-   evidence：投机解码中的信息复用以提升大模型推理效率
-4. [Accuracy is Not Enough: A Divergence-Based Approach to Evaluate Fidelity Loss in Quantized LLMs](/202609/10/2609.07664v2-accuracy-is-not-enough-a-divergence-based-approach-to-evaluate-fidelity-loss-in-quantized-llms)  
-   标签：评分：6.0/10、query:edge-llm
-   evidence：面向边缘大模型部署的量化评估
-5. [Scaling Post-Training Ternarisation to Qwen3-8B Capability Retention, Reproduction, Lossless Packing, and Packed Execution](/202609/10/2609.09240v1-scaling-post-training-ternarisation-to-qwen3-8b-capability-retention-reproduction-lossless-packing-and-packed-execution)  
-   标签：评分：6.0/10、query:edge-llm
-   evidence：面向高效LLM推理的超低位宽量化、打包与打包执行
+   evidence：减少权重反复搬运的内存高效MoE推理
 
 
 <div class="dpr-home-promo-card">
