@@ -6,32 +6,41 @@
 </div>
 
 ## 每次日报
-- 最新运行日期：2026-09-11
-- 运行时间：2026-09-11 22:05:36 UTC
+- 最新运行日期：2026-09-12
+- 运行时间：2026-09-12 21:19:50 UTC
 - 运行状态：成功
-- 本次总论文数：4
-- 精读区：1
-- 速读区：3
+- 本次总论文数：6
+- 精读区：0
+- 速读区：6
 
 ### 今日简报（AI）
-2026-09-11 日报精选4篇LLM推理与服务工作，精读EMMI多模态边缘推理优化（9.0分），速览ExaServe、PATTON、MoE缓存路由三项系统方案。最值得关注的是边缘多模态推理的融合表示压缩，以及超算级与PIM硬件上的大模型服务落地。普通读者可优先看EMMI了解端侧多模态如何省通信，再按兴趣扫读速读三篇把握服务系统趋势。
-- 详情：[/202609/11/README](/202609/11/README)
+今日扫读6篇、精读0篇，速读集中在LLM智能体与高效建模方向。  
+最值得关注的是车辆Agent函数调用的小模型可读Schema方案，以及LLM Agent会话KV常驻的近内存调度设计。  
+普通读者可优先翻这两篇，重点看它们如何降低部署与推理成本。
+- 详情：[/202609/12/README](/202609/12/README)
 
 ### 精读区论文标签
-1. [EMMI: Edge Multi-Modal Intelligence for Communication-Efficient MLLM Inference via Fused Representation Compression](/202609/11/2609.11058v1-emmi-edge-multi-modal-intelligence-for-communication-efficient-mllm-inference-via-fused-representation-compression)  
-   标签：评分：9.0/10、query:edge-llm
-   evidence：通过紧凑融合表示实现通信高效的边缘多模态大模型推理
+- 本次无精读推荐。
 
 ### 速读区论文标签
-1. [ExaServe: Large-Scale LLM Serving on Exascale HPC Systems](/202609/11/2609.10812v1-exaserve-large-scale-llm-serving-on-exascale-hpc-systems)  
-   标签：评分：7.0/10、query:edge-llm
-   evidence：面向超算系统的可复现大规模LLM服务框架部署
-2. [PATTON: Enabling Commodity PIM for Production LLM Serving](/202609/11/2609.11392v1-patton-enabling-commodity-pim-for-production-llm-serving)  
-   标签：评分：7.0/10、query:edge-llm
-   evidence：面向生产级LLM服务的存内计算KV缓存生命周期运行时
-3. [Cache-Aware Joint Router Adaptation for Memory-Efficient MoE Inference](/202609/11/2609.04895v2-cache-aware-joint-router-adaptation-for-memory-efficient-moe-inference)  
+1. [From Fixed Keys to Readable Schemas: Small Language Models for Vehicle Agent Function Calls](/202609/12/2609.09476v1-from-fixed-keys-to-readable-schemas-small-language-models-for-vehicle-agent-function-calls)  
    标签：评分：6.0/10、query:edge-llm
-   evidence：减少权重反复搬运的内存高效MoE推理
+   evidence：严格内存与延迟约束下的端侧小模型函数调用
+2. [UNISON: A Co-Designed Near-Memory Scheduler of Session KV Residency for LLM Agents](/202609/12/2609.09643v1-unison-a-co-designed-near-memory-scheduler-of-session-kv-residency-for-llm-agents)  
+   标签：评分：6.0/10、query:edge-llm
+   evidence：面向LLM服务KV驻留的软硬协同近存调度器
+3. [RiLM: Parameter-Efficient Language Modeling via Geodesic Decoding](/202609/12/2609.10305v1-rilm-parameter-efficient-language-modeling-via-geodesic-decoding)  
+   标签：评分：6.0/10、query:edge-llm
+   evidence：面向边缘部署的参数高效语言模型
+4. [The Art of Closed-Formula Defaults: Search-Free Code Generation for Tensor Operators](/202609/12/2609.10937v1-the-art-of-closed-formula-defaults-search-free-code-generation-for-tensor-operators)  
+   标签：评分：6.0/10、query:edge-llm
+   evidence：面向LLM推理张量算子的免搜索代码生成
+5. [LILA: Calibration-Free Structured Pruning of Large Language Models via Latent Spectral Geometry](/202609/12/2609.11163v1-lila-calibration-free-structured-pruning-of-large-language-models-via-latent-spectral-geometry)  
+   标签：评分：6.0/10、query:edge-llm
+   evidence：免校准结构化剪枝，实现硬件友好的LLM压缩
+6. [Structured Transforms for Low-Overhead Quantization of Language Models](/202609/12/2609.11687v1-structured-transforms-for-low-overhead-quantization-of-language-models)  
+   标签：评分：6.0/10、query:edge-llm
+   evidence：面向语言模型的低开销权重量化
 
 
 <div class="dpr-home-promo-card">

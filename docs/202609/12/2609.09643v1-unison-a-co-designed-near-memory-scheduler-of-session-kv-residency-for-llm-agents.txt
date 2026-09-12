@@ -1,0 +1,1055 @@
+Title: UNISON: A Co-Designed Near-Memory Scheduler of Session KV Residency for LLM Agents
+
+URL Source: https://arxiv.org/pdf/2609.09643v1
+
+Published Time: Thu, 10 Sep 2026 00:29:12 GMT
+
+Number of Pages: 13
+
+Markdown Content:
+1
+
+# UNISON: A Co-Designed Near-Memory Scheduler of Session KV Residency for LLM Agents 
+
+Fan He, Yan Li, Member, IEEE, and Xiaoyang Zeng, Senior Member, IEEE 
+
+Abstract —Large language models are increasingly composed into agent loops that plan, call tools, and resume the same task after each action. These loops press a shared memory hierarchy harder than conventional multi-turn chat, because they hold a growing key-value (KV) prefix across tool waits and place many sessions on one static random-access memory (SRAM) and high-bandwidth memory (HBM) pool, so that eviction and hierarchical placement become a session-level efficiency problem orthogonal to compute-mode optimization. Existing proxies based on recency, timeout, or identity miss the mechanism information of the loop and therefore treat a live wait as a cold, discardable unit. To address this problem, we present Unified Native Inter-turn Session Orchestration Nexus (U NISON ), an event-driven near-memory scheduler beside the memory hierarchy in which Survival-Penalty Eviction for Agent Return-gap (S PEAR ) and Tiering in Idle-window DMA Events (T IDE ) share one live ranking. S PEAR selects who leaves from a gap average and a turn-indexed hazard, while T IDE spends the observed wait as a direct memory access (DMA) budget for who sits in the fast tier. On both coding and general-mission benchmarks with three model families, totaling 1 415 sessions and 33 596 turns, the joint policy is the best non-oracle entry on hit rate and average memory access time (AMAT) on every trace, raising the hit rate by 0.3% 
+
+to 23 .1% and reducing AMAT by 22% to 51% , and lowering time to first token (TTFT) by 58% to 89% on the long-horizon traces. A structural necessity analysis shows that the unified near-memory design cannot be decomposed into independent IPs or realized in software without re-introducing documented failure modes. The 28-nm CMOS scheduling core occupies 0.169 mm 2 at 13.6 mW and 150 MHz, a negligible overhead relative to the KV hierarchy it manages, and reproduces the floating-point ranking at a Kendall τ exceeding 0.998. 
+
+Index Terms —session KV residency, memory tiering, eviction, LLM agents, near-memory scheduler 
+
+I. I NTRODUCTION 
+
+# LARGE language models (LLMs) are now widely de-ployed as general-purpose generators, and the rise of tool use has composed them into multi-step agent loops [1], [2] that plan, invoke external tools, and resume the same task after each action. Although multi-turn chat already retains a conversation prefix in the key-value (KV) cache, an agent loop further superimposes structured tool waits, larger tool-result inserts, and more model invocations per task, so that the object of serving is no longer a single request but a session that is expected to return. Serving systems have accordingly devoted most of their effort to how tokens are computed, including how prefill and 
+
+This work was supported by the National Natural Science Foundation of China under Grant 62574049. ( Corresponding author: Yan Li. )Fan He, Yan Li, and Xiaoyang Zeng are with the State Key Laboratory of Integrated Chips and Systems, Fudan University, Shanghai 200433, China (e-mail: liyan@fudan.edu.cn). Shared KV Cache      
+
+> On-die SRAM
+> Hot SRAM
+> HBM
+> Agent sessions
+> Agent 1 PD
+> Agent 2 PD
+> ...
+> Agent n PD
+> Other Atn. Comp.
+> VLM
+> ViT / NN / ...
+> SoC
+> NPU CPU
+> SRAM HBM
+> Memory Hierarchy
+> GPU ...
+
+(a) Agent prefixes stay resident in a shared KV cache pool across tool waits 
+
+> SWE Qwen
+> SWE Devstral
+> SWE Gemma
+> GAIA Qwen
+> GAIA Devstral
+> GAIA Gemma
+> SWE Qwen
+> SWE Devstral
+> SWE Gemma
+> GAIA Qwen
+> GAIA Devstral
+> GAIA Gemma
+> AMAT / Oracle
+> Extra prefill
+
+(b)  The same KV growth appears 
+
+across tasks and models 
+
+(c) Common strategies recompute extra 
+
+tokens and raise E2E TTFT 
+
+> Burst–wait occupancy
+
+Fig. 1. Motivation. (a) Agent-resident occupancy versus a request-scoped counterfactual on the same twelve-turn session. (b) Monotonic prefix growth across 1 415 sessions into edge and cloud SRAM/HBM envelopes. (c) Re-cency, timeout, and ETA remain above a Bélády oracle in AMAT, extra prefill, and TTFT. 
+
+decode share or split devices [3], [4]. Under agent loops, however, the end-to-end cost is often set by how the KV cache is retained, evicted, and placed. Whereas a multi-turn conver-sation remains paced by one user, agent workloads place many agents and many sessions on the same pool at once and hold a growing prefix across tool waits. The resulting live set shares static random-access memory (SRAM) and high-bandwidth memory (HBM) with other attention clients, including prefill, decode, and an optional vision-language model, on both edge systems-on-chip (SoCs) and cloud servers. Once aggregate res-idency outgrows that pool, eviction and hierarchical placement become an efficiency problem in their own right and stand orthogonal to compute-mode optimization. Fig. 1(a) records this operating point. Fig. 1(a) contrasts two KV contracts on the same twelve-turn session. The agent-resident curve holds the prefix through every tool wait, whereas the request-scoped pulses drop the cache after each decode. Unlike a multi-turn chat staircase whose idle interval is a human pause that may never return, an agent tool wait is a scheduled return, and recency or timeout policies therefore treat the second kind of idle as if it were the first. That resident contract becomes expensive once the prefix outgrows the finite pool. Fig. 1(b) overlays prefix tokens on arXiv:2609.09643v1 [cs.AR] 9 Sep 2026 2
+
+coding and web-agent traces across 1 415 sessions and three model families. The curves rise monotonically into the SRAM and HBM envelopes that edge and cloud stacks provision, and a budget that cannot hold the live set is what makes session-level scheduling unavoidable. Published proxies miss the mechanism information that the loop already produces and therefore treat a live wait as a cold, discardable unit. Recency and timeout invert the rank by reading a tool wait as coldness. A per-request lifecycle issues an absolute keep-or-drop without ever ranking the live set against other residents [5], [6]. A tool-type arrival table ranks residents yet assigns the same wait to every job that shares a tool. Identity- or workflow-conditioned scores separate res-idents only while roles or graphs remain diverse and flatten toward recency once the batch is uniform [7]–[9]. Hierarchical stores enlarge the pool yet still place from a static plan, a job-scheduler hint, or prefix popularity, so that a kept prefix is served on the slow path. Paged and radix runtimes [10], [11] manage the pool at block granularity. Token, device, and interconnect engines decide which bytes of one request to compute or move, a decision that is complementary to ranking who stays in the shared pool, as Table VI places on one grid. As Fig. 1(c) reports, recency, timeout, and estimated time of arrival (ETA) all sit above a Bélády next-reference oracle in average memory access time (AMAT), extra prefill, and time to first token (TTFT) across six traces and six capacity envelopes. Because that oracle is not observable online, a useful substitute must exploit a signal that is already present on every session, observable at runtime, and cheap to maintain, namely the session’s own gap history and its own progress toward completion. Orthogonal to token datapaths and cluster routers that pursue the same end-to-end efficiency from complementary vantage points, this work proposes a near-memory scheduler beside the hierarchy for long-horizon agent tasks in which many attention clients compete for a two-tier pool on the edge and in the cloud. The scheduler must decide who leaves the pool and who sits in the fast tier, and both decisions are conditioned on the loop’s mechanism information rather than on an attempt to read task content. To address those issues, we present Unified Native Inter-turn Session Orchestration Nexus (U NISON ), an event-driven near-memory scheduler in which Survival-Penalty Eviction for 
+
+Agent Return-gap (S PEAR ) and Tiering in Idle-window DMA 
+
+Events (T IDE ) share one live ranking in a session register file beside the memory hierarchy. S PEAR scores remaining distance from a gap exponential moving average (EMA) and a turn-indexed hazard and selects who leaves, while T IDE reads the complementary order, spends the observed wait as a direct memory access (DMA) budget, and selects who sits in the appropriate memory hierarchy. The main contributions are as follows. 1) Algorithm. SPEAR and T IDE jointly rank sessions from loop signals that the serving runtime already observes. Evaluated on six traces that cross the SWE-bench [12] and GAIA [13] agent benchmarks with three model families [14]–[16], totaling 1 415 sessions, 33 596 turns, and six capacity envelopes from edge to cloud, the joint policy is the best non-oracle entry on hit rate and AMAT on every trace, raising the hit rate by 0.3% to 23 .1% and reducing AMAT by 22% to 51% . On the long-horizon traces it also lowers serving TTFT by 58% to 89% when extra prefill sits on the critical path. 2) Architecture. We show that cycle-level event fidelity, unified eviction and migration state, and deterministic gap-window completion jointly require a near-memory control plane that cannot be decomposed into indepen-dent IPs or realized in software. The 28-nm CMOS scheduling core occupies 0.169 mm 2 at 13.6 mW and 150 MHz for 64 sessions, a negligible overhead that re-produces the floating-point ranking at Kendall τ > 0.998 .II. R ELATED WORK 
+
+A finite two-tier pool poses two ordering problems: eviction ranks who leaves, and placement ranks who sits in the fast tier. Both oracles reduce to Bélády next-reference distance, which is not observable online, so every policy substitutes a proxy conditioned on progressively richer information. 
+
+A. Information-Conditioned Eviction Methods 
+
+Access-history methods treat a recent touch as evidence of future need. PagedAttention [10] pages a growing KV pool in the style of virtual memory, and SGLang [11] reuses shared prefixes through a radix tree. Both evict by block recency, so a session alive on a tool wait appears oldest and leaves first. Lifecycle methods promote the pause to a first-class request state. InferCept [5] chooses discard, preserve, or swap from a per-request waste account, and Continuum [6] pins paused KV with a time-to-live derived from reload cost. Both keep a paused session resident yet issue an absolute keep-or-drop for one request, so the locally cheap choice can be the globally expensive victim. Arrival-table methods predict the next request. AGSERVE [17] reads the next arrival from a tool-type latency table, assigning the same wait to every session that shares a tool, which homogenizes heterogeneous jobs and mis-ranks the longest residents. Structure-conditioned methods exploit workflow or role di-versity. CacheScout [7] learns a Markov table over agent roles, KVFlow [8] reads steps-to-execution off a declared graph, and PBKV [9] predicts future agent calls. The contrast in all three is borrowed from structural diversity; a homogeneous batch flattens the scores and the policy falls back to recency. A parallel line shortens the token set of one trajectory rather than ranking who leaves a shared pool. IntentKV [18] scores history tokens from cross-turn intent, MemDecay [19] assigns region-specific decay, and CommitKV [20] retires pages only after a tool-call commit. All three trade accuracy for a smaller working set without comparing live sessions against one another. Semantic queues [21], variable-grain paging [22], and workflow-aware job admission [23] similarly reshape what a request contains or which job runs, yet none ranks live sessions on a shared pool. Learned replacement policies trained by reinforcement learning or imitation, such as LRB [24] in web caching, 3
+
+achieve strong offline accuracy but require per-decision infer-ence times of hundreds of microseconds to milliseconds, which exceeds the single-digit microsecond budget of a near-memory scheduler by two orders of magnitude and therefore cannot serve as an online eviction oracle in the hardware pipeline targeted here. Taken together, access history inverts the ranking, a per-request lifecycle yields no ranking, a population table ho-mogenizes it, and borrowed structure yields a ranking that vanishes when the batch is uniform, and none of these proxies conditions on the signal that every session carries in every regime, namely its own observed gaps and its own progress toward completion. 
+
+B. Hierarchy-Aware Placement Strategies 
+
+A kept session still has an access cost; the oracle places the soonest next reference in the fast tier. Prior placement work has widened its information from a static offload plan to job-scheduler hints to a global reuse store. FlexGen [25] solves a linear program over GPU, CPU, and disk, conditioning on membership in the current computation, so a session alive on a tool wait is demoted first. CachedAttention [26] places blocks from scheduler hints across a three-level store, but the hint names the next scheduled job, not the remaining wait of each session. Mooncake [27] pools DRAM, SSD, and RDMA under prefix-popularity ordering, which ranks by reuse frequency rather than by proximity. Consequently, a static plan inverts the placement in time, a scheduler hint homogenizes it across pauses, and a popularity score orders it by frequency instead of proximity, so all three keep the right bytes in the wrong place because none conditions on the gap this session just opened. 
+
+C. Near-Memory and Datapath KV Hardware 
+
+Token, device, and interconnect engines decide which bytes of one request to compute or move, a decision complementary to ranking who stays in a shared pool. Table VI in Section VI places both objects on one grid. Importance datapaths prune or skip tokens inside one de-code step. Token-Picker [28] withholds transfers based on pre-softmax probability, UniCAIM [29] prunes via content-addressable search, a KV-MMU [30] replaces least-relevant to-kens at runtime, HiKV [31] evicts tokens then loads significant elements through a reconfigurable sorter, and Kelle [32] evicts by attention score in embedded DRAM. Look-back and voting designs such as MATA [33] and VEDA [34] belong to the same datapath family. Capacity-expansion hardware enlarges the store. CXL-SpecKV [35] offloads KV to FPGA memory with speculative prefetch, and V-Rex [36] retrieves clustered video-token subsets. None of these engines observes a tool wait or a pool of other live sessions. A near-memory scheduler sits beside the hierarchy and ranks session residency on request and gap events, so that eviction and tiering become two reads of that ranking. The datapath can still prune tokens of the request now in flight; the two mechanisms do not substitute for each other. III. M ETHODOLOGY 
+
+This section decomposes the online control problem of Section I into three sub-problems and solves each under causal information alone. Section III-A formalizes the two-tier pool and the cost asymmetry that makes victim choice the dominant lever. Section III-B introduces S PEAR , which approximates the Bélády eviction oracle from two observable signals, namely a gap recurrence estimate and a turn-indexed completion hazard. Section III-C introduces T IDE , which converts measured idle windows into tier-placement migrations ranked by the same signal. Section III-D unifies both mechanisms in a single event-driven control loop as shown in Algorithm 1. Fig. 2 gives the corresponding pipeline. 
+
+A. Workload Model and Problem Formulation 
+
+An agent execution is a session s of Ts turns. Turn k arrives at wall time as,k after a tool gap 
+
+gs,k = as,k − cs,k −1, (1) where cs,k −1 is the completion time of the previous turn. The resident KV length ℓs,k is prefix-heavy because later turns inherit most of their context from earlier ones, so a hit avoids re-prefilling the full prefix while a miss pays the entire sequence length. The reuse ratio 
+
+ρs,k = ℓs,k −1
+
+ℓs,k 
+
+, ∆ℓs,k = ℓs,k − ℓs,k −1 (2) quantifies this asymmetry. A miss costs ℓs,k tp whereas a hit costs only ∆ℓs,k tp, making victim choice the dominant lever on serving latency. The live set L(t) occupies a two-tier budget of SRAM capacity CS and HBM capacity CH together with a hard session-slot limit Nsess ,
+
+X
+
+> s∈L S
+
+ℓs ≤ CS, X
+
+> s∈L H
+
+ℓs ≤ CH, |L S ∪ L H| ≤ Nsess .
+
+(3) A policy maps L(t) to a victim on overflow and to promotion and demotion candidates during a gap. The offline Bélády oracle v⋆ evicts the session whose next request is farthest in the future. An online policy π may use only the causal filtration Ft, comprising the last gap, the turn index, and the completion flag, and may use neither future arrivals nor agent-role identity. The design target is to approximate v⋆ while remaining a function of Ft alone. A learned policy such as a small neural network could in principle fit the same mapping, but the eviction decision sits on the critical path of every cache miss and must complete within single-digit microseconds at the hardware event rate, a latency regime that is incompatible with even a minimal inference pass and that motivates the closed-form scoring function developed below. 
+
+B. SPEAR : Survival-Penalty Eviction for Agent Return-Gap 
+
+The Bélády distance of a paused session depends on two quantities that operate on different timescales, namely how long the current tool gap will last and whether the session will return at all. S PEAR approximates the first through a gap 4A. Trace Construction  B. Algorithm Design  
+
+> A1
+
+Agent Harness    
+
+> SWE
+> bench
+> GAIA
+> Harness
+> LLM
+> Ollama
+> Docker
+> sandbox
+> Web Tools
+> Qwen3-30B Devstral-24B Gemma4-27B
+> A2
+
+Timing Proxy    
+
+> litellm Proxy Ollama
+> A3
+
+Data Profile  1,451 sessions · 33,596 turns  
+
+> B1
+
+SPEAR Scorer  score = g/σ(t)+(1−σ)·P      
+
+> Read LUT σMAC Victim
+> B2
+
+TIDE Migrator  budget = gap × bw 
+
+SRAM  session  session  session 
+
+HBM  session  session   
+
+> promote demote
+> B3
+
+UNISON Event Pipeline on request  on gap  
+
+> C1
+
+Replay Engine  C2  Config Space        
+
+> Policies (7) +
+> ours baselines
+> Workloads (6) SWE
+> GAIA
+> HW (3×2) Edge Srv CXL
+> C3
+
+Metric Pipeline  C4  Evaluation Rigor       
+
+> Cross-Validation
+> train train train
+> train test train
+> Capacity Sweep
+> 10K
+> 20K
+> 50K
+> 100K
+> Ablation
+> SPEAR only TIDE only UNISON
+> Baselines
+> Oracle Upper Bound
+> State-of-the-Art Policies
+> Classical Heuristics
+
+C. Evaluation Framework         
+
+> REQ SPEAR ALLOC INFER EMA GAP TIDE END
+> events events
+> replayable traces with policy
+
+Fig. 2. U NISON methodology. A shared event log bridges workload characterization, survival-based scoring, idle-window migration, and multi-metric evaluation. 
+
+exponential moving average and the second through a turn-indexed hazard, combining them into a single eviction score that ranks all residents by estimated next-reference distance. 
+
+a) Gap recurrence estimate: The gap EMA tracks the characteristic return interval of session s with coefficient 
+
+α=3 /10 as 
+
+gs ← α g s,k + (1 − α) gs = 3 gs,k + 7 gs
+
+10 . (4) A session with a long smoothed gap is expected to remain idle longer, so it should be evicted before a session that returns frequently. 
+
+b) Turn-indexed completion hazard: A session closer to its final turn is more likely to complete and release its KV permanently. The discrete hazard at turn t is 
+
+h(t) = d(t)
+
+n(t) , t ∈ { 0, . . . , 50 }, (5) where n(t) sessions remain live at turn t and d(t) complete there, counted over the observed population. The survival mass is the local complement 
+
+σ(t) = max  ε, 1 − h(min( t, 50)) , ε = 0 .01 , (6) which requires a single table lookup, avoiding the sequential dependence of the cumulative product-limit estimator. 
+
+c) Composite eviction score: The two signals combine into 
+
+score( s) = 
+
+
+
+Smax , s completed ,gs
+
+σ(t) +  1 − σ(t)P, otherwise , (7) where P is a programmable completion penalty. A high score denotes high eviction priority. The first term is the expected remaining wait scaled by survival likelihood, so a session with low σ near completion sees an inflated ratio that raises its eviction priority. The second term adds a penalty that grows as 
+
+σ falls, accelerating eviction of sessions whose KV will soon have no future request. The signal contribution and parameter sensitivity of (7) are evaluated in Sections V-D and V-B. Scoring determines who leaves the pool but not where a surviving session should reside within the two-tier hierarchy. The complementary placement problem is addressed next. 
+
+C. TIDE : Tiering in Idle-Window DMA Events 
+
+A tool gap is wasted time from the perspective of the memory hierarchy, because the paused session holds a tier slot but issues no requests. T IDE converts this idle window into a DMA budget and migrates sessions between SRAM and HBM so that the lowest-scoring residents occupy the fast tier when the next request arrives. On a gap_start event with estimated remaining duration 
+
+∆, the migration budget in tokens is 
+
+B = ∆ · B, (8) where B is the logical DMA bandwidth in tokens per nanosec-ond. Let H be the HBM residents and S the SRAM residents. 5 
+
+> Algorithm 1. U NISON event loop
+
+Require: event e, live set L, capacities (CS, C H, N sess ),shared register file R, DMA state 
+
+Ensure: victim v and logical DMA descriptors  
+
+> 1:
+
+write e into R {turn, gap, completion}  
+
+> 2:
+
+if e is gap_end then  
+
+> 3:
+
+gs ← α g s,k + (1 − α) gs {(4)}  
+
+> 4:
+
+end if  
+
+> 5:
+
+if L violates (3) then  
+
+> 6:
+
+for s ∈ L do  
+
+> 7:
+
+score( s) ← (7)  
+
+> 8:
+
+end for  
+
+> 9:
+
+v ← arg max s score( s) 
+
+> 10:
+
+evict v from its tier  
+
+> 11:
+
+end if  
+
+> 12:
+
+if e is gap_start and DMA is free then  
+
+> 13:
+
+B ← ∆ · B 
+
+> 14:
+
+while B covers a legal pair do  
+
+> 15:
+
+p ← arg min s∈H score( s) 
+
+> 16:
+
+d ← arg max s∈S score( s) 
+
+> 17:
+
+migrate (p, d ); B ← B − ℓp − ℓd 
+
+> 18:
+
+end while  
+
+> 19:
+
+end if 
+
+Promotion and demotion then solve the complementary selec-tions 
+
+p = arg min  
+
+> s∈H
+
+score( s), (9) 
+
+d = arg max  
+
+> s∈S
+
+score( s), (10) subject to ℓp + ℓd ≤ B and to (3) after the swap. The key property of T IDE is that it ranks migration candidates with the same S PEAR score used for eviction, so eviction quality directly determines placement quality, and the two mecha-nisms share a single ranking signal rather than maintaining independent state. This coupling is validated quantitatively in the component ablation of Section V-C. 
+
+D. Joint Online Control Loop 
+
+SPEAR and T IDE share a single session register file updated on every event. Algorithm 1 specifies the complete loop. Each incoming event updates the register file, triggers an eviction scan if capacity is violated, and initiates migrations if a gap is open and the DMA engine is free. The two mechanisms read the same scores from the same state, which is why a unified control plane outperforms dual independent engines with periodic synchronization, as the architectural ablation of Section IV demonstrates. Section IV maps this algorithmic contract to a synthesizable fixed-point pipeline, and Sections V–VI evaluate the resulting policy against the Bélády oracle and competing baselines. IV. A RCHITECTURE 
+
+The policy of Section III is defined over causal information alone, but a software implementation on top of a block-level cache cannot reconstruct the precise event timing that the scoring contract requires, as the vLLM study in Section V-G will confirm. A hardware realization addresses three structural limitations that software cannot. First, the controller must observe every request arrival, gap onset, and gap closure with cycle-level fidelity, which a near-memory placement provides without interrupt or polling overhead. Second, eviction and migration decisions must complete within the tool-gap window so that the promoted KV is already in the fast tier when the next request arrives, which demands a deterministic pipeline rather than a software thread. Third, eviction and tiering are two reads of one ranking, and a single register file eliminates the staleness that any dual-engine design would introduce. This section maps the algorithmic policy to a synthesizable control-plane IP. Section IV-A defines the controller scope and system interface. Section IV-B derives the unified control plane from the interleaving structure of agent workloads. Section IV-C locks the integer contract through a format sweep. Section IV-D maps the result to a pipelined event core. Section IV-E explores the session-capacity design space and selects the design point. Fig. 3 shows the resulting architecture. 
+
+A. Controller Scope and System Placement 
+
+UNISON is a session-level control-plane IP that ranks res-idency in a shared KV pool. It does not compute attention, store KV payload, or manage the HBM PHY. Runtime soft-ware writes events, namely request arrivals, gap onsets, gap closures, and completions, into a CSR event FIFO, and the controller returns a victim index and logical DMA descriptors. Physical address mapping, KV arrays, the HBM PHY, and the on-chip network remain external. The IP therefore owns (19) and (8), not the bytes that those decisions move. Near-memory placement beside the hierarchy is motivated by the event interface. A software scheduler that polls block-cache timestamps approximates gap onset with millisecond granularity at best, and Section V-G shows that this approxima-tion inverts the gap signal when tool waits approach the decode window. A controller wired to the memory hierarchy observes the same events at cycle granularity without software inter-vention, which is the structural advantage that Section VI-I quantifies under placement variation. 
+
+B. Unified Control Plane 
+
+Agent workloads interleave request and gap events at fine granularity rather than in long homogeneous phases. A dual design that pairs a S PEAR engine with a T IDE engine under periodic synchronization is the textbook decomposition, but it is structurally unsound under this interleaving pattern. Evic-tion and promotion are two reads of one ranking, not two independent computations, so a second engine is either stale or redundant. Let Ru denote the unified register file and Rd the pair of private views in a dual design. The dual stores 
+
+|Rd| = 2 |Ru| (11) and applies a stale snapshot at every decision between syn-chronization points. If the last sync was at event ek−m, the dual victim is 
+
+vd = arg max  
+
+> s∈L
+
+score q
+
+ s; Rd(ek−m), (12) 6SRAM 
+
+> DMA
+> HBM
+
+Memory Hierarchy 
+
+Event  Score  Victim  DMA desc  CSR  KV  
+
+> ROM
+> gap MUX
+> pipe reg
+> om unit
+> INV-σ
+> DIV
+> SUB
+> MUL MUL
+> DIV
+> Penalty
+> MAC
+> sat
+> Score
+> ALU
+
+Cand 
+
+Scan  
+
+> MUL DIV
+> SUB
+> CMP
+> budget ALU
+> ADD
+
+S0 
+
+RF 
+
+rd 
+
+... 
+
+> pipe reg
+
+S1 
+
+ROM 
+
+S2 
+
+DIV 
+
+Array  
+
+> +-
+
+... 
+
+> restore
+> MUX
+
+S3 
+
+MAC 
+
+MUL 
+
+MUL 
+
+ADD 
+
+S4 
+
+CMP 
+
+> pipe reg
+> pipe reg
+> pipe reg
+
+IDLE  BUDGET  FILL  SWAP  DONE 
+
+FSM 
+
+budget ALU  Cand 
+
+Scan  wr_ptr  ...  rd_ptr 
+
+SPEAR 
+
+TIDE 
+
+UNISON Control Plane 
+
+> EVT mux
+> RF mux
+> Sid reg
+> CMP
+
+Sequencer 
+
+IDLE  REQ  ARB 
+
+GAP FINISH 
+
+FSM 
+
+APB 
+
+CSR File 
+
+> CTRL / STATUS
+> SRAM_CAP / HBM_CAP / DMA_BW
+> EVENT_PUSH / RESULT_POP
+
+wr ptr  ...  rd ptr 
+
+Event FIFO 
+
+> row decoder
+
+V C A turn  ...  kv  tier 
+
+... 
+
+rd 
+
+wr 
+
+Nsess=128 
+
+Session RF SRAM 
+
+turn  h
+
+Hazard ROM 
+
+51×12 b 
+
+Control Plane Peripherals 
+
+> SUB
+> floor MUX
+> Surv Clamp
+> DMA_BW
+> Victim ID
+> h
+> surv
+> om
+> gap
+> surv
+> term2
+> CMP
+> CMP
+> CMP
+
+···     
+
+> CMP
+> pipe reg
+> Victim ID
+> run-max
+> +−
+> restore MUX
+> pipe reg
+> pipe reg
+> +−
+> restore MUX
+> +−
+> restore MUX
+
+···  
+
+> term1
+> gap ema glob gap
+> scan
+
+Fig. 3. U NISON hardware architecture. The scheduling core integrates S PEAR ranking and T IDE migration into a unified pipeline beside the two-tier KV hierarchy. 
+
+whereas the unified victim uses Ru(ek). Tab. I confirms the structural prediction. Even with every-event synchronization the dual design diverges on SRAM placement, and with reduced synchronization the stale view causes hit-rate drops of up to 5.4 pp and inconsistent AMAT signs across traces, confirming that a unified register file is not merely preferable but structurally necessary. The unified pipeline therefore keeps one live register file and sequences S PEAR before T IDE in the same datapath, paying 
+
+|Ru| rather than (11). 
+
+C. Fixed-Point Quantization of the Scoring Contract 
+
+Realizing the floating-point policy in synthesizable logic requires an integer image of (7) whose ranking fidelity is in-distinguishable from the reference. The local complement σ(t)
+
+rather than the cumulative product-limit survival is the key enabler, because a single ROM lookup avoids the sequential dependence chain that a cumulative estimator would impose on the pipeline. Let b be a fractional width and Λb = 2 b − 1.The unsigned quantizer 
+
+Qb(x) = clip   x Λb + 12
+
+, 0, Λb
+
+ (13) maps x ∈ [0 , 1] onto UQ0 .b . Hazard and survival then become 
+
+hq = Qbh
+
+ h(min( t, 50)) , (14) 
+
+σq = max   εΛbh + 12
+
+, Λbh − hq
+
+. (15) A time divisor τ ∈ { 1, 10 3, 10 6} stores the gap as 
+
+gq = clip   gs/τ , 0, 2bg − 1 , (16) 
+
+TABLE I ARCHITECTURAL ABLATION OF A UNIFIED CONTROL PLANE VERSUS INDEPENDENT DUAL IP S UNDER VARYING SYNCHRONIZATION GRANULARITY .
+
+Trace Vict ̸=a Prom ̸= ∆HR b ∆SRAM ∆Pre ∆AMAT c
+
+(%) (%) (%) (%) (%) (%) 
+
+Dual IPs copy R after every request and gap 
+
+SWE/Qw3 0 0 +0 .0 +0 .0 +0 .0 +0 .0
+
+SWE/Dev 0 0 +0 .0 +0 .0 +0 .0 +0 .0
+
+SWE/Ge4 0 0 +0 .1 +0 .0 −0.0 +0 .0
+
+GAIA/Qw3 0 0 +0 .0 +0 .5 +0 .8 −1.7
+
+GAIA/Dev 0 0 +0 .0 −0.2 +0 .8 −4.7
+
+GAIA/Ge4 0 0 +0 .2 −1.3 +1 .0 −1.8
+
+Dual IPs copy R every 8 requests 
+
+SWE/Qw3 64 55 −2.2 −0.4 −1.2 +1 .2
+
+SWE/Dev 68 62 −1.9 +0 .0 −1.1 +1 .1
+
+SWE/Ge4 53 43 −5.4 +0 .0 −1.9 +2 .0
+
+GAIA/Qw3 35 50 −3.5 −0.7 −3.2 +6 .4
+
+GAIA/Dev 18 68 −0.2 +1 .0 +0 .9 −5.0
+
+GAIA/Ge4 39 45 −4.5 −1.2 −4.1 +7 .3
+
+Dual IPs copy R only at gap start 
+
+SWE/Qw3 3 29 −0.0 −0.1 −0.0 +0 .0
+
+SWE/Dev 2 43 +0 .2 +0 .2 +0 .0 −0.0
+
+SWE/Ge4 4 16 +0 .4 +0 .0 +0 .1 −0.1
+
+GAIA/Qw3 5 39 +0 .9 −0.2 +1 .2 −2.5
+
+GAIA/Dev 13 77 −3.4 +0 .7 −1.7 +9 .0
+
+GAIA/Ge4 4 29 +0 .8 −1.9 +1 .2 −2.1 
+
+> a
+
+Vict ̸= and Prom ̸= are the shares of copied evictions and promotions that pick a different session.  
+
+> b
+
+∆HR, ∆SRAM, and ∆Pre are percentage-point shifts versus the live table.  
+
+> c
+
+∆AMAT is the percent AMAT change, and either sign represents a consistency failure. 
+
+so τ = 1 is nanoseconds, τ = 10 3 is microseconds, and τ =10 6 is milliseconds. The two score terms are integers, 
+
+T1 =
+
+ gq Λbh
+
+σq
+
+
+
+, (17) 
+
+T2 =
+
+ (Λ bh − σq ) PZ
+
+Λbh
+
+
+
+, (18) 7
+
+and the hardware score is the saturating sum 
+
+score q (s) = sat bs
+
+ T1 + T2
+
+, bs = 64 , (19) with PZ = P/τ so that the multiplicative penalty remains an affine image of (1 − σ)P after the time scaling. The EMA in (4) is the same fraction in integer arithmetic, 
+
+gq ←
+
+ 3 gnew  
+
+> q
+
++ 7 gq
+
+10 
+
+
+
+. (20) A completed session writes 2bs − 1.The contract is selected on a pre-registered grid of 180 format points that vary bh ∈ { 8, 10 , 12 }, bg ∈ { 24 , 32 , 64 },
+
+τ ∈ { 1, 10 3, 10 6}, divider type, and penalty form. Ranking fidelity is measured on 7265 real eviction snapshots from the six traces and three capacity envelopes of Section V. The hard gates are top-1 victim agreement ≥0.99 and maximum hit-rate drift ≤0.20 pp. The sweep selects 
+
+(bh, b g , b s, τ, P Z) = (12 , 32 , 64 , 10 3, 5 × 10 8), (21) at which the aggregate Kendall τ exceeds 0.998 and the worst-cell hit-rate drift is 0.192 pp. Twelve-bit hazard is the minimum width that passes the ranking gate, microsecond storage balances register width against fidelity, and an exact divider is preferred over a reciprocal LUT because the LUT ties fidelity while adding a table of depth Λbh . Section IV-E shows that the bits ranking demanded are essentially free relative to the session register file. 
+
+D. Event Core Microarchitecture 
+
+The unified pipeline must evaluate (19) for every live session within the tool-gap window so that the eviction or migration decision is ready before the next request arrives. A parallel comparator tree would close in O(1) cycles but scale as O(N ) in area. A pipelined linear scan trades latency for area, closing in N +5 cycles at a cost that grows with the register file rather than with dedicated comparator logic. The five-stage depth maps directly to the arithmetic of the quantized score, with the critical-path divider of (17) dictating the pipeline depth. The stages are 
+
+S0 : ( t, g q , done) ← R[s],
+
+S1 : hq ← ROM[ t], σ q ← (15) ,
+
+S2 : T1 ← (17) ,
+
+S3 : T2 ← (18) ,
+
+S4 : score q ← (19) , update running arg max .
+
+(22) A full scan of N live sessions takes 
+
+Lscan = N + 5 (23) cycles after pipeline fill, yielding a decision latency of 
+
+τ (N ) = N + 5 
+
+fclk 
+
+. (24) The T IDE budget uses the same microsecond gap, 
+
+Bq = ∆/τ  · Bμ, (25) 16 32 64 128 256       
+
+> NSESS
+> 400 600 800 Cells ( ×10 3)
+> S32 pipe S48 pipe S64 pipe S64 comb S64 recip ASE
+> 0.900 0.925 0.950 0.975 1.000
+> ASE (norm.)
+> (a) Cell count and ASE versus Nsess S32 pipe S48 pipe S64 pipe S64 comb S64 recip
+> 370 380 390 400 410 Cells ( ×10 3)(b) Structural variants at N=64
+> Fig. 4. Design-space exploration of session capacity and structural variants on the Yosys/Nangate45 synthesis flow.
+
+where Bμ is tokens per microsecond. Cosimulation of the locked format against the floating-point reference is bit-exact on all 1 937 events and 845 decisions of the GAIA/Gemma4 Edge-Tight trace. Given the pipeline and the quantization contract, the remain-ing architectural degree of freedom is the session capacity N .
+
+E. Session-Capacity Design-Space Exploration 
+
+Session capacity N governs both decision latency through (24) and register-file area. To evaluate the policy side of this tradeoff, we define Agent Serving Effectiveness (ASE) as the six-dataset geometric mean 
+
+ASE( N ) = 
+
+> 6
+
+Y
+
+> d=1
+
+HR d
+
+HR max 
+
+> d
+
+· AMAT min 
+
+> d
+
+AMAT d
+
+· TTFT min 
+
+> d
+
+TTFT d
+
+!1/18 
+
+(26) inside the capacity sweep, where the inner product runs over three normalized metrics and the outer over six traces. Fig. 4 reports the exploration on the Yosys/Nangate45 flow used to rank variants by relative cell count. ASE saturates near N =64 where trace concurrency plateaus, while decision latency from (24) remains well below the median tool gap at that point. The capacity knee is therefore N =64 . Absolute ASE values, latency measurements, and the Design Compiler PPA at this point are reported in Section VI. Fig. 4b details the N =64 column. The five live configura-tions occupy a narrow cell-count band, and the selected design point retains the exact divider of (17) for bit-exact scoring against the software reference, because the reciprocal-LUT alternative ties ranking fidelity without improving the end-to-end gate. Sections V and VI evaluate the policy and report synthesis results. V. S OFTWARE EVALUATION 
+
+Before committing silicon area to the scheduling core of Section IV, the eviction and migration policies must be validated on realistic agent traces. This section evaluates the UNISON policy along five dimensions that, taken together, stress different failure modes of session-level caching. Sec-tion V-B compares aggregate performance against baseline and published policies on six traces. Section V-C ablates scoring and tiering to confirm their complementarity. Section V-D quantifies each signal term via leave-one-out analysis on the full evaluation grid. Section V-E verifies that the gain persists under storage-hierarchy perturbation, and Section V-F 8
+
+examines hazard lookup table (LUT) fairness and online convergence. Finally, Section V-G replaces the trace-driven simulator with a live vLLM server to validate that the policy transfers to a production block-cache pool. 
+
+A. Experimental Setup and Metrics 
+
+The evaluation replays six agent traces constructed by crossing the SWE-bench [12] and GAIA [13] task suites with three model families, namely Qwen3-Coder-30B [14], Devstral-24B [15], and Gemma4-E4B [16], yielding 1 415 sessions and 33 596 turns in total. No public multi-agent serving trace with session-level annotations exists as of this writing, so this single-agent replay corpus is the most detailed open benchmark available. The main comparison includes recency (LRU), timeout, the AGSERVE expected-completion estimator, CacheScout, U NISON , and the offline Bélády ora-cle. CacheScout is evaluated on a matched two-tier harness at the Edge-Tight envelope against its own LRU reference. Scoring-only and tiering-only variants are deferred to Fig. 5. Six SRAM-and-HBM capacity envelopes span edge through CXL configurations. Hit rate and prefill reduction are arith-metic means over these envelopes, while AMAT/LRU and TTFT/LRU are geometric-mean ratios relative to recency. TTFT is reported at the p50 percentile under 4× load. A request is an SRAM hit, an HBM hit, or a miss. With R
+
+requests the hit rate and the average memory access time are 
+
+HR = HS + HH
+
+R , AMAT = 1
+
+R
+
+> R
+
+X
+
+> i=1
+
+
+
+ℓi ts SRAM hit ,ℓi th HBM hit ,ℓi tp miss ,
+
+(27) where ts, th, and tp are the per-token SRAM, HBM, and prefill costs. Prefill reduction is the fraction of those tokens that a hit avoids, 
+
+PreRED = 1 −
+
+P 
+
+> i
+
+ℓcomp 
+
+> i
+
+P 
+
+> i
+
+ℓi
+
+, (28) and the Bélády ratio is 
+
+BR = HR HR ⋆ (29) against the offline oracle. Prefetch accuracy is defined only when T IDE is present. Serving TTFT follows the same prefill accounting under a trace-driven load model. 
+
+B. Main Results 
+
+Tab. II compares UNISON with baseline recency and timeout rules, the AGSERVE expected-completion estimator, CacheScout, and the offline Bélády oracle across all six traces. UNISON is the best non-oracle entry on hit rate and AMAT on every dataset, achieving a Bélády ratio of BR=0 .93 . It surpasses LRU on AMAT in all 36 matched comparisons with a mean reduction of 34.8% and outperforms CacheScout on hit rate across all six datasets. The remaining 7% gap to Bélády reflects the inherent cost of causality, since an online policy cannot observe the next arrival and the residual is the portion that (7) does not close. 
+
+a) TTFT and the hit-rate versus latency trade-off: 
+
+Although UNISON dominates on hit rate and AMAT, the AGSERVE expected-completion estimator achieves amarginally lower aggregate TTFT/LRU ratio. The serving model charges leftover prefill tokens to the request at the head of the GPU queue. The estimator evicts the session it predicts will return latest and can therefore discard a long-prefix session that the U NISON completion penalty retains. The retained prefixes improve hit rate and AMAT but leave a longer residual prefill on the critical path of a competing arrival, allowing the estimator to gain on first-token latency while losing on every other metric. The 0.01-point TTFT difference therefore reflects a fundamental hit-rate versus latency trade-off rather than a ranking deficiency. More broadly, when long prefills saturate GPU compute as on SWE/Qwen3 and SWE/Devstral, the bottleneck shifts to queuing delay and policy ordering ceases to influence TTFT. The cache-bound regime where eviction policy most directly improves latency is isolated in the vLLM validation of Section V-G. Scoring and tiering ablations are presented in Fig. 5. 
+
+C. Scoring and Tiering Ablation 
+
+Scoring and tiering could in principle be substitutes, so Fig. 5 crosses both evictors with and without T IDE to test this hypothesis. The joint U NISON configuration outperforms either component in isolation because scoring determines which sessions to retain while tiering determines where they reside. A strong evictor without migration strands hot sessions in HBM, and a migrator without S PEAR promotes the wrong sessions, yielding a prefetch accuracy of only 1.1%. 
+
+D. Signal Contribution Analysis 
+
+The hardware scorer of Section IV-C retains only two of the three S PEAR signals, so a leave-one-out analysis on the full 36-point grid is needed to validate that reduction. Fig. 6 confirms that hazard and gap recurrence are both indispensable, while elapsed idle contributes the least with a mean impact of 1.55 pp on hit rate. Because elapsed idle is also the only term that requires a per-slot timer in hardware, its omission from the register-transfer level (RTL) implementation is justified on both accuracy and area grounds. 
+
+E. Robustness Across Capacity Operating Points 
+
+The preceding results use a single default storage envelope. Tab. III verifies that the advantage is not an artifact of that operating point by sweeping three hierarchy axes, namely HBM capacity with SRAM fixed, SRAM capacity with HBM fixed, and the SRAM-to-HBM partition with the total held at 60K tokens. The six-trace mean remains positive on hit rate, AMAT, and prefill reduction at every tabulated point. The gain grows monotonically with the SRAM share because a larger fast tier amplifies the benefit of accurate residency ranking. It diminishes only when HBM is large enough that recency alone approaches the hit-rate ceiling, a regime in which two GAIA traces tie on hit rate while the six-trace mean remains 9
+
+TABLE II OVERALL ALGORITHMIC PERFORMANCE OF REPRESENTATIVE SESSION -LEVEL POLICIES ACROSS SIX AGENT -TRACE FAMILIES .A
+
+Policy SWE/Qw3 SWE/Dev SWE/Ge4 GAIA/Qw3 GAIA/Dev GAIA/Ge4 Aggregate b
+
+HR AMAT HR AMAT HR AMAT HR AMAT HR AMAT HR AMAT BR PreRED TTFT c
+
+(%) /LRU (%) /LRU (%) /LRU (%) /LRU (%) /LRU (%) /LRU (%) /LRU Recency (LRU) 20.7 1.00 15.2 1.00 48.3 1.00 72.8 1.00 83.3 1.00 63.0 1.00 0.63 55.7 1.00 Timeout (TTL) 21.6 0.95 16.2 0.97 48.7 0.99 73.4 1.01 83.6 0.96 65.0 0.98 0.64 56.5 0.95 ETA (AGSERVE) [17] 32.5 0.78 26.8 0.82 56.8 0.87 77.9 0.83 83.4 0.99 72.7 0.75 0.80 63.4 0.63 
+
+CacheScout [7] 2.6 1.00 2.8 1.00 4.4 1.00 31.9 0.95 67.2 0.98 24.0 0.98 – 26.0 0.97 
+
+UNISON 43.8 0.65 30.5 0.78 65.3 0.55 82.3 0.49 83.6 0.72 76.7 0.52 0.93 66.6 0.64 Bélády oracle 43.9 0.68 39.9 0.68 65.3 0.76 81.6 0.69 83.6 0.95 77.2 0.67 1.00 67.8 0.43  
+
+> a
+
+Qw3 stands for Qwen3-Coder-30B, Dev stands for Devstral-24B and Ge4 stands for Gemma4-E4B.  
+
+> b
+
+Hit rate(HR) and prefill reduction(PreRED) are means over six capacity envelopes.  
+
+> c
+
+Average memory access time(AMAT/LRU) and time to first token(TTFT/LRU) metrics are geomean ratios to recency, and TTFT is p50 at 4× load. SWE Qw3 SWE Dev SWE Ge4 GAIA Qw3 GAIA Dev GAIA Ge4 
+
+> 020 40 60 80 100
+> Hit rate (%)
+> LRU SPEAR Only TIDE with LRU UNISON
+
+(a) Hit rate SWE Qw3 SWE Dev SWE Ge4 GAIA Qw3 GAIA Dev GAIA Ge4  
+
+> 0.0 0.2 0.4 0.6 0.8 1.0 1.2
+> AMAT (norm. to LRU)  LRU SPEAR Only TIDE with LRU UNISON
+
+(b) AMAT / LRU SWE Qw3 SWE Dev SWE Ge4 GAIA Qw3 GAIA Dev GAIA Ge4  
+
+> 020 40 60 80 100
+> Prefill reduction (%)  LRU SPEAR Only TIDE with LRU UNISON
+
+(c) Prefill reduction SWE Qw3 SWE Dev SWE Ge4 GAIA Qw3 GAIA Dev GAIA Ge4   
+
+> 0.0 0.2 0.4 0.6 0.8
+> Prefetch accuracy
+> TIDE with LRU UNISON
+
+(d) Prefetch accuracy 
+
+Fig. 5. Component ablation of scoring and tiering. SWE Qw3 SWE Dev SWE Ge4 GAIA Qw3 GAIA Dev GAIA Ge4 
+
+> -12 -10 -8 -6 -4 -2 0
+> ∆HR vs full 3-signal (pp)
+> without hazard without gap without elapsed
+
+(a) ∆HR vs full-3sig SWE Qw3 SWE Dev SWE Ge4 GAIA Qw3 GAIA Dev GAIA Ge4  
+
+> 0510 15
+> ∆AMAT vs full 3-signal (%)  without hazard without gap without elapsed
+
+(b) ∆AMAT vs full-3sig 
+
+Fig. 6. Mechanism-signal ablation of S PEAR via leave-one-out on the 36-point evaluation grid. 
+
+positive. Ancillary parameters, including read latency, DMA bandwidth, and prefill rate, do not reorder the policies and shift the mean AMAT gain by less than 0.6 percentage points around the 19.6% baseline, so they are omitted from the table. 
+
+F. Hazard LUT Fairness and Online Convergence 
+
+All experiments so far rely on a hazard LUT fitted on the full trace, which could bias the evaluation by overfitting its own sessions or by embedding deployment-time knowledge unavailable during online serving. Tab. IV answers the first concern with a five-fold cross-validation on SWE/Qwen3. Because a scatter of the same 20 fold-by-capacity cells would cluster on y=x, the table reports the residual. The held-out LUT deviates from the all-session LUT by at most 0.85 pp and by 0.17 pp on average, confirming that the hazard distribution is a stable property of the turn-survival law rather than of a particular session split. Fig. 7 addresses the second concern by measuring how quickly an initially empty LUT converges to the offline perfor-mance. Each trace incrementally rebuilds the table as sessions complete, accumulating the counts in (5) with N ranging from 
+
+TABLE III GAIN ROBUSTNESS OF UNISON AGAINST LRU UNDER STORAGE -HIERARCHY PERTURBATION .
+
+Gain against LRU a
+
+Point ∆HR b ∆AMAT ∆Pre 
+
+(%) (%) (%) 
+
+HBM capacity, SRAM fixed at 10K tokens 
+
+30K +14 .5 +15 .9 +11 .1
+
+50K ⋆ +15 .5 +19 .6 +12 .4
+
+100K +15 .0 +24 .4 +11 .8
+
+200K +10 .4 +16 .2 +5 .3
+
+SRAM capacity, HBM fixed at 50K tokens 
+
+5K +13 .0 +15 .9 +8 .7
+
+10K ⋆ +15 .6 +19 .6 +12 .4
+
+20K +18 .4 +26 .5 +15 .2
+
+40K +25 .2 +38 .0 +24 .1
+
+SRAM:HBM partition, total fixed at 60K tokens 
+
+5K:55K +13 .5 +15 .7 +9 .2
+
+10K:50K ⋆ +15 .5 +19 .6 +12 .4
+
+20K:40K +18 .4 +26 .7 +15 .3
+
+30K:30K +22 .8 +30 .9 +19 .4
+
+40K:20K +28 .8 +34 .7 +25 .3 
+
+> a
+
+Each cell is the six-trace mean of the gain against LRU, with the starred row representing the Edge-Tight point.  
+
+> b
+
+Hit-rate and prefill-reduction gains are percentage points, and the AMAT gain is the percent reduction in AMAT. 
+
+128 to 496. To compare traces with different absolute hit-rate scales on a common frame, we define the attainment metric 
+
+A(n) = Hon (n) − HLRU 
+
+Hoff − HLRU 
+
+(30) as the fraction of the offline-minus-LRU hit-rate surplus real-ized after n observed sessions, where A=0 corresponds to the LRU floor and A=1 to the offline table. All six convergence curves reach A=1 . Residual fluctuations on GAIA/Gemma4 reflect count noise from its 128-session corpus, and the two Devstral traces start near the ceiling because LRU already ap-proaches the offline hit rate on those workloads. The globally fitted LUT is therefore an evaluation convenience rather than 10                                 
+
+> TABLE IV CROSS -VALIDATION EVIDENCE FOR HAZARD -MECHANISM GENERALIZABILITY ON SWE/Q WEN 3.
+> Capacity All-sess. aHeld-out aMean ∆bMax |∆|
+> 100K 4.90 4.88 −0.03 0.11 200K 18.94 18.82 −0.11 0.82 300K 38.75 38.53 −0.21 0.78 500K 63.53 63.20 −0.33 0.85
+> aThe reported metric is five-fold mean hit rate in percent.
+> b∆is held-out minus all-session in percentage points. 0.0 0.2 0.4 0.6 0.8 1.0
+
+Observed sessions / N                               
+
+> 0.00 0.25 0.50 0.75 1.00
+> Attainment  A
+> SWE/Qwen3 SWE/Devstral SWE/Gemma4 GAIA/Qwen3 GAIA/Devstral GAIA/Gemma4
+> Fig. 7. Online convergence of the hazard mechanism. TABLE V MEASURED SPEAR GAIN UNDER V LLM PRODUCTION -STACK DEPLOYMENT .A
+> Case Model Pool Gap b∆HR ∆TTFT c∆e2e
+> (pp) (%) (%) Cache-bound 1.5B 60K Tight +3.4 −35 −72
+> Capacity-stressed 1.5B 30K Loose +2.5 −6−4
+> Native-model 30B 60K Tight +1.6 −1−3
+> aWorkload is GAIA/Qwen3 at 32-way concurrency. 1.5B is Qwen2.5-1.5B and 30B is the trajectory-native Qwen3-Coder-30B-AWQ. Pool sizes are 60K and 30K tokens.
+> bTight/Loose denotes the diverse tool-gap schedule.
+> cDeltas are versus paired LRU in vLLM and TTFT is the mean and e2e is p99, in percent.
+
+a hidden prior, as a production deployment accumulates the same table incrementally at runtime. 
+
+G. Production-Stack Validation with vLLM 
+
+The preceding experiments use a trace-driven simulator that abstracts away serving-stack scheduling and memory-management details. To validate that the S PEAR ranking trans-fers to a real inference server, we integrate the score into the vLLM [10] v1 prefix cache, replacing the default LRU victim order with the S PEAR score derived exclusively from runtime-observable metadata. Paired replays of the GAIA/Qwen3 tra-jectory issue token-identical loads at 32-way concurrency and zero temperature. Tool-call frequency is varied between tight and loose schedules to span the cache-contention range that representative agent workloads exhibit. All pairings complete without request errors, and Tab. V reports the measured gain against LRU under three deployment cases that each isolate one operational factor. 
+
+a) Gain on representative configurations: The cache-bound case pairs a small testbed model whose fast decode makes the workload prefill-dominated with a tight tool-call schedule; S PEAR cuts mean TTFT by 35% and tail end-to-end latency by 72%. The capacity-stressed case uses a loose schedule on a halved pool and still delivers a 2.5 pp hit-rate gain with a 6% mean TTFT reduction. The native-model case replaces the testbed with the trajectory-native 30B under the tight schedule and confirms a positive hit-rate gain of 1.6 pp, ruling out a model-mismatch artifact. 
+
+b) Degradation under specific regimes: Three traces not tabulated exhibit degraded or neutral outcomes. On GAIA/Devstral under a halved pool and a tight schedule, tool gaps fall below the decode latency, so the software idle timestamp inverts the gap signal and hit rate drops by 6.6 pp. GAIA/Gemma4 has only 128 sessions, producing a noisy hazard LUT whose variance masks the S PEAR advantage. SWE/Qwen3 is GPU-bound with negligible cache pressure, matching the queue-bound SWE traces in Tab. II. 
+
+c) Efficacy boundary and hardware implication: The degradation pattern reveals two efficacy boundaries of the software patch. First, when the tool gap is shorter than the decode window, a block-cache timestamp cannot resolve the idle onset and the gap signal reverses, which is a fundamental limitation of any software-level approximation that lacks a precise request-completion event. Second, when prefill already saturates the GPU, a cache hit saves tokens but does not shorten the queuing delay, so hit-rate gains do not translate to latency gains. The first boundary is precisely what the event-driven hardware interface of UNISON eliminates, because a dedicated event FIFO stamps gap onset and closure at cycle granularity and thereby removes the software timing approximation that fails on short gaps. Note that the T IDE 
+
+migration mechanism is not evaluated in this vLLM integration because the production block cache exposes no tier-placement API, so only the S PEAR ranking is exercised here. VI. H ARDWARE EVALUATION 
+
+Section IV locked the integer contract, the unified pipeline, and the session capacity at N =64 . This section evaluates the resulting IP under a 28-nm CMOS standard-cell flow, establishes the architectural case for a dedicated scheduling core, and provides a board-level demonstration. The evaluation proceeds from synthesis results through efficiency, timeliness, and fidelity analyses to a structural necessity argument that explains why the same policy cannot be realized in software or as a pair of independent IPs. 
+
+A. Locus Against Datapath KV Hardware 
+
+Table VI positions the U NISON scheduling core against token-level, device-level, and interconnect-level engines. Ev-ery existing entry operates on a single request and optimizes a per-token or per-block metric, whereas the scheduler ranks a pool of live sessions on gap and completion signals that no token-level engine observes. The two classes of hardware are complementary rather than competing. 
+
+B. Synthesis Methodology 
+
+The synthesized netlist comprises an APB wrapper, a CSR file, an event FIFO, and the unified S PEAR scan plus T IDE 
+
+engine, with the session table mapped to flip-flops at roughly 
+
+Nsess × 126 bits plus a four-bit T IDE working copy. SRAM 11                                                       
+
+> TABLE VI COMPARISON OF REPRESENTATIVE KV CACHE HARDWARE AGAINST THE SESSION -LEVEL NEAR -MEMORY SCHEDULER .A
+> Work Granularity Locus Decision epoch Mechanism
+> Token-Picker [28] token attention datapath decode step lossy probability prune; skip KV transfer UniCAIM [29] token CAM/CIM array attention step lossy static-dynamic prune; in-place attention KV-MMU [30] token accelerator MMU generate step lossy regularized token replace HiKV [31] token and element attention datapath decode step lossy two-stage importance sort Kelle [32] token eDRAM controller decode step lossy attention-score evict; refresh density CXL-SpecKV [35] block CXL FPGA speculative prefetch expand pool; predict and move blocks V-Rex [36] video token retrieval engine frame / iterative prefill retrieve a frame subset
+> UNISON session near-memory scheduler request and gap events lossless next-reference rank; evict and tier
+> aToken-level importance datapaths also include MATA [33] and VEDA [34].
+> TABLE VII BACK -END SYNTHESIS RESULTS OF THE UNISON SCHEDULING CORE .
+> Process Area aPower WNS Fmax Cells
+> (mm 2)(mW) (ns) (MHz) 28-nm CMOS 0.169 13.6 +0.01 153.4 158k
+> aScope is the APB wrapper, CSR, event FIFO, and unified core, excluding HBM PHY and KV payload SRAM.
+
+compiler macros, the HBM PHY, and KV payload arrays are outside the cell area, and a prefix directory together with a multi-instance router are likewise excluded. Logic synthesis uses Synopsys Design Compiler on a com-mercial 28-nm CMOS library at a 150 MHz clock constraint, an application-side budget rather than a race against the HBM PHY. Power is a vectorless estimate at the timing corner. The RTL locks a pipelined scan and the exact divider of (17), matching the bit-exact cosimulation of Section IV-D. Unless stated otherwise, bit-exact validation and the FPGA demon-stration use the GAIA/Gemma4 Edge-Tight trace, which is the most hazard-sensitive of the six families and therefore the hardest case for the fixed-point contract. Timeliness analysis draws on all three GAIA families because only the GAIA traces carry recorded tool-gap annotations. 
+
+C. Area, Power, and Timing 
+
+Table VII reports the 64-session design point at the ASE knee of Section IV-E, occupying 0.169 mm 2 at 13.6 mW and meeting 150 MHz with 0.01 ns positive setup slack for an estimated Fmax of 153.4 MHz. Combinational logic accounts for 54% of cell area and sequential logic for 46%. The T IDE budget divider is the largest block at 34%, followed by the S PEAR divider at 17% and the APB wrapper, CSR, and event FIFO at a combined 6%. The critical path runs through the first T IDE divider stage from the programmed DMA bandwidth register into the remainder pipeline. On the Yosys/Nangate45 flow of Fig. 4, ASE reaches 0.900, 0.952, and 0.985 at 16, 32, and 64 sessions and saturates beyond 64 because trace concurrency never exceeds that count. Mean decision latency per (24) grows from 0.30 μs at 16 sessions to 2.00 μs at 64 and 3.95 μs at 256. The five structural variants at N =64 span 2.6% in cells, and varying bh or bs from the locked values shifts area by less than 3%, confirming that the precision demanded by ranking is essentially free relative to the register file. 
+
+D. Decision Efficiency and Control-Plane Overhead 
+
+The scheduler outputs a victim index and DMA descriptors rather than computing attention, so its relevant efficiency met-ric is control-plane cost relative to the data plane it manages. 
+
+a) Area amortization: The 0.169 mm 2 controller man-ages a two-tier pool of 10 K to 60 K tokens. At 128 heads, 128 dimensions, and 16-bit KV per layer, a 60 K-token HBM bank occupies several hundred megabytes, and the scheduling core is negligible relative to the HBM PHY and KV payload arrays that together dominate die area on any contemporary inference accelerator. Yet this vanishing fraction of total silicon delivers a 34.8% mean AMAT reduction and a Bélády ratio of 0.93, a cost-benefit asymmetry analogous to the branch predictor that occupies less than 2% of core area while eliminating the majority of pipeline stalls. 
+
+b) Energy per decision: At 13.6 mW and a 2.00 μs mean decision latency, each eviction or migration decision consumes approximately 27.2 pJ, which is orders of magnitude below the per-access energy of the HBM transactions that the decision orchestrates. 
+
+c) Workload proportionality: Controller area scales with 
+
+Nsess through the register file, not with model dimensionality or sequence length. Increasing model size from 7 B to 70 B parameters multiplies the KV store and attention datapath but leaves the scheduling core unchanged, while doubling session capacity beyond 64 roughly doubles the register file without improving ASE, which is already saturated at 0.985. A general-purpose microcontroller could in principle execute the same algorithm, but its instruction-fetch and interrupt overhead would push decision latency into the tens of microseconds, and the area of even a minimal core with tightly coupled memory exceeds the 0.169 mm 2 of the dedicated datapath while delivering lower determinism. 
+
+E. Decision Timeliness 
+
+At N =64 and 150 MHz the mean scan latency is 2.00 μsand the worst case is 3.14 μs. The GAIA traces exhibit median tool gaps of 3.7 s for Qwen3, 4.4 s for Devstral, and 7.2 s for Gemma4, with the minimum observed gap across all three families at 1 ms. The worst-case decision latency is therefore 0.31% of the minimum gap and below 0.0001% of the median, leaving four to six orders of magnitude of timing headroom. This margin implies that even a ten-fold frequency reduction to 15 MHz would keep the decision latency at 31 μs, well within the millisecond-scale minimum gap, so the controller can be placed in a slow clock domain or power-gated between 12 
+
+events. By contrast, a software scheduler polling block-cache timestamps at millisecond granularity occupies the same order of magnitude as the minimum gap itself, which is why the software approximation inverts the gap signal on short waits as documented in Section V-G. 
+
+F. Implementation Fidelity 
+
+Cosimulation of the locked RTL format against the floating-point reference is bit-exact on all 1 937 events and 845 decisions of the validation trace. Across 7 265 real eviction snapshots from six traces and three capacity envelopes, the aggregate top-1 victim agreement is 0.9945, the Kendall τ ex-ceeds 0.998, and per-dataset agreement ranges from 0.991 on SWE/Devstral at 2 400 snapshots to 1.000 on GAIA/Devstral at 16 snapshots, with no dataset falling below the 0.99 hard gate. The worst-cell end-to-end hit-rate drift is 0.192 pp within the 0.20 pp hard gate, and the mean drift across all 18 dataset-by-capacity cells is 0.019 pp while the AMAT drift is 
+
+−0.018 %. Because each eviction decision is an independent arg max 
+
+over instantaneous scores, the 0.55% top-1 disagreement is a per-snapshot coin flip that does not accumulate into trajectory-level drift, as confirmed by the 0.019 pp mean hit-rate de-viation over full traces. The fixed-point pipeline is therefore functionally transparent with respect to the policy it imple-ments, reproducing the ranking within a residual that is smaller than the inter-policy gap between U NISON and CacheScout on every dataset. 
+
+G. Structural Necessity of the Unified Near-Memory Design 
+
+Three lines of evidence converge to show that the same policy cannot be realized more cheaply in software or as a pair of independent IPs. 
+
+a) Software cannot reconstruct the event interface: 
+
+Section V-G demonstrates that a software scheduler operating on block-cache timestamps inverts the gap signal when the tool wait approaches the decode window, because the timestamp granularity at millisecond resolution is coarser than the gap itself, whereas the hardware event FIFO resolves the same transition at cycle granularity. More broadly, any software scheduler sharing the Python runtime is subject to GIL se-rialization and OS-level jitter that inflate scheduling latency by orders of magnitude beyond the microsecond decisions the hardware achieves. 
+
+b) A dual-IP design diverges under agent interleaving: 
+
+Section IV-B shows that splitting eviction and migration into two engines with private register files causes hit-rate drops of up to 5.4 pp even under every-event synchronization, because agent workloads interleave request and gap events at fine granularity rather than in long homogeneous phases. 
+
+c) Convergence of the three constraints: Cycle-level event observation requires near-memory placement, consistent state requires a unified register file, and deterministic gap-window completion requires a pipelined datapath. Relaxing any one constraint re-introduces a documented failure mode, so the architectural contribution is this constraint intersection realized as a sub-0.2 mm 2 control-plane IP.  
+
+> Fig. 8. FPGA prototype implementation of the U NISON scheduling core on Xilinx Zynq-7020.
+
+H. Board-Level Demonstration 
+
+Fig. 8 shows a Xilinx Zynq-7020 prototype that replays the validation trace over 1 937 events and 845 decisions, stamping decision latency at the 150 MHz Design Compiler clock. The post-implementation netlist occupies 43 415 LUTs at 81.6% slice utilization, 20 938 flip-flops at 19.7%, and 20 DSP48E1 blocks at 9.1%, with no block RAM consumed. 
+
+I. Physical Placement Considerations 
+
+The timeliness margin of Section VI-E implies that the controller does not require co-location with the HBM PHY clock domain. The essential requirement is access to the event stream that software timestamps cannot reconstruct, which a sideband event bus from the memory controller provides without a shared clock or a high-bandwidth data interface. VII. C ONCLUSION 
+
+As large language models are composed into agents that retain a growing key-value (KV) cache across tool waits, many concurrent sessions share a finite static random-access memory (SRAM) and high-bandwidth memory (HBM) pool, so that eviction and hierarchical placement become a session-level efficiency problem orthogonal to compute-mode optimization. Existing proxies based on recency, timeout, or identity miss the mechanism information of the loop and therefore treat a live wait as a cold, discardable unit. U NISON addresses both decisions from runtime-observable signals. S PEAR ranks who leaves from a gap exponential moving average and a turn-indexed hazard, while T IDE spends the observed wait as a direct memory access (DMA) budget for who sits in the fast tier, and the two modules share one live ranking in an event-driven near-memory scheduler beside the hierarchy. Evaluated on six traces crossing SWE-bench [12] and GAIA [13] with three model families, totaling 1 415 sessions, 33 596 turns, and six capacity envelopes from edge to cloud, the joint policy is the best non-oracle entry on hit rate and average memory access time (AMAT) on every trace, raising the hit rate by 
+
+0.3% to 23 .1% and reducing AMAT by 22% to 51% . On 13 
+
+the long-horizon traces it also lowers serving time to first token (TTFT) by 58% to 89% when extra prefill sits on the critical path. The same ranking is realized as an event-driven near-memory scheduler that occupies 0.169 mm 2 and draws 13.6 mW at 150 MHz for 64 sessions in 28-nm CMOS. REFERENCES [1] S. Yao, J. Zhao, D. Yu, N. Du, I. Shafran, K. Narasimhan, and Y. Cao, “ReAct: Synergizing reasoning and acting in language models,” 2023, arXiv:2210.03629. [2] L. Wang, C. Ma, X. Feng, Z. Zhang, H. Yang, J. Zhang, Z. Chen, J. Tang, X. Chen, Y. Lin, W. X. Zhao, Z. Wei, and J. Wen, “A survey on large language model based autonomous agents,” Frontiers of Computer Science , vol. 18, no. 6, p. 186345, 2024. [3] P. Patel, E. Choukse, C. Zhang, A. Shah, I. Goiri, S. Maleki, and R. Bianchini, “Splitwise: Efficient generative LLM inference using phase splitting,” in Proc. 51st Annu. Int. Symp. Computer Architecture (ISCA) ,2024, pp. 118–132. [4] Y. Zhong, S. Liu, J. Chen, J. Hu, Y. Zhu, X. Liu, X. Jin, and H. Zhang, “DistServe: Disaggregating prefill and decoding for goodput-optimized large language model serving,” in Proc. 18th USENIX Symp. Operating Systems Design and Implementation (OSDI) , 2024, pp. 193–210. [5] R. Abhyankar, Z. He, V. Srivatsa, H. Zhang, and Y. Zhang, “InferCept: Efficient intercept support for augmented large language model infer-ence,” 2024, arXiv:2402.01869. [6] H. Li, R. He, Q. Mang, Q. Zhang, H. Mao, X. Chen, H. Zhou, A. Cheung, J. Gonzalez, and I. Stoica, “Continuum: Efficient and robust multi-turn LLM agent scheduling with KV cache time-to-live,” 2026, arXiv:2511.02230. [7] R. Zhang, C. Kim, S. Feng, K. Du, Y. Liu, Y. Zhong, C.-W. Ching, J. Jiang, and L. Hu, “Learning agent execution for KV-cache manage-ment in agentic serving,” 2026, arXiv:2608.14624. [8] Z. Pan, A. Patel, Z. Hu, Y. Shen, Y. Guan, W.-L. Li, L. Qin, Y. Wang, and Y. Ding, “KVFlow: Efficient prefix caching for accelerating LLM-based multi-agent workflows,” 2025, arXiv:2507.07400. [9] H. Zheng, F. Fu, J. Wu, B. Yuan, Y. Zhang, H. Wang, Y. Zhu, X. Yan, and J. Jiang, “Efficient serving for dynamic agent workflows with prediction-based KV-cache management,” 2026, arXiv:2605.06472. [10] W. Kwon, Z. Li, S. Zhuang, Y. Sheng, L. Zheng, C. H. Yu, J. E. Gonzalez, H. Zhang, and I. Stoica, “Efficient memory management for large language model serving with PagedAttention,” in Proc. 29th Symp. Operating Systems Principles (SOSP) , 2023, pp. 611–626. [11] L. Zheng, L. Yin, Z. Xie, C. Sun, J. Huang, C. H. Yu, S. Cao, C. Kozyrakis, I. Stoica, J. E. Gonzalez, C. Barrett, and Y. Sheng, “SGLang: Efficient execution of structured language model programs,” 2024, arXiv:2312.07104. [12] C. E. Jimenez, J. Yang, A. Wettig, S. Yao, K. Pei, O. Press, and K. R. Narasimhan, “SWE-bench: Can language models resolve real-world GitHub issues?” in Proc. Int. Conf. Learning Representations (ICLR) , 2024. [13] G. Mialon, C. Fourrier, C. Swift, T. Wolf, Y. LeCun, and T. Scialom, “GAIA: A benchmark for general AI assistants,” 2023, arXiv:2311.12983. [14] A. Yang, A. Li, B. Yang, B. Zhang, B. Hui, B. Zheng, B. Yu, C. Gao, C. Huang, C. Lv, C. Zheng, D. Liu, F. Zhou, F. Huang, F. Hu, H. Ge, H. Wei, H. Lin, J. Tang, J. Yang, J. Tu, J. Zhang, J. Yang, J. Yang, J. Zhou, J. Zhou, J. Lin, K. Dang, K. Bao, K. Yang, L. Yu, L. Deng, M. Li, M. Xue, M. Li, P. Zhang, P. Wang, Q. Zhu, R. Men, R. Gao, S. Liu, S. Luo, T. Li, T. Tang, W. Yin, X. Ren, X. Wang, X. Zhang, X. Ren, Y. Fan, Y. Su, Y. Zhang, Y. Zhang, Y. Wan, Y. Liu, Z. Wang, Z. Cui, Z. Zhang, Z. Zhou, and Z. Qiu, “Qwen3 technical report,” 2025, arXiv:2505.09388. [15] A. Rastogi, A. Yang, A. Q. Jiang, A. H. Liu, A. Sablayrolles, A. Héliou, A. Martin, A. Agarwal, A. Ehrenberg, A. Lo, A. Roux, A. Darcet, A. Mensch, B. Bout, B. Rozière et al. , “Devstral: Fine-tuning language models for coding agent applications,” 2025, arXiv:2509.25193. [16] Gemma Team, “Gemma 4 technical report,” 2026, arXiv:2607.02770. [17] Y. Ren, L. Chen, D. Li, X. Wang, Z. Wu, Y. Miao, and Y. Bai, “Transcending the cost-quality tradeoff in agent serving via session-awareness,” in Advances in Neural Information Processing Systems (NeurIPS) , 2025. [18] J. Li, J. Lou, and J. Li, “IntentKV: Cross-turn intent-aware KV cache pruning for agent inference,” 2026, arXiv:2606.09916. [19] V. Matam and K. Kim, “MemDecay: Region-aware KV cache eviction for efficient LLM agent inference,” 2026, arXiv:2607.10582. [20] W. Huang, J. Zhang, and X. Zheng, “CommitKV: Lifecycle-aware KV cache compression via commit transitions for multi-turn agents,” 2026, arXiv:2608.07855. [21] S. Fang, Z. Li, W. Wu, J. Ji, Q. Liu, and R. Pu, “Not all tokens are worth caching: Learning semantic-aware eviction for LLM prefix caches,” 2026, arXiv:2605.18825. [22] J. Jeon and S. Yoo, “GraniKV: Asymmetric granularity KV-cache paging for multi-agent systems with long shared prefix,” 2026, arXiv:2608.15584. [23] H. Ni, H. Tian, C. Zhang, G. Li, and H. Tan, “TOPAS: Workflow-aware prefix-state scheduling for multi-agent LLM serving,” 2026, arXiv:2608.25523. [24] Z. Song, D. S. Berger, K. Li, and W. Lloyd, “Learning relaxed Belady for content distribution network caching,” in 17th USENIX Symp. Networked Systems Design and Implementation (NSDI) . USENIX Association, 2020, pp. 529–544. [25] Y. Sheng, L. Zheng, B. Yuan, Z. Li, M. Ryabinin, B. Chen, P. Liang, C. Re, I. Stoica, and C. Zhang, “FlexGen: High-throughput generative inference of large language models with a single GPU,” in Proc. 40th Int. Conf. Machine Learning (ICML) , 2023, pp. 31 094–31 116. [26] B. Gao, Z. He, P. Sharma, Q. Kang, D. Jevdjic, J. Deng, X. Yang, Z. Yu, and P. Zuo, “Cost-efficient large language model serving for multi-turn conversations with CachedAttention,” in USENIX Annual Technical Conf. (ATC) , 2024, pp. 111–126. [27] R. Qin, Z. Li, W. He, J. Cui, F. Ren, M. Zhang, Y. Wu, W. Zheng, and X. Xu, “Mooncake: Trading more storage for less computation — a KVCache-centric architecture for serving LLM chatbot,” in Proc. 23rd USENIX Conf. File and Storage Technologies (FAST) , 2025, pp. 155– 170. [28] J. Park, M. Kang, Y. Han, Y.-G. Kim, J. Shin, and L.-S. Kim, “Token-picker: Accelerating attention in text generation with minimized memory transfer via probability estimation,” in Proc. 61st ACM/IEEE Design Automation Conf. (DAC) , 2024, pp. 1–6. [29] W. Xu, W. Zeng, Q. Huang, M. Li, and R. Huang, “UniCAIM: A unified CAM/CIM architecture with static-dynamic KV cache pruning for efficient long-context LLM inference,” in Proc. 62nd ACM/IEEE Design Automation Conf. (DAC) , 2025, pp. 1–7. [30] A. Moradifirouzabadi and M. Kang, “End-to-end acceleration of gener-ative models with runtime regularized KV cache management,” IEEE J. Emerg. Sel. Topics Circuits Syst. , vol. 15, no. 2, pp. 217–230, 2025. [31] C. Fang, J. Yin, M. Shi, and M. Verhelst, “HiKV: Hierarchical importance-aware KV cache with hardware acceleration for LLM de-coding,” IEEE Trans. Circuits Syst. I, Reg. Papers , pp. 1–14, 2026, arXiv:2607.22389. [32] T. Xia and S. Q. Zhang, “Kelle: Co-design KV caching and eDRAM for efficient LLM serving in edge computing,” in Proc. 58th IEEE/ACM Int. Symp. Microarchitecture (MICRO) , 2025, pp. 18–33. [33] Z. Zhu, G. Li, T. Liu, Z. Mo, X. Liang, and J. Cheng, “MATA: A memory-efficient attention accelerator for LLMs exploiting look-back KV cache pruning,” IEEE Trans. Comput. , vol. 75, no. 8, pp. 2660– 2672, 2026. [34] Z. Wang, H. Fan, H. Waris, G. Wang, Z. Li, J. Jiang, Y. Sun, and G. He, “VEDA: Efficient LLM generation through voting-based KV cache eviction and dataflow-flexible accelerator,” in Proc. 62nd ACM/IEEE Design Automation Conf. (DAC) , 2025, pp. 1–7. [35] D. Liu and Y. Yu, “CXL-SpecKV: A disaggregated FPGA speculative KV-cache for datacenter LLM serving,” in Proc. 2026 ACM/SIGDA Int. Symp. Field Programmable Gate Arrays (FPGA) , 2026, pp. 56–66. [36] D. Kim, S. Yang, W. Shin, and J.-Y. Kim, “V-rex: Real-time streaming video LLM acceleration via dynamic KV cache retrieval,” in Proc. IEEE Int. Symp. High Performance Computer Architecture (HPCA) , 2026, pp. 1–14.
