@@ -6,41 +6,26 @@
 </div>
 
 ## 每次日报
-- 最新运行日期：2026-09-12
-- 运行时间：2026-09-12 21:19:50 UTC
+- 最新运行日期：2026-09-13
+- 运行时间：2026-09-13 21:59:54 UTC
 - 运行状态：成功
-- 本次总论文数：6
-- 精读区：0
-- 速读区：6
+- 本次总论文数：1
+- 精读区：1
+- 速读区：0
 
 ### 今日简报（AI）
-今日扫读6篇、精读0篇，速读集中在LLM智能体与高效建模方向。  
-最值得关注的是车辆Agent函数调用的小模型可读Schema方案，以及LLM Agent会话KV常驻的近内存调度设计。  
-普通读者可优先翻这两篇，重点看它们如何降低部署与推理成本。
-- 详情：[/202609/12/README](/202609/12/README)
+- 今日共生成 1 篇推荐（精读 1 篇，速读 0 篇）
+- 精读：《SymbolicLight V2: Hybrid Neuromorphic Architecture and Sparse Execution for Low-Energy Language Inference》（8.0/10）
+- 这些结果覆盖了当下较热的方向，建议先看精读区论文的关键问题与方法。
+- 详情：[/202609/13/README](/202609/13/README)
 
 ### 精读区论文标签
-- 本次无精读推荐。
+1. [SymbolicLight V2: Hybrid Neuromorphic Architecture and Sparse Execution for Low-Energy Language Inference](/202609/13/2609.09772v1-symboliclight-v2-hybrid-neuromorphic-architecture-and-sparse-execution-for-low-energy-language-inference)  
+   标签：评分：8.0/10、query:edge-llm
+   evidence：FPGA与ARM稀疏执行的混合神经形态架构实现低能耗推理
 
 ### 速读区论文标签
-1. [From Fixed Keys to Readable Schemas: Small Language Models for Vehicle Agent Function Calls](/202609/12/2609.09476v1-from-fixed-keys-to-readable-schemas-small-language-models-for-vehicle-agent-function-calls)  
-   标签：评分：6.0/10、query:edge-llm
-   evidence：严格内存与延迟约束下的端侧小模型函数调用
-2. [UNISON: A Co-Designed Near-Memory Scheduler of Session KV Residency for LLM Agents](/202609/12/2609.09643v1-unison-a-co-designed-near-memory-scheduler-of-session-kv-residency-for-llm-agents)  
-   标签：评分：6.0/10、query:edge-llm
-   evidence：面向LLM服务KV驻留的软硬协同近存调度器
-3. [RiLM: Parameter-Efficient Language Modeling via Geodesic Decoding](/202609/12/2609.10305v1-rilm-parameter-efficient-language-modeling-via-geodesic-decoding)  
-   标签：评分：6.0/10、query:edge-llm
-   evidence：面向边缘部署的参数高效语言模型
-4. [The Art of Closed-Formula Defaults: Search-Free Code Generation for Tensor Operators](/202609/12/2609.10937v1-the-art-of-closed-formula-defaults-search-free-code-generation-for-tensor-operators)  
-   标签：评分：6.0/10、query:edge-llm
-   evidence：面向LLM推理张量算子的免搜索代码生成
-5. [LILA: Calibration-Free Structured Pruning of Large Language Models via Latent Spectral Geometry](/202609/12/2609.11163v1-lila-calibration-free-structured-pruning-of-large-language-models-via-latent-spectral-geometry)  
-   标签：评分：6.0/10、query:edge-llm
-   evidence：免校准结构化剪枝，实现硬件友好的LLM压缩
-6. [Structured Transforms for Low-Overhead Quantization of Language Models](/202609/12/2609.11687v1-structured-transforms-for-low-overhead-quantization-of-language-models)  
-   标签：评分：6.0/10、query:edge-llm
-   evidence：面向语言模型的低开销权重量化
+- 本次无速读推荐。
 
 
 <div class="dpr-home-promo-card">
