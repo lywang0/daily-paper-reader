@@ -1,0 +1,3292 @@
+OpWeave: Flexible Operator Disaggregation for
+Heterogeneous LLM Serving
+Zikun Li∗
+Carnegie Mellon University
+zikunl@andrew.cmu.edu
+Yixuan Mei∗
+Carnegie Mellon University
+yixuanm@andrew.cmu.edu
+Shiqi Pan
+Carnegie Mellon University
+shiqip@andrew.cmu.edu
+Zixuan Chen
+Carnegie Mellon University
+zixuanc3@andrew.cmu.edu
+Xiaowen Zhang
+Carnegie Mellon University
+xiaowen5@andrew.cmu.edu
+Mengdi Wu
+Carnegie Mellon University
+mengdiwu@andrew.cmu.edu
+Shuhuai Lin
+Carnegie Mellon University
+shuhuailinux@gmail.com
+Yutong Yang
+Carnegie Mellon University
+aprilytyang@gmail.com
+Zhihao Zhang
+Carnegie Mellon University
+zhihaoz3@andrew.cmu.edu
+Xupeng Miao†
+Peking University
+xupeng.miao@pku.edu.cn
+Rashmi Vinayak
+Carnegie Mellon University and
+Google
+rvinayak@andrew.cmu.edu
+Zhihao Jia
+Carnegie Mellon University
+zhihao@cmu.edu
+Abstract
+LLM serving systems increasingly disaggregate inference
+into finer-grained stages, with recent approaches separating
+attention from FFN or MoE execution during decode. This
+operator-level disaggregated serving (ODS) can improve hard-
+ware matching and enable independent scaling, particularly
+across heterogeneous devices. However, existing systems fix
+operator boundaries and lack a unified characterization of
+when disaggregation reduces serving cost. We present Op-
+Weave, an end-to-end framework for heterogeneous ODS.
+OpWeave provides an analytical cost model that bounds the
+gains of homogeneous and heterogeneous ODS over colo-
+cated serving. It jointly optimizes operator partitioning and
+deployment configuration through a regularity-aware plan-
+ner that keeps the search tractable even for hybrid-attention
+models. A vLLM-based runtime executes the synthesized
+plans with flexible operator stages across heterogeneous de-
+vice groups. In our evaluation, OpWeave reduces serving
+cost by up to 1.78× on homogeneous and 1.89× on hetero-
+geneous GPU clusters relative to the best feasible baseline,
+while meeting latency SLOs.
+1
+Introduction
+Large language model (LLM) inference accounts for a sub-
+stantial share of AI infrastructure spending and requires
+significant investment in compute [36, 38, 52]. At this scale,
+even modest improvements in throughput and hardware uti-
+lization, or reductions in per-token cost, can yield substantial
+savings. Improving LLM serving efficiency has therefore be-
+come a central systems challenge [1, 23, 44, 54, 56].
+∗Zikun Li and Yixuan Mei contributed equally to this work.
+†Work done at Purdue.
+Heterogeneous ODS
+Device 
+Group 
+Attn
+FFN/MoE
+Attn
+FFN/MoE
+GPU Type A
+…
+Colocation
+Fixed Partition (AFD)
+General Partition (OpWeave)
+Q
+A
+O
+F
+Q
+A …
+Q
+A
+O
+F
+Q
+A …
+Q QKV Proj
+Core Attn
+A
+O Output Proj
+F FFN/MoE
+Fixed stage 
+boundary in AFD
+Candidate stage 
+boundary in OpWeave
+Stage Partition in HODS
+GPU Type B
+Stage 1
+Stage 3
+Stage n
+GPU Type A
+Stage 0
+Stage 2
+Stage n-1
+Activations
+Device 
+Group 2 
+…
+Device 
+Group 1 
+…
+Figure 1. Colocated serving versus heterogeneous operator-
+level disaggregated serving (ODS). AFD fixes stage bound-
+aries at attention–FFN interfaces, whereas OpWeave sup-
+ports general operator partitions across heterogeneous de-
+vice groups.
+Modern serving systems increasingly separate inference
+phases to optimize and scale them independently. Most exist-
+ing approaches disaggregate coarse-grained phases, particu-
+larly prefill and decode [10, 11, 33, 44, 48, 56]. However, these
+approaches generally retain decode as a single execution unit,
+despite substantial differences in the resource demands of
+its constituent operators. Recent systems extend disaggre-
+gation into the decode phase by separating attention from
+feed-forward network (FFN) or mixture-of-experts (MoE)
+execution [3, 31, 49, 50, 58]. This development motivates our
+focus on operator-level disaggregated serving.
+Operator-level disaggregated serving (ODS) partitions de-
+code computation into separately executed operator stages,
+such as attention and FFN or MoE stages. Heterogeneous ODS
+further assigns these stages to different device types, as il-
+lustrated in Figure 1. This design addresses two sources of
+inefficiency in conventional serving engines [1, 23, 54, 55].
+1
+arXiv:2609.14237v1  [cs.DC]  13 Sep 2026
+
+
+Li et al.
+1
+4
+16
+64
+256 1K
+Batch Size (log scale)
+0
+25
+50
+75
+Tensor Core
+Utils (%)
+FFN
+Attn-seqlen-1K
+Attn-seqlen-2K
+Attn-seqlen-4K
+(a)
+256
+1K
+4K
+16K
+Avg. Seqlen (log scale)
+200
+400
+600
+Max Batch Size
+Min batch size
+to saturate GEMM
+Max Batch Size
+(b)
+Figure 2. Decode-phase bottlenecks of Gemma-3-27B moti-
+vating ODS. (a) Tensor-core utilization of attention and FFN
+operators across batch sizes (B200): attention remains under-
+utilized while batching improves FFN utilization. (b) Max-
+imum feasible batch size across sequence lengths (H100):
+KV-cache growth constrains batching.
+First, colocating operators can lead to poor hardware match-
+ing: decode attention is often limited by memory bandwidth
+and underutilizes tensor cores, while FFN and MoE opera-
+tors rely heavily on matrix multiplications and benefit from
+high arithmetic throughput [50, 57, 58]. Second, colocation
+introduces memory-capacity coupling: as sequence length in-
+creases, the growing key–value (KV) cache limits the feasible
+batch size for the entire workload, potentially constraining
+FFN and MoE throughput.
+Heterogeneous ODS mitigates these inefficiencies by
+pipelining operator stages across groups of heterogeneous
+GPUs [15, 31, 49, 50, 58]. First, it improves hardware match-
+ing by assigning each stage to devices suited to its resource
+requirements. Second, it enables independent scaling, al-
+lowing FFN and MoE stages to use batch sizes that are
+not directly constrained by the KV-cache capacity of an
+individual attention stage. Together, these capabilities can
+improve decode efficiency and reduce serving cost.
+Despite this potential, realizing these benefits requires
+addressing three challenges.
+Theory gap. Existing work provides empirical evidence
+and analytical models for specific ODS designs [31, 49, 50,
+58]. A unified analysis is needed to determine when ODS
+reduces cost relative to colocated serving, establish bounds
+on the benefits of homogeneous and heterogeneous ODS,
+and characterize how these benefits depend on sequence
+length, model architecture, and hardware characteristics.
+Planning gap. Existing systems optimize deployments
+around fixed operator boundaries, such as attention–FFN or
+attention–MoE splits [50, 58]. These fixed boundaries con-
+strain joint optimization of operator partitioning, hardware
+assignment, parallelism, and batching. A general formulation
+is needed to synthesize efficient deployment plans across
+this broader design space, particularly for hybrid-attention
+models whose operator structures vary across layers.
+AFD Partition
+𝐴!,#
+Attn at layer 𝑙of mb 𝑚
+𝐹!,#
+FFN/MoE at layer 𝑙of mb 𝑚
+(3 microbatches, 2 layers)
+Time
+DG1
+DG2
+𝐴$,$
+𝐴$,%
+𝐴$,&
+𝐴%,$
+𝐹$,$
+𝐹$,%
+𝐹$,&
+𝐹%,$
+𝐴%,%
+𝐴%,&
+𝐹%,%
+𝐹%,&
+Idle
+Data Transfer
+GPU Type B
+FFN/MoE
+FFN/MoE
+FFN/MoE
+GPU Type A
+Attn
+Attn
+Attn
+Activations
+Device 
+Group 2 
+…
+Device 
+Group 1 
+…
+Pipeline Schedule
+Figure 3. Pipelined attention–FFN disaggregation (AFD).
+Runtime gap. Existing ODS runtimes organize execu-
+tion and communication around specific attention–FFN or
+attention–MoE splits [50, 58]. Executing synthesized plans
+with different operator boundaries and pipeline schedules
+requires flexible operator staging, efficient pipeline orches-
+tration, and low-overhead communication across heteroge-
+neous device groups.
+To address these challenges, we present OpWeave, an end-
+to-end framework for heterogeneous ODS that integrates
+theoretical analysis, deployment planning, and runtime exe-
+cution.
+First, OpWeave uses an analytical cost model for colo-
+cated serving, homogeneous ODS, and heterogeneous ODS.
+The analysis characterizes how cost reductions depend on se-
+quence length, model architecture, and hardware, and upper-
+bounds the gains of disaggregation and heterogeneous hard-
+ware assignment. Under this model, core-attention disaggre-
+gation (CAD) realizes the idealized ODS cost when its stages
+are balanced and communication is fully overlapped. The
+analysis also identifies two limitations of CAD: hardware
+and workload constraints can prevent stage balance, and lay-
+erwise variation in hybrid-attention models can introduce
+pipeline imbalance under a fixed two-stage partition.
+Second, OpWeave formulates heterogeneous ODS plan-
+ning as a joint optimization problem over operator parti-
+tioning, hardware assignment, parallelism, batching, and
+pipeline orchestration. To make this combinatorial search
+tractable, we introduce the partition block: the smallest re-
+peating, layer-aligned operator pattern in a model, used as
+the unit of plan construction and reuse. Building on this
+abstraction, OpWeave develops a regularity-aware planner
+that reduces the search space by reusing partitioning deci-
+sions across layers with the same high-level operator struc-
+ture, even when attention mechanisms differ. Together they
+support operator partitions beyond fixed attention–FFN or
+attention–MoE splits.
+Third, OpWeave executes synthesized serving plans
+through a distributed runtime built on vLLM. The runtime’s
+staged engines support flexible operator partitions and
+pipeline schedules across heterogeneous device groups. To
+reduce host orchestration overhead, each worker submits
+its computation and communication sequence in one native
+2
+
+
+OpWeave : Flexible Operator Disaggregation for Heterogeneous LLM Serving
+1K
+4K
+16K
+64K
+Avg. Seqlen
+1
+2
+3
+Gain Ratio
+3.13
+1.54
+1.23
+Qwen3-235B H100
+TP8/EP8
+TP8/EP16
+TP8/EP32
+1K
+4K
+16K
+64K
+Avg. Seqlen
+1
+2
+3
+4
+Gain Ratio
+3.72
+1.58
+1.22
+1.10
+GPT-OSS-120B H100
+TP1/EP1
+TP2/EP2
+TP4/EP4
+TP8/EP8
+Figure 4. Theoretical cost gain of homogeneous ODS over
+colocated serving. Solid curves show gains for Qwen3-
+235B and GPT-OSS-120B on H100 under different attention-
+TP/MoE-EP configurations; dashed lines show upper bounds.
+call per decoding iteration. Low-overhead communication
+further reduces transfer costs.
+Finally, we evaluate OpWeave across representative mod-
+els, hardware configurations, and long-context workloads.
+On homogeneous H100 clusters, OpWeave reduces serving
+cost by up to 1.78× compared to the best existing approaches
+while attaining time-per-output-token (TPOT) service-level
+objectives (SLOs). Compared with attention–FFN disaggre-
+gation (AFD), OpWeave plans require fewer pipeline stages
+(20.7 versus 124 on average for Gemma-3-27B) and reduce
+inter-node data transfer per output token by up to 22.8×;
+the resulting latency reduction lets OpWeave meet strin-
+gent TPOT SLOs that AFD cannot satisfy. OpWeave also
+keeps hardware executing the model over 80% of the time,
+whereas AFD leaves it idle roughly half the time. On hetero-
+geneous clusters combining H100 with L40S or A100 GPUs,
+heterogeneous OpWeave reduces serving cost by up to 1.89×
+compared to the best non-OpWeave baseline and by up to
+21.8% compared to homogeneous OpWeave.
+2
+Background and Motivation
+Transformer Inference. Transformer-based LLMs stack
+repeated layers of attention and feed-forward computation,
+implemented as FFN or MoE blocks. Inference consists of two
+phases with distinct computational profiles: prefill processes
+the input context in parallel and is typically compute-bound,
+whereas decode generates one token per autoregressive it-
+eration. This contrast motivates prefill-decode disaggrega-
+tion, which places the two phases on separate resources
+for independent optimization [44, 56]. For generation-heavy
+workloads, such as reasoning tasks that produce long output
+sequences, decode often dominates latency and serving cost.
+Decode-Phase Tensions. Serving systems batch concur-
+rent requests to amortize model-weight accesses and improve
+hardware utilization, particularly for GEMM-heavy FFN and
+MoE operators. However, attention and FFN/MoE benefit
+differently from batching. Attention remains memory-band-
+width-bound and exhibits low tensor-core utilization even
+as batch size increases, as shown in Figure 2a. Moreover, as
+context length grows, the attention key-value (KV) cache
+1
+2
+4
+8
+16
+32
+Avg. Seqlen (K)
+0.0
+0.2
+0.4
+Normalized
+Cost
+H100 Homo
+H20 Homo
+H100+H20
+Hetero
+1
+2
+4
+8
+16
+32
+Avg. Seqlen (K)
+1.0
+1.5
+2.0
+Gain Ratio
+1.91
+Homo Min / Hetero
+Figure 5. Heterogeneous vs. homogeneous ODS for Qwen3-
+235B on H100 and H20 GPUs. The heterogeneous setup runs
+core attention on H20 and GEMM-dominated operators on
+H100. Left: normalized cost per token. Right: cost gain over
+the best homogeneous deployment.
+reduces the maximum feasible batch size, as shown in Fig-
+ure 2b, preventing FFN and MoE operators from reaching
+the batch sizes needed for efficient execution.
+Attention–FFN Disaggregation. Prior heterogeneous
+ODS systems, including Step-3 and MegaScale-Infer, pri-
+marily adopt a fixed attention–FFN disaggregation (AFD)
+design rather than searching over general operator parti-
+tions [50, 58]. The attention stage executes the full attention
+module, including the QKV and output projections, while
+the FFN/MoE stage executes feed-forward or expert com-
+putation. Because attention and FFN/MoE alternate within
+each Transformer layer, hidden states must be transferred
+between the device groups at each stage boundary, as shown
+in Figure 3. These systems divide batches into microbatches
+and pipeline their execution to keep both stages busy while
+overlapping inter-stage communication with computation.
+Consequently, performance depends strongly on stage
+balance: latency mismatches create pipeline bubbles and
+reduce utilization. Although prior systems demonstrate the
+feasibility of AFD, their fixed partitions leave unresolved
+when heterogeneous ODS reduces serving cost and what
+determines its benefit, the question we address next through
+theoretical analysis.
+3
+Theoretical Analysis
+3.1
+Analytical Setup
+Scope and assumptions. We analyze steady-state de-
+code serving with memory-bound attention and GEMM-
+dominated projections, FFN, and MoE computation. Each
+GPU type has unit-time monetary cost𝑐, memory bandwidth
+𝛽, memory capacity 𝑀, and peak compute throughput 𝐹; we
+minimize GPU cost per decoded token. We model attention
+execution time as memory traffic divided by memory band-
+width, and GEMM execution time as FLOP count divided
+by peak GPU compute throughput only in the compute-
+bound regime. We assume disaggregation enables GEMM
+batches large enough for compute-bound execution, and that
+microbatching and pipelining hide inter-device communica-
+tion. Appendices A.1 and A.2 give the operator-level roofline
+model and formal regime assumptions.
+3
+
+
+Li et al.
+Cost model. Let 𝑚kv(𝑠) be the KV-cache memory per re-
+quest at average sequence length 𝑠. Let 𝑃act be the effective
+number of GEMM-side parameters activated per request af-
+ter model-parallel sharding, and let 𝑀weights be the resident
+model-weight footprint on the modeled device group, includ-
+ing inactive MoE experts. For GPU type 𝑗, define 𝛼𝑗≜𝑐𝑗/𝛽𝑗
+and 𝛾𝑗≜𝑐𝑗/𝐹𝑗as monetary cost per byte of memory traffic
+and per FLOP, respectively. Under the regime assumptions
+above, homogeneous ODS on type 𝑗has cost
+CPThom
+𝑗
+(𝑠) = 𝛼𝑗𝑚kv(𝑠) + 2𝛾𝑗𝑃act,
+(1)
+while heterogeneous ODS with attention on GPU type 𝑗and
+GEMM-dominated operators on type 𝑘has cost
+CPThet
+𝑗,𝑘(𝑠) = 𝛼𝑗𝑚kv(𝑠) + 2𝛾𝑘𝑃act.
+(2)
+For colocated serving on type 𝑗with memory capacity 𝑀,
+define the continuous relaxation ¯𝑏(𝑠) and the exact integer
+batch limit 𝑏max(𝑠) as
+¯𝑏(𝑠) ≜𝑀−𝑀weights
+𝑚kv(𝑠)
+,
+𝑏max(𝑠) = ⌊¯𝑏(𝑠)⌋.
+(3)
+For feasible sequence lengths, the minimum colocated cost
+under the continuous batch-size relaxation is
+CPTcoloc
+𝑗
+(𝑠) = 𝛼𝑗𝑚kv(𝑠) + max
+𝛼𝑗𝑀weights
+¯𝑏(𝑠)
+, 2𝛾𝑗𝑃act
+
+.
+(4)
+The largest relaxed batch ¯𝑏(𝑠) attains this minimum because
+cost is non-increasing in batch size. The maximum captures
+whether GEMM is limited by weight loading or compute.
+GEMM threshold. For local batch size 𝑏, Eqs. 1–4 use
+the approximations that attention traffic scales as 𝑏𝑚kv(𝑠),
+active GEMM work as 2𝑏𝑃act, and GEMM weight traffic as
+𝑀weights. Equating GEMM weight-loading time and compute
+time gives the threshold𝑏∗=
+𝑀weights𝐹
+2𝑃act𝛽, which is the batch size
+at which GEMM becomes compute-bound. Appendix A.3
+derives the cost expressions, and Appendix A.4 states the
+scaling approximations and threshold derivation in full.
+3.2
+Homogeneous Disaggregation vs. Colocation
+We first analyze when homogeneous operator-level disaggre-
+gation reduces cost relative to colocation, and how that gain
+depends on sequence length. We fix the GPU type and omit
+its index. We restrict the comparison to sequence lengths for
+which colocation is feasible, i.e., 𝑏max(𝑠) ≥1, equivalently
+¯𝑏(𝑠) ≥1, and assume that𝑚kv(𝑠) is strictly increasing on this
+domain. Define the cost gain of homogeneous disaggregation
+over colocation as 𝐺hom(𝑠) ≜CPTcoloc(𝑠)
+CPThom(𝑠) .
+Theorem 3.1 (Cost gain of homogeneous disaggregation over
+colocation). Consider a homogeneous GPU setting with param-
+eters (𝑐, 𝛽, 𝑀, 𝐹). Suppose attention is memory-bound and adopt
+the scaling approximations from Section 3.1. Let𝑏∗be the GEMM
+compute-bound threshold (Section 3.1) and let ¯𝑏(𝑠) be the re-
+laxed feasible batch size defined in Eq. 3. Then, for every feasible
+sequence length 𝑠with 𝑏max(𝑠) ≥1:
+1. (No gain at short sequences.) If ¯𝑏(𝑠)
+≥𝑏∗, then
+𝐺hom(𝑠) = 1.
+2. (Strictly increasing gain.) On the feasible region where
+¯𝑏(𝑠) < 𝑏∗, 𝐺hom(𝑠) > 1 and 𝐺hom is strictly increasing
+in 𝑠.
+3. (Bounded gain.) The gain satisfies
+1 ≤𝐺hom(𝑠) <
+𝑀
+𝑀−𝑀weights
+.
+(5)
+Homogeneous disaggregation helps only after KV-cache
+growth pushes the colocated feasible batch size below the
+GEMM compute-bound threshold. Beyond that point, the
+gain increases monotonically with sequence length but re-
+mains bounded by 𝑀/(𝑀−𝑀weights). Disaggregation im-
+proves efficiency by decoupling GEMM batching from KV-
+cache memory pressure, so its benefit is fundamentally lim-
+ited by how much device memory is already consumed by
+model weights. Figure 4 shows cost gains and upper bounds
+calculated from our theoretical model for Qwen3-235B and
+GPT-OSS-120B on H100 under different parallelism configu-
+rations. See Appendix A.5.1 for the proof.
+3.3
+Heterogeneous vs. Homogeneous Disaggregation
+Optimizing Eqs. 1–2 over all available GPU types 𝑗and 𝑘
+gives
+CPThom
+★
+(𝑠) = min
+𝑗
+CPThom
+𝑗
+(𝑠),
+(6)
+CPThet
+★(𝑠) = min
+𝑗(𝛼𝑗) 𝑚kv(𝑠) + min
+𝑘(𝛾𝑘) 2𝑃act.
+(7)
+The optimized heterogeneous deployment assigns attention
+to the GPU type with the lowest cost per byte and GEMM-
+dominated operators to the type with the lowest cost per
+FLOP; the homogeneous deployment uses one type for both.
+Define 𝐺het(𝑠) ≜CPThom
+★
+(𝑠)
+CPThet
+★(𝑠) as the gain over homogeneous
+disaggregation. For the theorem below, restrict these min-
+ima to 𝑗,𝑘∈{1, 2} and define 𝜂≜(𝛽1𝐹2)/(𝛽2𝐹1) as the
+hardware ratio. Assume 𝜂≥1 without loss of generality. Let
+I be a sequence-length interval where all compared ODS de-
+ployments are feasible and 𝑚kv(𝑠) is continuous and strictly
+increasing.
+4
+
+
+OpWeave : Flexible Operator Disaggregation for Heterogeneous LLM Serving
+Theorem 3.2 (Cost gain of heterogeneous over homoge-
+neous disaggregation). Consider two GPU types with parame-
+ters (𝛽1, 𝐹1) and (𝛽2, 𝐹2), and respective unit-time costs 𝑐1 and
+𝑐2. Adopt the scaling approximations of Section 3.1. Then, over
+the feasible interval I:
+1. (Non-negative gain.) For every 𝑠∈I, 𝐺het(𝑠) ≥1.
+2. (No gain under dominance.) If one GPU type dominates
+the other on both cost-efficiency metrics, i.e., 𝛼𝑗≤𝛼𝑘
+and 𝛾𝑗≤𝛾𝑘for some 𝑗≠𝑘, then 𝐺het(𝑠) = 1 for every
+𝑠∈I.
+3. (Unimodal and bounded gain.) Otherwise, under the
+labeling 𝜂≥1, we have 𝛼1 < 𝛼2 and 𝛾2 < 𝛾1. Define the
+homogeneous-cost crossing
+𝑥∗≜2𝑃act(𝛾1 −𝛾2)
+𝛼2 −𝛼1
+.
+As a function of𝑥= 𝑚kv(𝑠), the gain strictly increases for
+𝑥< 𝑥∗and strictly decreases for 𝑥> 𝑥∗. If 𝑥∗∈𝑚kv(I),
+the gain therefore has a unique peak at the corresponding
+𝑠∗∈I; otherwise, it is monotone over I. Moreover, for
+every 𝑠∈I,
+𝐺het(𝑠) ≤1 + √𝜂
+2
+.
+(8)
+The theorem shows that heterogeneous assignment helps
+only when the two GPU types trade off bandwidth effi-
+ciency against compute efficiency, rather than one domi-
+nating on both dimensions. When the homogeneous-cost
+crossing lies in the feasible interval, heterogeneity helps
+most there: at shorter sequences the best homogeneous GPU
+already matches the compute side well, while at longer se-
+quences the best homogeneous GPU already matches the
+bandwidth side well. If the crossing lies outside the feasible
+interval, only the increasing or decreasing branch appears
+in that interval. Figure 5 shows normalized costs per token
+and the gain of heterogeneous disaggregation over the best
+homogeneous deployment, calculated from our theoretical
+model for Qwen3-235B using H100 and H20 GPUs. The full
+proof is given in Appendix A.5.2.
+3.4
+From Bounds to Plans: CAD and Its Limits
+The bounds above assume that attention and the remaining
+operators run on hardware suited to their bottlenecks and
+that communication is fully hidden by computation. Core-
+Attention Disaggregation (CAD) implements this separation
+by placing core attention on one device group and the remain-
+ing projection, FFN, and MoE GEMMs on another. Under the
+assumptions in Section 3.1, attaining the corresponding ideal-
+ized ODS cost requires balanced stage latencies and sufficient
+microbatching to hide communication (Appendix A.3).
+The first limitation, however, is whether stage balance is
+feasible. GPU memory must accommodate the KV caches
+of all resident microbatches and attention layers, constrain-
+ing each attention operation’s KV-cache size and hence its
+Case1: Ranges 
+overlap, feasible
+Stage 
+Latency
+𝑙%$$&Range
+𝑙!"#$Range
+0
+Rest Lower Bound
+(Weight Access)
+Stage 
+Latency
+𝑙!"#$Range
+Attn Upper Bound
+(Mem / BW)
+0
+𝑙%$$&Range
+Balanced Region
+Case 2: Ranges 
+separate, infeasible
+Figure 6. Feasibility of balanced CAD. Case 1: the attention
+and rest-of-model latency ranges overlap, admitting a bal-
+anced operating point. Case 2: the ranges are disjoint, so
+pipeline bubbles are unavoidable.
+maximum latency under our memory-bound model. GEMM-
+based operators, meanwhile, must load their weights from
+HBM, imposing a latency floor that our compute-bound cost
+model does not capture. If this floor exceeds the maximum
+feasible attention latency, the two stages’ feasible latency
+ranges do not overlap, and the attention stage remains idle
+for part of every pipeline cycle. Higher memory bandwidth
+on the GEMM devices lowers this floor and can therefore
+make stage balance feasible. Figure 6 illustrates both cases,
+and Appendix A.6 derives the overlap condition for uniform-
+layer models.
+The NVIDIA Vera Rubin and Groq 3 LPX design illustrates
+this principle: it retains the KV cache and decode attention on
+GPUs while placing FFN or MoE weights in LPX’s SRAM [3].
+SRAM residency reduces weight-loading latency, lowering
+the FFN/MoE stage’s latency floor and potentially enabling
+its feasible latency range to overlap with the attention stage’s.
+Although this design uses AFD rather than CAD, the same
+two-stage balance principle applies.
+The second limitation is layerwise variation. Hybrid archi-
+tectures commonly mix full attention with sliding-window,
+linear, or recurrent sequence operators [2, 12, 22, 43, 47].
+Full attention loads KV cache for the entire context, whereas
+efficient operators access a bounded window or compact re-
+current state. CAD places both on the same attention device
+group, but the rest-of-model stage has one fixed latency for
+a given microbatch size and cannot match both layer types.
+This mismatch leaves one stage waiting for the other at some
+layers, creating the pipeline bubbles shown in Figure 7.
+4
+Serving-Plan Formulation
+CAD’s limitations motivate searching over general operator
+partitions rather than fixed module splits. Our formulation
+jointly determines how operators are partitioned into stages,
+which device-group types execute them with what hardware
+and parallelism, and how resident batches and microbatches
+are sized. It evaluates each plan using a steady-state latency
+model that accounts for both stage execution and inter-stage
+activation transfers, and minimizes serving cost subject to
+memory and TPOT constraints.
+5
+
+
+Li et al.
+DG1
+DG2
+𝐶!,!
+#
+𝐶!,$
+#
+𝐶!,%
+#
+𝐶$,!
+&
+𝐶$,$
+&
+𝐶$,%
+&
+𝐶!,!
+#
+𝑅!,! 𝑅!,$ 𝑅!,%
+𝑅$,!
+𝑅$,$
+𝑅$,%
+…
+…
+Time
+𝐶!,#
+'
+Full attn
+𝑅!,#
+Rest ops
+Idle
+Data Transfer
+𝐶!,#
+(
+Efficient attn at layer 𝑙of mb 𝑚
+Example imbanlanced pipeline schedule
+(3 microbatches, 2 layers)
+Model Arch
+Example hybrid-
+attn model
+Variable attn time leads to bubbles
+Eff Attn
+Rest Ops
+Full Attn
+Rest Ops
+Figure 7. CAD pipeline schedule for a hybrid-attention
+model. A fixed rest-of-model stage cannot balance both
+efficient- and full-attention layers, leaving idle pipeline slots.
+Partition-block abstraction. The key challenge is to
+capture cross-layer heterogeneity without searching an un-
+constrained partition of the entire model. We address it with
+a partition block, the smallest layer-aligned operator pattern
+that repeats across the model. A partition block may contain
+one layer in a uniform transformer or span a full period of
+full-attention, sliding-window, and other layer types in a
+hybrid-attention model. Within a block of 𝑁block ordered
+operators, the planner chooses a contiguous stage template
+q = (𝑞0, . . . ,𝑞𝑆), where 0 = 𝑞0 < · · · < 𝑞𝑆= 𝑁block and
+stage 𝑗contains operators 𝑞𝑗−1 + 1, . . . ,𝑞𝑗. Stages may span
+layer boundaries, allowing the planner to balance heteroge-
+neous operators jointly across layers. Reusing the resulting
+template across all partition blocks preserves the model’s
+regularity and reduces the partition search to one repeating
+unit. Each stage then serves as the basic unit of placement
+and pipeline execution; Appendix B.1 provides the formal
+DAG, ordering, and block definitions.
+Structured placement and batching. Given the stage
+template, the planner determines where each stage executes
+and with what resources. We represent the deployment us-
+ing 𝐾ordered device-group types. Type 𝑚has configuration
+(ℎ𝑚, 𝜋𝑚), consisting of a GPU type and a supported paral-
+lelism strategy such as tensor or expert parallelism, and may
+be instantiated by multiple replicas. All replicas of a type
+execute the same assigned stage positions while processing
+disjoint subsets of the global batch. To obtain a reusable
+pipeline structure, we require 𝑆= 𝑘𝐾for some positive in-
+teger 𝑘and assign stage 𝑗using the structured round-robin
+map 𝜎(𝑗) = ((𝑗−1) mod 𝐾) + 1. Each type therefore owns
+the same 𝑘stage positions in every partition block, so one
+template and pipeline schedule serve the entire model even
+though the stages’ operator contents and execution costs
+may differ. A replica of type 𝑚has resident batch size 𝑏𝑚,
+divided into 𝜇microbatches of size b𝑏𝑚= 𝑏𝑚/𝜇.
+Communication-aware latency model. Plan latency de-
+pends on both stage execution and communication across
+stage boundaries. For each stage 𝑗, let 𝑡𝑗= 𝑓lat(·) denote its
+profiled execution latency under the assigned device-group
+configuration and microbatch size. Let 𝑢𝑗= 𝑓comm(·) de-
+note the profiled transfer latency after stage 𝑗, including any
+redistribution required by the source and destination paral-
+lel layouts. The boundary after stage 𝑆connects to stage 1
+of the next partition block and is omitted after the final
+block. With 𝐵total repeated partition blocks, the steady-state
+pipeline round-trip time is 𝑇rtt = 𝑓rtt(𝜇, 𝐵total, t, u), where
+t = (𝑡1, . . . ,𝑡𝑆) and u = (𝑢1, . . . ,𝑢𝑆). We evaluate 𝑓rtt by
+schedule simulation, which enforces execution and trans-
+fer dependencies, models resource contention, and permits
+computation–communication overlap only when the sched-
+ule and resources allow. Appendices B.2 and B.3 provide the
+complete placement, batching, execution, and communica-
+tion definitions.
+Design-space expressiveness. The planner can isolate ex-
+pensive full-attention operators, combine efficient-attention
+operators with neighboring projections, or map repeated
+stage positions to heterogeneous device-group types while
+reusing one block-level template. This flexibility directly
+addresses the layerwise imbalance of Section 3.4. AFD and
+CAD are recovered as restricted two-way templates: AFD
+separates complete attention modules from FFN or MoE oper-
+ators, whereas CAD isolates only the core attention kernels;
+colocated serving is the single-stage template.
+Optimization problem. A serving plan is specified by
+P =  𝑆, 𝐾, q,  (ℎ𝑚, 𝜋𝑚,𝑏𝑚)𝐾
+𝑚=1, 𝜇,
+where q is the stage template defined above. The variables 𝑆,
+𝐾, 𝜇, and 𝑏𝑚are positive integers with 𝐾| 𝑆and 𝜇| 𝑏𝑚for
+every type 𝑚. Each ℎ𝑚is drawn from the available hardware
+types, and 𝜋𝑚is a parallelism strategy supported by ℎ𝑚. The
+indexed sequence of device-group configurations is ordered
+because stage 𝑗is assigned to type 𝜎(𝑗).
+min
+P
+CPTplan = 𝑇rtt
+𝐾
+∑︁
+𝑚=1
+𝑐𝑚
+𝑏𝑚
+(9a)
+s.t.
+𝑇rtt ≤𝑇SLO,
+(9b)
+𝑀weights,𝑚+ 𝜇KV𝑚(b𝑏𝑚,𝑠) ≤𝑀𝑚,
+𝑚= 1, . . . , 𝐾.
+(9c)
+The objective in equation 9a minimizes serving cost per
+generated token. For device-group type𝑚,𝑐𝑚is the unit-time
+cost of one replica. Thus, Í
+𝑚𝑐𝑚/𝑏𝑚is the aggregate cost rate
+per global resident request; since each resident request pro-
+duces one token per pipeline round trip, multiplying by 𝑇rtt
+gives the steady-state cost per token. Appendix B.5 derives
+this objective from the global batch size and replica counts.
+The constraints require the pipeline round-trip time to meet
+the TPOT SLO and each replica to fit its assigned model
+weights and the resident KV cache for all 𝜇microbatches
+at sequence length 𝑠; Appendix B.4 provides the complete
+memory notation.
+6
+
+
+OpWeave : Flexible Operator Disaggregation for Heterogeneous LLM Serving
+Coupled search challenge. The planning decisions can-
+not be optimized independently: stage boundaries, device-
+group configurations, parallelism strategies, resident batch
+sizes, and microbatch count jointly determine execution la-
+tency, transfer overhead, memory feasibility, and replica
+count. A lower-cost device may increase total cost if its
+smaller feasible batch size requires more replicas, while a
+compute-balanced partition may miss the TPOT SLO af-
+ter boundary transfers are scheduled. Section 5 exploits
+partition-block regularity and Pareto structure to search this
+coupled space efficiently.
+5
+Algorithms
+The serving-plan search in Section 4 is difficult for three rea-
+sons. First, independently placing every legal stage boundary
+creates a combinatorial partition space. Second, each device-
+group type, which we call an owner because it owns fixed
+stage positions in every partition block, admits many hard-
+ware, parallelism, and batching configurations. Third, the
+cross-owner product of these configurations is too large to
+enumerate and simulate exhaustively. Our planner addresses
+them in order: it parameterizes partitions with regularity-
+aware sub-block templates, constructs a network-safe Pareto
+frontier for each owner, and combines the surviving fron-
+tiers using exact branch-and-bound. Only combinations that
+survive all three reductions reach the schedule simulator.
+5.1
+Regularity-Aware Sub-Block Templates
+An unrestricted partition that chooses every stage bound-
+ary independently produces  𝑁block−1
+𝑆−1
+ templates for a block
+with 𝑁block operators and 𝑆stages, even though the same
+operator order often repeats across many layers. This re-
+dundancy is especially large in hybrid-attention models: lay-
+ers may use different attention variants while retaining the
+same sequence of attention projections, attention core, and
+FFN or MoE operators. We remove it by searching a smaller
+sub-partition block. Let 𝐿block be the number of layers in a
+partition block, and let 𝐿sub be a sub-block length in layers
+that divides 𝐿block and preserves the repeated layer pattern;
+each block then contains 𝑛= 𝐿block/𝐿sub sub-block repeti-
+tions. For a chosen number of owners 𝐾, the planner selects
+a legal contiguous template qsub = (𝑞0, . . . ,𝑞𝐾) inside one
+sub-block and tiles it over the 𝑛repetitions. Stage position 𝑚
+in every repetition is assigned to owner 𝑚, giving 𝑆= 𝑛𝐾
+stages per partition block (Section 4’s 𝑆= 𝑘𝐾with 𝑘= 𝑛).
+This parameterization reduces the number of templates to
+ 𝑁block/𝑛−1
+𝐾−1
+ while retaining layer-dependent execution costs
+after the template is expanded; it is a structural restriction of
+the searched plan family, not a cost-based pruning heuristic.
+5.2
+Network-Safe Per-Owner Pareto Frontiers
+The structural reduction still leaves many configurations for
+every owner. Given a template, global resident batch 𝐵, and
+Device Group 
+Type A × 𝑛%
+Replica A1
+Stage 1
+Stage 3
+Stage 5
+Device Group 
+Type B × 𝑛&
+Replica B1
+Stage 2
+Stage 4
+Stage 6
+Staged Engine on Replica B1 
+GPU Worker 𝑖
+Next-token IDs
+GPU 
+Execution
+NCCL
+CUDA
+IPC
+Distributed Execution Plane
+One process per GPU rank
+Activations
+Figure 8. Distributed execution plane. Black dashed arrows
+carry activations between stages; the orange dashed path
+returns next-token IDs to the first-stage workers.
+Algorithm 1 Regularity-Aware Exact Serving-Plan Search
+Require: Model operator pattern, finite search grid, profiles, TPOT
+SLO
+Ensure: Cheapest feasible plan in the structured space
+1: best ←∞
+2: for each regular sub-block and legal template qsub do
+3:
+Tile qsub over the model
+4:
+for each feasible (𝐵, 𝜇) do
+5:
+Build network-safe frontiers F1, . . . , F𝐾from memory-
+feasible owner points
+6:
+Explore(1, ∅)
+7: return best plan
+8: procedure Explore(𝑖, 𝑃)
+9:
+if optimistic resource and cost bounds for 𝑃rule out a
+feasible improvement over best then return
+10:
+if 𝑖> 𝐾then
+11:
+Tighten bounds; if 𝑃survives, simulate and update best
+if feasible and improved
+12:
+return
+13:
+for each 𝑝∈F𝑖do
+14:
+Explore(𝑖+ 1, 𝑃∪{𝑝})
+microbatch count 𝜇, a feasible point 𝑝for owner 𝑚chooses
+a hardware and parallelism configuration and a per-replica
+microbatch size b𝑏𝑚(𝑝), which fix an integral replica count.
+Profiling gives the execution latencies T𝑚(𝑝) =  𝑡𝑗(𝑝)
+𝑗∈S𝑚
+of the stage positions S𝑚= {𝑗: 𝜎(𝑗) = 𝑚} owned by 𝑚.
+The point also has normalized cost and GPU coordinates
+𝑟𝑚(𝑝) = 𝑐𝑚(𝑝)/𝑏𝑚(𝑝) and 𝜌𝑚(𝑝) = 𝑔𝑚(𝑝)/𝑏𝑚(𝑝), where
+𝑏𝑚(𝑝) = 𝜇b𝑏𝑚(𝑝) and 𝑔𝑚(𝑝) is the GPU count per replica.
+Latency and cost alone are insufficient for safe local prun-
+ing. Two points with similar execution latency can induce
+different replica counts, total GPU use, and per-endpoint
+transfer sizes when combined with neighboring owners. We
+therefore compare points using
+z𝑚(𝑝) =  T𝑚(𝑝),𝑟𝑚(𝑝), 𝜌𝑚(𝑝),b𝑏𝑚(𝑝).
+(10)
+Point 𝑝dominates point 𝑝′ only if both use the same tensor-
+parallel degree, 𝑝is no worse in every coordinate of equa-
+tion 10, and it is strictly better in at least one; the degree
+7
+
+
+Li et al.
+restriction is needed because transfer volume varies non-
+monotonically with tensor parallelism. The GPU coordinate
+preserves the planner’s preference for fewer GPUs among
+otherwise equal plans; the microbatch coordinate preserves
+the inputs of the batch-dependent transfer model. This domi-
+nance relation yields the network-safe frontier F𝑚. Retaining
+T𝑚as a per-occurrence vector prevents a point that acceler-
+ates one layer type but slows another from being removed,
+so the frontier eliminates only configurations that cannot
+improve any feasible complete plan.
+5.3
+Exact Branch-and-Bound over Frontier Products
+Explicitly evaluating F1 × · · · × F𝐾can still require exponen-
+tially many schedule simulations, so the planner explores
+the product with depth-first branch-and-bound. For each
+prefix of assigned owners, it forms an optimistic comple-
+tion from the best remaining coordinates of the unassigned
+frontiers: mandatory serialized compute work lower-bounds
+each owner’s latency contribution, and mandatory transfer
+work at each network endpoint lower-bounds communica-
+tion, with unassigned endpoints minimized independently
+over feasible replica counts, keeping the estimate optimistic.
+The larger of the two is a valid lower bound on 𝑇rtt, and
+multiplying it by the suffix-minimal normalized cost lower-
+bounds the objective. A subtree is discarded if its optimistic
+completion violates the TPOT SLO or cannot improve the
+incumbent. Once every owner is assigned, the bounds are
+recomputed with the complete configuration, and only sur-
+vivors invoke the schedule simulator. Appendix C.1 states
+these bounds formally.
+The schedule simulator remains authoritative for every
+surviving candidate, so the planner is exact over the config-
+ured finite hardware, batching, and template grid; its worst-
+case complexity remains Î
+𝑚|F𝑚| when no bound prunes.
+6
+System Design and Implementation
+OpWeave is implemented in 32K lines of Python and C++
+on the vLLM GPU model runner [23]; each worker loads
+only its assigned model components and state. Inter-node
+activation transfers use point-to-point NCCL, and intra-node
+fanout uses CUDA interprocess communication (IPC) peer
+copies with GPU doorbells. The planner-selected batch size
+fixes the plan’s scheduling capacity: logical slots, microbatch
+shapes, stage placement, and per-rank action order are static,
+so CUDA graphs and buffers are bound once, while token,
+position, and KV-cache metadata change between iterations.
+6.1
+System Overview and Execution Flow
+Runtime organization. Figure 8 shows the distributed
+execution plane after plan installation. A OpWeave deploy-
+ment consists of a global coordinator (outside the figure) and
+replicas of the device-group types selected by the plan; each
+replica runs a staged engine with one GPU worker process
+Table 1. GPU specifications [39–41]. Prices are averaged
+across selected public clouds.
+GPU type
+Memory BW
+(GB/s)
+Memory
+(GB)
+BF16
+(TFLOPS)
+Price
+($/GPU-h)
+H100 SXM
+3,350
+80
+989
+3.49
+L40S
+864
+48
+362.05
+1.09
+A100 SXM
+2,039
+80
+312
+1.74
+per GPU rank. The coordinator acts only at setup, instanti-
+ating the replicas and installing the plan; during decoding,
+workers execute the compiled stage schedule without coordi-
+nator or RPC intervention between stages and microbatches.
+Request and stage execution. First-stage workers con-
+sume the current token IDs of batched requests. Each micro-
+batch traverses the ordered stages, transferring activations
+whenever consecutive stages reside on different replicas; ter-
+minal workers produce next-token IDs, which return to the
+first-stage workers on the GPU (Section 6.2). A stage runs
+once its input activation has arrived, enforced by receive-
+completion events, and the preceding compute action in
+its worker’s fixed action order has completed; independent
+computation and communication still overlap.
+6.2
+Optimizations
+Fine-grained disaggregation creates many short compute and
+transfer actions per token. If each traverses Python or be-
+comes a separate network operation, its overhead can erase
+the benefit of finer placement. We apply three optimizations.
+Single native submission. A naive executor returns to
+Python for every stage, send, and receive, placing host dis-
+patch between otherwise short GPU actions. Instead, Op-
+Weave compiles the complete per-rank sequence; for each
+token, one native submission enqueues all CUDA-graph
+launches, staging copies, communication rounds, and event
+dependencies, eliminating Python dispatch, allocation, and
+RPCs between stages and microbatches.
+GPU-resident decoding. A centralized implementation
+would copy generated token IDs to the host, assemble and
+redistribute them, and rebuild execution metadata at every
+step, serializing a CPU–GPU round trip into each token.
+In OpWeave, terminal workers compute token IDs on the
+GPU, one NCCL all-reduce distributes the token vector to
+embedding owners, and tokens stay device-resident between
+iterations; only global rank zero retains the token history for
+eventual host-side output. Each stage reuses preconstructed
+metadata and preallocated buffers, updating only the tensors
+that change between iterations.
+Low-overhead communication. Our runtime packs com-
+patible tensors into shared buffers and batches transfers into
+8
+
+
+OpWeave : Flexible Operator Disaggregation for Heterogeneous LLM Serving
+Table 2. Evaluated models and TPOT SLOs. Eff. Attn. is the
+efficient attention mechanism interleaved with full attention;
+Pattern is the ratio of efficient- to full-attention layers.
+Model
+MoE
+Eff.
+Attn.
+Pattern
+Strict
+SLO (ms)
+Relaxed
+SLO (ms)
+Gemma-3-27B
+✗
+SWA
+5:1
+25
+60
+Qwen3-Next-80B-A3B
+✓
+Linear
+3:1
+40
+80
+NCCL rounds, reducing per-operation overhead without in-
+creasing activation payload. When an unsharded activation
+crosses a stage boundary into a TP group, the runtime sends
+one inter-node copy to a destination leader rather than one
+copy per rank; the leader fans it out to the remaining TP
+ranks locally through CUDA IPC, and leader assignment
+rotates across routes to balance cross-node traffic.
+7
+Evaluation
+7.1
+Evaluation Setup
+Devices and Models. Table 1 lists the GPUs used in our
+evaluation. We conduct the homogeneous evaluation on a
+cluster of H100 nodes connected by RDMA over Converged
+Ethernet (RoCE). For the simulator fidelity tests, we use H100
+and L40S GPUs on AWS, where RDMA transfers stage GPU
+data through host memory. We evaluate two representative
+hybrid-attention models [12, 47], with their architectures
+and TPOT SLOs summarized in Table 2.
+Metrics. We use serving cost per million output tokens
+as our primary efficiency metric and time per output token
+(TPOT) as our latency metric. A configuration satisfies a
+target TPOT service-level objective (SLO) if its p95 step-level
+TPOT across the measured iterations does not exceed the
+target; for each serving policy, we report the lowest-cost
+configuration that satisfies the SLO.
+Baselines. We compare OpWeave against three baselines:
+colocated serving (COL), attention–FFN disaggregation
+(AFD) [50, 58], and core-attention disaggregation (CAD).
+COL is implemented with vLLM 0.26.0 [23] and executes all
+operators on GPUs within the same node. AFD and CAD are
+implemented in our OpWeave runtime as fixed-partition
+special cases. AFD separates complete attention modules
+from FFN/MoE operators, whereas CAD isolates core-
+attention kernels from all remaining operators; their two
+device groups may be placed on different nodes. This setup
+gives COL a well-optimized production implementation and
+keeps the runtime identical across disaggregated policies.
+Search Configuration. For each model, workload, and
+TPOT SLO, our planner searches the serving-plan space of
+Section 5 for the lowest-cost plan meeting the SLO. We re-
+strict each plan to at most 32 GPUs, three device-group types,
+four replicas per type, and four microbatches. OpWeave and
+all baselines use the same search configuration and resource
+constraints; their admissible plans differ only in the imposed
+disaggregation policy. The planner returns the optimal feasi-
+ble plan within this configured finite search space.
+Workloads. We evaluate steady-state decoding using
+long-context workloads derived from OpenThoughts3-
+1.2M [14]. We tokenize the dataset to obtain an empirical
+distribution of generation-time context lengths and rescale
+it to construct synthetic request cohorts with mean context
+lengths of 8K, 32K, and 128K tokens. Requests are con-
+structed deterministically, and all serving policies use the
+same distribution and construction procedure, ensuring
+comparable workloads.
+7.2
+Homogeneous End-to-End Evaluation
+We evaluate OpWeave and all baselines on H100 GPUs
+across both models, both SLOs (Table 2), and all three context
+lengths. As shown in Figure 9, OpWeave achieves the lowest
+serving cost in 11 of the 12 evaluated model–context–SLO
+settings. OpWeave is up to 1.78× cheaper than the best fea-
+sible baseline for Gemma-3-27B and up to 1.76× cheaper for
+Qwen3-Next-80B-A3B.
+OpWeave finds feasible plans in all evaluated scenarios
+and achieves lower serving costs than AFD and CAD wher-
+ever they are feasible. Its first advantage is lower latency
+through fewer pipeline stages. Whereas AFD and CAD im-
+pose two stages per layer, OpWeave selects stage bound-
+aries across an entire partition block, enabling a larger, more
+flexible partition space. As shown in Figure 10(a) and (d),
+the selected OpWeave plans average only 20.7 stages for
+Gemma-3-27B and 24 for Qwen3-Next-80B-A3B, compared
+with 124 and 96, respectively, for both baselines. Fewer stage
+boundaries reduce network transfers: Figure 10(b) and (e)
+show that OpWeave reduces mean inter-node data trans-
+ferred per output token by factors of 16.9 and 22.8 relative to
+CAD and AFD, respectively, for Gemma, and by factors of 6.5
+and 6.1 for Qwen3-Next. Because inter-stage communication
+lies on the execution critical path of each microbatch, this
+reduction lowers decoding latency, helping OpWeave satisfy
+strict TPOT SLOs in settings where neither baseline finds a
+feasible plan.
+OpWeave’s second advantage is higher hardware occupancy
+by model execution, reducing idle time during decoding. We
+report system-level occupancy as the average of per-replica
+occupancy, weighting each replica type by its price times
+its replica count, i.e., the fraction of hardware spending that
+performs model execution. As shown in Figure 10(c) and (f),
+OpWeave achieves mean compute occupancy above 80% for
+both models, while CAD and AFD leave roughly half of the
+hardware time unused. One reason for the baselines’ lower
+occupancy is heterogeneity across layers: the selected hybrid
+models interleave attention mechanisms with substantially
+different execution latencies, making their fixed partitions
+9
+
+
+Li et al.
+8K
+32K
+128K
+(a) Gemma-3-27B
+TPOT SLO = 25 ms
+0
+10
+20
+1.20×
+1.51×
+0.94×
+8K
+32K
+128K
+(b) Gemma-3-27B
+TPOT SLO = 60 ms
+0
+10
+20
+1.27×
+1.29×
+1.78×
+8K
+32K
+128K
+(c) Qwen3-Next-80B-A3B
+TPOT SLO = 40 ms
+0
+2
+4
+1.30×
+1.68×
+1.62×
+8K
+32K
+128K
+(d) Qwen3-Next-80B-A3B
+TPOT SLO = 80 ms
+0
+2
+4
+1.42×
+1.76×
+1.76×
+Cost per 1M output
+tokens (USD)
+Colocation
+AFD
+CAD
+OpWeave
+Infeasible
+Figure 9. Measured serving cost across context lengths and TPOT SLOs. Crosses mark infeasible configurations. Labels above
+each group show 𝑔× cheaper, where 𝑔is the best feasible baseline cost divided by OpWeave cost.
+CAD AFD OpW
+0
+100
+Avg. stages
+124 124
+20.7
+CAD AFD OpW
+0
+5
+10
+MiB/token
+6.54
+8.84
+0.39
+CAD AFD OpW
+0
+50
+100
+Occupancy (%)
+49.7 47.0
+88.1
+CAD AFD OpW
+0
+50
+100
+Avg. stages
+96
+96
+24
+CAD AFD OpW
+0
+1
+2
+MiB/token
+2.29 2.16
+0.35
+CAD AFD OpW
+0
+50
+100
+Occupancy (%)
+51.5 54.4
+81.7
+Gemma-3-27B
+Qwen3-Next-80B-A3B
+(a)
+(b)
+(c)
+(d)
+(e)
+(f)
+Figure 10. Homogeneous-machine evaluation results. OpW denotes OpWeave. (a) and (d): Mean number of pipeline stages. (b)
+and (e): Mean inter-node stage-to-stage payload per output token (MiB). (c) and (f): Mean price-weighted compute occupancy
+(Section 7.2).
+COL AFD CAD OpW
+0.0
+0.5
+1.0
+Normalized
+batch size
+0.68
+0.38 0.39
+1.00
+(a) Gemma-3-27B.
+COL AFD CAD OpW
+0.0
+0.5
+1.0
+Normalized
+batch size
+0.36
+0.98 0.98 1.00
+(b) Qwen3-Next-80B-A3B.
+Figure 11. Mean per-GPU batch size at the relaxed TPOT
+SLO, normalized to OpWeave within each context and aver-
+aged across contexts. Higher is better.
+AFD
+CAD
+OpW
+0.0
+0.5
+1.0
+Normalized
+TPOT
+-6.5%
+-6.1%
+-4.8%
+AFD
+CAD
+OpW
+0.0
+0.5
+1.0
+Normalized
+TPOT
+-1.0%
+-8.6% +3.3%
+Simulation
+Real machine
+Gemma-3-27B
+Qwen3-Next-80B-A3B
+Figure 12. Simulated and measured TPOT for AFD, CAD,
+and OpWeave, normalized by measured TPOT. Labels show
+signed simulation errors.
+difficult to balance. For example, at 128K context and batch
+size 1 on one H100, our profiles estimate 700 𝜇s for a Qwen3-
+Next full-attention module versus 58 𝜇s for linear attention, a
+12× gap. OpWeave’s flexible partition boundaries allow it to
+balance work across these layers. Moreover, AFD and CAD’s
+high network transfer volume leaves limited latency head-
+room for increasing the number of microbatches to overlap
+work across device groups. Even under Gemma’s relaxed
+60-ms SLO, their selected plans still use only one microbatch.
+The two device groups therefore execute dependent stages
+sequentially, leaving one group idle while the other works.
+OpWeave also alleviates the memory contention that lim-
+its batching in colocated serving. The attention KV cache
+competes with model weights for GPU memory, so longer
+contexts reduce the maximum feasible batch size. OpWeave
+mitigates this constraint by decoupling GEMM batching from
+KV-cache memory pressure. Consistent with our theoreti-
+cal analysis, Figure 11 shows that OpWeave achieves larger
+mean per-GPU batch sizes than colocation for both models
+under the relaxed SLOs. AFD and CAD similarly alleviate
+this constraint for Qwen3-Next, achieving batch sizes close
+to OpWeave’s. For Gemma, however, their high communi-
+cation latency forces them to use smaller batches to satisfy
+the TPOT SLO, resulting in lower per-GPU batch sizes even
+than colocation.
+7.3
+Simulator Fidelity
+We use the simulator for large-scale heterogeneous evalu-
+ation because real-machine experiments at this scale are
+prohibitively expensive and heterogeneous clusters with
+high-speed inter-node connections are difficult to allocate
+on public clouds. We validate it using two H100 and two
+L40S GPUs for Gemma-3-27B and four of each for Qwen3-
+Next-80B-A3B. As shown in Figure 12, the average absolute
+10
+
+
+OpWeave : Flexible Operator Disaggregation for Heterogeneous LLM Serving
+8K
+32K
+128K
+(a) Gemma-3-27B
+TPOT SLO = 60 ms
+0
+1
+2
+H100 GPUs + L40S GPUs
+1.14×
+1.38×
+1.54×
+8K
+32K
+128K
+(b) Qwen3-Next-80B-A3B
+TPOT SLO = 80 ms
+0
+1
+2
+H100 GPUs + L40S GPUs
+1.59×
+1.30×
+1.59×
+8K
+32K
+128K
+(c) Gemma-3-27B
+TPOT SLO = 60 ms
+0
+1
+2
+A100 GPUs + H100 GPUs
+1.14×
+1.39×
+1.89×
+8K
+32K
+128K
+(d) Qwen3-Next-80B-A3B
+TPOT SLO = 80 ms
+0
+1
+2
+A100 GPUs + H100 GPUs
+1.45×
+1.66×
+1.48×
+Normalized
+cost
+Colocation
+Homo AFD
+Hetero AFD
+Homo CAD
+Hetero CAD
+Homo OpWeave
+Hetero OpWeave
+Figure 13. Simulated serving cost across context lengths and TPOT SLOs, normalized to heterogeneous OpWeave within each
+context. Labels show 𝑔× cheaper, where 𝑔is the best feasible non-OpWeave baseline cost divided by heterogeneous OpWeave
+cost.
+simulation errors across AFD, CAD, and OpWeave are 5.8%
+for Gemma-3-27B and 4.3% for Qwen3-Next-80B-A3B.
+7.4
+Heterogeneous End-to-End Evaluation
+We use our simulator to evaluate OpWeave and all baselines
+on two heterogeneous setups, H100 with L40S and H100 with
+A100 (Table 1), using the relaxed TPOT SLOs and all three
+context lengths. As shown in Figure 13, heterogeneous Op-
+Weave achieves lower serving cost than all non-OpWeave
+baselines in all 12 evaluated model–hardware–context set-
+tings. On H100 with L40S, heterogeneous OpWeave is up
+to 1.54× cheaper for Gemma-3-27B and 1.59× cheaper for
+Qwen3-Next-80B-A3B than the best feasible non-OpWeave
+baseline. On H100 with A100, heterogeneous OpWeave is
+up to 1.89× and 1.66× cheaper, respectively. OpWeave thus
+retains its cost advantage over non-OpWeave baselines in
+heterogeneous settings.
+Compared with homogeneous OpWeave, heterogeneous
+OpWeave is 1.04× cheaper on average (arithmetic mean of
+per-setting cost ratios across both models and contexts) and
+up to 1.11× cheaper on H100 with L40S. On H100 with A100,
+heterogeneous OpWeave is 1.14× cheaper on average and
+up to 1.28× cheaper. The larger benefit on H100 with A100
+is consistent with the analysis in Section 3.3: a greater dis-
+parity in the GPUs’ compute-to-memory-bandwidth ratios
+permits a higher upper bound on the idealized gain from het-
+erogeneous assignment. Using the specifications in Table 1,
+the hardware ratio 𝜂is 1.42 for H100 with L40S and 1.93
+for H100 with A100, yielding idealized gain bounds of 1.10×
+and 1.19×, respectively, under Eq. 8. The measured gains can
+exceed these idealized bounds because the bounds assume
+both deployments fully disaggregate memory-bound atten-
+tion from compute-bound GEMM-based operators, which
+neither deployment achieves in practice.
+7.5
+Ablation Study and Sensitivity Study
+Planner Search Ablation. This ablation quantifies the
+benefits of Pareto-frontier pruning and branch-and-bound
+for planner search. We search for Gemma-3-27B plans at 32K
+5
+20
+50
+200 500
+Network latency (µs)
+0
+1
+2
+3
+4
+Cost per 1M Output
+Tokens (USD)
+Bandwidth = 32 GB/s
+1
+2
+4
+8
+16
+32
+Bandwidth (GB/s)
+0
+2
+4
+6
+Cost per 1M Output
+Tokens (USD)
+Latency = 20 µs
+AFD
+CAD
+OpWeave
+Figure 14. Network sensitivity of OpWeave, AFD and CAD.
+HW
+Method
+Candidates
+Simulations
+Time (s)
+H100
+Full
+4.78M (1.00×)
+4.78M (1.00×)
+228.3 (1.00×)
+No-PF
+8.83M (1.85×)
+8.83M (1.85×)
+264.4 (1.16×)
+No-B&B 219.79M (45.96×) 4.78M (1.00×)
+290.3 (1.27×)
+Neither 293.24M (61.31×) 8.83M (1.85×)
+330.5 (1.45×)
+A100
++H100
+Full
+13.89M (1.00×)
+13.89M (1.00×) 446.7 (1.00×)
+No-PF
+52.14M (3.75×)
+52.14M (3.75×) 776.4 (1.74×)
+No-B&B 630.97M (45.42×) 13.89M (1.00×) 636.6 (1.42×)
+Neither
+2.33B (167.79×) 52.14M (3.75×) 1,495.8 (3.35×)
+Table 3. Planner search ablation. Full enables Pareto-frontier
+(PF) pruning and branch-and-bound (B&B); No-PF, No-B&B,
+and Neither disable the corresponding optimizations. Paren-
+theses show degradation relative to Full on the same hard-
+ware. Lower is better; all methods find the same best plan.
+context under a 60-ms TPOT SLO, using 64 CPU cores for ev-
+ery run. Table 3 reports candidates considered, simulator in-
+vocations, and end-to-end search time. Because inexpensive
+memory and SLO checks discard many candidates before the
+costly simulator is invoked, reducing candidate count does
+not translate proportionally into wall-clock time. Pareto-
+frontier pruning reduces simulator invocations, whereas
+branch-and-bound removes candidates before simulation.
+Disabling PF increases simulator invocations by 1.85× on
+H100 and 3.75× on A100+H100, increasing wall-clock time
+by 1.16× and 1.74×, respectively. Disabling B&B instead in-
+creases considered candidates by 45.96× and 45.42× without
+increasing simulator invocations; these are rejected by the
+cheaper checks, so wall-clock time increases by only 1.27×
+11
+
+
+Li et al.
+and 1.42×. Together, they make search 1.45× faster on H100
+and 3.35× on A100+H100 than using neither.
+Network Sensitivity. We use simulation to evaluate the
+sensitivity of OpWeave, AFD, and CAD to network condi-
+tions, varying inter-node transfer latency and bandwidth for
+Gemma-3-27B at 8K context under a 60-ms TPOT SLO. Each
+method is reoptimized at every setting over H100, L40S, and
+mixed deployments. As shown in Figure 14, OpWeave is less
+sensitive than AFD and CAD to both network latency and
+bandwidth. This robustness follows from OpWeave’s much
+lower network transfer volume (Figure 10(b) and (e)): the
+remaining transfers can be overlapped with model execu-
+tion, leaving serving performance less affected by network
+conditions.
+8
+Related Work
+LLM Serving Optimization. General-purpose LLM serv-
+ing systems improve efficiency through continuous batch-
+ing [54], paged KV-cache management [23], KV reuse and
+prefix caching [46, 55], prefill–decode disaggregation and
+scheduling [1, 44, 56], and speculative decoding [6–9, 16, 24–
+28, 32, 37, 42]. These techniques substantially improve LLM
+serving, but they do not directly address the different bottle-
+necks of attention and GEMMs.
+Operator-Level Disaggregated Serving. MegaScale-Infer
+and Step-3 AFD are closest to our setting: both use a fixed
+two-way split that disaggregates attention from FFN, MLP,
+or MoE during decoding [50, 58]. FastDecode similarly sep-
+arates attention and its KV cache from the dense layers,
+but offloads attention to distributed CPU workers rather
+than another GPU group [15]. Infinite-LLM distributes atten-
+tion computation and KV-cache capacity across instances,
+rather than general operator-class placement [30]. NanoFlow
+also operates at operation granularity, but overlaps compute,
+memory, and network work within a device instead of sep-
+arating attention and FFN onto distinct device groups [57].
+Unlike these systems, we provide a theoretical analysis of
+the achievable ODS cost gains, formalize the broader serving-
+plan space, and show why fixed two-way splits can fail for
+hybrid-attention architectures such as Gemma 3, GPT-OSS,
+and Qwen3-Next [12, 43, 47].
+Heterogeneous LLM Serving. A growing line of work
+serves LLMs across heterogeneous GPU resources. Helix
+formulates heterogeneous serving as a max-flow problem,
+jointly optimizing layer placement and request routing
+across GPU types [35]. Other systems apply asymmetric
+pipeline parallelism to decentralized heterogeneous or
+volunteer GPUs [4, 5, 17, 19–21, 29, 45, 51, 53], or exploit
+price-performance gaps across GPU types by routing re-
+quests to the best-suited hardware [13, 18, 34]. All of these
+systems partition at the transformer-layer boundary or
+coarser; in contrast, this paper disaggregates at the operator
+level, matching heterogeneous GPU types to operator classes
+with different resource bottlenecks inside a single layer.
+9
+Conclusion
+This paper presented OpWeave, an end-to-end framework
+for heterogeneous operator-level disaggregated serving that
+connects theory, planning, and execution. OpWeave devel-
+ops an analytical cost model that characterizes and bounds
+the gains of homogeneous and heterogeneous ODS over
+colocated serving, a regularity-aware planner that jointly
+optimizes operator partitioning, hardware assignment, par-
+allelism, and batching over the partition block abstraction,
+and a vLLM-based distributed runtime that executes the syn-
+thesized plans across heterogeneous device groups. In our
+evaluation, OpWeave is up to 1.78× cheaper than the best
+feasible baseline on homogeneous GPUs and up to 1.89×
+cheaper on heterogeneous clusters, while attaining latency
+SLOs. We hope the analysis and abstractions in OpWeave
+provide a foundation for future work on operator-level dis-
+aggregation across increasingly heterogeneous models and
+hardware.
+Acknowledgments
+We used ChatGPT, Claude, and Gemini to improve the clar-
+ity and readability of the manuscript. We also used Claude
+and GPT to assist with code development for this work.
+This work was partially supported by NSF awards CNS-
+2211882 and CNS-2239351, a Sloan Research Fellowship, and
+research awards from Amazon, Cisco, Google, Jane Street,
+Meta, NVIDIA, Oracle, Qualcomm, and Samsung.
+References
+[1] Amey Agrawal, Nitin Kedia, Ashish Panwar, Jayashree Mohan, Nipun
+Kwatra, Bhargav S. Gulavani, Alexey Tumanov, and Ramachandran
+Ramjee. 2024. Taming Throughput-Latency Tradeoff in LLM Inference
+with Sarathi-Serve. In 18th USENIX Symposium on Operating Systems
+Design and Implementation (OSDI 24). USENIX Association.
+[2] Ai2. 2026. Introducing Olmo Hybrid: Combining Transformers and Lin-
+ear RNNs for Superior Scaling. Allen Institute for Artificial Intelligence.
+https://allenai.org/blog/olmohybrid
+[3] Kyle Aubrey and Farshad Ghodsian. 2026. Inside NVIDIA Groq 3 LPX:
+The Low-Latency Inference Accelerator for the NVIDIA Vera Rubin
+Platform. https://developer.nvidia.com/blog/inside-nvidia-groq-
+3-lpx-the-low-latency-inference-accelerator-for-the-nvidia-vera-
+rubin-platform/. NVIDIA Technical Blog. Accessed: 2026-04-16.
+[4] Alexander Borzunov, Dmitry Baranchuk, Tim Dettmers, Max Ryabinin,
+Younes Belkada, Artem Chumachenko, Pavel Samygin, and Colin Raf-
+fel. 2023. Petals: Collaborative Inference and Fine-tuning of Large
+Models. In Proceedings of the 61st Annual Meeting of the Association for
+Computational Linguistics (Volume 3: System Demonstrations). Associa-
+tion for Computational Linguistics, 558–568. doi:10.18653/v1/2023.acl-
+demo.54
+[5] Alexander Borzunov, Max Ryabinin, Artem Chumachenko, Dmitry
+Baranchuk, Tim Dettmers, Younes Belkada, Pavel Samygin, and Colin
+Raffel. 2023. Distributed Inference and Fine-tuning of Large Language
+Models Over the Internet. In Advances in Neural Information Processing
+Systems (NeurIPS).
+12
+
+
+OpWeave : Flexible Operator Disaggregation for Heterogeneous LLM Serving
+[6] Tianle Cai, Yuhong Li, Zhengyang Geng, Hongwu Peng, Jason D.
+Lee, Deming Chen, and Tri Dao. 2024. Medusa: Simple LLM Inference
+Acceleration Framework with Multiple Decoding Heads. arXiv preprint
+arXiv:2401.10774 (2024).
+[7] Charlie Chen, Sebastian Borgeaud, Geoffrey Irving, Jean-Baptiste
+Lespiau, Laurent Sifre, and John Jumper. 2023. Accelerating Large
+Language Model Decoding with Speculative Sampling. arXiv preprint
+arXiv:2302.01318 (2023).
+[8] Siyuan Chen, Zhipeng Jia, Samira Khan, Arvind Krishnamurthy, and
+Phillip B. Gibbons. 2025. SLOs-Serve: Optimized Serving of Multi-SLO
+LLMs. arXiv preprint arXiv:2504.08784 (2025).
+[9] Zhuoming Chen, Avner May, Ruslan Svirschevski, Yuhsun Huang,
+Max Ryabinin, Zhihao Jia, and Beidi Chen. 2024. Sequoia: Scalable,
+Robust, and Hardware-aware Speculative Decoding. arXiv preprint
+arXiv:2402.12374 (2024).
+[10] Xianzhe Dong, Tongxuan Liu, Yuting Zeng, Liangyu Liu, Yang Liu,
+Siyu Wu, Yu Wu, Hailong Yang, Ke Zhang, and Jing Li. 2025. HydraIn-
+fer: Hybrid Disaggregated Scheduling for Multimodal Large Lan-
+guage Model Serving. arXiv preprint arXiv:2505.12658 (2025). https:
+//arxiv.org/abs/2505.12658
+[11] Vivek Gangasani, Andrew Smith, and Goutham Annem. 2026. Intro-
+ducing Disaggregated Inference on AWS powered by llm-d. https:
+//aws.amazon.com/blogs/machine- learning/introducing-
+disaggregated-inference-on-aws-powered-by-llm-d/.
+AWS
+Blog. Accessed: 2026-04-16.
+[12] Gemma Team, Aishwarya Kamath, Johan Ferret, Shreya Pathak, Nino
+Vieillard, Ramona Merhej, Sarah Perrin, Tatiana Matejovicova, Alexan-
+dre Ramé, Morgane Rivière, Louis Rouillard, Thomas Mesnard, Ge-
+offrey Cideron, Jean bastien Grill, Sabela Ramos, Edouard Yvinec,
+Michelle Casbon, Etienne Pot, Ivo Penchev, Gaël Liu, Francesco Visin,
+Kathleen Kenealy, Lucas Beyer, Xiaohai Zhai, Anton Tsitsulin, Robert
+Busa-Fekete, Alex Feng, Noveen Sachdeva, Benjamin Coleman, Yi
+Gao, Basil Mustafa, Iain Barr, Emilio Parisotto, David Tian, Matan
+Eyal, Colin Cherry, Jan-Thorsten Peter, Danila Sinopalnikov, Surya
+Bhupatiraju, Rishabh Agarwal, Mehran Kazemi, Dan Malkin, Ravin
+Kumar, David Vilar, Idan Brusilovsky, Jiaming Luo, Andreas Steiner,
+Abe Friesen, Abhanshu Sharma, Abheesht Sharma, Adi Mayrav Gilady,
+Adrian Goedeckemeyer, Alaa Saade, Alex Feng, Alexander Kolesnikov,
+Alexei Bendebury, Alvin Abdagic, Amit Vadi, András György, An-
+dré Susano Pinto, Anil Das, Ankur Bapna, Antoine Miech, Antoine
+Yang, Antonia Paterson, Ashish Shenoy, Ayan Chakrabarti, Bilal Piot,
+Bo Wu, Bobak Shahriari, Bryce Petrini, Charlie Chen, Charline Le
+Lan, Christopher A. Choquette-Choo, CJ Carey, Cormac Brick, Daniel
+Deutsch, Danielle Eisenbud, Dee Cattle, Derek Cheng, Dimitris Pa-
+paras, Divyashree Shivakumar Sreepathihalli, Doug Reid, Dustin Tran,
+Dustin Zelle, Eric Noland, Erwin Huizenga, Eugene Kharitonov, Fred-
+erick Liu, Gagik Amirkhanyan, Glenn Cameron, Hadi Hashemi, Hanna
+Klimczak-Plucińska, Harman Singh, Harsh Mehta, Harshal Tushar
+Lehri, Hussein Hazimeh, Ian Ballantyne, Idan Szpektor, Ivan Nardini,
+Jean Pouget-Abadie, Jetha Chan, Joe Stanton, John Wieting, Jonathan
+Lai, Jordi Orbay, Joseph Fernandez, Josh Newlan, Ju yeong Ji, Jyotinder
+Singh, Kat Black, Kathy Yu, Kevin Hui, Kiran Vodrahalli, Klaus Greff,
+Linhai Qiu, Marcella Valentine, Marina Coelho, Marvin Ritter, Matt
+Hoffman, Matthew Watson, Mayank Chaturvedi, Michael Moynihan,
+Min Ma, Nabila Babar, Natasha Noy, Nathan Byrd, Nick Roy, Nikola
+Momchev, Nilay Chauhan, Noveen Sachdeva, Oskar Bunyan, Pankil
+Botarda, Paul Caron, Paul Kishan Rubenstein, Phil Culliton, Philipp
+Schmid, Pier Giuseppe Sessa, Pingmei Xu, Piotr Stanczyk, Pouya Tafti,
+Rakesh Shivanna, Renjie Wu, Renke Pan, Reza Rokni, Rob Willoughby,
+Rohith Vallu, Ryan Mullins, Sammy Jerome, Sara Smoot, Sertan Girgin,
+Shariq Iqbal, Shashir Reddy, Shruti Sheth, Siim Põder, Sijal Bhatna-
+gar, Sindhu Raghuram Panyam, Sivan Eiger, Susan Zhang, Tianqi Liu,
+Trevor Yacovone, Tyler Liechty, Uday Kalra, Utku Evci, Vedant Misra,
+Vincent Roseberry, Vlad Feinberg, Vlad Kolesnikov, Woohyun Han,
+Woosuk Kwon, Xi Chen, Yinlam Chow, Yuvein Zhu, Zichuan Wei,
+Zoltan Egyed, Victor Cotruta, Minh Giang, Phoebe Kirk, Anand Rao,
+Kat Black, Nabila Babar, Jessica Lo, Erica Moreira, Luiz Gustavo Mar-
+tins, Omar Sanseviero, Lucas Gonzalez, Zach Gleicher, Tris Warkentin,
+Vahab Mirrokni, Evan Senter, Eli Collins, Joelle Barral, Zoubin Ghahra-
+mani, Raia Hadsell, Yossi Matias, D. Sculley, Slav Petrov, Noah Fiedel,
+Noam Shazeer, Oriol Vinyals, Jeff Dean, Demis Hassabis, Koray
+Kavukcuoglu, Clement Farabet, Elena Buchatskaya, Jean-Baptiste
+Alayrac, Rohan Anil, Dmitry (Dima) Lepikhin, Sebastian Borgeaud,
+Olivier Bachem, Armand Joulin, Alek Andreev, Cassidy Hardin, Robert
+Dadashi, and Léonard Hussenot. 2025. Gemma 3 Technical Report.
+arXiv:2503.19786 [cs.CL] https://arxiv.org/abs/2503.19786
+[13] Tyler Griggs, Xiaoxuan Liu, Jiaxiang Yu, Doyoung Kim, Wei-Lin Chi-
+ang, Alvin Cheung, and Ion Stoica. 2024. Mélange: Cost Efficient Large
+Language Model Serving by Exploiting GPU Heterogeneity. arXiv
+preprint arXiv:2404.14527 (2024).
+[14] Etash Guha, Ryan Marten, Sedrick Keh, Negin Raoof, Georgios Smyr-
+nis, Hritik Bansal, Marianna Nezhurina, Jean Mercat, Trung Vu, Za-
+yne Sprague, Ashima Suvarna, Benjamin Feuer, Liangyu Chen, Zaid
+Khan, Eric Frankel, Sachin Grover, Caroline Choi, Niklas Muennighoff,
+Shiye Su, Wanjia Zhao, John Yang, Shreyas Pimpalgaonkar, Kartik
+Sharma, Charlie Cheng-Jie Ji, Yichuan Deng, Sarah Pratt, Vivek Ra-
+manujan, Jon Saad-Falcon, Jeffrey Li, Achal Dave, Alon Albalak, Kushal
+Arora, Blake Wulfe, Chinmay Hegde, Greg Durrett, Sewoong Oh, Mo-
+hit Bansal, Saadia Gabriel, Aditya Grover, Kai-Wei Chang, Vaishaal
+Shankar, Aaron Gokaslan, Mike A. Merrill, Tatsunori Hashimoto,
+Yejin Choi, Jenia Jitsev, Reinhard Heckel, Maheswaran Sathiamoorthy,
+Alexandros G. Dimakis, and Ludwig Schmidt. 2025. OpenThoughts:
+Data Recipes for Reasoning Models. arXiv:2506.04178 [cs.LG] https:
+//arxiv.org/abs/2506.04178
+[15] Jiaao He, Kezhao Huang, and Jidong Zhai. 2024. FASTDECODE: High-
+Throughput LLM Serving through Disaggregating Attention Compu-
+tation. In Proceedings of the 1st Workshop on Long-Context Foundation
+Models. https://openreview.net/forum?id=GahfuPsGw2
+[16] Kaiyu Huang, Hao Wu, Zhubo Shi, Han Zou, Minchen Yu, and
+Qingjiang Shi. 2025. AdaSpec: Adaptive Speculative Decoding for
+Fast, SLO-Aware Large Language Model Serving.
+arXiv preprint
+arXiv:2503.05096 (2025).
+[17] Youhe Jiang, Fangcheng Fu, Xiaozhe Yao, Taiyi Wang, Bin Cui, Ana
+Klimovic, and Eiko Yoneki. 2025. ThunderServe: High-performance
+and Cost-efficient LLM Serving in Cloud Environments. In Proceedings
+of Machine Learning and Systems (MLSys).
+[18] Youhe Jiang, Fangcheng Fu, and Eiko Yoneki. 2026. BOute: Cost-
+Efficient LLM Serving with Heterogeneous LLMs and GPUs via Multi-
+Objective Bayesian Optimization. arXiv preprint arXiv:2602.10729
+(2026).
+[19] Youhe Jiang, Ran Yan, Xiaozhe Yao, Yang Zhou, Beidi Chen, and Bin-
+hang Yuan. 2024. HexGen: Generative Inference of Large Language
+Model over Heterogeneous Environment. In Proceedings of the 41st
+International Conference on Machine Learning (ICML).
+[20] Youhe Jiang, Ran Yan, and Binhang Yuan. 2025. HexGen-2: Disaggre-
+gated Generative Inference of LLMs in Heterogeneous Environment.
+In The Thirteenth International Conference on Learning Representations
+(ICLR).
+[21] Kihyun Kim, Jinwoo Kim, James J. Kim, Dong Li, and Youngjae Kim.
+2025. FlexLLM: Flexible and Cost-Efficient LLM Serving with Hetero-
+geneous GPUs. In Proceedings of the IEEE International Symposium on
+Modeling, Analysis, and Simulation of Computer and Telecommunica-
+tion Systems (MASCOTS).
+[22] Kimi Team, Yu Zhang, Zongyu Lin, Xingcheng Yao, Jiaxi Hu, Fanqing
+Meng, Chengyin Liu, Xin Men, Songlin Yang, Zhiyuan Li, Wentao
+Li, Enzhe Lu, Weizhou Liu, Yanru Chen, Weixin Xu, Longhui Yu,
+Yejie Wang, Yu Fan, Longguang Zhong, Enming Yuan, Dehao Zhang,
+Yizhi Zhang, T. Y. Liu, Haiming Wang, Shengjun Fang, Weiran He,
+13
+
+
+Li et al.
+Shaowei Liu, Yiwei Li, Jianlin Su, Jiezhong Qiu, Bo Pang, Junjie Yan,
+Zhejun Jiang, Weixiao Huang, Bohong Yin, Jiacheng You, Chu Wei,
+Zhengtao Wang, Chao Hong, Yutian Chen, Guanduo Chen, Yucheng
+Wang, Huabin Zheng, Feng Wang, Yibo Liu, Mengnan Dong, Zheng
+Zhang, Siyuan Pan, Wenhao Wu, Yuhao Wu, Longyu Guan, Jiawen Tao,
+Guohong Fu, Xinran Xu, Yuzhi Wang, Guokun Lai, Yuxin Wu, Xinyu
+Zhou, Zhilin Yang, and Yulun Du. 2025. Kimi linear: An expressive,
+efficient attention architecture. arXiv preprint arXiv:2510.26692 (2025).
+[23] Woosuk Kwon, Zhuohan Li, Siyuan Zhuang, Ying Sheng, Lianmin
+Zheng, Cody Hao Yu, Joseph E. Gonzalez, Hao Zhang, and Ion Stoica.
+2023.
+Efficient Memory Management for Large Language Model
+Serving with PagedAttention. arXiv preprint arXiv:2309.06180 (2023).
+[24] Yaniv Leviathan, Matan Kalman, and Yossi Matias. 2022. Fast Infer-
+ence from Transformers via Speculative Decoding. arXiv preprint
+arXiv:2211.17192 (2022).
+[25] Yuhui Li, Fangyun Wei, Chao Zhang, and Hongyang Zhang. 2024.
+EAGLE-2: Faster Inference of Language Models with Dynamic Draft
+Trees. arXiv preprint arXiv:2406.16858 (2024).
+[26] Yuhui Li, Fangyun Wei, Chao Zhang, and Hongyang Zhang. 2024. EA-
+GLE: Speculative Sampling Requires Rethinking Feature Uncertainty.
+arXiv preprint arXiv:2401.15077 (2024).
+[27] Yuhui Li, Fangyun Wei, Chao Zhang, and Hongyang Zhang. 2025.
+EAGLE-3: Scaling up Inference Acceleration of Large Language Models
+via Training-Time Test. arXiv preprint arXiv:2503.01840 (2025).
+[28] Zikun Li, Zhuofu Chen, Remi Delacourt, Gabriele Oliaro, Zeyu Wang,
+Qinghan Chen, Shuhuai Lin, April Yang, Zhihao Zhang, Zhuoming
+Chen, Yi-Hsiang Lai, Xinhao Cheng, Xupeng Miao, and Zhihao Jia.
+2026. AdaServe: Accelerating Multi-SLO LLM Serving with SLO-
+Customized Speculative Decoding. In Proceedings of the 21st European
+Conference on Computer Systems (EuroSys ’26). ACM, New York, NY,
+USA, 36–54. doi:10.1145/3767295.3769315
+[29] Zonghang Li, Wenjiao Feng, Mohsen Guizani, and Hongfang Yu. 2024.
+TPI-LLM: Serving 70B-scale LLMs Efficiently on Low-resource Edge
+Devices. arXiv preprint arXiv:2410.00531 (2024).
+[30] Bin Lin, Chen Zhang, Tao Peng, Hanyu Zhao, Wencong Xiao, Minmin
+Sun, Anmin Liu, Zhipeng Zhang, Lanbo Li, Xiafei Qiu, Shen Li, Zhi-
+gang Ji, Tao Xie, Yong Li, and Wei Lin. 2024. Infinite-LLM: Efficient
+LLM Service for Long Context with DistAttention and Distributed
+KVCache. arXiv preprint arXiv:2401.02669 (2024).
+[31] Guowei Liu, Hongming Li, Yaning Guo, Yongxi Lyu, Mo Zhou, Yi Liu,
+Zhaogeng Li, and Yanpeng Wang. 2026. Revealing the Challenges of
+Attention-FFN Disaggregation for Modern MoE Models and Hardware
+Systems. arXiv preprint arXiv:2602.09721 (2026). https://arxiv.org/ab
+s/2602.09721
+[32] Xiaoxuan Liu, Jongseok Park, Langxiang Hu, Woosuk Kwon, Zhuohan
+Li, Chen Zhang, Kuntai Du, Xiangxi Mo, Kaichao You, Alvin Cheung,
+Zhijie Deng, Ion Stoica, and Hao Zhang. 2024. TurboSpec: Closed-loop
+Speculation Control System for Optimizing LLM Serving Goodput.
+arXiv preprint arXiv:2406.14066 (2024).
+[33] Mark Lohmeyer and Drew Bradstock. 2025. GKE Inference Gateway
+and Quickstart are GA. https://cloud.google.com/blog/products/ai-
+machine-learning/gke-inference-gateway-and-quickstart-are-ga.
+Google Cloud Blog. Accessed: 2026-04-16.
+[34] Yixuan Mei, Zikun Li, Zixuan Chen, Shiqi Pan, Mengdi Wu, Xu-
+peng Miao, Zhihao Jia, and K. V. Rashmi. 2026. Coral: Cost-Efficient
+Multi-LLM Serving over Heterogeneous Cloud GPUs. arXiv preprint
+arXiv:2605.04357 (2026).
+[35] Yixuan Mei, Yonghao Zhuang, Xupeng Miao, Juncheng Yang, Zhihao
+Jia, and Rashmi Vinayak. 2024. Helix: Serving Large Language Models
+over Heterogeneous GPUs and Network via Max-Flow. arXiv preprint
+arXiv:2406.01566 (2024).
+[36] Nicholas Merizzi, Chris Thomas, and Ed Burns. 2025. The AI In-
+frastructure Reckoning: Optimizing Compute Strategy in the Age of
+Inference Economics. https://www.deloitte.com/us/en/insights/to
+pics/technology-management/tech-trends/2026/ai-infrastructure-
+compute-strategy.html. Deloitte Insights. Accessed: 2026-04-15.
+[37] Xupeng Miao, Gabriele Oliaro, Zhihao Zhang, Xinhao Cheng, Zeyu
+Wang, Zhengxin Zhang, Rae Ying Yee Wong, Alan Zhu, Lijie Yang,
+Xiaoxiang Shi, Chunan Shi, Zhuoming Chen, Daiyaan Arfeen, Reyna
+Abhyankar, and Zhihao Jia. 2024. SpecInfer: Accelerating Large Lan-
+guage Model Serving with Tree-based Speculative Inference and Veri-
+fication. In Proceedings of the 29th ACM International Conference on
+Architectural Support for Programming Languages and Operating Sys-
+tems, Volume 3. ACM, New York, NY, USA, 932–949.
+[38] Jesse Noffsinger, Mark Patel, Pankaj Sachdeva, Arjita Bhan, Haley
+Chang, and Maria Goodpaster. 2025. The Cost of Compute: A $7
+Trillion Race to Scale Data Centers. https://www.mckinsey.com/indus
+tries/technology-media-and-telecommunications/our-insights/the-
+cost-of-compute-a-7-trillion-dollar-race-to-scale-data-centers.
+McKinsey & Company. Accessed: 2026-04-18.
+[39] NVIDIA. 2026. A100 Tensor Core GPU: Specifications. https://www.
+nvidia.com/en-us/data-center/a100/. Accessed: 2026-09-07.
+[40] NVIDIA. 2026. H100 Tensor Core GPU: Product Specifications. https:
+//www.nvidia.com/en-sg/data-center/h100/. Accessed: 2026-09-07.
+[41] NVIDIA. 2026. L40S GPU Specifications. https://www.nvidia.com/en-
+us/data-center/l40s/. Accessed: 2026-09-07.
+[42] Gabriele Oliaro, Zhihao Jia, Daniel Campos, and Aurick Qiao. 2024.
+SuffixDecoding: Extreme Speculative Decoding for Emerging AI Ap-
+plications. arXiv preprint arXiv:2411.04975 (2024).
+[43] OpenAI, Sandhini Agarwal, Lama Ahmad, Jason Ai, Sam Altman,
+Andy Applebaum, Edwin Arbus, Rahul K. Arora, Yu Bai, Bowen Baker,
+Haiming Bao, Boaz Barak, Ally Bennett, Tyler Bertao, Nivedita Brett,
+Eugene Brevdo, Greg Brockman, Sebastien Bubeck, Che Chang, Kai
+Chen, Mark Chen, Enoch Cheung, Aidan Clark, Dan Cook, Marat
+Dukhan, Casey Dvorak, Kevin Fives, Vlad Fomenko, Timur Garipov,
+Kristian Georgiev, Mia Glaese, Tarun Gogineni, Adam Goucher, Lukas
+Gross, Katia Gil Guzman, John Hallman, Jackie Hehir, Johannes Hei-
+decke, Alec Helyar, Haitang Hu, Romain Huet, Jacob Huh, Saachi
+Jain, Zach Johnson, Chris Koch, Irina Kofman, Dominik Kundel, Jason
+Kwon, Volodymyr Kyrylov, Elaine Ya Le, Guillaume Leclerc, James Park
+Lennon, Scott Lessans, Mario Lezcano-Casado, Yuanzhi Li, Zhuohan
+Li, Ji Lin, Jordan Liss, Lily (Xiaoxuan) Liu, Jiancheng Liu, Kevin Lu,
+Chris Lu, Zoran Martinovic, Lindsay McCallum, Josh McGrath, Scott
+McKinney, Aidan McLaughlin, Song Mei, Steve Mostovoy, Tong Mu,
+Gideon Myles, Alexander Neitz, Alex Nichol, Jakub Pachocki, Alex
+Paino, Dana Palmie, Ashley Pantuliano, Giambattista Parascandolo,
+Jongsoo Park, Leher Pathak, Carolina Paz, Ludovic Peran, Dmitry
+Pimenov, Michelle Pokrass, Elizabeth Proehl, Huida Qiu, Gaby Raila,
+Filippo Raso, Hongyu Ren, Kimmy Richardson, David Robinson, Bob
+Rotsted, Hadi Salman, Suvansh Sanjeev, Max Schwarzer, D. Sculley,
+Harshit Sikchi, Kendal Simon, Karan Singhal, Yang Song, Dane Stuckey,
+Zhiqing Sun, Philippe Tillet, Sam Toizer, Foivos Tsimpourlas, Nikhil
+Vyas, Eric Wallace, Xin Wang, Miles Wang, Olivia Watkins, Kevin Weil,
+Amy Wendling, Kevin Whinnery, Cedric Whitney, Hannah Wong, Lin
+Yang, Yu Yang, Michihiro Yasunaga, Kristen Ying, Wojciech Zaremba,
+Wenting Zhan, Cyril Zhang, Brian Zhang, Eddie Zhang, and Shengjia
+Zhao. 2025. gpt-oss-120b & gpt-oss-20b model card. arXiv preprint
+arXiv:2508.10925 (2025).
+[44] Pratyush Patel, Esha Choukse, Chaojie Zhang, Aashaka Shah, Íñigo
+Goiri, Saeed Maleki, and Ricardo Bianchini. 2024. Splitwise: Efficient
+Generative LLM Inference Using Phase Splitting. In 2024 ACM/IEEE
+51st Annual International Symposium on Computer Architecture (ISCA).
+IEEE, 118–132.
+[45] You Peng, Youhe Jiang, Wenqi Jiang, Chen Wang, and Binhang Yuan.
+2025. HEXGEN-FLOW: Optimizing LLM Inference Request Scheduling
+for Agentic Text-to-SQL. arXiv preprint arXiv:2505.05286 (2025).
+14
+
+
+OpWeave : Flexible Operator Disaggregation for Heterogeneous LLM Serving
+[46] Ruoyu Qin, Zheming Li, Weiran He, Mingxing Zhang, Yongwei
+Wu, Weimin Zheng, and Xinran Xu. 2024. Mooncake: A KVCache-
+Centric Disaggregated Architecture for LLM Serving. arXiv preprint
+arXiv:2407.00079 (2024).
+[47] Qwen Team. 2025. Qwen3-Next: Towards Ultimate Training & Infer-
+ence Efficiency. https://qwen.ai/blog?id=4074cca80393150c248e508a
+a62983f9cb7d27cd. Qwen blog, September 10, 2025.
+[48] Gursimran Singh, Xinglu Wang, Yifan Hu, Timothy Tin Long Yu,
+Linzi Xing, Wei Jiang, Zhefeng Wang, Xiaolong Bai, Yi Li, Ying
+Xiong, Yong Zhang, and Zhenan Fan. 2025.
+Efficiently Serving
+Large Multimodal Models Using EPD Disaggregation. In Proceedings
+of the 42nd International Conference on Machine Learning (Proceed-
+ings of Machine Learning Research, Vol. 267). 55740–55756.
+https:
+//openreview.net/forum?id=n7VLFYNoCb
+[49] Chendong Song, Meixuan Wang, Hang Zhou, Hong Liang, Yuan
+Lyu, Zixi Chen, Yuwei Fan, and Zijie Zhou. 2026. Analytical Pro-
+visioning for Attention-FFN Disaggregated LLM Serving under Sto-
+chastic Workloads. arXiv preprint arXiv:2601.21351 (2026).
+https:
+//arxiv.org/abs/2601.21351
+[50] StepFun, Bin Wang, Bojun Wang, Changyi Wan, Guanzhe Huang,
+Hanpeng Hu, Haonan Jia, Hao Nie, Mingliang Li, Nuo Chen, Siyu
+Chen, Song Yuan, Wuxun Xie, Xiaoniu Song, Xing Chen, Xingping
+Yang, Xuelin Zhang, Yanbo Yu, Yaoyu Wang, Yibo Zhu, Yimin Jiang, Yu
+Zhou, Yuanwei Lu, Houyi Li, Jingcheng Hu, Ka Man Lo, Ailin Huang,
+Binxing Jiao, Bo Li, Boyu Chen, Changxin Miao, Chang Lou, Chen Hu,
+Chen Xu, Chenfeng Yu, Chengyuan Yao, Daokuan Lv, Dapeng Shi,
+Deshan Sun, Ding Huang, Dingyuan Hu, Dongqing Pang, Enle Liu,
+Fajie Zhang, Fanqi Wan, Gulin Yan, Han Zhang, Han Zhou, Hanghao
+Wu, Hangyu Guo, Hanqi Chen, Hanshan Zhang, Hao Wu, Haocheng
+Zhang, Haolong Yan, Haoran Lv, Haoran Wei, Hebin Zhou, Heng
+Wang, Heng Wang, Hongxin Li, Hongyu Zhou, Hongyuan Wang,
+Huiyong Guo, Jia Wang, Jiahao Gong, Jialing Xie, Jian Zhou, Jianjian
+Sun, Jiaoren Wu, Jiaran Zhang, Jiayu Liu, Jie Cheng, Jie Luo, Jie Yan,
+Jie Yang, Jieyi Hou, Jinguang Zhang, Jinlan Cao, Jisheng Yin, Junfeng
+Liu, Junhao Huang, Junzhe Lin, Kaijun Tan, Kaixiang Li, Kang An,
+Kangheng Lin, Kenkun Liu, Lei Yang, Liang Zhao, Liangyu Chen, Lieyu
+Shi, Liguo Tan, Lin Lin, Lin Zhang, Lina Chen, Liwen Huang, Liying
+Shi, Longlong Gu, Mei Chen, Mengqiang Ren, Ming Li, Mingzhe Chen,
+Na Wang, Nan Wu, Qi Han, Qian Zhao, Qiang Zhang, Qianni Liu,
+Qiaohui Chen, Qiling Wu, Qinglin He, Qinyuan Tan, Qiufeng Wang,
+Qiuping Wu, Qiuyan Liang, Quan Sun, Rui Li, Ruihang Miao, Ruosi
+Wan, Ruyan Guo, Shangwu Zhong, Shaoliang Pang, Shengjie Fan, Shi-
+jie Shang, Shilei Jiang, Shiliang Yang, Shiming Hao, Shuli Gao, Siming
+Huang, Siqi Liu, Tiancheng Cao, Tianhao Cheng, Tianhao Peng, Wang
+You, Wei Ji, Wen Sun, Wenjin Deng, Wenqing He, Wenzhen Zheng,
+Xi Chen, Xiangwen Kong, Xianzhen Luo, Xiaobo Yang, Xiaojia Liu,
+Xiaoxiao Ren, Xin Han, Xin Li, Xin Wu, Xu Zhao, Yanan Wei, Yang Li,
+Yangguang Li, Yangshijie Xu, Yanming Xu, Yaqiang Shi, Yeqing Shen,
+Yi Yang, Yifei Yang, Yifeng Gong, Yihan Chen, Yijing Yang, Yinmin
+Zhang, Yizhuang Zhou, Yuanhao Ding, Yuantao Fan, Yuanzhen Yang,
+Yuchu Luo, Yue Peng, Yufan Lu, Yuhang Deng, Yuhe Yin, Yujie Liu,
+Yukun Chen, Yuling Zhao, Yun Mou, Yunlong Li, Yunzhou Ju, Yusheng
+Li, Yuxiang Yang, Yuxiang Zhang, Yuyang Chen, Zejia Weng, Zhe Xie,
+Zheng Ge, Zheng Gong, Zhenyi Lu, Zhewei Huang, Zhichao Chang,
+Zhiguo Huang, Zhirui Wang, Zidong Yang, Zili Wang, Ziqi Wang,
+Zixin Zhang, Binxing Jiao, Daxin Jiang, Heung-Yeung Shum, and Xi-
+angyu Zhang. 2025. Step-3 is Large yet Affordable: Model-system
+Co-design for Cost-effective Decoding. arXiv preprint arXiv:2507.19427
+(2025).
+[51] Chris Tong, Youhe Jiang, Gufeng Chen, Tianyi Zhao, Sibian Lu, Wenjie
+Qu, Eric Yang, Lynn Ai, and Binhang Yuan. 2025. Parallax: Efficient
+LLM Inference Service over Decentralized Environment. arXiv preprint
+arXiv:2509.26182 (2025).
+[52] Tim Tully, Joff Redfern, Deedy Das, and Derek Xiao. 2025. 2025 Mid-
+Year LLM Market Update: Foundation Model Landscape & Economics.
+https://menlovc.com/perspective/2025-mid-year-llm-market-
+update/. Menlo Ventures. Accessed: 2026-04-15.
+[53] Linyu Wu, Xiaoyuan Liu, Tianneng Shi, Zhe Ye, and Dawn Song. 2025.
+DeServe: Towards Affordable Offline LLM Inference via Decentraliza-
+tion. arXiv preprint arXiv:2501.14784 (2025).
+[54] Gyeong-In Yu, Joo Seong Jeong, Geon-Woo Kim, Soojeong Kim, and
+Byung-Gon Chun. 2022. Orca: A Distributed Serving System for
+Transformer-Based Generative Models. In 16th USENIX Symposium
+on Operating Systems Design and Implementation (OSDI 22). USENIX
+Association, 521–538.
+[55] Lianmin Zheng, Liangsheng Yin, Zhiqiang Xie, Chuyue Sun, Jeff
+Huang, Cody Hao Yu, Shiyi Cao, Christos Kozyrakis, Ion Stoica,
+Joseph E. Gonzalez, Clark Barrett, and Ying Sheng. 2023. SGLang:
+Efficient Execution of Structured Language Model Programs. arXiv
+preprint arXiv:2312.07104 (2023).
+[56] Yinmin Zhong, Shengyu Liu, Junda Chen, Jianbo Hu, Yibo Zhu, Xu-
+anzhe Liu, Xin Jin, and Hao Zhang. 2024. DistServe: Disaggregating
+Prefill and Decoding for Goodput-Optimized Large Language Model
+Serving. arXiv preprint arXiv:2401.09670 (2024).
+[57] Kan Zhu, Yufei Gao, Yilong Zhao, Liangyu Zhao, Gefei Zuo, Yile Gu,
+Dedong Xie, Tian Tang, Qinyu Xu, Zihao Ye, Keisuke Kamahori, Chien-
+Yu Lin, Ziren Wang, Stephanie Wang, Arvind Krishnamurthy, and
+Baris Kasikci. 2024. NanoFlow: Towards Optimal Large Language
+Model Serving Throughput. arXiv preprint arXiv:2408.12757 (2024).
+[58] Ruidong Zhu, Ziheng Jiang, Chao Jin, Peng Wu, Cesar A. Stuardo,
+Dongyang Wang, Xinlei Zhang, Huaping Zhou, Haoran Wei, Yang
+Cheng, Jianzhe Xiao, Xinyi Zhang, Lingjun Liu, Haibin Lin, Li-Wen
+Chang, Jianxi Ye, Xiao Yu, Xuanzhe Liu, Xin Jin, and Xin Liu. 2025.
+MegaScale-Infer: Serving Mixture-of-Experts at Scale with Disaggre-
+gated Expert Parallelism. arXiv preprint arXiv:2504.02263 (2025).
+15
+
+
+Li et al.
+A
+Analytical Model and Proofs for
+Section 3
+This appendix section collects the analytical model, proofs,
+and CAD feasibility details used by Section 3.
+A.1
+Detailed analytical model
+We now formalize the analytical abstraction used in Sec-
+tion 3.1. We model one decode step of an LLM as the sequen-
+tial execution of an ordered operator sequence
+o = (𝑜1,𝑜2, . . . ,𝑜𝑁model),
+where each𝑜𝑖denotes one computational kernel invoked dur-
+ing the decode step. This abstraction follows the execution
+pattern of current serving engines, which invoke the model’s
+kernels in a fixed topological order during each decoding
+iteration.
+For an operator𝑜𝑖executed at batch size𝑏, let 𝐷𝑖(𝑏) denote
+the total number of bytes loaded from memory and let𝑊𝑖(𝑏)
+denote the total number of floating-point operations. We
+characterize each GPU type by four quantities: unit-time
+monetary cost 𝑐, memory bandwidth 𝛽, memory capacity
+𝑀, and peak compute throughput 𝐹. Under the exclusive-
+occupancy assumption, the monetary cost of operator 𝑜𝑖
+is
+Cost(𝑜𝑖) = 𝑇(𝑜𝑖) · 𝑐,
+where 𝑇(𝑜𝑖) is the execution latency of the operator. We
+model this latency using a roofline-style expression:
+𝑇(𝑜𝑖) = max
+𝐷𝑖(𝑏)
+𝛽
+, 𝑊𝑖(𝑏)
+𝐹
+
+.
+The first term is the memory-load time and the second term
+is the compute time, so the maximum captures whether the
+operator is memory-bound or compute-bound on the target
+GPU.
+The cost of a full decode step is then the sum of the costs
+of all operators in the sequence:
+Coststep =
+𝑁model
+∑︁
+𝑖=1
+Cost(𝑜𝑖).
+Since one decode step produces one token per request, the
+GPU cost per token is obtained by dividing Coststep by the
+batch size 𝑏.
+Throughout the theoretical analysis, we intentionally fo-
+cus on GPU-side cost. Although a disaggregated pipeline
+introduces activation transfers between device groups, the
+analysis studies the idealized steady-state regime in which
+these transfers are overlapped with computation through
+microbatching and pipelining. Under this assumption, com-
+munication does not lie on the throughput-critical path and
+is therefore omitted from the analytical objective.
+A.2
+Execution-regime assumptions
+This subsection formalizes the execution-regime assump-
+tions used in Section 3.1. Under the roofline model above, an
+operator is memory-bound when
+𝐷𝑖(𝑏)
+𝛽
+≥𝑊𝑖(𝑏)
+𝐹
+,
+and compute-bound when the reverse inequality holds.
+We assume that decode-phase attention lies in the
+memory-bound regime. During decoding, each request
+contributes only one query token while the attention
+operator must load the full KV cache associated with the
+prior context, which keeps arithmetic intensity low and
+makes latency primarily determined by memory traffic.
+Formally, for attention operators 𝑜attn
+𝑖
+, we assume
+𝐷attn
+𝑖
+(𝑏)
+𝛽
+≥𝑊attn
+𝑖
+(𝑏)
+𝐹
+.
+For GEMM-dominated operators, we assume that there
+exists a batch-size threshold 𝑏∗such that these operators
+become compute-bound once the batch size is sufficiently
+large. Formally, for GEMM operators 𝑜gemm
+𝑖
+, we assume that
+for all 𝑏≥𝑏∗,
+𝑊gemm
+𝑖
+(𝑏)
+𝐹
+≥𝐷gemm
+𝑖
+(𝑏)
+𝛽
+.
+The threshold 𝑏∗marks the transition at which arithmetic
+time overtakes memory-load time, so beyond this point fur-
+ther execution is limited by compute throughput rather than
+bandwidth.
+The role of disaggregation is to make this compute-bound
+GEMM regime attainable. In colocated serving, GEMM op-
+erators share device memory with the KV cache, so long
+contexts reduce the maximum feasible batch size and can
+keep GEMM in a memory-bound regime. Under operator-
+level disaggregation, the compute side no longer needs to
+reserve memory for the KV cache, and requests forwarded
+from multiple attention-side replicas can be aggregated on
+the GEMM side. This decoupling allows the GEMM side to
+sustain a larger effective batch size and thus operate in the
+compute-bound regime assumed in the main-text analysis.
+A.3
+Derivation and interpretation of the final cost
+expressions
+This subsection derives the cost expressions used in Sec-
+tion 3.1 from the operator-level roofline model.
+Operator-class aggregates. Let Oattn denote the set of at-
+tention operators executed in one decode step and let Ogemm
+denote the set of GEMM-dominated operators, where the
+16
+
+
+OpWeave : Flexible Operator Disaggregation for Heterogeneous LLM Serving
+latter includes the linear projections, FFN, and MoE compu-
+tation. We define the aggregate quantities
+𝐷attn(𝑏) =
+∑︁
+𝑜𝑖∈Oattn
+𝐷𝑖(𝑏),
+𝐷gemm(𝑏) =
+∑︁
+𝑜𝑖∈Ogemm
+𝐷𝑖(𝑏),
+𝑊gemm(𝑏) =
+∑︁
+𝑜𝑖∈Ogemm
+𝑊𝑖(𝑏).
+These aggregate terms collect, respectively, the total
+attention-side memory traffic, the total GEMM-side memory
+traffic, and the total GEMM-side floating-point work for a
+batch of size 𝑏in one decode step.
+Substituting these class aggregates into the roofline cost
+model of Appendix A.1 and dividing by the batch size yields
+the per-token costs as follows.
+Homogeneous disaggregated serving. In homogeneous
+ODS, attention and GEMM-dominated operators are placed
+on separate device groups of the same GPU type (𝑐, 𝛽, 𝑀, 𝐹).
+Under the execution-regime assumptions of Section 3.1,
+decode-phase attention is memory-bound while GEMM-
+dominated operators are compute-bound. Their class-level
+costs therefore reduce to
+Costattn
+step = 𝐷attn(𝑏)
+𝛽
+𝑐,
+Costgemm
+step
+= 𝑊gemm(𝑏)
+𝐹
+𝑐.
+Dividing the sum by 𝑏yields
+CPThom = 𝑐
+𝑏
+𝐷attn(𝑏)
+𝛽
++ 𝑊gemm(𝑏)
+𝐹
+
+.
+Heterogeneous disaggregated serving. In heterogeneous
+ODS, the attention side and the GEMM side may run on
+different GPU types. If attention runs on GPU type 1 with
+parameters (𝑐1, 𝛽1, 𝑀1, 𝐹1) and GEMM-dominated operators
+run on GPU type 2 with parameters (𝑐2, 𝛽2, 𝑀2, 𝐹2), the same
+regime assumptions give
+Costattn
+step = 𝐷attn(𝑏)
+𝛽1
+𝑐1,
+Costgemm
+step
+= 𝑊gemm(𝑏)
+𝐹2
+𝑐2,
+and thus
+CPThet
+1,2 = 1
+𝑏
+𝐷attn(𝑏)
+𝛽1
+𝑐1 + 𝑊gemm(𝑏)
+𝐹2
+𝑐2
+
+.
+The cost-efficiency metrics 𝛼𝑗and𝛾𝑗defined in Section 3.1
+measure monetary cost per byte of memory traffic and per
+FLOP, respectively. Heterogeneous specialization allows at-
+tention to use the GPU type with the lower 𝛼𝑗and GEMM-
+dominated operators to use the type with the lower 𝛾𝑗.
+Colocated serving. In colocated serving, all operators
+share the same device memory, so the feasible batch size is
+constrained by both model weights and the KV cache. Let
+𝑀weights denote the memory occupied by model weights and
+let𝑚kv(𝑠) denote the KV-cache memory required per request
+at average sequence length 𝑠. Neglecting activation memory
+for simplicity, the maximum feasible batch size is
+𝑏max(𝑠) =
+𝑀−𝑀weights
+𝑚kv(𝑠)
+
+.
+As 𝑠grows, 𝑚kv(𝑠) increases and the feasible batch size
+shrinks.
+Attention remains memory-bound under colocation, so
+its contribution is still
+𝐷attn(𝑏)
+𝛽
+𝑐.
+For GEMM-dominated operators, however, the smaller fea-
+sible batch size may prevent the compute side from reach-
+ing the compute-bound regime. We therefore retain the full
+roofline expression,
+Costgemm
+step
+= max
+𝐷gemm(𝑏)
+𝛽
+, 𝑊gemm(𝑏)
+𝐹
+
+𝑐,
+which gives, for 1 ≤𝑏≤𝑏max(𝑠),
+CPTcoloc(𝑠,𝑏) = 𝑐
+𝑏
+ 
+𝐷attn(𝑏)
+𝛽
++ max
+𝐷gemm(𝑏)
+𝛽
+, 𝑊gemm(𝑏)
+𝐹
+!
+.
+Intuition for the small-batch regime. The max term
+in the colocated expression is important because GEMM
+efficiency depends on batch size. When the feasible batch
+size remains large enough, GEMM can stay compute-bound
+and its contribution is governed by 𝑊gemm(𝑏)/𝐹. But once
+KV-cache growth drives the feasible batch size down, GEMM
+may enter a small-batch regime in which loading weights
+dominates the arithmetic work. In that case,
+𝐷gemm(𝑏)
+𝛽
+> 𝑊gemm(𝑏)
+𝐹
+,
+so GEMM becomes memory-bound and the GPU’s compute
+capability is underutilized. This is precisely the inefficiency
+that operator-level disaggregation removes: by decoupling
+the compute side from KV-cache memory pressure, disag-
+gregation allows GEMM-dominated operators to recover the
+larger effective batch sizes needed to operate in the compute-
+bound regime.
+Conditional achievability via CAD. The idealized dis-
+aggregated cost expressions above are attainable by the Core-
+Attention Disaggregation (CAD) partition under pipeline bal-
+ance. CAD assigns the core attention kernels to the attention
+device group and assigns the remaining GEMM-dominated
+operators, including projections, FFN, and MoE computa-
+tion, to the rest-of-model device group. Under the regime
+assumptions in Appendix A.2, the attention side therefore
+incurs bandwidth cost while the rest-of-model side incurs
+compute cost. If the two stages are provisioned so that their
+steady-state latencies match and inter-stage communication
+17
+
+
+Li et al.
+is overlapped by microbatching, the realized per-token GPU
+cost is exactly the homogeneous or heterogeneous ODS cost
+expression derived above.
+A.4
+Scaling approximations and GEMM threshold
+This subsection formalizes the approximations used in Sec-
+tion 3.1 to obtain closed-form analytical results.
+Attention-side memory traffic. During decoding, each
+request contributes one newly generated token, but attention
+must load the KV cache associated with that request’s prior
+context. As a result, the total attention-side memory traffic
+grows linearly with the batch size and with the average
+sequence length. We therefore approximate
+𝐷attn(𝑏) ≈𝑏𝑚kv(𝑠),
+where 𝑚kv(𝑠) denotes the KV-cache memory required per
+request at average sequence length 𝑠.
+GEMM-side floating-point work. We approximate the
+total GEMM work in one decode step as
+𝑊gemm(𝑏) ≈2𝑏𝑃act,
+where 𝑃act is the effective number of GEMM-side parameters
+activated by one request on the modeled device group after
+any model-parallel sharding. For dense models, this includes
+all GEMM-side parameters assigned to the device group. For
+MoE models, it includes shared dense parameters and only
+the routed expert parameters used by the request, rather
+than all resident expert parameters. The factor of 2 reflects
+one multiply-add per active parameter per request. This
+approximation captures the fact that GEMM-side arithmetic
+scales linearly with the number of concurrently processed
+requests.
+GEMM-side memory traffic. For GEMM-dominated op-
+erators, we approximate the total memory traffic by the
+model-weight footprint:
+𝐷gemm(𝑏) ≈𝑀weights,
+where 𝑀weights is the resident footprint of all model weights
+assigned to the modeled device group after sharding. In an
+MoE model, inactive experts do not contribute to 𝑃act for an
+individual request, but their resident weights still contribute
+to 𝑀weights. The approximation 𝐷gemm(𝑏) ≈𝑀weights corre-
+sponds to a sufficiently large batch whose routed tokens
+collectively access and amortize the resident expert-weight
+shards; the runtime planner uses measured operator costs
+rather than relying on this approximation.
+Continuous form of the colocated batch-size limit.
+In the main text, the exact colocated feasible batch size is
+defined as
+𝑏max(𝑠) =
+𝑀−𝑀weights
+𝑚kv(𝑠)
+
+.
+For the closed-form analysis, we use the continuous relax-
+ation
+¯𝑏(𝑠) = 𝑀−𝑀weights
+𝑚kv(𝑠)
+.
+Dropping the floor changes the feasible batch size by at most
+one request.
+Derivation of the GEMM threshold. The threshold 𝑏∗is
+defined as the batch size at which GEMM transitions from
+memory-bound to compute-bound execution. Under the ap-
+proximations above, the GEMM memory-load time is
+𝐷gemm(𝑏)
+𝛽
+≈𝑀weights
+𝛽
+,
+while the GEMM compute time is
+𝑊gemm(𝑏)
+𝐹
+≈2𝑏𝑃act
+𝐹
+.
+Equating these two terms gives the transition point:
+𝑀weights
+𝛽
+= 2𝑏𝑃act
+𝐹
+,
+and therefore
+𝑏∗= 𝑀weights𝐹
+2𝑃act𝛽
+.
+Interpretation. When 𝑏≥𝑏∗, GEMM compute time
+exceeds weight-loading time, so GEMM operates in the
+compute-bound regime. When 𝑏< 𝑏∗, the opposite holds
+and GEMM is memory-bound. This threshold is central to
+the later gain analysis: homogeneous ODS begins to improve
+over colocation precisely when KV-cache pressure pushes
+the colocated feasible batch size below this compute-bound
+threshold.
+Scope of the approximation. These approximations are
+introduced only to obtain interpretable closed-form char-
+acterizations of when ODS helps and what bounds its gain.
+They are not intended as a full performance model of the
+runtime system; the later planner and end-to-end evaluation
+use richer model- and hardware-specific information.
+A.5
+Proofs for Section 3
+This appendix provides complete proofs for the theorems
+stated in Section 3. We use the same notation and scaling ap-
+proximations introduced in Section 3.1: 𝐷attn(𝑏) = 𝑏·𝑚kv(𝑠),
+𝑊gemm(𝑏) = 2𝑏𝑃act, 𝐷gemm(𝑏) = 𝑀weights, and the continu-
+ous relaxation ¯𝑏(𝑠) = (𝑀−𝑀weights)/𝑚kv(𝑠). For the homoge-
+neous comparison, we restrict attention to sequence lengths
+with 𝑏max(𝑠) ≥1 and assume 𝑚kv(𝑠) is strictly increasing on
+this feasible domain, as stated in Section 3.2.
+A.5.1
+Proof of Theorem 3.1: Homogeneous Disaggre-
+gation vs. Colocation.
+18
+
+
+OpWeave : Flexible Operator Disaggregation for Heterogeneous LLM Serving
+Step 1: Simplify the disaggregated CPT. Suppressing
+the fixed GPU-type index and expanding 𝛼= 𝑐/𝛽and 𝛾=
+𝑐/𝐹in Eq. 1 gives:
+CPThom = 𝑐
+𝑏
+𝑏· 𝑚kv(𝑠)
+𝛽
++ 2𝑏𝑃act
+𝐹
+
+= 𝑐
+𝑚kv(𝑠)
+𝛽
++ 2𝑃act
+𝐹
+
+.
+(11)
+The batch size 𝑏cancels because both the attention memory
+traffic and the GEMM compute scale linearly with 𝑏. The
+disaggregated CPT depends on 𝑠only through 𝑚kv(𝑠).
+Step 2: Simplify the colocated CPT. For an arbitrary
+local batch size 𝑏, the colocated cost derived in Appendix A.3
+becomes:
+CPTcoloc(𝑠,𝑏) = 𝑐
+𝑏
+𝑏· 𝑚kv(𝑠)
+𝛽
++ max
+𝑀weights
+𝛽
+, 2𝑏𝑃act
+𝐹
+
+= 𝑐
+𝑚kv(𝑠)
+𝛽
++ 1
+𝑏max
+𝑀weights
+𝛽
+, 2𝑏𝑃act
+𝐹
+
+.
+(12)
+Here 𝑏is a local batch-size variable; Section 4 distinguishes
+the global, per-replica, and microbatch quantities used by the
+planner. The cost is non-increasing in 𝑏, so its minimum over
+1 ≤𝑏≤¯𝑏(𝑠) is attained at 𝑏= ¯𝑏(𝑠), yielding CPTcoloc(𝑠) in
+Eq. 4. The two GEMM regimes yield:
+Compute-bound GEMM (¯𝑏(𝑠) ≥𝑏∗):
+CPTcoloc = 𝑐
+𝑚kv(𝑠)
+𝛽
++ 2𝑃act
+𝐹
+
+.
+(13)
+Memory-bound GEMM (¯𝑏(𝑠) < 𝑏∗):
+CPTcoloc = 𝑐
+𝑚kv(𝑠)
+𝛽
++ 𝑀weights
+¯𝑏(𝑠) · 𝛽
+
+.
+(14)
+Step 3: Case 1: Compute-bound GEMM (¯𝑏(𝑠) ≥𝑏∗).
+When the colocated batch size is large enough for GEMM to
+saturate compute, comparing Eq. 11 and Eq. 13 gives
+CPTcoloc = 𝑐
+𝑚kv(𝑠)
+𝛽
++ 2𝑃act
+𝐹
+
+= CPThom.
+Therefore 𝐺hom(𝑠) = 1. This establishes claim 1: when the
+batch size is large enough for GEMM to fully utilize compute
+under colocation, there is no efficiency gap for disaggrega-
+tion to exploit.
+Step 4: Case 2: Memory-bound GEMM (¯𝑏(𝑠) < 𝑏∗).
+When KV-cache pressure pushes ¯𝑏(𝑠) below 𝑏∗, GEMM un-
+der colocation becomes memory-bound while disaggregation
+maintains compute-bound GEMM.
+Step 4a: Rewrite the colocated CPT. Substituting ¯𝑏(𝑠) = (𝑀−
+𝑀weights)/𝑚kv(𝑠) into Eq. 14:
+CPTcoloc = 𝑐
+𝑚kv(𝑠)
+𝛽
++ 𝑀weights · 𝑚kv(𝑠)
+(𝑀−𝑀weights) · 𝛽
+
+= 𝑐· 𝑚kv(𝑠)
+𝛽
+
+1 +
+𝑀weights
+𝑀−𝑀weights
+
+= 𝑐· 𝑚kv(𝑠)
+𝛽
+·
+𝑀
+𝑀−𝑀weights
+.
+(15)
+Step 4b: Cost gain expression. Dividing Eq. 15 by Eq. 11:
+𝐺hom(𝑠) =
+𝑚kv(𝑠)/𝛽
+𝑚kv(𝑠)/𝛽+ 2𝑃act/𝐹·
+𝑀
+𝑀−𝑀weights
+.
+(16)
+Step 4c: Monotonicity. Let 𝑥= 𝑚kv(𝑠)/𝛽, which increases
+with 𝑠since 𝑚kv(𝑠) is increasing in 𝑠. Define 𝐴= 𝑀/(𝑀−
+𝑀weights) > 1 (since 𝑀weights > 0) and 𝜅= 2𝑃act/𝐹> 0. Then
+𝐺hom =
+𝐴𝑥
+𝑥+ 𝜅,
+𝑑𝐺hom
+𝑑𝑥
+=
+𝐴𝜅
+(𝑥+ 𝜅)2 > 0.
+(17)
+Since 𝑑𝐺hom/𝑑𝑥> 0 for all 𝑥> 0, the cost gain 𝐺hom is
+strictly increasing in 𝑥and therefore in 𝑠. This establishes
+claim 2.
+Step 4d: Upper bound. For any feasible 𝑠in the memory-
+bound regime, 𝐺hom(𝑠) < 𝐴because 𝐴𝑥/(𝑥+ 𝜅) < 𝐴for
+every finite 𝑥> 0. Combining this fact with the compute-
+bound case, where 𝐺hom(𝑠) = 1 ≤𝐴, gives the following
+bound for every feasible 𝑠with 𝑏max(𝑠) ≥1:
+1 ≤𝐺hom(𝑠) <
+𝑀
+𝑀−𝑀weights
+.
+This establishes claim 3 and completes the proof.
+□
+Summary. The cost gain is 𝐺hom(𝑠) = 1 when ¯𝑏(𝑠) ≥𝑏∗.
+When ¯𝑏(𝑠) < 𝑏∗, it is
+𝐺hom(𝑠) =
+𝑚kv(𝑠)/𝛽
+𝑚kv(𝑠)/𝛽+ 2𝑃act/𝐹·
+𝑀
+𝑀−𝑀weights
+.
+(18)
+Here, equality holds in the compute-bound case, while the
+displayed formula applies in the memory-bound case. Over
+the feasible memory-bound domain, 𝐺hom is strictly increas-
+ing in 𝑠and bounded above by 𝑀/(𝑀−𝑀weights).
+A.5.2
+Proof of Theorem 3.2: Heterogeneous vs. Ho-
+mogeneous Disaggregation. Let I be the feasible interval
+from Theorem 3.2, and let 𝑥= 𝑚kv(𝑠). We first establish the
+shape of the analytically extended gain as a function of 𝑥≥0,
+then restrict it to 𝑥∈𝑚kv(I).
+Step 1: 𝐺het(𝑠) ≥1 (Claims 1 and 2). For each GPU type
+𝑗, the heterogeneous CPT satisfies
+CPThet
+★= min(𝛼1, 𝛼2) · 𝑚kv(𝑠) + min(𝛾1,𝛾2) · 2𝑃act
+≤𝛼𝑗· 𝑚kv(𝑠) + 𝛾𝑗· 2𝑃act = CPThom
+𝑗
+,
+(19)
+19
+
+
+Li et al.
+because min(𝛼1, 𝛼2) ≤𝛼𝑗and min(𝛾1,𝛾2) ≤𝛾𝑗for all 𝑗. Since
+this holds for every 𝑗, it holds for the minimum:
+CPThet
+★≤min
+𝑗
+CPThom
+𝑗
+= CPThom
+★
+.
+Therefore 𝐺het(𝑠) ≥1 for every 𝑠∈I, establishing claim 1.
+For claim 2: if GPU type 𝑗dominates type 𝑘on both met-
+rics (𝛼𝑗≤𝛼𝑘and 𝛾𝑗≤𝛾𝑘), then min(𝛼1, 𝛼2) = 𝛼𝑗and
+min(𝛾1,𝛾2) = 𝛾𝑗. Hence CPThet
+★
+= CPThom
+𝑗
+= CPThom
+★
+and
+𝐺het(𝑠) = 1 for every 𝑠∈I.
+Step 2: Unimodal structure (Claim 3). When neither
+type dominates, the metric orderings must be crossed. Un-
+der the theorem’s labeling 𝜂≥1, the only possible crossed
+ordering is 𝛼1 < 𝛼2 and 𝛾2 < 𝛾1; the reverse ordering would
+imply 𝜂< 1. Define 𝑟= 𝛼2/𝛼1 > 1 and 𝑞= 𝛾1/𝛾2 > 1. The
+cost expressions become:
+CPThom
+1
+= 𝛼1 · 𝑚kv(𝑠) + 𝑞𝛾2 · 2𝑃act,
+(20)
+CPThom
+2
+= 𝑟𝛼1 · 𝑚kv(𝑠) + 𝛾2 · 2𝑃act,
+(21)
+CPThet
+★= 𝛼1 · 𝑚kv(𝑠) + 𝛾2 · 2𝑃act.
+(22)
+Step 2a: Crossing point. The two homogeneous CPTs are
+equal when
+𝛼1 · 𝑚kv(𝑠) + 𝑞𝛾2 · 2𝑃act = 𝑟𝛼1 · 𝑚kv(𝑠) + 𝛾2 · 2𝑃act,
+which gives the crossing traffic
+𝑥∗= (𝑞−1) 𝛾2 · 2𝑃act
+(𝑟−1) 𝛼1
+= 2𝑃act(𝛾1 −𝛾2)
+𝛼2 −𝛼1
+.
+(23)
+For 𝑥< 𝑥∗, GPU type 2 is the better homogeneous choice
+(CPThom
+2
+< CPThom
+1
+). For 𝑥> 𝑥∗, GPU type 1 is the better
+homogeneous choice.
+Step 2b: Monotonicity in each sub-region. Let 𝑥= 𝑚kv(𝑠) for
+brevity.
+Sub-region 1 (𝑥≤𝑥∗, short sequences, homogeneous uses
+GPU type 2):
+𝐺het(𝑥) = 𝑟𝛼1𝑥+ 𝛾2 · 2𝑃act
+𝛼1𝑥+ 𝛾2 · 2𝑃act
+.
+(24)
+Differentiating,
+𝑑𝐺het
+𝑑𝑥
+= (𝑟−1) 𝛼1 · 𝛾2 · 2𝑃act
+(𝛼1𝑥+ 𝛾2 · 2𝑃act)2
+> 0.
+(25)
+So 𝐺het is strictly increasing in this sub-region. At 𝑥= 0:
+𝐺het(0) = (𝛾2 · 2𝑃act)/(𝛾2 · 2𝑃act) = 1.
+Sub-region 2 (𝑥≥𝑥∗, long sequences, homogeneous uses
+GPU type 1):
+𝐺het(𝑥) = 𝛼1𝑥+ 𝑞𝛾2 · 2𝑃act
+𝛼1𝑥+ 𝛾2 · 2𝑃act
+.
+(26)
+Differentiating,
+𝑑𝐺het
+𝑑𝑥
+= −(𝑞−1) 𝛼1 · 𝛾2 · 2𝑃act
+(𝛼1𝑥+ 𝛾2 · 2𝑃act)2
+< 0.
+(27)
+So 𝐺het is strictly decreasing in this sub-region. As 𝑥→∞:
+𝐺het →𝛼1/𝛼1 = 1.
+Combining both sub-regions, the analytic gain 𝐺het(𝑥)
+increases from 1 at 𝑥= 0, peaks at 𝑥= 𝑥∗, and decreases to-
+ward 1 as 𝑥→∞. Because 𝑚kv(𝑠) is continuous and strictly
+increasing on I, if 𝑥∗∈𝑚kv(I), there is a unique 𝑠∗∈I sat-
+isfying𝑚kv(𝑠∗) = 𝑥∗and the restricted gain peaks there. If 𝑥∗
+lies outside 𝑚kv(I), the feasible interval contains only one
+side of the analytic curve, so the restricted gain is monotone.
+This establishes claim 3.
+Step 3: Upper-bound part of Claim 3. By the unimodal-
+ity established in Step 2, the supremum of the analytic gain
+over 𝑥≥0 is attained at the crossing point 𝑥= 𝑥∗. The same
+upper bound therefore applies to any restricted feasible in-
+terval.
+Step 3a: Peak gain at 𝑥∗. Using the sub-region 1 expression
+at 𝑥= 𝑥∗and noting from Eq. 23 that 𝛼1𝑥∗= (𝑞−1)𝛾2 ·
+2𝑃act/(𝑟−1):
+𝐺het(𝑥∗) = 𝑟𝛼1𝑥∗+ 𝛾2 · 2𝑃act
+𝛼1𝑥∗+ 𝛾2 · 2𝑃act
+=
+𝑟· (𝑞−1)
+(𝑟−1) + 1
+(𝑞−1)
+(𝑟−1) + 1
+= 𝑟(𝑞−1) + (𝑟−1)
+(𝑞−1) + (𝑟−1) =
+𝑟𝑞−1
+𝑟+ 𝑞−2.
+(28)
+Step 3b: Factor out cost ratio. Let 𝑤= 𝑐1/𝑐2. Then 𝑟=
+𝛼2/𝛼1 = 𝛽1/(𝑤𝛽2) and 𝑞= 𝛾1/𝛾2 = 𝑤𝐹2/𝐹1. The product is
+cost-independent:
+𝑟𝑞= 𝛽1 𝐹2
+𝛽2 𝐹1
+= 𝜂.
+(29)
+The peak gain 𝐺het(𝑥∗) = (𝜂−1)/(𝑟+ 𝑞−2) is decreasing
+in 𝑟+ 𝑞for fixed 𝑟𝑞= 𝜂> 1. To obtain the tightest bound,
+we minimize 𝑟+ 𝑞subject to 𝑟𝑞= 𝜂:
+𝑟+ 𝑞=
+𝛽1
+𝑤𝛽2
++ 𝑤𝐹2
+𝐹1
+.
+By the AM-GM inequality, 𝑟+𝑞≥2√𝑟𝑞= 2√𝜂, with equality
+when 𝑟= 𝑞= √𝜂, which occurs at the cost ratio
+𝑤∗=
+√︄
+𝛽1𝐹1
+𝛽2𝐹2
+.
+Step 3c: Evaluate the bound. Substituting 𝑟+ 𝑞= 2√𝜂and
+𝑟𝑞= 𝜂:
+sup
+𝑥≥0, 𝑤
+𝐺het(𝑥) =
+𝜂−1
+2√𝜂−2 = (√𝜂−1)(√𝜂+ 1)
+2(√𝜂−1)
+= 1 + √𝜂
+2
+.
+(30)
+This establishes the upper-bound part of claim 3 and com-
+pletes the proof.
+□
+20
+
+
+OpWeave : Flexible Operator Disaggregation for Heterogeneous LLM Serving
+Summary. The cost gain in the non-trivial case (𝛼1 < 𝛼2,
+𝛾2 < 𝛾1) can be expressed as
+𝐺het(𝑠) =
+
+
+𝑟𝛼1𝑚kv(𝑠) + 𝛾2 · 2𝑃act
+𝛼1𝑚kv(𝑠) + 𝛾2 · 2𝑃act
+if 𝑚kv(𝑠) ≤𝑥∗,
+𝛼1𝑚kv(𝑠) + 𝑞𝛾2 · 2𝑃act
+𝛼1𝑚kv(𝑠) + 𝛾2 · 2𝑃act
+if 𝑚kv(𝑠) ≥𝑥∗.
+(31)
+The analytic gain is unimodal in 𝑥= 𝑚kv(𝑠), with 𝐺het(0) =
+1, a peak of (𝑟𝑞−1)/(𝑟+ 𝑞−2) at 𝑥= 𝑥∗, and 𝐺het(𝑥) →1
+as 𝑥→∞. On the feasible interval I, this peak is attained
+only when 𝑥∗∈𝑚kv(I); otherwise, the restricted gain is
+monotone. The tightest upper bound over all non-negative
+traffic values and all cost ratios is
+sup
+𝑥≥0, 𝑤
+𝐺het(𝑥) = 1 +
+√︁
+𝛽1𝐹2/(𝛽2𝐹1)
+2
+.
+A.6
+CAD Feasibility Condition for Uniform-Layer
+Models
+This section gives a simple condition for the feasibility
+mismatch discussed in Section 3.4. The condition applies
+to the uniform-layer CAD setting, where every layer has
+the same attention pattern and therefore the attention
+side can be described by a single feasible latency range.
+Hybrid-attention architectures, where full-attention, sliding-
+window-attention, or linear-attention layers may have
+different latency and memory behavior, require the separate
+discussion in Section 3.4.
+Following the heterogeneous notation in Section 3.1, let
+GPU type 1 serve the attention side and GPU type 2 serve
+the rest-of-model side. Let 𝑀1 be the memory capacity of one
+GPU of type 1, 𝛽1 be its memory bandwidth, and 𝜇be the
+number of micro-batches sharing the attention-side memory.
+Then a simple upper bound on the feasible attention-stage
+latency is
+𝑇max
+attn = 𝑀1
+𝜇𝛽1
+.
+(32)
+This expression reflects that each micro-batch can use at
+most 𝑀1/𝜇bytes of attention-side memory, which can be
+streamed at bandwidth 𝛽1.
+Let 𝜋2 denote the parallelism strategy on the rest-of-model
+side. Let 𝑀weights,2(𝜋2) be the per-GPU model-weight foot-
+print on GPU type 2 under this strategy, and let 𝛽2 be the
+memory bandwidth of GPU type 2. The rest-of-model stage
+must at least load its shard of the model weights, so its la-
+tency is lower-bounded by
+𝑇min
+rest (𝜋2) = 𝑀weights,2(𝜋2)
+𝛽2
+.
+(33)
+For example, under an even sharding strategy over 𝑔2(𝜋2)
+GPUs, one can approximate
+𝑀weights,2(𝜋2) ≈𝑀weights
+𝑔2(𝜋2) .
+(34)
+For CAD to be feasible under this simplified uniform-layer
+model, the feasible latency ranges of the two stages must
+overlap. A necessary condition is therefore
+𝑇max
+attn ≥𝑇min
+rest (𝜋2),
+i.e.,
+𝑀1
+𝜇𝛽1
+≥𝑀weights,2(𝜋2)
+𝛽2
+. (35)
+When this inequality fails, even the largest feasible attention-
+stage latency is smaller than the unavoidable weight-loading
+latency on the rest-of-model side. In that case, the two CAD
+stages cannot be balanced, and pipeline bubbles are unavoid-
+able.
+B
+Detailed Serving-Plan Formulation
+This appendix section expands the compact formulation in
+Section 4. The main text keeps only the abstractions needed
+to motivate the planner; here we spell out the structural
+definitions, batching notation, execution and communication
+latency, and memory constraint.
+B.1
+Model Representation and Partition
+We model one decode step as a computation DAG G =
+(V, E), where each node 𝑣∈V is an operator and each
+edge (𝑢, 𝑣) ∈E is a data dependency. During serving, op-
+erators are executed according to a fixed topological order.
+For transformer inference this order is effectively a linear
+operator sequence
+o = (𝑜1,𝑜2, . . . ,𝑜𝑁model),
+and all partitioning decisions below refer to positions in this
+sequence.
+Let 𝐿model be the number of transformer layers. A layer
+boundary is the first operator of a layer; we denote these
+positions by ℓ1 < ℓ2 < · · · < ℓ𝐿model, with ℓ1 = 1. A partition
+block is the minimal layer-aligned repeating unit of the op-
+erator sequence. Formally, it spans 𝐿block consecutive layers,
+or equivalently 𝑁block consecutive operators, where 𝐿block is
+the smallest positive period such that the operator pattern
+of layers ℓ𝑘, . . . , ℓ𝑘+𝐿block−1 repeats for every block-aligned
+starting layer 𝑘. We take the first partition block to start at ℓ1
+and assume 𝐿block divides 𝐿model, giving 𝐵total = 𝐿model/𝐿block
+partition blocks.
+Within one partition block, the optimizer chooses a stage
+template
+q = (𝑞0,𝑞1, . . . ,𝑞𝑆),
+0 = 𝑞0 < 𝑞1 < · · · < 𝑞𝑆= 𝑁block.
+Stage 𝑗contains operators at relative positions𝑞𝑗−1+1, . . . ,𝑞𝑗
+inside the block. The same template is applied to every parti-
+tion block in the model, so stage 𝑗denotes the same relative
+operator slice in each repeated block.
+B.2
+Device-Group Types, Replicas, and Placement
+A device-group type 𝑚is a logical configuration (ℎ𝑚, 𝜋𝑚),
+where ℎ𝑚is the GPU type and 𝜋𝑚is the intra-group paral-
+lelism strategy, such as tensor parallelism, expert parallelism,
+21
+
+
+Li et al.
+or their composition. A device-group replica is one physical
+instance of that type. Replicas of the same type have identi-
+cal configuration and execute the same stage set, but serve
+disjoint subsets of the global resident batch.
+We restrict the number of stages to 𝑆= 𝑘𝐾for an integer
+𝑘≥1. Stages are assigned to the ordered device-group types
+by the round-robin map
+𝜎(𝑗) = ((𝑗−1) mod 𝐾) + 1,
+𝑗= 1, . . . ,𝑆.
+(36)
+This map is applied identically within every partition block.
+Consequently, each type owns exactly 𝑘stage positions per
+block, and the stage-to-type assignment repeats with the
+same partition template. The stage set assigned to type 𝑚is
+therefore
+S𝑚= {𝑗: 1 ≤𝑗≤𝑆, 𝜎(𝑗) = 𝑚}.
+Every replica of type 𝑚executes all stages in S𝑚.
+Let 𝐵be the global resident batch size across the full de-
+ployment. If a replica of type 𝑚has resident batch size 𝑏𝑚,
+then the number of replicas of that type is
+𝑛𝑚= 𝐵
+𝑏𝑚
+,
+𝑚= 1, . . . , 𝐾,
+(37)
+which requires 𝑏𝑚to divide 𝐵. This coupling ensures that
+all device-group types collectively process the same global
+batch.
+B.3
+Scheduling Parameters
+The resident batch on each replica is split into 𝜇microbatches.
+We write
+b𝐵= 𝐵
+𝜇,
+b𝑏𝑚= 𝑏𝑚
+𝜇,
+for the global microbatch size and per-replica microbatch
+size, respectively. The divisibility requirements are 𝜇| 𝐵
+and 𝜇| 𝑏𝑚for all device-group types. The resident batch 𝑏𝑚
+determines the number of tokens completed by a replica per
+round trip, while b𝑏𝑚determines the work executed in one
+pipeline scheduling step.
+The execution latency of stage 𝑗is
+𝑡𝑗= 𝑓lat
+
+o𝑞𝑗−1+1:𝑞𝑗, (ℎ𝜎(𝑗), 𝜋𝜎(𝑗)),b𝑏𝜎(𝑗)
+
+,
+𝑗= 1, . . . ,𝑆.
+(38)
+Let 𝐴𝑗denote the activation interface at the boundary after
+stage 𝑗, including its tensor shape, byte size per request, and
+parallel layout. Define 𝑗+ = 𝑗+ 1 for 𝑗< 𝑆and 𝑗+ = 1
+for 𝑗= 𝑆; the latter is the boundary between consecutive
+partition blocks. The corresponding transfer latency is
+𝑢𝑗= 𝑓comm
+ 𝐴𝑗,ℎ𝜎(𝑗), 𝜋𝜎(𝑗),b𝑏𝜎(𝑗),
+ℎ𝜎(𝑗+), 𝜋𝜎(𝑗+),b𝑏𝜎(𝑗+)
+,
+(39)
+where 𝑓comm is obtained from communication profiles and
+accounts for any resharding or redistribution between the
+source and destination replicas. It returns the local handoff
+cost when the adjacent stages execute on the same replica.
+The 𝑗= 𝑆transfer occurs between consecutive blocks and is
+omitted after the final block.
+The steady-state round-trip time is then
+𝑇rtt = 𝑓rtt(𝜇, 𝐵total, t, u),
+(40)
+where t = (𝑡1, . . . ,𝑡𝑆) and u = (𝑢1, . . . ,𝑢𝑆). The scheduling
+model enforces execution and transfer dependencies, mod-
+els contention for compute and communication resources,
+and permits overlap only when the selected schedule and
+resources allow it. The planner evaluates this function by
+lightweight simulation.
+B.4
+Memory Constraint
+For each device-group type 𝑚, 𝑀weights,𝑚denotes the weight
+memory for the stages assigned to that type, including all
+repeated partition blocks hosted by a replica. Let KV𝑚(b𝑏𝑚,𝑠)
+denote the KV-cache memory required by one per-replica
+microbatch at sequence length 𝑠; this term is zero for stages
+that do not own KV-resident attention state. Since all 𝜇mi-
+crobatches are resident in the pipeline, a replica of type 𝑚
+must satisfy
+𝑀weights,𝑚+ 𝜇KV𝑚(b𝑏𝑚,𝑠) ≤𝑀𝑚,
+where 𝑀𝑚is the effective memory capacity of the device
+group after accounting for the parallelism strategy 𝜋𝑚. To-
+gether with the SLO constraint and the objective in equa-
+tion 9a, this yields the compact optimization problem in
+equation 9. The cost-per-token objective is derived from
+global batch size and replica counts in Appendix B.5.
+B.5
+Derivation of the Cost-per-Token Objective
+We derive the general serving-plan objective CPTplan in equa-
+tion 9a from the perspective of the global batch size and
+device-group replicas introduced in Section B.2.
+Setup. Consider a global resident batch of 𝐵requests pro-
+cessed in parallel across all replicas. Each replica of device-
+group type 𝑚holds a per-replica resident batch of 𝑏𝑚re-
+quests. When the schedule uses 𝜇micro-batches, the global
+micro-batch size is b𝐵= 𝐵/𝜇and the per-replica micro-batch
+size is b𝑏𝑚= 𝑏𝑚/𝜇. The system therefore requires
+𝑛𝑚=
+𝐵
+𝑏𝑚
+=
+b𝐵
+b𝑏𝑚
+(41)
+replicas of type 𝑚.
+Throughput. In steady-state pipeline execution, each
+replica completes one decoding step (i.e., generates one out-
+put token for each of its 𝑏𝑚= 𝜇b𝑏𝑚resident requests) every
+𝑇rtt seconds. Since there are 𝑛𝑚= 𝐵/𝑏𝑚replicas of type 𝑚,
+and every request passes through every device-group type,
+the system-wide throughput is determined by the global
+resident batch:
+Throughput =
+𝐵
+𝑇rtt
+tokens/s.
+(42)
+22
+
+
+OpWeave : Flexible Operator Disaggregation for Heterogeneous LLM Serving
+Total cost rate. The instantaneous monetary cost rate of
+operating all replicas is
+CostRatetotal =
+𝐾
+∑︁
+𝑚=1
+𝑛𝑚· 𝑐𝑚=
+𝐾
+∑︁
+𝑚=1
+𝐵
+𝑏𝑚
+𝑐𝑚= 𝐵
+𝐾
+∑︁
+𝑚=1
+𝑐𝑚
+𝑏𝑚
+.
+(43)
+Cost per token. Dividing the total cost rate by the
+throughput yields
+CPTplan = CostRatetotal
+Throughput =
+𝐵
+𝐾
+∑︁
+𝑚=1
+𝑐𝑚
+𝑏𝑚
+𝐵
+𝑇rtt
+= 𝑇rtt ·
+𝐾
+∑︁
+𝑚=1
+𝑐𝑚
+𝑏𝑚
+,
+(44)
+which recovers equation 9a. Note that the global batch size 𝐵
+cancels, confirming that the cost-per-token objective de-
+pends only on the device-group configurations and per-
+replica resident batch sizes, equivalently on 𝜇b𝑏𝑚, not on the
+absolute scale of the deployment. This cancellation assumes
+scale-invariant replication: adding replicas repeats the same
+per-replica execution and transfer pattern.
+C
+Planner Details for Section 5
+This appendix details the latency and cost lower bounds
+used by the branch-and-bound search in Section 5.3. These
+bounds allow the planner to prune partial assignments before
+invoking the schedule simulator.
+C.1
+Branch-and-Bound Lower Bounds
+After selecting a prefix 𝑃𝑖= (𝑝1, . . . , 𝑝𝑖) of owner points, the
+planner computes an optimistic completion using the best
+remaining coordinate from each unassigned frontier.
+For a point 𝑝of owner 𝑚, the mandatory serialized com-
+pute work is 𝐶𝑚(𝑝) = 𝜇Í
+𝑗∈S𝑚𝑡𝑗(𝑝). The compute lower
+bound for a prefix is therefore
+𝐿comp(𝑃𝑖) = max
+
+max
+𝑚≤𝑖𝐶𝑚(𝑝𝑚), max
+𝑚>𝑖min
+𝑝∈F𝑚𝐶𝑚(𝑝)
+
+.
+(45)
+The planner similarly lower-bounds communication by accu-
+mulating mandatory serialized transfer work at each network
+endpoint. A boundary whose endpoint has not yet been as-
+signed is minimized over that owner’s feasible replica counts.
+Boundaries are minimized independently, which can only
+make the estimate optimistic. Denoting this endpoint bound
+by 𝐿net(𝑃𝑖) gives the valid latency lower bound
+𝐿𝑇(𝑃𝑖) = max
+
+𝐿comp(𝑃𝑖), 𝐿net(𝑃𝑖)
+	
+≤𝑇rtt.
+(46)
+Suffix minima also lower-bound the normalized cost of
+any completion; let 𝑅LB(𝑃𝑖) denote this bound. The best
+possible objective below the prefix satisfies CPTLB(𝑃𝑖) =
+𝐿𝑇(𝑃𝑖) 𝑅LB(𝑃𝑖) ≤CPTplan.
+23
+
+
+Li et al.
+D
+Notation
+Symbol
+Description
+Model and workload
+o
+Operator sequence (𝑜1, . . . ,𝑜𝑁model ) of one decode step
+𝑁model
+Total number of operators
+𝐿model
+Total number of transformer layers
+𝑃act
+GEMM-side parameters activated per request after model-parallel sharding (routed experts only for MoE)
+𝑀weights
+Resident model-weight footprint after sharding, including inactive experts
+𝐷attn(𝑏), 𝐷gemm(𝑏)
+Aggregated attention and GEMM memory traffic at batch size 𝑏
+𝑊gemm(𝑏)
+Aggregated GEMM FLOPs at batch size 𝑏
+𝑠
+Average sequence length (workload parameter)
+𝑚kv(𝑠)
+Per-request KV-cache memory at sequence length 𝑠
+𝑏∗
+GEMM compute-bound threshold batch size
+𝑏max(𝑠)
+Max feasible batch size under memory at sequence length 𝑠
+¯𝑏(𝑠)
+Continuous relaxation of 𝑏max(𝑠) used in closed-form analysis
+GPU hardware (per GPU type 𝑗)
+𝑐𝑗
+Unit-time monetary cost of GPU type 𝑗($/s); shorthand 𝑐in the single-type case, 𝑐1,𝑐2 for two types
+𝛽𝑗
+Memory bandwidth (bytes/s); shorthand 𝛽, or 𝛽1, 𝛽2
+𝐹𝑗
+Peak compute throughput (FLOPS); shorthand 𝐹, or 𝐹1, 𝐹2
+𝑀𝑗
+Memory capacity (bytes); shorthand 𝑀, or 𝑀1, 𝑀2
+𝛼𝑗, 𝛾𝑗
+Monetary cost per byte of memory traffic and per FLOP, respectively, for GPU type 𝑗
+CPT
+Cost per token; CPTplan is the serving-plan objective; superscripts coloc/hom/het denote serving modes
+Theoretical analysis (Section 3)
+𝐺hom(𝑠)
+Cost gain of homogeneous ODS over colocated serving
+𝐺het(𝑠)
+Cost gain of heterogeneous over homogeneous ODS
+𝜂
+Hardware ratio (𝛽1𝐹2)/(𝛽2𝐹1) of two GPU types
+Model structure (partition block; Section 4)
+𝐿block
+Number of transformer layers per partition block
+𝑁block
+Number of operators per partition block
+𝐵total
+Number of partition blocks (= 𝐿model/𝐿block)
+Decision variables (Section 4)
+𝑆
+Number of stages per partition block
+q
+Stage-boundary offsets (𝑞0, . . . ,𝑞𝑆) within a block
+𝐾
+Number of device-group types
+(ℎ𝑚, 𝜋𝑚)
+Device-group configuration (GPU type, parallelism) of type 𝑚
+𝑏𝑚
+Per-replica resident batch size of device-group type 𝑚
+b𝑏𝑚
+Per-replica micro-batch size of device-group type 𝑚(= 𝑏𝑚/𝜇)
+𝜇
+Number of micro-batches
+Derived / scheduling quantities (Section 4)
+S𝑚
+Stages assigned to device-group type 𝑚(placement group)
+𝜎(𝑗)
+Placement map from stage 𝑗to its device-group type
+𝐵
+Global resident batch size across all replicas
+𝑛𝑚
+Replicas of device-group type 𝑚(= 𝐵/𝑏𝑚)
+𝑐𝑚
+Unit-time monetary cost of one replica of device-group type 𝑚
+𝑀𝑚
+Effective memory capacity of a replica of type 𝑚under 𝜋𝑚
+𝑀weights,𝑚
+Total weight memory of stages assigned to type 𝑚
+KV𝑚(b𝑏𝑚,𝑠)
+KV-cache memory for one per-replica micro-batch on a replica of type 𝑚
+𝑡𝑗
+Execution latency of stage 𝑗
+𝑢𝑗
+Activation-transfer latency at the boundary after stage 𝑗
+𝑇rtt
+Pipeline round-trip time (per-token latency in steady state)
+𝑇SLO
+TPOT service-level objective
+Planner (Section 5)
+𝐿sub, 𝑛
+Sub-block length in layers and repetitions per block (𝑛= 𝐿block/𝐿sub)
+qsub
+Sub-block stage template, tiled over the 𝑛repetitions
+T𝑚(𝑝)
+Stage-latency vector of owner 𝑚’s point 𝑝over S𝑚
+𝑟𝑚(𝑝), 𝜌𝑚(𝑝)
+Normalized cost and GPU count of point 𝑝: 𝑐𝑚(𝑝)/𝑏𝑚(𝑝), 𝑔𝑚(𝑝)/𝑏𝑚(𝑝)
+F𝑚
+Network-safe Pareto frontier of owner 𝑚
+Table 4. Unified notation used throughout the paper.
+24

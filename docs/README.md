@@ -6,50 +6,53 @@
 </div>
 
 ## 每次日报
-- 最新运行日期：2026-09-14
-- 运行时间：2026-09-14 22:32:54 UTC
+- 最新运行日期：2026-09-15
+- 运行时间：2026-09-15 22:27:08 UTC
 - 运行状态：成功
-- 本次总论文数：9
-- 精读区：3
-- 速读区：6
+- 本次总论文数：11
+- 精读区：4
+- 速读区：7
 
 ### 今日简报（AI）
-- 今日共生成 9 篇推荐（精读 3 篇，速读 6 篇）
-- 精读：《Vortex: Bridging Extreme Compression and Efficient LLM Inference》（9.0/10）, 《HeatCache: Thermal-aware Energy-efficient LLM Inference Scheduling for Chassis-level Liquid Cooling in Sustainable Edge Server Rooms》（8.0/10）
-- 速读：《Efficient Vision-Language-Action Management and Serving for Robot Factories》（7.0/10）, 《ForgeMegakernel: A General Framework for Efficient Auto-Regressive Model Decode Megakernels》（7.0/10）, 《RoofLang: Enabling AI-Driven Architecting of LLM Inference Systems》（7.0/10）
-- 这些结果覆盖了当下较热的方向，建议先看精读区论文的关键问题与方法。
-- 详情：[/202609/14/README](/202609/14/README)
+今日扫读 11 篇 LLM 推理与部署论文，精读 4 篇，聚焦异构服务与端侧 MoE 加速。最值得看的是同获 9.0 分的 OpWeave 异构 LLM 服务算子解耦方案，以及 BigMoMo 在移动端用投机解码高效推理大规模 MoE。普通读者可先挑这两篇精读，速读部分则关注 BOOST 的 HBM 与主机内存并发访问思路。
+- 详情：[/202609/15/README](/202609/15/README)
 
 ### 精读区论文标签
-1. [Vortex: Bridging Extreme Compression and Efficient LLM Inference](/202609/14/2609.12208v1-vortex-bridging-extreme-compression-and-efficient-llm-inference)  
+1. [OpWeave: Flexible Operator Disaggregation for Heterogeneous LLM Serving](/202609/15/2609.14237v1-opweave-flexible-operator-disaggregation-for-heterogeneous-llm-serving)  
    标签：评分：9.0/10、query:edge-llm
-   evidence：面向高效LLM推理的加速器架构
-2. [HeatCache: Thermal-aware Energy-efficient LLM Inference Scheduling for Chassis-level Liquid Cooling in Sustainable Edge Server Rooms](/202609/14/2609.12449v1-heatcache-thermal-aware-energy-efficient-llm-inference-scheduling-for-chassis-level-liquid-cooling-in-sustainable-edge-server-rooms)  
+   evidence：面向异构LLM服务的算子级解耦
+2. [BigMoMo: Efficient Inference of Large-Scale MoE with Speculative Decoding on Mobile Devices](/202609/15/2609.14643v1-bigmomo-efficient-inference-of-large-scale-moe-with-speculative-decoding-on-mobile-devices)  
+   标签：评分：9.0/10、query:edge-llm
+   evidence：移动端MoE推理运行时结合NPU与推测解码
+3. [Carbon-Aware Routing for Function Calling in Edge-Cloud LLM Systems](/202609/15/2609.13559v1-carbon-aware-routing-for-function-calling-in-edge-cloud-llm-systems)  
    标签：评分：8.0/10、query:edge-llm
-   evidence：面向边缘服务器机房的热感知节能LLM推理调度
-3. [Rethinking Heterogeneous System Disaggregation for Subquadratic Attention](/202609/14/2609.13134v1-rethinking-heterogeneous-system-disaggregation-for-subquadratic-attention)  
+   evidence：在异构硬件上跨边缘-云三层LLM的碳感知路由
+4. [MAPS: Memory-Aware Predictive Scheduling Framework for Large Language Model Serving](/202609/15/2609.15359v1-maps-memory-aware-predictive-scheduling-framework-for-large-language-model-serving)  
    标签：评分：8.0/10、query:edge-llm
-   evidence：面向DRAM/SRAM异构系统的LLM推理解耦
+   evidence：面向边缘设备LLM服务的预测调度
 
 ### 速读区论文标签
-1. [Efficient Vision-Language-Action Management and Serving for Robot Factories](/202609/14/2609.12075v1-efficient-vision-language-action-management-and-serving-for-robot-factories)  
+1. [BOOST: Concurrent Access to Host Memory and HBM to Accelerate LLM Inference](/202609/15/2609.13592v1-boost-concurrent-access-to-host-memory-and-hbm-to-accelerate-llm-inference)  
    标签：评分：7.0/10、query:edge-llm
-   evidence：在多GPU边缘服务器上满足SLO的多请求多模型VLA服务
-2. [ForgeMegakernel: A General Framework for Efficient Auto-Regressive Model Decode Megakernels](/202609/14/2609.12379v1-forgemegakernel-a-general-framework-for-efficient-auto-regressive-model-decode-megakernels)  
-   标签：评分：7.0/10、query:edge-llm
-   evidence：面向高效LLM推理的解码巨核生成
-3. [RoofLang: Enabling AI-Driven Architecting of LLM Inference Systems](/202609/14/2609.12551v1-rooflang-enabling-ai-driven-architecting-of-llm-inference-systems)  
-   标签：评分：7.0/10、query:edge-llm
-   evidence：用于LLM推理系统架构设计的DSL
-4. [FastE: Readout-Triggered Token Compression for LLM Embedding Inference](/202609/14/2609.08407v2-faste-readout-triggered-token-compression-for-llm-embedding-inference)  
+   evidence：硬件感知的内存分层加速LLM推理
+2. [FastE: Readout-Triggered Token Compression for LLM Embedding Inference](/202609/15/2609.08407v3-faste-readout-triggered-token-compression-for-llm-embedding-inference)  
    标签：评分：6.0/10、query:edge-llm
-   evidence：面向高效LLM嵌入推理的token压缩
-5. [HoliBench: A Cross-Platform Benchmarking and Deployment Toolkit for Foundation Models in CPS-IoT Applications](/202609/14/2609.12412v1-holibench-a-cross-platform-benchmarking-and-deployment-toolkit-for-foundation-models-in-cps-iot-applications)  
+   evidence：免训练的LLM嵌入推理token压缩
+3. [ExaServe: Large-Scale LLM Serving on Exascale HPC Systems](/202609/15/2609.10812v2-exaserve-large-scale-llm-serving-on-exascale-hpc-systems)  
    标签：评分：6.0/10、query:edge-llm
-   evidence：面向边缘异构平台的基础模型基准工具
-6. [Dissecting GPU Utilization for LLM Inference on Nvidia Hopper](/202609/14/2609.12923v1-dissecting-gpu-utilization-for-llm-inference-on-nvidia-hopper)  
+   evidence：超算上的大规模LLM服务框架部署
+4. [Partition-Aware Scheduling for Mobile Heterogeneous Inference Co-Execution](/202609/15/2609.14213v1-partition-aware-scheduling-for-mobile-heterogeneous-inference-co-execution)  
    标签：评分：6.0/10、query:edge-llm
-   evidence：剖析GPU利用率以优化LLM推理
+   evidence：移动端异构CPU-GPU协同执行推理调度
+5. [Self-Orchestrating Language Models: Leveraging Semantic Dependence for Efficient Inference](/202609/15/2609.14850v1-self-orchestrating-language-models-leveraging-semantic-dependence-for-efficient-inference)  
+   标签：评分：6.0/10、query:edge-llm
+   evidence：自编排推理以提升硬件加速器利用率并降低时延
+6. [ETCInfer: An Energy-efficient Thermal-aware Cooling-joint Scheduler for LLM Inference in AI Datacenters](/202609/15/2609.15230v1-etcinfer-an-energy-efficient-thermal-aware-cooling-joint-scheduler-for-llm-inference-in-ai-datacenters)  
+   标签：评分：6.0/10、query:edge-llm
+   evidence：热感知LLM推理调度与GPU频率控制
+7. [Proportional-Fair Resource Allocation and Dual-Threshold Early-Exit Inference for Secure Cooperative Multi-Layer Edge Intelligence](/202609/15/2609.15847v1-proportional-fair-resource-allocation-and-dual-threshold-early-exit-inference-for-secure-cooperative-multi-layer-edge-intelligence)  
+   标签：评分：6.0/10、query:edge-llm
+   evidence：边缘智能的资源分配与早退推理
 
 
 <div class="dpr-home-promo-card">
