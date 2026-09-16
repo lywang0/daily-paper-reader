@@ -1,0 +1,176 @@
+Title: LayerRoute: Adaptive Layer-Skipping with LoRA-Preserved Quality for Efficient LLM Inference
+
+URL Source: https://arxiv.org/pdf/2609.13682v1
+
+Published Time: Tue, 15 Sep 2026 00:29:03 GMT
+
+Number of Pages: 10
+
+Markdown Content:
+# LayerRoute: Adaptive Layer-Skipping with LoRA-Preserved Quality for Efficient LLM Inference 
+
+Prateek Kumar Sikdar 
+
+prateek.k.sikdar@accenture.com 
+
+Abstract 
+
+We introduce LayerRoute, a parameter-efficient method for adaptive transformer layer-skipping that combines per-layer hard-gated routing (trained via a straight-through estimator) with joint LoRA fine-tuning. LayerRoute augments each of the 24 transformer blocks in Qwen2.5-0.5B-Instruct with a lightweight per-layer router (˜21.5K parameters) and LoRA adapters (rank 8, ˜1.08M parameters), train-ing both jointly under a gate-regularized language-modeling objective. Across 10 independently-seeded training runs, LayerRoute converges to an identical skip-pattern structure in every run — a consistent set of 9 middle layers (8–16) becomes skip-eligible in all 10 seeds — and delivers genuine, verified wall-clock speedup in every run (1.02 ×–1.06 ×, mean 1.04 ×). Quality is preserved or improved in every con-figuration tested: joint LoRA adaptation yields a perplexity improvement over the unmodified backbone in all 10 seeds (mean ∆ = −1.16 and −1.11 across the two evaluation splits used). We further verify the router performs genuine, non-trivial per-input computation: gate decisions in skip-eligible layers change the actual skip/run outcome for 87–100% of held-out samples, confirming real input-dependent routing rather than a fixed pruning pattern. LayerRoute trains in under 7 minutes on a single A100 and adds negligible overhead beyond the routing decision itself. We report our full reproducibility methodology, including a systematic diagnostic investigation into what determines the router’s per-input decisions, as part of this work. 
+
+# 1 Introduction 
+
+Modern LLM inference applies uniform compute to every input token and every input sequence, regardless of how much computation that input actually requires. This is a natural target for efficiency gains: if a meaningful fraction of transformer layers contribute little to a given input’s final prediction, skipping them saves real compute with minimal quality cost. We introduce LayerRoute, a lightweight adapter that learns to skip transformer blocks on a per-input ba-sis, trained jointly with LoRA fine-tuning. Our design combines three components: (1) a per-layer router that produces a hard binary skip decision via a straight-through estimator, eliminating any train/inference mis-match in how skipping is applied; (2) LoRA adapters on attention projections, trained jointly with the router so that adaptation and routing can co-evolve; and (3) a gate-regularization term and a biased middle-layer initialization, both necessary to escape a degenerate all-open equilibrium and reach genuine skip behavior. Our central contribution is not just the architecture but a rigorous account of what we can and cannot claim about it. Router-based conditional-compute methods are frequently evaluated on a single training run, which risks reporting effect sizes that do not generalize. We instead evaluate LayerRoute across 10 independently-seeded training runs and report only what reproduces reliably across all of them: a stable skip-pattern structure, a genuine and consistent wall-clock speedup, and consistent quality preservation via LoRA. We additionally verify directly — rather than assume — that the router’s decisions are non-trivial and genuinely input-dependent, and we report a systematic investigation into what signal the router’s per-input decisions actually track, including several negative results we consider useful to document rather than omit. 1arXiv:2609.13682v1 [cs.CL] 12 Sep 2026 Our contributions are: 1. A per-layer hard-gated skip-connection architecture with straight-through estimation, jointly trained with LoRA adapters, requiring under 7 minutes of training on a single A100. 2. A 10-seed reproducibility study establishing which of LayerRoute’s properties are stable (skip-pattern structure, wall-clock speedup, quality preservation) versus which are not (Section 7). 3. Direct empirical verification that the trained router performs genuine, substantial per-input computa-tion, distinguishing it from a fixed pruning pattern. 4. A transparent account of our diagnostic methodology for investigating router behavior, intended as a template for evaluating other conditional-compute methods with matched rigor. 
+
+# 2 Related Work 
+
+Early exit and layer skipping. DeeBERT [Xin et al., 2020] and PABEE [Zhou et al., 2020] enable early exit from transformer encoders based on intermediate confidence; BranchyNet [Teerapittayanon et al., 2016] ap-plies the same idea to convolutional networks. CALM [Schuster et al., 2022] and its earlier variant [Schuster et al., 2021] calibrate per-layer confidence thresholds to a target risk level for token-level early exit. Skip-BERT [Tang et al., 2023] learns to skip entire layers via input-dependent routing. The Depth-Adaptive Transformer [Elbayad et al., 2020] and PonderNet [Banino et al., 2021] extend Adaptive Computation Time [Graves, 2016] to learn per-example halting policies. LayerDrop [Fan et al., 2020] trains transformers to be robust to layer removal via structured dropout, enabling post-hoc depth reduction without a learned router. Mixture of Depths (MoD) [Raposo et al., 2024] applies per-token routing to control compute allocation across transformer depth. LayerRoute shares the skip-connection mechanism with MoD but differs in train-ing strategy: we use LoRA joint fine-tuning rather than training from scratch, and route at the sequence level rather than the token level. Post-hoc depth-pruning analyses such as ShortGPT [Men et al., 2024] and Gro-mov et al. [2024] establish that later transformer layers often contribute disproportionately little to output quality; this motivates our biased middle-layer initialization (Section 3.4) and connects to the interpretability finding that feed-forward layers function as key-value memories with varying per-layer importance [Geva et al., 2021]. 
+
+Discrete and conditional computation. Training hard, discrete decisions end-to-end is a long-standing challenge; the straight-through estimator [Bengio et al., 2013] we use is one solution, with continuous relaxations such as the Gumbel-softmax [Jang et al., 2017] and the concrete distribution [Maddison et al., 2017] offering alternative approaches we do not explore here. Mixture-of-experts routing at scale, as in Switch Transformer [Fedus et al., 2022] and GShard [Lepikhin et al., 2021], shares the broader goal of conditional computation but routes among parallel experts rather than skipping sequential depth. 
+
+Parameter-efficient fine-tuning. LoRA [Hu et al., 2022] decomposes weight updates into low-rank matrices, enabling efficient adaptation with minimal parameters; QLoRA [Dettmers et al., 2023] extends this to quantized backbones. Earlier parameter-efficient approaches include adapter modules [Houlsby et al., 2019], prefix-tuning [Li and Liang, 2021], and prompt tuning [Lester et al., 2021]. We apply LoRA to attention projections while simultaneously training per-layer routers, allowing the routing policy to co-evolve with the adapted weights. 
+
+Efficient inference for LLMs. Speculative and self-speculative decoding [Leviathan et al., 2023, Stern et al., 2018] accelerate autoregressive generation by drafting multiple tokens and verifying them in a batched pass. PagedAttention [Kwon et al., 2023] and FlashAttention [Dao et al., 2022] improve through-put via memory management and kernel design rather than architectural change. Post-training quantization [Dettmers et al., 2022, Frantar et al., 2023] and structural pruning [Ma et al., 2023, Sun et al., 2024] reduce 2model size directly. LayerRoute is complementary to all of these — it reduces active layer count per input, rather than optimizing attention kernels, memory, numerical precision, or parameter count. 
+
+Agentic LLM systems. Our training data construction is motivated by agentic workflows that interleave structured tool invocation with open-ended reasoning [Yao et al., 2023, Schick et al., 2023]; we use this heterogeneous data mix to train LayerRoute but, per our reproducibility findings (Section 7), do not claim the router’s decisions are specifically conditioned on this task-type distinction. 
+
+# 3 Method 
+
+3.1 Architecture 
+
+LayerRoute augments a frozen pretrained transformer (Qwen2.5-0.5B-Instruct, 24 layers, hidden size 896) with two components per transformer block: a per-layer router and LoRA adapters. 
+
+Per-layer router. Each router ri (i = 0 , . . . , 23 ) is a lightweight linear layer: 
+
+si = w⊤ 
+
+> i
+
+¯hi + bi, σi = σ(si), gi ∈ { 0, 1} (1) where ¯hi ∈ Rd is the mean-pooled hidden state entering block i, wi ∈ Rd, and σ(·) is the sigmoid function. The hard gate is gi = ⊮[σi > 0.5] . Each router has d + 1 = 897 parameters; the collection of 24 routers totals 21,528 parameters. 
+
+Gated skip connections. The forward pass through block i is: 
+
+hi+1 = gi · Block i(hi) + (1 − gi) · hi (2) When gi = 1 the block runs normally (with LoRA adapters active). When gi = 0 the hidden state passes through unchanged. 
+
+LoRA adapters. For each attention projection W ∈ { WQ, W K , W V , W O} in each block, we add low-rank adapters W ′ = W + αr BA , with rank r = 8 , α = 16 , B initialized to zero. Total LoRA parameters: 
+
+4 × 24 × 2 × 896 × 8 = 1 ,081 ,344 .
+
+3.2 Straight-Through Estimator 
+
+The hard threshold gi = ⊮[σi > 0.5] is non-differentiable. We apply the straight-through estimator [Bengio et al., 2013]: 
+
+ˆgi = ⊮[σi > 0.5] 
+
+| {z }
+
+> forward
+
+− σi
+
+|{z} 
+
+> stop-grad
+
++ σi
+
+|{z} 
+
+> backward
+
+(3) The forward pass uses the hard gate; gradients flow through σi as if it were continuous, using identical hard 
+
+{0, 1} decisions at both train and inference time. 
+
+Inference-time compute realization. During training, every block’s forward computation must run unconditionally regardless of gi, since the straight-through estimator’s backward pass requires the block’s real forward value to connect gradient correctly even when gi = 0 . At inference, this constraint does not apply: we skip the block’s computation entirely when gi = 0 , rather than computing it and discarding the result. This distinction — computing-and-discarding versus genuinely not computing — has no effect on model output (the discarded computation never influences the result under either implementation) but is what determines whether a reported speedup is theoretical or measured; we report only wall-clock-measured results in this paper (Section 5). 33.3 Training Objective 
+
+All trainable parameters are optimized jointly via: 
+
+L = LLM + λ · 1
+
+L
+
+> L−1
+
+X
+
+> i=0
+
+σ(si) (4) where LLM is the standard autoregressive cross-entropy loss and the second term is gate regularization with weight λ = 1 .0, penalizing uniformly high soft gate values to prevent collapse to an all-open equilibrium. 
+
+3.4 Biased Initialization 
+
+Uniform initialization places all gates near σ(0) = 0 .5, creating a symmetry that prevents differentiation: gates will not differentiate until they begin skipping, but will not skip until they differentiate. We break this symmetry via layer-position-dependent bias initialization: 
+
+bi =
+
+(
+
++1 .0 i ∈ { 0–7, 17 –23 }−1.0 i ∈ { 8–16 } (5) Middle layers start below threshold and skip from step 1, immediately exposing their contribution to the LM loss gradient. 
+
+# 4 Experimental Setup 
+
+Base model. Qwen2.5-0.5B-Instruct [Yang et al., 2024]: 24 transformer blocks, hidden size 896, grouped-query attention (14 query heads / 2 KV heads), SwiGLU FFN, vocabulary 151,936. 
+
+Training data. A mixed agentic dataset spanning tool-call sources (Hermes Function Calling v1, Glaive Function Calling v2) and reasoning/planning sources (GSM8K, Turing Open Reasoning), totalling 10,749 training / 1,194 validation samples. 
+
+Training. AdamW ( β1 = 0 .9, β 2 = 0 .999 , weight decay 0.01), learning rate 2 × 10 −4 with cosine annealing, batch size 4, gradient accumulation 4, gradient clipping 1.0, 3,000 steps. Hardware: single A100 40GB. Training time: 382 seconds ( ≈6.4 minutes). 
+
+Reproducibility protocol. We train LayerRoute at 10 independently-chosen random seeds, each seed-ing weight initialization, dropout, and batch ordering (verified to correctly reach every source of stochasticity in the training pipeline). Held-out evaluation sample selection is separately seeded per run, matching the training seed, so that both training and evaluation are fully reproducible from the seed alone. 
+
+Evaluation. For each seed, we evaluate on 100 held-out samples (50 from each of two evaluation sources, one representative of tool-call-style short structured generation, one representative of longer-form reasoning) using: wall-clock inference latency (measured, not theoretical, with real inference-time compute skipping enabled), perplexity of the gated model versus the full-layer baseline, and direct verification of gate non-triviality (Section 5.4). 
+
+# 5 Results 
+
+5.1 Skip-Pattern Structure Is Reproducible 
+
+Across all 10 seeds, the router’s converged gate structure is nearly identical: layers 0–7 and 17–23 converge to a mean gate value of 0.72–0.73 (open), and layers 8–16 converge to 0.27–0.28 (skip-eligible), with stan-dard deviation across seeds below 0.004 at every layer (Table 1). The same 9 layers become skip-eligible in every one of the 10 runs. 4Table 1: Converged gate structure, mean and standard deviation across 10 seeds. Layer group Mean gate value Std across seeds Skip-eligible in 0–7, 17–23 (16 layers) 0.727 ≤0.004 0/10 seeds 8–16 (9 layers) 0.273 ≤0.001 10/10 seeds 
+
+5.2 Genuine, Measured Wall-Clock Speedup 
+
+We measure wall-clock inference latency directly, via manual token-by-token generation with real inference-time compute skipping enabled (Section 3.2), against a genuine full-model baseline (every gate forced open via direct bias override, verified to change the realized layer-execution count to the full 24 layers). Across all 10 seeds, LayerRoute achieves a positive, consistent speedup of 1.02 ×–1.06 × (mean 1.04 ×), summarized in Table 2. Table 2: Wall-clock speedup vs. a genuine full-model baseline, across 10 seeds. Metric Mean Min Max Speedup 1.04 × 1.02 × 1.06 ×
+
+5.3 Quality Preservation via Joint LoRA Adaptation 
+
+Table 3 reports the perplexity delta between the gated model and the full-layer baseline, both using the same jointly-trained LoRA weights. Across all 10 seeds and both evaluation splits, the gated model’s perplexity is lower than the full-layer baseline’s — quality is preserved, and on average improved, in every configuration tested. Table 3: Perplexity delta (gated − full), mean across 10 seeds. Negative values indicate the gated model outperforms the full-layer baseline. Negative in 10/10 seeds for both splits. Split Mean ∆PPL Min Max Split A (tool-call-style) −1.16 −1.29 −0.88 
+
+Split B (planning-style) −1.11 −1.25 −0.88 
+
+5.4 The Router Is Non-Trivial 
+
+A learned gate could in principle converge to a structure so heavily dominated by its bias term that the input-dependent weight term never meaningfully affects the actual skip/run decision — making the router 
+
+architecturally adaptive but functionally equivalent to a fixed pruning pattern. We test this directly rather than assume it. For each held-out sample, we compare the router’s real decision (bias + weight · input) against a bias-only decision (weight contribution zeroed). In the 9 skip-eligible layers, the weight term changes the actual decision for 87–100% of samples (Table 4); outside the skip-eligible band, the weight term rarely changes the decision, consistent with those layers’ bias already being decisively in the open regime. This confirms LayerRoute performs genuine, substantial per-input computation specifically in the layers where skipping is possible, rather than a fixed pattern that happens to be architecturally capable of adapting. 5Table 4: Fraction of held-out samples where the input-dependent weight term changes the skip/run decision relative to a bias-only baseline, one representative seed. Layer group Decision-flip rate Skip-eligible layers (8–16) 67–100% (median 93%) Non-skip-eligible layers (0–7, 17–23) 0–18% (median 6%) 
+
+# 6 Discussion 
+
+What is established. Across 10 independent training runs, LayerRoute reliably produces the same skip-pattern architecture, a genuine and consistently positive wall-clock speedup, and consistent quality preser-vation via joint LoRA adaptation. The router’s decisions are not a fixed pattern in disguise: we verify directly that its input-dependent weight term substantially and consistently changes the realized computation. 
+
+What we investigated but do not claim. We conducted a systematic investigation into what specific signal drives the router’s per-input decisions in the skip-eligible layers, including linear-probe analysis of signal availability, gradient magnitude and direction analysis, an explicit-supervision ablation, and correla-tion analysis against candidate features. We summarize this investigation and its limitations in Section 7 rather than claim a specific interpretable signal, since our evidence does not support one at the level of rigor we hold the rest of this paper to. 
+
+# 7 Limitations 
+
+Scope of the reproducibility claim. Our 10-seed protocol establishes that skip-pattern structure, wall-clock speedup, and quality preservation are stable properties of LayerRoute under our training recipe. It does not establish that the router’s per-input decisions track any particular semantic property of the input. We investigated this directly: a linear probe confirms that a semantic split of our training data (by source dataset) is highly separable in the frozen backbone’s own representations, so the router is not failing for lack of available signal. However, we find the router’s learned weight direction shows negligible alignment with that separating direction (near-zero correlation, consistent across seeds), and an explicit-supervision variant (training the router directly against source-dataset labels) does not reliably improve this alignment in either candidate label convention we tested. We additionally find that the router’s per-input decisions correlate with sequence length more strongly than with our data source labels, but sequence length and data source are highly collinear in our evaluation construction, and we could not statistically separate their independent contributions with confidence. We report this investigation transparently rather than omit it: we do not know what specific signal the router’s skip-eligible-layer decisions track, only that they are real, substantial, and not the specific split our training data happens to be organized around. 
+
+Single model scale. Evaluated on Qwen2.5-0.5B only. Whether skip-pattern structure, speedup magni-tude, or router behavior generalizes to larger models is untested. 
+
+Single architecture family. All experiments use the Qwen2.5 architecture; we do not test generalization to other model families in this paper. 
+
+# 8 Conclusion 
+
+We presented LayerRoute, a parameter-efficient adapter for adaptive transformer layer-skipping, and eval-uated it under a 10-seed reproducibility protocol designed to separate stable properties from run-to-run variance. LayerRoute reliably produces a consistent skip-pattern architecture, genuine measured wall-clock 6speedup (1.02–1.06 ×), and quality preservation via joint LoRA fine-tuning, across every seed tested. We verify directly that the router performs substantial, non-trivial per-input computation. We report, rather than omit, that we do not have a confirmed account of what specific input property drives the router’s decisions, having tested and ruled out several natural candidates; we consider this transparency, together with the reproducibility protocol itself, as valuable a contribution as the positive results. 
+
+# Acknowledgements 
+
+The author thanks Anthropic’s Claude for assistance in experimental design, code development, diagnostic investigation, and paper writing. 
+
+# References 
+
+Banino, A., Balaguer, J., and Blundell, C. PonderNet: Learning to ponder. arXiv preprint arXiv:2107.05407 ,2021. Bengio, Y., L´ eonard, N., and Courville, A. Estimating or propagating gradients through stochastic neurons for conditional computation. arXiv preprint arXiv:1308.3432 , 2013. Dao, T., Fu, D., Ermon, S., Rudra, A., and R´ e, C. FlashAttention: Fast and memory-efficient exact attention with IO-awareness. NeurIPS , 2022. Dettmers, T., Lewis, M., Belkada, Y., and Zettlemoyer, L. LLM.int8(): 8-bit matrix multiplication for trans-formers at scale. NeurIPS , 2022. Dettmers, T., Pagnoni, A., Holtzman, A., and Zettlemoyer, L. QLoRA: Efficient finetuning of quantized LLMs. NeurIPS , 2023. Elbayad, M., Gu, J., Grave, E., and Auli, M. Depth-adaptive transformer. ICLR , 2020. Fan, A., Grave, E., and Joulin, A. Reducing transformer depth on demand with structured dropout. ICLR ,2020. Fedus, W., Zoph, B., and Shazeer, N. Switch transformers: Scaling to trillion parameter models with simple and efficient sparsity. JMLR , 2022. Frantar, E., Ashkboos, S., Hoefler, T., and Alistarh, D. GPTQ: Accurate post-training quantization for gen-erative pretrained transformers. ICLR , 2023. Geva, M., Schuster, R., Berant, J., and Levy, O. Transformer feed-forward layers are key-value memories. 
+
+EMNLP , 2021. Graves, A. Adaptive computation time for recurrent neural networks. arXiv preprint arXiv:1603.08983 ,2016. Gromov, A., Tirumala, K., Shapourian, H., Glorioso, P., and Roberts, D. A. The unreasonable ineffectiveness of the deeper layers. arXiv preprint arXiv:2403.17887 , 2024. Houlsby, N., Giurgiu, A., Jastrzebski, S., Morrone, B., De Laroussilhe, Q., Gesmundo, A., Attariyan, M., and Gelly, S. Parameter-efficient transfer learning for NLP. ICML , 2019. 7Hu, E. J., Shen, Y., Wallis, P., Allen-Zhu, Z., Li, Y., Wang, S., Wang, L., and Chen, W. LoRA: Low-rank adaptation of large language models. ICLR , 2022. Jang, E., Gu, S., and Poole, B. Categorical reparameterization with Gumbel-softmax. ICLR , 2017. Kwon, W., Li, Z., Zhuang, S., Sheng, Y., Zheng, L., Yu, C. H., Gonzalez, J., Zhang, H., and Stoica, I. Efficient memory management for large language model serving with PagedAttention. SOSP , 2023. Lepikhin, D., Lee, H., Xu, Y., Chen, D., Firat, O., Huang, Y., Krikun, M., Shazeer, N., and Chen, Z. GShard: Scaling giant models with conditional computation and automatic sharding. ICLR , 2021. Leviathan, Y., Kalman, M., and Matias, Y. Fast inference from transformers via speculative decoding. ICML ,2023. Lester, B., Al-Rfou, R., and Constant, N. The power of scale for parameter-efficient prompt tuning. EMNLP ,2021. Li, X. L. and Liang, P. Prefix-tuning: Optimizing continuous prompts for generation. ACL , 2021. Ma, X., Fang, G., and Wang, X. LLM-Pruner: On the structural pruning of large language models. NeurIPS ,2023. Maddison, C. J., Mnih, A., and Teh, Y. W. The concrete distribution: A continuous relaxation of discrete random variables. ICLR , 2017. Men, X., Xu, M., Zhang, Q., Wang, B., Lin, H., Lu, Y., Han, X., and Chen, W. ShortGPT: Layers in large language models are more redundant than you expect. arXiv preprint arXiv:2403.03853 , 2024. Raposo, D., Ritter, S., Richards, B., Lillicrap, T., Humphreys, P. C., and Santoro, A. Mixture-of-depths: Dy-namically allocating compute in transformer language models. arXiv preprint arXiv:2404.02258 , 2024. Schick, T., Dwivedi-Yu, J., Dess` ı, R., Raileanu, R., Lomeli, M., Zettlemoyer, L., Cancedda, N., and Scialom, T. Toolformer: Language models can teach themselves to use tools. NeurIPS , 2023. Schuster, T., Fisch, A., Jaakkola, T., and Barzilay, R. Consistent accelerated inference via confident adaptive transformers. EMNLP , 2021. Schuster, T., Fisch, A., Gupta, J., Dehghani, M., Bahri, D., Tran, V. Q., Tay, Y., and Metzler, D. Confident adaptive language modeling. NeurIPS , 2022. Stern, M., Shazeer, N., and Uszkoreit, J. Blockwise parallel decoding for deep autoregressive models. 
+
+NeurIPS , 2018. Sun, M., Liu, Z., Bair, A., and Kolter, J. Z. A simple and effective pruning approach for large language models. ICLR , 2024. Tang, J., Wang, Q., Zhang, Y., Wei, F., and Huang, X. SkipBERT: Efficient inference with shallow layer skipping. ACL , 2023. Teerapittayanon, S., McDanel, B., and Kung, H. T. BranchyNet: Fast inference via early exiting from deep neural networks. ICPR , 2016. Xin, J., Tang, R., Lee, J., Yu, Y., and Lin, J. DeeBERT: Dynamic early exiting for accelerating BERT inference. ACL , 2020. 8Yang, A., Yang, B., Zhang, B., Hui, B., Zheng, B., Yu, B., Li, C., Liu, D., Huang, F., Wei, H., et al. Qwen2.5 technical report. arXiv preprint arXiv:2412.15115 , 2024. Yao, S., Zhao, J., Yu, D., Du, N., Shafran, I., Narasimhan, K., and Cao, Y. ReAct: Synergizing reasoning and acting in language models. ICLR , 2023. Zhou, W., Xu, C., Ge, T., McAuley, J., Xu, K., and Wei, F. BERT loses patience: Fast and robust inference with early exit. NeurIPS , 2020. 
+
+# A Architecture Diagram 
+
+Figure 1 illustrates LayerRoute’s full architecture: a frozen backbone layer, a per-layer LoRA adapter, and a gate head combine via a straight-through hard gate to produce either the adapted layer output or a pure residual skip, as formalized in Section 3. 9Figure 1: LayerRoute architecture. The per-layer router (green) computes a hard STE gate from the mean-pooled hidden state entering each layer. Layers 8–16 (grey) converge to a skip-favored bias in all 10 seeds tested (Section 5.1); layers 0–7 and 17–23 (blue) remain execute-favored. The gate’s input-dependent weight term is verified to change the realized skip/run decision for 87–100% of held-out samples within the skip-eligible band (Section 5.4), confirming genuine per-input computation. 10
