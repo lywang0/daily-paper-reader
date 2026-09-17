@@ -1,0 +1,420 @@
+Title: LLM Inference in a Flash!
+
+URL Source: https://arxiv.org/pdf/2609.16161v1
+
+Published Time: Wed, 16 Sep 2026 00:06:43 GMT
+
+Number of Pages: 20
+
+Markdown Content:
+# LLM Inference in a Flash! 
+
+## Sebastian Zhao ∗1 Minseo Kim ∗1 Coleman Hooper ∗1 Luca Manolache 1
+
+## Michael W. Mahoney 1,2,3 Yakun Sophia Shao 1 Kurt Keutzer 1 Amir Gholami 1,2 1 UC Berkeley 2 ICSI 3 LBNL 
+
+Abstract 
+
+Large Language Models (LLMs) have shown impressive capabilities across a range of natural language pro-cessing tasks, and LLM inference has emerged as a critical workload for enabling downstream applications. The demands of serving LLM inference are becoming increasingly challenging as requests shift toward longer sequences and heavier inference, driven by retrieval-augmented generation, inference-time compute scaling, and long-context applications. Additionally, these challenges are compounded by hardware trends, as memory capacity and commu-nication bandwidth are not scaling as fast as increases in workload complexity. Compute-in-Flash is a promising solution to address memory bandwidth limitations by moving computation close to memory, and to exploit the large capacity of SSD technologies. However, it is challenging to deploy LLMs on these systems as they lack support for high-precision floating point operations and have limited write endurance. In our work, we aim to address these chal-lenges by designing inference algorithms to enable LLM inference on Flash compute-in-memory devices. We present an end-to-end integer-only quantization approach to eliminate expensive floating-point computations. To address the limited write endurance, we design a dictionary-based KV cache compression strategy based on sparse dictionary coding that represents each KV vector as a linear combination of static dictionary vectors. These algorithmic improve-ments enable us to exploit the benefits of Compute-in-Flash for both model weights and KV cache, and to minimize expensive data transfer operations. Across Llama-3.1-8B and Qwen-2.5-7B, our combined method exhibits limited accuracy degradation while reducing dynamic KV cache traffic by 15 ×. We then model the system-level benefits of our method, showing how it enables 3.1 ×/2.7 × latency/energy savings for short context lengths and 4.4 ×/6.8 ×
+
+latency/energy savings for long context lengths relative to inference with a standard DRAM-enabled system. 
+
+# 1 Introduction 
+
+Large Language Models (LLMs) have enabled groundbreaking progress in natural language processing capabilities. With these advances, LLM inference has become a critical workload to enable a range of downstream applications like chatbots and agents [53, 42, 9]. However, LLM inference is incredibly resource-intensive, with memory constraints emerging as a key bottleneck for inference due to substantial storage requirements for model weights as well as for cached activations for longer contexts [14]. Autoregressive decoding is typically memory-bandwidth-bound because each token requires reading the growing KV cache, limiting parallelism [28]. This pressure increases with longer contexts and serving patterns such as retrieval-augmented generation [31] and inference-time compute scaling [44]. These workload trends are compounded by hardware scaling limits: memory capacity and bandwidth scale more slowly than compute, a phenomenon often referred to as the memory wall [14]. This gap is further amplified by practical limits of SRAM/DRAM-based memory hierarchies. SRAM-only designs are not able to provide sufficient capacity for LLM inference workloads [37]. Additionally, energy consumption for memory transfers is not scaling down as we shift to newer technology nodes [24]. HBM and DRAM technologies are also not scaling as we go to newer compute nodes, and are becoming increasingly expensive due to limited supply [37]. While Flash memory provides much greater capacities, these systems are typically unsuitable for LLM inference due to high energy consumption for off-chip memory transfers, as well as limited write endurance (which is unsuitable for KV cache activations) [55, 4]. Compute-in-memory has emerged as a promising solution to address memory bandwidth limitations by moving computation close to memory (Figure 1(a)) [19, 40, 36]. Compute-in-Flash can potentially allow computations to be 
+
+> *Equal contribution
+
+1arXiv:2609.16161v1 [cs.LG] 14 Sep 2026 (a) (b) (c)      
+
+> Traditional Computing Compute-in-Memory
+> CPU CPU Memory Components Memory Components
+> Processing Units
+> ❌Challenges
+> • Memory Wall (Bandwidth / Capacity) • DRAM scaling is slowing and costly
+> ❌Challenges
+> • Limited FP support • Limited write endurance
+> ✅Benefits
+> • Capacity of SSD • Eliminates memory wall bottleneck
+> Challenges for LLMs on CIM
+> Q (INT8) MatMul (INT8) Dequantize Softmax (FP32) Quantize MatMul (INT8) INT8 FP32 FP32 INT8 K (INT8) V (INT8)
+> Frequent KV writes quickly wear out flash cells FP32 ops expensive in flash memory
+> Our Methods
+> ✅Addressing CIM Challenges
+> • Integer-only LLM inference → no FP offloading required • Dictionary-based method enables CIM-friendly KV caching
+> Q (INT8) MatMul (INT8) INT8 K (INT8) Softmax (INT32) MatMul (INT8) INT8 V (INT8) INT8 INT8
+> Read-only Dictionary D
+> Reconstructed from the dictionary Reconstructed from the dictionary
+
+Figure 1: Motivation and overview of LLM inference on flash compute-in-memory (CIM). (a) Comparison between traditional computing and CIM, illustrating the memory-wall bottleneck. (b) Key challenges for LLM decoding on flash CIM: frequent KV-cache writes (endurance) and costly FP32/nonlinear operations. (c) Proposed methods: end-to-end integer-only inference and dictionary-based KV caching. performed directly in the memory array, thereby reducing energy and latency from data transfers [50]. However, there are multiple challenges with deploying LLMs on Compute-in-Flash systems (Figure 1(b)). These systems typically do not support high-precision floating-point operations (e.g. for nonlinearities in LLMs), have low off-chip band-width, and limited write endurance (which makes them unsuitable for dynamic activations) [37]. There is a need for algorithmic improvements to enable LLM inference to be deployed on compute-in-memory technologies. In this work, we enable LLM inference on Compute-in-Flash systems. We first design a quantization strategy that supports LLM inference on devices without efficient floating-point arithmetic. This strategy uses integer arithmetic end-to-end, including for nonlinear operations. To address the large, dynamic KV cache, which is difficult to place on flash due to limited write endurance, we develop a KV-cache compression strategy that leverages a large read-only dictionary. This approach enables KV reconstruction while substantially reducing dynamic state and write traffic. Together, our techniques map both weights and KV-cache operations to Compute-in-Flash and minimize off-chip data transfers and dynamic memory operations. Specifically, we make the following contributions: • We design an end-to-end integer-only quantization strategy that eliminates floating-point computation through-out LLM inference, including attention and nonlinear operations. This enables efficient execution on Compute-in-Flash devices and reduces latency and energy by avoiding FP offloading. • We develop a dictionary-based KV-cache compression method based on sparse dictionary coding, representing each KV vector with sparse codes over a static, flash-resident dictionary. This design minimizes write traffic while exploiting flash capacity and internal read bandwidth, with only lightweight metadata handled by the host. • We present a system-level analytical model that quantifies the latency and energy benefits of our design under realistic Compute-in-Flash constraints. Our model shows how our approach enables 3.1 ×/2.7 × latency/energy savings for short context lengths and 4.4 ×/6.8 × latency/energy savings for long context lengths (for our S2 configuration; see Section 5.5), enabling efficient LLM inference on resource-constrained systems. 
+
+# 2 Related Work 
+
+## 2.1 Compute-in-Memory for LLM Inference 
+
+There has been existing work on compute-in-memory processing for LLM inference [50, 57]. A recent survey provides an overview of compute-in-memory technologies for LLM inference [37]. In particular, several existing works have aimed to exploit Compute-in-Flash technologies to minimize data transfers [25, 22, 30]. LLM-on-the-Palm [25] stores 2weights in Compute-in-Flash for efficient processing on resource-constrained mobile devices with limited DRAM bandwidth. AiF [30] tailors the Flash chip for LLM inference by enabling highly concurrent read accesses. Other work aims to support KV caching in compute-in-memory for long-context inference [15]. Key challenges for running LLM inference on Flash technologies include limited support for high precision floating point operations, limited write endurance, and low off-chip bandwidth [37], as well as substantial energy requirements for transferring data to/from the Flash chip [29]. There has been existing work on co-designing LLM inference to adapt to the limitations of Flash computing technologies. LLM-in-a-Flash [4] stores model weights in SSDs to leverage their capacity and adapts the inference algorithm to minimize data transfers under limited SSD bandwidth. Cambricon-LLM [55] uses Flash as a high-density memory to enable edge inference with 70B-parameter LLMs, combining near-flash compute with an NPU co-processor and efficient tiling. Lincoln [46] accelerates LLM inference on Compute-in-Flash by enabling an LPDDR interface for higher-bandwidth communication. A concurrent work, KVNAND [8], aims to place both the KV cache and model weights on SSDs by optimizing KV placement to maximize device lifetime. KVNAND’s own reliability evaluation estimates that continuous decoding of a 65B model at 3 tokens/s for 5 years generates 143 TB of KV data, and the write volume scales approximately linearly with decoding throughput. Recent SSD-based KV swapping systems make the endurance implication explicit: HiFC [21] measures 1.98 TiB/day of KV writes under a sustained long-context workload and shows that achieving multi-year lifetime requires confining KV traffic to a 200 GiB pSLC region (6,000 TiB TBW), whereas the same 1TB drive’s default TLC-mode endurance is only 750 TBW. Crucially, prior work has largely focused on (i) hardware support for flash-based compute-in-memory, or (ii) system-level scheduling and placement strategies to extend device lifetime. However, there is limited work on algorithmic co-design that reshapes LLM inference itself to match Flash CIM constraints, especially limited floating-point support and write endurance. Our work addresses this gap with two complementary contributions: (1) end-to-end integer-only execution for weights, KV cache, and nonlinear operations, enabling on-device computation without FP offloading, and (2) a dictionary-based KV cache compression scheme that minimizes KV write traffic and off-chip transfers while exploiting dense CIM arrays. 
+
+## 2.2 Quantization 
+
+LLM decoding has a large memory footprint due to the substantial weights and activations required for inference [14]. Since decoding is often memory-bandwidth-bound [14], reducing the size of weights and activations can improve throughput. Quantization is a promising direction that reduces memory footprint and latency by representing weights and ac-tivations with lower-precision data types. SmoothQuant [51] observes that activations are harder to quantize than weights and shifts quantization difficulty from activations to weights by scaling activations down and weights up. AWQ [33] focuses on weight-only quantization and protects salient channels by scaling them to reduce quantization error. OmniQuant [43] similarly redistributes quantization difficulty between activations and weights through a differ-entiable calibration procedure, learning clipping thresholds instead of using standard min–max. SpinQuant [34] takes a different approach by rotating weights and activations to mitigate outliers and improve quantizability. Complemen-tary directions replace expensive floating-point computation with table-based approximations: LUT-based methods precompute operator outputs and perform inference via table lookup [39], while NN-LUT [54] learns neural approxi-mations of nonlinear functions as a lookup table. While quantization alone can provide speedups on GPUs, the overhead of dequantization and floating-point nonlin-ear/reduction operators can dominate on edge devices and alternative hardware [27]. I-BERT [27] enables integer-only inference for Transformer-based BERT models by avoiding intermediate dequantization and approximating nonlin-earities with integer polynomials. I-LLM [20] extends end-to-end integer inference to LLMs, using bit-shift-based approximations for nonlinear operators. Despite these advances, many approaches still assume efficient floating-point support (e.g., for nonlinearities and reductions) or require dequantization at key operators, which is poorly matched to Flash/PIM controllers. Motivated by SmoothQuant [51] and I-BERT [27], our work targets end-to-end integer execution for modern LLM decoding by combining activation smoothing with finer-grained group-wise quantization and by redesigning integer nonlinear operators (e.g., Softmax and RMSNorm) to remain accurate under long-context, high-dynamic-range activations. 32.3 KV Cache Compression 
+
+Transformers [49] are the backbone architecture of modern large language models (LLMs), but memory constraints arise as generation length grows. During autoregressive decoding, attention reuses past keys and values by storing them in a key-value (KV) cache. The KV cache grows linearly with sequence length, which makes memory capacity and bandwidth the dominant bottlenecks for generation [14]. One line of work to address this memory constraint is KV-cache eviction, which reduces the memory footprint and thus saves memory bandwidth. StreamingLLM [52] maintains attention sink tokens and a local window, and H2O [56] leaves only “heavy hitter” important tokens. SnapKV [32] evicts prompt tokens before decoding, whereas SpecKV [12] uses an explicit drafter to guide which tokens to evict. Another line of work is sparse attention, which maintains the full KV cache but changes the access pattern to save memory bandwidth. MInference [23] uses three types of sparse attention patterns for the prompt during prefill, and Quest [47] estimates token importance at page-level granularity of the KV cache using query vectors. SqueezeAtten-tion [16] preprocesses the KV cache to create a hierarchical index, and retrieves the full KV cache only for important clusters during attention. MultipoleAttention [17] further improves this by approximating the remaining unimportant KV-cache clusters with representative centroid values. Other interesting lines of work include quantizing the KV cache to lower precision [35], or caching only quantized input activations and rematerializing KV values on-the-fly during inference [48]. While these approaches effectively reduce KV footprint and/or HBM bandwidth in GPU settings, they are primarily optimized around the GPU memory hierarchy. Lexico [26] compresses the KV cache into sparse representations using an input-agnostic static dictionary. Our KV-cache compression shares a similar idea with Lexico in maintaining a dictionary and sparse codes, but ours is carefully adapted for compute-in-memory constraints, whereas Lexico targets conventional GPU inference. We also adopt an additional hierarchical sparsity scheme to further save read I/O. 
+
+# 3 Algorithm 
+
+## 3.1 Integer-Only LLM Quantization 
+
+3.1.1 Quantization Challenges for PIM 
+
+Flash SSD controllers and near-flash processing engines provide limited support for high-precision floating-point arith-metic, making it challenging to execute Transformer decoding when key operators depend on FP nonlinear/reduction primitives [55, 37]. To execute decoding near data, we aim to keep both linear layers and dominant nonlinear/reduction operators in the integer domain, minimizing dequantization and host round-trips. Beyond device compatibility, integer execution also improves efficiency by reducing memory footprint and avoiding FP-heavy special-function logic that is costly in area and energy [27]. A direct obstacle is that many quantization pipelines [51, 43, 33] are developed under GPU-centric assumptions: while weights and activations are quantized for storage or GEMM speedups, intermediate tensors often fall back to floating point for numerically sensitive operators such as Softmax and normalization. Such FP fallbacks and dequanti-zation complicate deployment on Flash/PIM controllers and can dominate end-to-end latency/energy when offloading is required. We therefore target an integer-centric decoding pipeline tailored to Flash/PIM constraints. We quantize weights and activations to INT8 (W8A8) for linear operators and implement key nonlinear/reduction operators using integer approximations, building on prior integer-only formulations [27] but adapting them to modern LLM architectures and long-context regimes. We find that maintaining accuracy under high-dynamic-range activations requires additional algorithmic adaptations, which we detail next. 
+
+3.1.2 Activation Smoothing 
+
+Naive INT8 quantization can incur substantial error due to activation outliers and high dynamic range. We therefore adopt activation smoothing as in SmoothQuant [51], which rescales activations and compensates in the subsequent weights to make activations more quantization-friendly. However, we find that the inputs and outputs to nonlinear operations are particularly sensitive and keeping these in high precision is vital to the overall fidelity of the model. To mitigate this, we use group-wise quantization along the hidden dimension, using per-group scale factors for both weights and activations to achieve finer quantization granularity. 43.1.3 Nonlinear Operations 
+
+We approximate nonlinear operations with second-order polynomial approximations, similar to the approximations used in I-BERT [27]. Since modern LLMs such as LLaMA use SwiGLU (instead of GeLU), we also implement an integer approximation of SiLU (IntSiLU) using the same second-order exp (·) approximation and use it to support SwiGLU in the integer pipeline. Our group-wise quantization scheme poses a challenge for these polynomial approximations because both Softmax and RMSNorm require reduction across the hidden dimension. If activations are quantized with different scale factors across the hidden dimension, the reduction is no longer valid without dequantizing to full precision. However, if we do not quantize in groups along the hidden dimension, the quantization error becomes unacceptable, even though this is unnecessary for I-BERT [27]. In our analysis, we find that longer context lengths and the larger activation dynamic range in LLMs lead to substantially higher quantization error compared to BERT. To address this problem, we apply requantization to the input activations of Softmax and RMSNorm into token-wise INT16; that is, instead of using separate scale factors for each ( hidden dimension // group size )group within a token, we use a single scale factor per token. Additionally, since we employ a second-order ap-proximation, requantizing to INT16 can cause intermediate values to overflow INT32. To prevent this, we estimate overflow from the INT16 magnitude and right-shift the input before the approximation, then left-shift the output after the approximation for mathematical equivalence. For RMSNorm, we compute the required 1/ √var using an integer square-root routine based on Newton–Raphson iterations [3]. Finally, for both Softmax and RMSNorm, we avoid explicit division by using a fixed-point reciprocal (e.g., 232 /x) and implement normalization via 32-bit multiply-and-shift with appropriate bit-shifts during reductions to prevent overflow. 
+
+## 3.2 Dictionary-Based KV Cache Compression 
+
+3.2.1 Hardware Constraints and Design Rationale 
+
+Flash cells have limited write endurance and can sustain only a finite number of program/erase cycles, making write-intensive workloads undesirable [37]. At the same time, flash offers large, dense read-only capacity, allowing a substantial static dataset, such as a dictionary or codebook, to be stored persistently and reused without endurance concerns [55, 8]. These platforms also provide high internal (intra-array) read bandwidth and support simple near-data computations, which makes read-heavy operations particularly efficient [55, 8, 30]. However, a conventional KV cache is updated at every decoding step by appending new keys and values, inducing frequent writes and rendering a direct KV-cache placement in flash impractical [37]. To align KV caching with these constraints, we represent the KV cache using a read-mostly formulation: a static dictionary is stored in flash, and per-token KV states are encoded as sparse codes (indices and coefficients). During attention, we operate directly on the codes via query–dictionary projections and lightweight gathers, while keeping only a small recent window in full precision. Figure 3 and Section 3.2.4 summarize the end-to-end compression and attention pipeline. 
+
+3.2.2 Learning the Overcomplete Dictionary 
+
+A key prerequisite for dictionary-based KV compression is a high-quality overcomplete dictionary that enables faithful sparse reconstructions of KV activations. A natural baseline is classical sparse dictionary learning (e.g., K-SVD [2] or MOD [10]), which alternates between a sparse-coding step and a dictionary-update step. However, applying these algorithms at the scale of LLM activations is often prohibitively expensive and difficult to scale, making it challenging to obtain a robust dictionary over a large language corpus. An alternative is to train a sparse autoencoder [5, 7, 13], where an encoder produces sparse coefficients and a decoder serves as an overcomplete dictionary. In our preliminary experiments, we find that encoder–decoder co-evolution can be unstable, leading to suboptimal reconstruction quality under tight sparsity budgets. Therefore, we adopt a training-based hybrid approach: we replace the encoder with a non-parameterized sparse-coding procedure and optimize only the decoder (dictionary) parameters, building on open-source sparse autoencoder (SAE) implementations [13]. We extract key and value activations from each attention layer, buffer them in a large shuffled pool to reduce temporal correlations, and train a separate dictionary per layer and per stream (key/value). Sparse codes are produced by our projection-based compress() procedure (Algorithm 1), which we detail in Sec-tion 3.2.3; the decoder matrix is then trained to reconstruct the original activations by minimizing reconstruction MSE. 5LLM 
+
+Embedding Transformer Layers LM Head 
+
+# Dictionary Training Quantization 
+
+activation compress() decoder matrix 
+
+reconstructed activation 
+
+scale quantize() Figure 2: Hybrid sparse dictionary learning for KV compression. We extract attention activations, obtain Top-K
+
+sparse codes using compress() , train the decoder as the dictionary, and per-tensor quantize the learned dictionary for flash CIM execution. 
+
+Algorithm 1 Projection-Based Sparse Coding (Compression) 
+
+Require: Dictionary D ∈ Rm×n with column-normalized atoms {dj}nj=1, input vector x ∈ Rm, sparsity budget K
+
+Ensure: Support indices I and coefficients γ ∈ Rn such that x ≈ Dγ with ∥γ∥0 ≤ K 
+
+> 1:
+
+r ← x ▷ residual  
+
+> 2:
+
+I ← ∅, γ ← 0 
+
+> 3:
+
+for t = 1 to K do  
+
+> 4:
+
+c ← DTr ▷ correlations (linear projection)  
+
+> 5:
+
+j⋆ ← arg max j/∈I |cj| ▷ avoid duplicates  
+
+> 6:
+
+I ← I ∪ { j⋆} 
+
+> 7:
+
+γj⋆ ← γj⋆ + cj⋆ ▷ use correlation as coefficient  
+
+> 8:
+
+r ← r − cj⋆ dj⋆ ▷ subtract selected atom contribution  
+
+> 9:
+
+end for  
+
+> 10:
+
+return I, γ
+
+After training, we apply per-tensor quantization to each dictionary using a single scale factor, enabling efficient storage and compute on flash CIM devices. We summarize the full training pipeline in Figure 2. 
+
+3.2.3 Projection-Based Sparse Coding 
+
+During decoding, given a pretrained dictionary D, we compress each full-precision key/value vector x into a sparse representation by selecting a small set of dictionary atoms and storing only their indices and coefficients. We use the same projection-based compress() operator both to generate training codes (Section 3.2.2) and to encode KV states at inference time, avoiding train–inference mismatch. A standard approach is Orthogonal Matching Pursuit (OMP) [41], which iteratively expands a support set and re-solves a least-squares refit over the selected atoms at every step; this class of OMP-style coding is also used in prior dictionary-based KV compression (e.g., Lexico [26]). While effective, this refit requires repeated least-squares solves (e.g., lstsq ), which are computationally expensive and poorly matched to compute-in-memory (CIM) primitives. We instead use a projection-based greedy pursuit that eliminates least-squares refitting and relies only on linear projections and residual updates (Algorithm 1). Starting from the residual r ← x, each iteration (i) computes correla-tions c = DTr, (ii) selects the atom whose correlation magnitude is largest, j⋆ = arg max j/∈I |cj|, (iii) appends j⋆ to the support set I, (iv) uses the correlation value directly as the coefficient for that atom, and (v) updates the residual by subtracting the selected contribution, r ← r − cj⋆ dj⋆ . By construction, this procedure performs only matrix–vector projections and scaled vector updates, making it substantially more hardware-friendly than OMP on CIM devices. Overall, the projection-based method provides a favorable accuracy–efficiency trade-off for our flash CIM setting. 6(on the fly, no materialization) sparse codes & indices compress() 
+
+static dictionaries 
+
+attn scores + softmax 
+
+# <Compression> <Attention Calculation> 
+
+local window Figure 3: End-to-end dictionary-based KV cache compression for flash CIM. Top: KV compression into sparse codes with static dictionaries. The dotted region shows the KV cache that are already approximated as static dictionaries, and the green region shows the local buffer of KV cache tokens that are being compressed as sparse codes and indices. Bottom: on-the-fly attention over compressed KV (no materialization), producing output O. The dotted region shows the KV cache which are being stored as sparse codes and indices (for which we compute a sparse GEMM operation). 
+
+3.2.4 Overall Pipeline. 
+
+Figure 3 illustrates our runtime pipeline for dictionary-based KV cache compression and attention during LLM decod-ing. We maintain a two-part KV cache: (i) a long compressed context represented by sparse codes over a pretrained dictionary, and (ii) a recent local window stored in full precision to preserve fidelity for the most recent tokens. Dur-ing generation, newly generated KV entries are first appended to the local window (yellow blob). When the window grows beyond its target size (we use a fixed local window size W in this work), we batch-compress the oldest tokens in the window (green blob) in fixed-size chunks of U tokens (the compression unit ), convert their keys and values into sparse codes using the pretrained dictionary, append these codes to the compressed context (dotted region), and evict the corresponding dense KV tensors from the raw cache. For the compressed context, we avoid explicit materialization of keys and values. We first project the query onto the dictionary ( QD T) and use the sparse codes to assemble approximate attention logits QK T. In parallel, we compute exact attention over the dense local window. We then compute the attention output by aggregating values directly from the value dictionary using the stored sparse coefficients, and combine contributions from the compressed context and the local window under a single softmax normalization. To support this pipeline efficiently, the runtime stores only sparse codes for the compressed region and a bounded dense buffer for the local window. 7Requant → K sparse gather → attn weights → IntSoftmax → V sparse gather 
+
+> ➃-b. Pursuit (K_high iters):
+> Host CPU DRAM
+> backup storage (overflow)
+> CIM-SSD SSD Controller CIM Flash Array
+> Internal Bus
+> Quantized Dictionaries Weights
+> (INT8)
+> SRAM
+> - Local Window - Compressed KV codes
+> INT8/32 Compute
+> - IntSoftmax - IntRMSNorm - Pursuit Residual
+
+(a)         
+
+> Controller/SRAM Bus CIM Flash
+> ➀Input x (INT8)
+> ➂Requant INT32 → INT8
+> Q, K, V (+ RoPE)
+> ➃-a. Append KV to local window (SRAM)
+> x (INT8) ➁QKV Proj (CIM_MAC)
+> W·x → INT32 accum INT32 psum R (INT8) (idx, coef, d*) R update (INT32) (idx, coef) → SRAM D^T·R (CIM_MAC) argmax
+> ➄Compressed Attention:
+> Q (INT8) Q·D_K^T (CIM_MAC) score INT32 c_h (INT8) D_V·c_h (CIM_MAC) O_h INT32
+> ➅Local window attention + compressed reconstruction → Attention Output
+
+(b) 
+
+> PCIe Gen4x4
+> In-memory MAC + Argmax
+
+Figure 4: System overview for analytical modeling. (a) Modeled CIM-SSD platform: a host CPU with DRAM backing and a PCIe-attached CIM-SSD comprising an SSD controller with SRAM and a CIM flash array. (b) Modeled decode pipeline and data movement across controller/SRAM, bus, and CIM flash. 
+
+3.2.5 Query-Aware Hierarchical Sparsity 
+
+To further reduce compute and read I/O, we allocate reconstruction budget non-uniformly across tokens in a query-aware manner, inspired by prior work on query-aware sparsification and hierarchical attention [17]. Our key idea is a two-stage refinement scheme: we first construct a coarse reconstruction for all tokens using a small budget Klow , and then selectively refine only the most relevant tokens up to a larger budget Khigh .Concretely, we form a coarse key approximation for each token i using only its first Klow dictionary atoms and compute a proxy attention logit: 
+
+Score (i) = Q ·
+
+ Klow 
+
+# ∑
+
+j=1
+
+γi,j didx i,j
+
+
+
+. (1) We then select the top-N% tokens by Score (i) and refine them by increasing the reconstruction budget from Klow to 
+
+Khigh . We compute attention under a single numerically stable softmax over this mixed representation (top tokens at 
+
+Khigh , others at Klow ), concentrating dictionary reads and near-data compute on the most relevant tokens. 
+
+3.2.6 Why Flash CIM? 
+
+Our dictionary-based KV representation is well matched to flash-based compute-in-memory (CIM), but less attractive on conventional accelerators such as GPUs, as they do not support compute-in-memory. The method requires repeated projections against a large dictionary (e.g., QD T) and gather-style aggregation from sparse codes. On conventional accelerators, this often means repeatedly streaming the dictionary (and related intermediates) from HBM, increasing memory traffic and potentially dominating runtime. Moreover, LLM decoding is frequently memory-bandwidth-bound even without compression; the additional dictionary reads and compute can offset the benefits of a more compact KV representation, yielding limited gains or slowdowns. In contrast, flash CIM can keep the dictionary resident in flash and execute projection/gather near data, exploiting high internal read bandwidth while reducing off-chip transfers. That said, dictionary-based KV coding can still be useful on conventional accelerators when the KV cache no longer fits in device memory (e.g., very long contexts or large batches), by storing sparse codes on the accelerator and reducing host–device offload bandwidth. 84 System Modeling 
+
+Overview and metrics. We implement an analytical Python model to compare a PCIe-attached inference NPU base-line against our CIM-SSD ( LLM-in-a-Flash ). The model targets absolute estimates grounded in published hardware data (see Appendix A) and is designed to capture relative trends with respect to context length, controller SRAM capacity, and pursuit placement. We focus on decoding behavior and report latency (throughput) and total per-token energy, with a breakdown that highlights KV write and read costs. 
+
+Systems and workload. We compare four configurations spanning two NPU baselines and two CIM-SSD variants. The first baseline B1 is an inference NPU with DDR5 DRAM that stores both model weights and the full FP16 KV cache. A second baseline B2 uses the same NPU+DRAM hardware but applies our dictionary-based KV cache compression, storing dictionaries and compressed codes in DRAM and performing compression/reconstruction on the NPU. The proposed CIM-SSD system S1 integrates an SSD controller (INT8/INT32) with on-controller SRAM, a CIM flash array that stores stationary weights and per-layer dictionaries, and DRAM as a backing store (Figure 4(a)). We assume PCIe Gen4 ×4 (8 GB/s) for the host–SSD link and a 16 GB/s internal bus between the controller and CIM array. Additionally, we explore a second configuration, S2 , which accounts for limited on-controller SRAM capacity, placing compressed codes on DRAM and loading this to the CPU during reconstruction (while still applying pursuit on CIM). All configurations model Llama 3.1–8B with GQA ( L=32 , HQ=32 , HKV =8, d=128 ), keeping HQ (query-side compute) separate from HKV (stored KV state) so that operations scaling with query heads versus stored KV heads are modeled distinctly. We focus on autoregressive decoding (batch size 1), where KV-cache access dominates. 
+
+Cost primitives and overlap. We decompose each decode step into compute and data movement. Each engine has peak throughput P (TOPS). For Nop operations, 
+
+tcomp = Nop 
+
+P , Ecomp = Nop · eop +
+
+ Nop 
+
+S
+
+
+
+· eovhd , (2) where S is SIMD width and eovhd is a per-SIMD-group instruction overhead. Transfers follow a bandwidth model with optional fixed protocol terms for interconnects: 
+
+txfer = tℓ + to + Bytes 
+
+B , Exfer = 8 · Bytes · eb, (3) where tℓ is the latency before the transfer starts (link latency), and to is the fixed overhead associated with initiating the transfer, with (tℓ, to ) > 0 for PCIe/internal buses and (tℓ, to ) = 0 for DRAM/flash, and where B is the bandwidth. Primitive energies follow Horowitz-style baselines [18] with 7 nm-class calibration guided by TPU-era references [24]; CIM periphery is treated as an older-node process. Within a stage, we model overlap between independent compute and communication engines using 
+
+overlap (t1, t2) = max (t1, t2) + ( 1 − ρ) min (t1, t2), (4) with ρ=0.8 for the NPU baseline and ρ=0.9 for CIM-SSD, applied only when concurrency is plausible (e.g., CIM mat-mul with internal-bus transfers). Across stages of a decode step (QKV projection → KV write → KV read/attention 
+
+→ FFN), execution is sequential due to shared engine/channel contention. Pursuit iterations are also sequential ( ρ=0)due to r(i+1) = r(i) − αidji .
+
+Layer modeling. Each decode layer follows a standard transformer decode pipeline (QKV projection, RoPE, KV-cache update, attention, output projection, residual paths, SwiGLU FFN, and RMSNorm). Figure 4(b) illustrates the CIM-SSD dataflow. 
+
+Linear layers (QKV, output, and FFN projections) are modeled as GEMV at batch size 1. In the baseline, the NPU streams FP16 weights from DRAM every token, making these projections primarily memory-bandwidth bound. In CIM-SSD (Figure 4(b), 1 – 3 ), weights remain stationary in flash: the controller broadcasts the INT8 activation 
+
+x over the internal bus, the CIM array performs in-place INT8 MAC, and INT32 partial sums return to the controller for requantization back to INT8. CIM compute and internal-bus transfers are overlapped within the linear stage. 9Nonlinear operations (RMSNorm, softmax, SiLU, RoPE, residual add, and post-Swish multiply) run on the NPU in FP32 for the baseline. On CIM-SSD, they execute on the SSD controller using integer-only approximations (INT8/INT32 + requantization), e.g., polynomial/shift-based exp for IntSoftmax and integer sqrt/divide for IntRM-SNorm, without relying on floating-point units. 
+
+KV cache write path. Each new token appends its INT8 key and value vectors to a local window in controller SRAM (Figure 4(b), 4 -a). Periodically, the oldest entries are batch-compressed using pursuit ( 4 -b): the controller sends the current residual r (INT8) to the CIM array over the internal bus; the CIM array computes D⊤r in-place and returns the selected atom and its corresponding index/coefficients; the controller then updates the residual in INT32 and records the sparse code. After a fixed number of pursuit iterations, each token is represented as a compact set of (index, coefficient) pairs stored in SRAM, while all intermediate state (residual buffers and partial codes) remains on-controller throughout the loop. In the baseline ( B1 ), KV vectors are written in FP16 directly to DRAM. In B2 ,the same compression runs on the NPU, but dictionaries and codes reside in DRAM, introducing additional DRAM transfers during encoding. 
+
+KV cache read path. The read path combines two regions, an uncompressed local window and a compressed con-text , with scenario-specific data movement (Figure 4(b), 5 – 6 ). B1 reads the full FP16 KV cache from DRAM and runs standard attention on the NPU ( QK ⊤, softmax, and Score · V). B2 reads compressed codes and per-layer dictio-naries from DRAM, reconstructs KV on the NPU, and then runs standard attention. The repeated dictionary transfer becomes a fixed per-layer cost during decoding. 
+
+S1 (CIM-SSD) avoids both full-KV transfer and dictionary loading. For the local window , the controller reads INT8 KV from SRAM and computes attention locally. For the compressed context , attention operates in the dictionary-score domain without materializing full KV: the CIM array computes QD ⊤ 
+
+> K
+
+, the controller combines the resulting scores with sparse codes to form attention weights and code aggregates, and the CIM array applies DV to produce the value-side contribution. The local-window and compressed-context outputs are then combined. S2 considers the memory constraints of the local buffer on the SSD by storing codes in DRAM and fetching them to the CPU when performing reconstruction. 
+
+SRAM budget and overflow. Controller SRAM must hold (i) an uncompressed local window (recent INT8 KV), and (ii) transient pursuit state (residual buffers, partial outputs, and control metadata) across all layers. For S1 , it also must store compressed KV history codes (growing with sequence length). Dictionaries are not stored in SRAM; they reside permanently in CIM flash. The dominant term is the compressed-history codes, which scale linearly with context length. In S1 , the SRAM budget is sized to keep both the local window and the history codes on-controller for typical sequence lengths. With S2 , the coefficients are stored in DRAM. 
+
+# 5 Results 
+
+We evaluate our approach on Llama-3.1-8B and Qwen-2.5-7B. We first ablate each component of our integer-only quantization pipeline (Section 5.2) and dictionary-based KV cache compression (Section 5.3), and then present com-bined downstream task results (Section 5.4). Finally, we report system-level latency and energy projections from our analytical model (Section 5.5). 
+
+## 5.1 Experimental Setup. 
+
+For integer-only quantization, we calibrate smoothing parameters and quantization scales using the Pile validation set following SmoothQuant [51], and use group size of 128 for group-wise quantization. For dictionary training, we extract key and value activations from Pile calibration sequences, train a separate overcomplete dictionary ( M=32768 
+
+atoms) per layer and per key/value, and apply per-tensor INT8 quantization to the learned dictionaries. We use a local window of W=128 tokens, and when this is full we compress the oldest U = 32 tokens from the window. We use a sparsity budget of Khigh =16 with Klow =3 for the hierarchical policy. 10 5.2 Integer-Only LLM Inference 
+
+We evaluate the impact of our integer-only quantization pipeline on language modeling quality, reporting perplexity on WikiText-2 [38] for Llama-3.1-8B. Table 1 ablates each design decision cumulatively. Starting from the FP16 baseline, naive per-tensor W8A8 quantization incurs substantial perplexity degradation due to activation outliers. Adding SmoothQuant [51] significantly recovers quality by redistributing quantization diffi-culty from activations to weights. Group-wise quantization along the hidden dimension further improves accuracy by providing finer-grained scale factors for both weights and activations. Replacing floating-point nonlinear operations (Softmax, RMSNorm, SiLU) with our integer polynomial approximations introduces a modest perplexity increase, as the second-order approximations trade off small numerical fidelity for full integer-domain execution. This degradation is mitigated by applying INT16 requantization at Softmax and RMSNorm inputs. Our final end-to-end integer-only pipeline achieves 7.5803 perplexity, within 0.0349 of the FP16 baseline, while eliminating all floating-point computa-tion from the critical path. 
+
+Table 1: Cumulative ablation of integer-only quantization on Llama-3.1-8B. Each row adds one component to the previous configuration. We report WikiText-2 perplexity ( ↓). * Applying integer nonlinear approximations naively results in the model activations diverging and resulting in NaN.  
+
+> Configuration WikiText-2 PPL (
+
+↓)  
+
+> FP16 baseline 7.5454 + Per-tensor W8A8 7.6525 + SmoothQuant and group-wise quant ( g
+
+=128 ) 7.5511 + Integer nonlinear approx. NaN* + INT16 requantization 7.5803 
+
+## 5.3 Dictionary-Based KV Cache Compression 
+
+We evaluate our dictionary-based KV cache compression on LongBench, a benchmark suite for long-context under-standing that covers single- and multi-document QA, summarization, few-shot learning, and code completion tasks. We report the average score across all LongBench tasks. Table 2 ablates each component of our compression pipeline, showing the accuracy versus KV cache size trade-off with 1) the baseline dictionary compression method, 2) our dic-tionary compression method, 3) INT8 quantization of the learned dictionaries, and 4) our query-aware hierarchical sparsity scheme. Dictionary compression with OMP-style coding at K=16 atoms per token provides a strong baseline, achieving a 4 × reduction in KV cache size (in terms of dynamic memory requirements) with minimal accuracy degradation. Replacing OMP with our projection-based sparse coding (see Algorithm 1) yields comparable accuracy while elimi-nating the costly least-squares operations, making the compression step substantially more hardware-friendly for CIM execution. Applying per-tensor INT8 quantization to the learned dictionaries introduces minimal additional quality loss, as the overcomplete dictionary is robust to moderate quantization noise. Finally, our query-aware hierarchical sparsity scheme uses Klow =3 atoms for coarse scoring and refines the top-10% of tokens to Khigh =16 , further reduc-ing read I/O with only a small accuracy trade-off. The combined pipeline reduces the effective KV cache footprint by 15 × without degrading the LongBench score (see Table 2). 
+
+Table 2: Cumulative ablation of dictionary-based KV cache compression on LongBench (Llama-3.1-8B). Each row adds one component to the previous configuration. We report per-task scores and the effective KV cache compression ratio (according to the amount of dynamic memory that we need to load at each decoding step, ignoring the footprint of the dictionary).                                
+
+> Configuration multifield 2wiki gov KV qa-en mqa report trec lcc Avg. Compr.
+> Full FP16 KV cache 32.79 13.99 30.2 73.0 70.35 44.07 1×
+> Sparse coding (K=16) 37.37 13.71 29.22 73.5 69.25 44.61 4×
+> + Hierarchical 36.06 13.75 29.71 73.5 69.76 44.56 15 ×
+
+11 5.4 End-to-End Results 
+
+Table 3 presents the end-to-end evaluation of our combined pipeline (integer-only quantization + dictionary-based KV cache compression) on LongBench across two models. Our combined pipeline retains 99% of the FP16 full-KV baseline score for both Llama-3.1-8B and Qwen-2.5-7B. Notably, applying our joint integer-only quantization and sparse dictionary KV cache compression method degrades performance by less than 1 point on average, while providing nearly 15 × KV compression compared to the floating point version. 
+
+Table 3: End-to-end LongBench evaluation of our combined pipeline (integer-only quantization + dictionary-based KV cache compression) on Llama-3.1-8B and Qwen-2.5-7B. We report per-task scores and the effective KV cache compression ratio (according to the amount of dynamic memory that we need to load at each decoding step, ignoring the footprint of the dictionary).                                       
+
+> Configuration multifield 2wiki gov KV qa-en mqa report trec lcc Avg. Compr. Llama-3.1-8B
+> Full FP16 KV cache 32.79 13.99 30.2 73.0 70.35 44.07 1×
+> Ours 31.17 13.95 30.41 73.0 69.71 43.65 15 ×
+> Qwen-2.5-7B
+> Full FP16 KV cache 35.36 15.98 32.2 72.0 66.68 44.44 1×
+> Ours 40.01 19.52 29.64 72.5 59.48 44.23 15 ×
+
+## 5.5 System-Level Modeling 
+
+We use the analytical model described in Section 4 to project system-level latency and energy for our CIM-SSD design, modeling Llama-3.1-8B at batch size 1 across varying context lengths. We report time-between-tokens (TBT) for decode latency and total energy per decode step. We compare four configurations spanning two baselines and two CIM-SSD variants: • B1 – NPU, no compression. NPU + DDR5 DRAM, FP16 inference. Full KV cache written to and read from DRAM each decode step. • B2 – NPU + dictionary compression. NPU + DDR5 DRAM, FP16 inference with dictionary-based KV com-pression. Dictionary and compressed codes are stored in DRAM, with pursuit being applied on the CPU. • S1 – CIM-SSD, coefficients on controller. CIM-SSD, INT8 inference, CIM-resident dictionary. SRAM stores the local window, compressed codes, and temporaries for the pursuit algorithm (no overflow). • S2 – CIM-SSD, coefficients on DRAM. CIM-SSD + DDR5 DRAM, INT8 inference, CIM-resident dictionary. Pursuit runs on the controller (same as S1), but compressed codes are written to DRAM. During attention, codes are read from DRAM to the CPU, and intermediate results are synchronized between CPU and SSD via PCIe. Table 4 summarizes all results for all four configurations for short (1K)/long (256K) context length inference (additional results for 64K context length are provided in Appendix C). Note that the headline savings reported in the abstract and contributions ( 3.1 ×/2.7 × latency/energy at 1K and 4.4 ×/6.8 × latency/energy at 256K) correspond to configuration S2 , which we treat as our default serving configuration since it supports both short and long context lengths. 
+
+End-to-end comparison (B1 vs. S1). Comparing the uncompressed NPU baseline against our CIM-SSD pipeline isolates the combined benefit of integer-only execution, CIM-resident weights, and dictionary-based KV compression. For short context lengths (1K tokens), S1 is 3.4 × faster and 2.7 × more energy-efficient than B1, as CIM-resident weights eliminate the dominant DRAM weight-streaming cost. For longer context lengths (256K tokens), the energy gap widens to 8.7 × while maintaining a 3.0 × latency advantage, with energy savings growing as KV cache I/O dominates. 12 Table 4: System-level decode latency (TBT, ms) and energy (J) across context lengths for Llama-3.1-8B (batch size 1). B1/B2 are NPU+DRAM baselines; S1/S2 are CIM-SSD variants. Parenthesized values show speedup ( ↑) / energy reduction ( ↑) relative to B1.                          
+
+> 1K 256K Configuration TBT Energy TBT Energy B1 NPU, no compr. 183.7 101.8 631.5 354.5 B2 NPU + dict. compr. 190.4 (0.96 ×)108.2 (0.94 ×)217.4 (2.91 ×)135.1 (2.62 ×)S1 CIM-SSD, coeff. on ctrl. 54.1 (3.40 ×)37.4 (2.72 ×)208.4 (3.03 ×)40.9 (8.66 ×)S2 CIM-SSD, coeff. on DRAM 59.9 (3.07 ×)37.8 (2.69 ×)143.5 (4.40 ×)52.5 (6.75 ×)
+
+Value of compression on NPU (B1 vs. B2). Adding dictionary compression to the NPU baseline provides reduced benefit because the dictionary itself must be loaded from DRAM each decode step, introducing a fixed data-movement cost that offsets the savings from compact KV codes. At 1K context, B2 is slightly slower than B1 ( 0.96 ×) and less energy-efficient ( 0.94 ×). The gains only materialize at long sequences: at 256K, B2 is 2.9 × faster and 2.6 ×
+
+more energy-efficient, demonstrating that while our compression algorithm can reduce KV transfers even on non-CIM hardware, it is particularly well-suited to CIM. 
+
+CIM advantage for compression (B2 vs. S1). The CIM-SSD architecture dramatically reduces the overhead from loading the dictionary: dictionaries reside stationary in the CIM flash array and are accessed via high-bandwidth internal channels rather than DRAM. At 1K context, S1 is already 3.5 × faster than B2 and 2.9 × more energy-efficient, since CIM avoids both the dictionary load and the weight-streaming costs. At 256K, S1 and B2 achieve comparable latency, but S1 uses 3.3 × less energy because it avoids streaming the dictionary from DRAM. 
+
+Coefficient placement trade-off (S1 vs. S2). S1 and S2 represent two strategies for where compressed codes reside: on-controller SRAM (S1) versus host DRAM (S2), with S2 being preferred for long contexts where SRAM capacity is exceeded. At 1K context, S1 is slightly faster because all codes fit in SRAM and no PCIe synchronization is needed. However, at longer contexts S2 is faster than S1 (with a 1.5 × latency advantage for S2 at 256K context length). This occurs because the controller has limited computational resources (50 GFLOPS), whereas the CPU has higher throughput (2 TFLOPS) and bandwidth (76.8 GB/s DDR5), leading to a 1.5 × latency advantage for S2. However, S1 remains more energy-efficient across all context lengths since on-controller reads avoid DRAM transfer energy. In practice, S1 is suitable when all codes fit in SRAM, while S2 provides a more generalizable solution for long contexts; we hence reference the S2 results as the assumed configuration when reporting summarized data. 
+
+# 6 Conclusion 
+
+With LLM inference becoming a predominant workload for enabling state-of-the-art performance across a range of downstream applications, the memory requirements of LLMs has become a critical bottleneck. Compute-in-Flash technologies have high potential to address the memory bottleneck by eliminating off-chip memory transfers; however, these devices have limited write endurance and support for high-precision floating point computation, as well as low off-chip bandwidth relative to HBM. In this work, we exploit Compute-in-Flash to address the memory bottleneck with LLM inference. We co-design LLM inference to exploit the benefits of in-memory computation by adapting the algorithm to only use efficient integer computations, and adapting the KV cache management to use read-only information to exploit the high internal read bandwidth. These adaptations enable 3.1 ×/2.7 × latency/energy savings for short context lengths and 4.4 ×/6.8 × latency/energy savings for long context lengths. Our approach demonstrates algorithmic solutions to the constraints of Compute-in-Flash, thereby enabling efficient inference and reducing the core memory bottleneck with LLM inference. 
+
+# 7 Limitations 
+
+One limitation of our study is that it focuses on the generation phase of LLM inference. The compute-bound prefill phase is more challenging to map efficiently to compute-in-memory platforms (as these platforms typically have lower total peak compute performance than CPU/GPU platforms). Exploring how to map both the prefill and decode phase 13 efficiently is important future work. A second limitation is that the Value dictionary is access both transposed (during pursuit) and non-transposed (when computing attention). To realize the energy and latency benefits of compute-in-memory for both pursuit and computing attention, we therefore assume that 2 copies of the Value dictionary are stored (one transposed and one non-transposed). 
+
+# Acknowledgements 
+
+We acknowledge the gracious support from the FuriosaAI, Intel, Apple, NVIDIA, Macronix, and Mozilla teams. Furthermore, we appreciate the support from Google Cloud, the Google TRC team, Prof. David Patterson, along with support from the Google Gemini team and Divy Thakkar. Prof. Keutzer’s lab is also sponsored by funding through BDD and BAIR. We also acknowledge support by the Director, Office of Science, Office of Advanced Scientific Computing Research, of the U.S. Department of Energy under Contract No. DE-AC02-05CH11231. Michael W. Mahoney would also like to acknowledge DARPA, DOE, NSF, ONR, and the DOE SciGPT grant. Our conclusions do not necessarily reflect the position or the policy of our sponsors, and no official endorsement should be inferred. 
+
+# References 
+
+[1] Advanced Micro Devices, Inc. AMD EPYC 7002 Series Processors: A New Standard for the Modern Datacenter ,February 2020. Document ID: LE-70002-01. [2] Michal Aharon, Michael Elad, and Alfred Bruckstein. K-svd: An algorithm for designing overcomplete dictio-naries for sparse representation. IEEE Transactions on signal processing , 54(11):4311–4322, 2006. [3] Saba Akram and Quarrat Ul Ann. Newton raphson method. International Journal of Scientific & Engineering Research , 6(7):1748–1752, 2015. [4] Keivan Alizadeh, Seyed Iman Mirzadeh, Dmitry Belenko, S Khatamifard, Minsik Cho, Carlo C Del Mundo, Mohammad Rastegari, and Mehrdad Farajtabar. Llm in a flash: Efficient large language model inference with limited memory. In Proceedings of the 62nd Annual Meeting of the Association for Computational Linguistics (Volume 1: Long Papers) , pages 12562–12584, 2024. [5] Trenton Bricken, Adly Templeton, Joshua Batson, Brian Chen, Adam Jermyn, Tom Conerly, Nick Turner, Cem Anil, Carson Denison, Amanda Askell, et al. Towards monosemanticity: Decomposing language models with dictionary learning. Transformer Circuits Thread , 2(5):6, 2023. [6] CORE-MATH Project. The CORE-MATH project. https://core-math.gitlabpages.inria.fr .Accessed: 2026-02-27. [7] Hoagy Cunningham, Aidan Ewart, Logan Riggs, Robert Huben, and Lee Sharkey. Sparse autoencoders find highly interpretable features in language models. arXiv preprint arXiv:2309.08600 , 2023. [8] Lishuo Deng, Shaojie Xu, Jinwu Chen, Changwei Yan, Jiajie Wang, Zhe Jiang, and Weiwei Shan. Kv-nand: Efficient on-device large language model inference using dram-free in-flash computing. arXiv preprint arXiv:2512.03608 , 2025. [9] Zane Durante, Qiuyuan Huang, Naoki Wake, Ran Gong, Jae Sung Park, Bidipta Sarkar, Rohan Taori, Yusuke Noda, Demetri Terzopoulos, Yejin Choi, et al. Agent ai: Surveying the horizons of multimodal interaction. arXiv preprint arXiv:2401.03568 , 2024. [10] Kjersti Engan, Sven Ole Aase, and J Hakon Husoy. Method of optimal directions for frame design. In 1999 IEEE International Conference on Acoustics, Speech, and Signal Processing. Proceedings. ICASSP99 (Cat. No. 99CH36258) , volume 5, pages 2443–2446. IEEE, 1999. [11] Agner Fog. Instruction Tables: Lists of Instruction Latencies, Throughputs and Micro-Operation Breakdowns for Intel, AMD, and VIA CPUs , 2025. Last updated 2025-09-20. 14 [12] Kevin Galim, Ethan Ewer, Wonjun Kang, Minjae Lee, Hyung Il Koo, and Kangwook Lee. Draft-based approxi-mate inference for LLMs. In The Fourteenth International Conference on Learning Representations , 2026. [13] Leo Gao, Tom Dupre la Tour, Henk Tillman, Gabriel Goh, Rajan Troll, Alec Radford, Ilya Sutskever, Jan Leike, and Jeffrey Wu. Scaling and evaluating sparse autoencoders. In The Thirteenth International Conference on Learning Representations , 2025. [14] Amir Gholami, Zhewei Yao, Sehoon Kim, Coleman Hooper, Michael W Mahoney, and Kurt Keutzer. Ai and memory wall. IEEE Micro , 44(3):33–39, 2024. [15] Yufeng Gu, Alireza Khadem, Sumanth Umesh, Ning Liang, Xavier Servot, Onur Mutlu, Ravi Iyer, and Reetu-parna Das. Pim is all you need: A cxl-enabled gpu-free system for large language model inference. In Pro-ceedings of the 30th ACM International Conference on Architectural Support for Programming Languages and Operating Systems, Volume 2 , pages 862–881, 2025. [16] Coleman Richard Charles Hooper, Sehoon Kim, Hiva Mohammadzadeh, Monishwaran Maheswaran, Sebastian Zhao, June Paik, Michael W Mahoney, Kurt Keutzer, and Amir Gholami. Squeezed attention: Accelerating long context length llm inference. In Proceedings of the 63rd Annual Meeting of the Association for Computational Linguistics (Volume 1: Long Papers) , pages 32631–32652, 2025. [17] Coleman Richard Charles Hooper, Sebastian Zhao, Luca Manolache, Sehoon Kim, Michael W. Mahoney, Sophia Shao, Kurt Keutzer, and Amir Gholami. Multipole attention for efficient long context reasoning. In The Thirty-ninth Annual Conference on Neural Information Processing Systems , 2025. [18] Mark Horowitz. 1.1 computing’s energy problem (and what we can do about it). In 2014 IEEE international solid-state circuits conference digest of technical papers (ISSCC) , pages 10–14. IEEE, 2014. [19] Han-Wen Hu, Wei-Chen Wang, Yuan-Hao Chang, Yung-Chun Lee, Bo-Rong Lin, Huai-Mu Wang, Yen-Po Lin, Yu-Ming Huang, Chong-Ying Lee, Tzu-Hsiang Su, et al. Ice: An intelligent cognition engine with 3d nand-based in-memory computing for vector similarity search acceleration. In 2022 55th IEEE/ACM International Symposium on Microarchitecture (MICRO) , pages 763–783. IEEE, 2022. [20] Xing Hu, Yuan Cheng, Dawei Yang, Zhihang Yuan, Jiangyong Yu, Chen Xu, and Sifan Zhou. I-llm: Efficient integer-only inference for fully-quantized low-bit large language models. arXiv preprint arXiv:2405.17849 ,2024. [21] Inho Jeong, Sunghyeon Woo, Sol Namkung, and Dongsuk Jeon. HiFC: High-efficiency flash-based KV cache swapping for scaling LLM inference. In The Thirty-ninth Annual Conference on Neural Information Processing Systems , 2025. [22] Gisan Ji, Sanghun Shin, Jangho Baik, Wonbo Shim, and Sungju Ryu. E-flash: Energy-efficient llm mapping on nand flash-based in-storage inference computing. IEEE Transactions on Very Large Scale Integration (VLSI) Systems , 2026. [23] Huiqiang Jiang, YUCHENG LI, Chengruidong Zhang, Qianhui Wu, Xufang Luo, Surin Ahn, Zhenhua Han, Amir H. Abdi, Dongsheng Li, Chin-Yew Lin, Yuqing Yang, and Lili Qiu. MInference 1.0: Accelerating pre-filling for long-context LLMs via dynamic sparse attention. In The Thirty-eighth Annual Conference on Neural Information Processing Systems , 2024. [24] Norman P Jouppi, Doe Hyun Yoon, Matthew Ashcraft, Mark Gottscho, Thomas B Jablin, George Kurian, James Laudon, Sheng Li, Peter Ma, Xiaoyu Ma, et al. Ten lessons from three generations shaped google’s tpuv4i: Industrial product. In 2021 ACM/IEEE 48th Annual International Symposium on Computer Architecture (ISCA) ,pages 1–14. IEEE, 2021. [25] Hyunjin Kim, Sanghyeok Han, and Jae-Joon Kim. Llm-on-the-palm: Mobile llm inference with pim-enhanced nand flash memory. In 2025 IEEE/ACM International Conference On Computer Aided Design (ICCAD) , pages 1–9. IEEE, 2025. 15 [26] Junhyuck Kim, Jongho Park, Jaewoong Cho, and Dimitris Papailiopoulos. Lexico: Extreme KV cache com-pression via sparse coding over universal dictionaries. In Forty-second International Conference on Machine Learning , 2025. [27] Sehoon Kim, Amir Gholami, Zhewei Yao, Michael W Mahoney, and Kurt Keutzer. I-bert: Integer-only bert quantization. In International conference on machine learning , pages 5506–5518. PMLR, 2021. [28] Sehoon Kim, Coleman Richard Charles Hooper, Amir Gholami, Zhen Dong, Xiuyu Li, Sheng Shen, Michael W. Mahoney, and Kurt Keutzer. SqueezeLLM: Dense-and-sparse quantization. In Forty-first International Confer-ence on Machine Learning , 2024. [29] Kwanhee Kyung, Sungmin Yun, and Jung Ho Ahn. Ssd offloading for llm mixture-of-experts weights considered harmful in energy efficiency. IEEE Computer Architecture Letters , 2025. [30] Jaeyong Lee, Hyeunjoo Kim, Sanghun Oh, Myoungjun Chun, Myungsuk Kim, and Jihong Kim. Aif: Accel-erating on-device llm inference using in-flash processing. In Proceedings of the 52nd Annual International Symposium on Computer Architecture , pages 529–543, 2025. [31] Patrick Lewis, Ethan Perez, Aleksandra Piktus, Fabio Petroni, Vladimir Karpukhin, Naman Goyal, Heinrich K¨ uttler, Mike Lewis, Wen-tau Yih, Tim Rockt¨ aschel, et al. Retrieval-augmented generation for knowledge-intensive nlp tasks. Advances in neural information processing systems , 33:9459–9474, 2020. [32] Yuhong Li, Yingbing Huang, Bowen Yang, Bharat Venkitesh, Acyr Locatelli, Hanchen Ye, Tianle Cai, Patrick Lewis, and Deming Chen. SnapKV: LLM knows what you are looking for before generation. In The Thirty-eighth Annual Conference on Neural Information Processing Systems , 2024. [33] Ji Lin, Jiaming Tang, Haotian Tang, Shang Yang, Wei-Ming Chen, Wei-Chen Wang, Guangxuan Xiao, Xingyu Dang, Chuang Gan, and Song Han. Awq: Activation-aware weight quantization for on-device llm compression and acceleration. Proceedings of machine learning and systems , 6:87–100, 2024. [34] Zechun Liu, Changsheng Zhao, Igor Fedorov, Bilge Soran, Dhruv Choudhary, Raghuraman Krishnamoorthi, Vikas Chandra, Yuandong Tian, and Tijmen Blankevoort. Spinquant: Llm quantization with learned rotations. 
+
+arXiv preprint arXiv:2405.16406 , 2024. [35] Zirui Liu, Jiayi Yuan, Hongye Jin, Shaochen Zhong, Zhaozhuo Xu, Vladimir Braverman, Beidi Chen, and Xia Hu. KIVI: A tuning-free asymmetric 2bit quantization for KV cache. In Forty-first International Conference on Machine Learning , 2024. [36] Zhaojun Lu, Xueyan Wang, Md Tanvir Arafin, Haoxiang Yang, Zhenglin Liu, Jiliang Zhang, and Gang Qu. An rram-based computing-in-memory architecture and its application in accelerating transformer inference. IEEE Transactions on Very Large Scale Integration (VLSI) Systems , 32(3):485–496, 2023. [37] Xiaoyu Ma and David Patterson. Challenges and research directions for large language model inference hard-ware. arXiv preprint arXiv:2601.05047 , 2026. [38] Stephen Merity, Caiming Xiong, James Bradbury, and Richard Socher. Pointer sentinel mixture models. arXiv preprint arXiv:1609.07843 , 2016. [39] Zhiwen Mo, Lei Wang, Jianyu Wei, Zhichen Zeng, Shijie Cao, Lingxiao Ma, Naifeng Jing, Ting Cao, Jilong Xue, Fan Yang, et al. Lut tensor core: A software-hardware co-design for lut-based low-bit llm inference. In 
+
+Proceedings of the 52nd Annual International Symposium on Computer Architecture , pages 514–528, 2025. [40] Onur Mutlu. Lightning talk: Memory-centric computing. In 2023 60th ACM/IEEE Design Automation Confer-ence (DAC) , pages 1–2. IEEE, 2023. [41] Yagyensh Chandra Pati, Ramin Rezaiifar, and Perinkulam Sambamurthy Krishnaprasad. Orthogonal matching pursuit: Recursive function approximation with applications to wavelet decomposition. In Proceedings of 27th Asilomar conference on signals, systems and computers , pages 40–44. IEEE, 1993. 16 [42] Timo Schick, Jane Dwivedi-Yu, Roberto Dess` ı, Roberta Raileanu, Maria Lomeli, Eric Hambro, Luke Zettle-moyer, Nicola Cancedda, and Thomas Scialom. Toolformer: Language models can teach themselves to use tools. Advances in neural information processing systems , 36:68539–68551, 2023. [43] Wenqi Shao, Mengzhao Chen, Zhaoyang Zhang, Peng Xu, Lirui Zhao, Zhiqian Li, Kaipeng Zhang, Peng Gao, Yu Qiao, and Ping Luo. Omniquant: Omnidirectionally calibrated quantization for large language models. In 
+
+The Twelfth International Conference on Learning Representations , 2024. [44] Charlie Snell, Jaehoon Lee, Kelvin Xu, and Aviral Kumar. Scaling llm test-time compute optimally can be more effective than scaling model parameters. arXiv preprint arXiv:2408.03314 , 2024. [45] David Suggs, Mahesh Subramony, and Dan Bouvier. The amd “zen 2” processor. IEEE micro , 40(2):45–52, 2020. [46] Weiyi Sun, Mingyu Gao, Zhaoshi Li, Aoyang Zhang, Iris Ying Chou, Jianfeng Zhu, Shaojun Wei, and Leibo Liu. Lincoln: Real-time 50˜ 100b llm inference on consumer devices with lpddr-interfaced, compute-enabled flash memory. In 2025 IEEE International Symposium on High Performance Computer Architecture (HPCA) , pages 1734–1750. IEEE, 2025. [47] Jiaming Tang, Yilong Zhao, Kan Zhu, Guangxuan Xiao, Baris Kasikci, and Song Han. QUEST: Query-aware sparsity for efficient long-context LLM inference. In Forty-first International Conference on Machine Learning ,2024. [48] Aditya Tomar, Coleman Hooper, Minjae Lee, Haocheng Xi, Rishabh Tiwari, Wonjun Kang, Luca Manolache, Michael W Mahoney, Kurt Keutzer, and Amir Gholami. Xquant: Breaking the memory wall for llm inference with kv cache rematerialization. arXiv preprint arXiv:2508.10395 , 2025. [49] Ashish Vaswani, Noam Shazeer, Niki Parmar, Jakob Uszkoreit, Llion Jones, Aidan N Gomez, Łukasz Kaiser, and Illia Polosukhin. Attention is all you need. Advances in neural information processing systems , 30, 2017. [50] Christopher Wolters, Xiaoxuan Yang, Ulf Schlichtmann, and Toyotaro Suzumura. Memory is all you need: An overview of compute-in-memory architectures for accelerating large language model inference. arXiv preprint arXiv:2406.08413 , 2024. [51] Guangxuan Xiao, Ji Lin, Mickael Seznec, Hao Wu, Julien Demouth, and Song Han. Smoothquant: Accurate and efficient post-training quantization for large language models. In International conference on machine learning ,pages 38087–38099. PMLR, 2023. [52] Guangxuan Xiao, Yuandong Tian, Beidi Chen, Song Han, and Mike Lewis. Efficient streaming language models with attention sinks. In The Twelfth International Conference on Learning Representations , 2024. [53] Shunyu Yao, Jeffrey Zhao, Dian Yu, Nan Du, Izhak Shafran, Karthik R Narasimhan, and Yuan Cao. React: Synergizing reasoning and acting in language models. In The eleventh international conference on learning representations , 2022. [54] Joonsang Yu, Junki Park, Seongmin Park, Minsoo Kim, Sihwa Lee, Dong Hyun Lee, and Jungwook Choi. Nn-lut: Neural approximation of non-linear operations for efficient transformer inference. In Proceedings of the 59th ACM/IEEE Design Automation Conference , pages 577–582, 2022. [55] Zhongkai Yu, Shengwen Liang, Tianyun Ma, Yunke Cai, Ziyuan Nan, Di Huang, Xinkai Song, Yifan Hao, Jie Zhang, Tian Zhi, et al. Cambricon-llm: A chiplet-based hybrid architecture for on-device inference of 70b llm. In 
+
+2024 57th IEEE/ACM International Symposium on Microarchitecture (MICRO) , pages 1474–1488. IEEE, 2024. [56] Zhenyu Zhang, Ying Sheng, Tianyi Zhou, Tianlong Chen, Lianmin Zheng, Ruisi Cai, Zhao Song, Yuandong Tian, Christopher Re, Clark Barrett, Zhangyang Wang, and Beidi Chen. H2o: Heavy-hitter oracle for efficient generative inference of large language models. In Thirty-seventh Conference on Neural Information Processing Systems , 2023. [57] Zhantong Zhu, Hongou Li, Wenjie Ren, Meng Wu, Le Ye, Ru Huang, and Tianyu Jia. Leveraging compute-in-memory for efficient generative model inference in tpus. In 2025 Design, Automation & Test in Europe Conference (DATE) , pages 1–7. IEEE, 2025. 17 A System Modeling Parameters 
+
+Tables A.1-A.5 summarize the hardware parameters used in our analytical system model (Section 4). 
+
+Compute energy. Table A.1 lists per-operation energy for CPU and SSD-CIM. CPU operation energies are from [24], assuming 7nm technology node. Each CPU instruction incurs an additional ∼13 pJ overhead from instruction fetch and register file access, estimated from [18] (scaled down to 7nm using SRAM energy ratios from [24]). We assume a digital Flash CIM device as in [55, 8, 46]. I8 MAC energy is 0.1 pJ [24], and input/output activation buffer energy is 0.8 pJ per 8 bits (extrapolated from 7nm data in [24], assuming 2KB I/O buffer as in [55]). SSD-CIM SRAM overhead ( ∼7 pJ per 32 bits) is estimated from 1 MB SRAM read energy [24]. FP32 Div ≈ 6× FP32 MAC and FP32 Sqrt ≈ 12 × FP32 MAC, estimated from Agner Fog instruction tables for Zen 7 nm [11]. FP32 Exp is typically approximated using ∼8 FMA instructions [6], incurring 8× computation and instruction overhead. 
+
+Table A.1: Per-operation compute energy.                                       
+
+> Device Operation Op Energy (pJ) Overhead (pJ)
+> CPU I32 Add 0.03 ∼13
+> CPU I32 Mul 1.5 ∼13
+> CPU FP32 Add 0.4 ∼13
+> CPU FP32 Mul 1.3 ∼13
+> CPU FP32 Div 10.2 ∼13
+> CPU FP32 Sqrt 20.4 ∼13
+> CPU FP32 Exp 13.6 ∼8×13
+> SSD-CIM I8 MAC 0.01 ∼0.8
+> SSD-CIM I32 Mul 1.5 ∼7
+> SSD-CIM I32 Add 0.03 ∼7
+> SSD-CIM Argmax 0.5 ∼7
+
+Memory energy. Table A.2 reports memory access energy per bit. DRAM read/write energy (7 pJ/bit) is from [8]. SSD energy (7.9 pJ/bit) and internal Flash read energy (3 pJ/bit) are from [8]. 
+
+Table A.2: Memory access energy per bit (read/write).         
+
+> Device Energy/Bit (pJ) Source
+> DRAM 7[8] SSD (Flash) 7.9 [8] SSD (Flash, internal) 3.0 [8]
+
+Bandwidth. Table A.3 lists the memory interface bandwidths assumed in our model: 76.8 GB/s for DDR5 DRAM (Dual-Channel) and 8 GB/s for PCIe 4.0. 
+
+Table A.3: Memory interface bandwidth.           
+
+> Interface Bandwidth Standard
+> CPU ↔DRAM 76.8 GB/s DDR5 CPU ↔SSD 8 GB/s PCIe 4.0
+
+Capacity. Table A.4 lists our storage capacity assumptions. We assume a 512 GB SSD (32 GB per die) with 192 MB of on-chip SRAM (using 6MB/die from [46]). We assume 64GB for the DRAM capacity. 
+
+Table A.4: Storage capacity assumptions.         
+
+> Device Capacity Source
+> DRAM 64GB —SSD (Flash) 512 GB (32 GB per die) —SSD (on-chip SRAM) 192 MB [46]
+
+18 Throughput. Table A.5 reports peak compute throughput. CPU throughput (2 TFLOPS FP32) is based on Zen 2 (7 nm) and is within the range of listed configurations [45, 1]. NPU throughput (32 TFLOPS BF16) assumes a 16 ×
+
+speedup over the CPU with matrix extension, and is consistent with [46]. SSD-CIM I8 MAC throughput (1 TB/s) is from [46] (determined by peak internal read bandwidth), scaled assuming the capacity from Table A.4. We assume SSD-CIM peak computation throughput for postprocessing in the peripheral logic is 20x lower than internal CIM throughput (50 GFLOPS). 
+
+Table A.5: Peak compute throughput.             
+
+> Device Peak Throughput Source
+> CPU (FP32 MAC) 2 TFLOPS [45, 1] NPU (BF16 MAC) 32 TFLOPS [46] SSD-CIM (I8 MAC) 1 TB/s [46] SSD-CIM (I32 Mul) 50 GFLOPS —SSD-CIM (I32 Add) 50 GFLOPS —
+
+# B Nonlinear Operation Offloading Ablations 
+
+Table B.1 shows ablations for offloading nonlinear operations to the NPU vs. our approach using integer approx-imations in the controller across short (1k)/medium (64K)/long (256K) context lengths. Both scenarios assume a streaming implementation of nonlinear operations. Offloading uses the NPU to do the nonlinear operations, and our approach (integer ops) uses the controller to approximate nonlinear operations with integer approximations. 
+
+Table B.1: Nonlinear layer forward pass latency (ms) and energy (J) across context lengths for Llama-3.1-8B (batch size 1). Parenthesized values show speedup ( ↑) / energy reduction ( ↑) relative to offloading.                                                
+
+> 1K 64K 256K Configuration Latency Energy Latency Energy Latency Energy Softmax CIM, offloading 0.018 6.04e-06 0.264 9.66e-05 4.197 1.54e-03 CIM, integer ops 0.010 (1.78 ×)1.42e-06 (4.25 ×)0.147 (1.80 ×)2.27e-05 (4.25 ×)2.334 (1.80 ×)3.63e-04 (4.25 ×)RMSNorm CIM, offloading 2.099 7.71e-04 33.556 1.23e-02 536.873 1.97e-01 CIM, integer ops 0.664 (3.16 ×)1.47e-04 (5.25 ×)10.613 (3.16 ×)2.35e-03 (5.25 ×)169.792 (3.16 ×)3.76e-02 (5.25 ×)SiLU CIM, offloading 7.342 2.72e-03 117.450 4.35e-02 1879.168 6.96e-01 CIM, integer ops 2.616 (2.81 ×)5.13e-04 (5.30 ×)41.839 (2.81 ×)8.21e-03 (5.30 ×)669.412 (2.81 ×)1.31e-01 (5.30 ×)
+
+Table B.2 shows full system modeling results comparing offloading nonlinear operations to the NPU vs. our approach using integer approximations in the controller across short (1k)/medium (64K)/long (256K) context lengths. Our approach results in speedup and less energy consumption, and scales better as the sequence length increases. 
+
+Table B.2: System-level decode latency (TBT, ms) and energy (J) across context lengths for Llama-3.1-8B (batch size 1). CIM, offloading refers to offloading nonlinear operations to the NPU; CIM, integer ops is our approach. Parenthesized values show speedup ( ↑) / energy reduction ( ↑) relative to offloading. NL % shows the fraction of total TBT and energy attributable to nonlinear layers.                                 
+
+> 1K 64K 256K Configuration TBT (ms) Energy (J) TBT (ms) Energy (J) TBT (ms) Energy (J) CIM, offloading 54.86 37.44 111.47 39.72 283.99 46.66 NL % of total 2.1% 0.1% 30.7% 4.0% 47.5% 13.6% CIM, integer ops 54.53 (1.01 ×)37.41 (1.00 ×)96.48 (1.16 ×)38.49 (1.03 ×)224.33 (1.27 ×)41.80 (1.12 ×)NL % of total 1.5% 0.0% 19.9% 1.0% 33.5% 3.6%
+
+# C Full System Results 
+
+Table C.1 provides full system modeling results across short (1K)/medium (64K)/long (256K) context length config-urations. 19 Table C.1: System-level decode latency (TBT, ms) and energy (J) across context lengths for Llama-3.1-8B (batch size 1). B1/B2 are NPU+DRAM baselines; S1/S2 are CIM-SSD variants. Parenthesized values show speedup ( ↑) / energy reduction ( ↑) relative to B1. 
+
+1K 64K 256K Configuration TBT Energy TBT Energy TBT Energy B1 NPU, no compr. 183.7 101.8 294.3 164.2 631.5 354.5 B2 NPU + dict. compr. 190.4 (0.96 ×) 108.2 (0.94 ×) 197.1 (1.49 ×) 114.9 (1.43 ×) 217.4 (2.91 ×) 135.1 (2.62 ×)S1 CIM-SSD, coeff. on ctrl. 54.1 (3.40 ×) 37.4 (2.72 ×) 92.2 (3.19 ×) 38.3 (4.29 ×) 208.4 (3.03 ×) 40.9 (8.66 ×)S2 CIM-SSD, coeff. on DRAM 59.9 (3.07 ×) 37.8 (2.69 ×) 80.6 (3.65 ×) 41.4 (3.96 ×) 143.5 (4.40 ×) 52.5 (6.75 ×)
+
+20
