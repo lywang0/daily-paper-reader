@@ -1,0 +1,586 @@
+Title: An Approximate Queueing Model of LLM Inference Serving for SLO-Driven Autoscaling
+
+URL Source: https://arxiv.org/pdf/2609.20957v1
+
+Published Time: Mon, 21 Sep 2026 00:06:03 GMT
+
+Number of Pages: 13
+
+Markdown Content:
+# An Approximate Queueing Model of LLM Inference Serving for SLO-Driven Autoscaling 
+
+Vishakha Ramani 
+
+IBM T. J. Watson Research Center 
+
+Yorktown Heights, NY vishakharamani@ibm.com 
+
+Asser N. Tantawi 
+
+IBM T. J. Watson Research Center 
+
+Yorktown Heights, NY tantawi@us.ibm.com 
+
+Abstract —Performance models of LLM servers support both latency evaluation and the design of controllers for autoscaling against service level objectives (SLOs) and for inference optimiza-tion. We model the multiplexed execution of prefill and decode operations with a tractable, approximate queueing model under Markovian assumptions. Three parameters characterize a model– accelerator pair, namely a baseline per-iteration overhead, a per-token compute cost, and a per-token key-value (KV) cache access cost. The model combines a mean-value analysis of per-iteration work with a state-dependent Markov chain for batch occupancy to predict mean time to first token (TTFT) and inter-token latency (ITL). We validate these predictions against measurements and show that the three parameters can be estimated from observed latencies. Over a grid of input and output lengths and arrival rates spanning light to moderate load, the relative error of the average ITL is about 5% for Llama-3.1-8B and 8% for Qwen2.5-14B running on an H100 GPU, and the corresponding TTFT errors are 14% and 16%. We then implement an autoscaling controller that uses the model to adjust inference-server replica counts as the workload changes. On an OpenShift cluster of H100 GPUs it tracks a fourfold load ramp under both latency targets, missing one in 7 of 127 control cycles, and its in-loop predictions carry median errors of at most 5% for TTFT and 9% for ITL. A decode-throughput analyzer from an existing autoscaler, which takes no latency target, misses 27 of 128 cycles under the same controller and load while provisioning 4% and 28% fewer replicas. 
+
+Index Terms —autoscaling, queueing theory, LLM inference, parameter estimation, performance modeling. 
+
+I. I NTRODUCTION 
+
+Large language model (LLM) inference services support latency-sensitive applications such as chatbots, coding assis-tants, and AI-powered search. Their service level objectives (SLOs) constrain response latency even as request rates fluc-tuate and each request consumes substantial computation and memory bandwidth. Providers handle this load by replicating models across accelerators such as GPUs or TPUs. Too many replicas waste expensive capacity, whereas too few create queues resulting in SLO violations. Resource allocation must therefore account for how arrival rate, request size, and the serving policy jointly determine latency. This is naturally a queueing problem. Requests arrive over time, share compute resources, and wait when demand exceeds immediately avail-able capacity. An analytical model can connect workload and configuration to latency, allowing an orchestrator to choose capacity that balances cost against SLO compliance. Many autoscalers avoid modeling this relationship explicitly and instead respond when a measured signal crosses a threshold. Such policies are attractive because they are simple and require little knowledge of the serving system. Their signals, however, are only indirect indicators of the latency objectives. The same KV-cache utilization can correspond to different TTFT and ITL values as prompt lengths, output lengths, and batch composition change. A threshold on measured latency, in turn, responds only after the degradation has been observed and does not directly indicate how much additional capacity is required. An analytical model offers a different control primitive. It can predict both latency metrics for candidate replica counts before actuation and allow the controller to select capacity against explicit SLO constraints. Our objective is therefore twofold, namely to develop a tractable analytical model of an LLM inference server and to use that model in an SLO-driven autoscaling controller. The paper makes three contributions toward this objective. First, we formulate a three-parameter queueing model for an inference server using continuous batching (Section IV and Section V). The model combines a mean-value analysis of the work performed in each iteration with a state-dependent Markov chain for the number of active requests. It represents the distinct costs of prefill computation, decode computation, and KV-cache access, and predicts mean TTFT and ITL for both unlimited and chunked prefill. This provides the controller with a direct mapping from workload and serving configuration to the two latency metrics it is intended to control. Second, we fit and validate the model on 224 operating points from vLLM [13], [26] serving Llama-3.1-8B and Qwen2.5-14B on an H100 GPU (Section VI). The experiments span 16 pairs of mean input and output lengths, ranging from 64 to 4096 tokens, and arrival rates from light to moderate load. The relative error of the average ITL is about 5% for Llama-3.1-8B and 8% for Qwen2.5-14B, while the corresponding TTFT errors are 14% and 16%. The fitted compute and KV-cache parameters also scale consistently with the architectural differences between the two models, providing a physical check on their interpretation. Third, we turn the model into a control mechanism rather than treating it only as an offline predictor. An initial multi-observation fit and an online sliding-window estimator calibrate the model from observed latencies as operating conditions arXiv:2609.20957v1 [cs.PF] 17 Sep 2026 change (Section VII). A queueing-model analyzer then evalu-ates candidate replica counts against the TTFT and ITL targets, and an actuator applies the chosen allocation (Section VIII). We deploy this controller in an OpenShift cluster of H100-backed vLLM servers and compare it against a decode-throughput analyzer, holding the surrounding control loop and workload fixed (Section IX). That analyzer provisions enough replicas to sustain the decode-token demand at a target KV-cache utilization, and it takes no latency target at all. The comparison exposes a capacity–latency tradeoff. Our controller misses a latency target in 7 of 127 control cycles against 27 of 128 for the throughput analyzer, which in exchange provisions fewer replicas on average. We discuss the implications of these results and directions for future work in Section X. II. B ACKGROUND 
+
+LLM inference is an autoregressive process that transforms an input prompt into an output sequence. Inference begins with tokenization, which decomposes the raw input text into tokens. This preprocessing is inexpensive relative to the subsequent model computation. Processing a request consists of repeatedly running a forward pass , a single execution of the model’s transformer layers that maps the current per-token hidden states to per-token outputs. Each layer is dominated by two costs, namely dense matrix multiplications between hidden states and the model weights, and an attention computation that updates each token’s representation using a weighted combination of the key and value (KV) vectors of all preceding tokens in its sequence. This processing happens in two serial phases that have very different computational profiles. In the first phase, called prefill , the server runs a single forward pass over all input tokens of the request and stores their KV vectors in a per-request KV cache so that subsequent steps need not recompute them. The final hidden state of the prompt then seeds the decode phase, whose first step produces the first output token. Prefill is compute bound because all input tokens are processed in parallel and the cost of the dense linear operations grows with the input length. In the second phase, called decode , the server generates the output tokens one at a time, where each step runs a forward pass on a single new token, appends its KV vectors to the cache, and lets the attention computation read the entire cache to predict the next token. A single decode step is memory bound because it generates only one new token, whose compute cost is small, while the attention computation must read the full KV cache from high-bandwidth memory (HBM), and the cost of this read grows with the request’s sequence length. To increase GPU utilization, modern inference servers run a single forward pass over tokens from multiple requests concurrently. A batch is the set of tokens that the server schedules together in one forward pass, and the execution of that pass is called an iteration . Depending on the scheduling discipline, a batch may consist of input tokens from a single prefilling request, input tokens from several prefilling requests, one decode token from each of several decoding requests, or a mix of input and decode tokens drawn from both prefilling and decoding requests. Regardless of the mix, the model weights are loaded from HBM once per layer per iteration and the matrix multiplications that consume them amortize the load over every token in the batch. The per-token compute cost and per-request KV-cache read cost still grow with the batch token count and each request’s sequence length, respectively, so larger batches and longer sequences both increase iteration time. Modern serving systems adopt continuous batching [29], where requests do not wait to be assembled into a synchronized batch and do not wait for the other requests in their batch to finish. Instead, on every iteration boundary, a request that has just completed its decode phase departs and any waiting request can be admitted into the batch and start its prefill in the very next iteration. The batch composition therefore varies continuously over time, with requests at different phases coexisting in the same iteration. In the following section, we develop an analytical model for latency in an LLM inference server employing continuous batching. We represent each request by the work it adds to the system and model iteration time as the total work of all active requests. III. R ELATED WORK 
+
+a) Serving mechanisms and benchmarking: Prior systems work introduced the scheduling mechanisms represented by our model. Yu et al. [29] introduce continuous batching, where requests join and leave the active batch at iteration boundaries rather than waiting for a full batch to complete. Agrawal et al. [1] introduce chunked prefill, splitting a long input prompt into smaller chunks that are interleaved with ongoing decode steps, and evaluate the resulting throughput-latency tradeoff against other scheduling disciplines. Patel et al. [22] propose a method for splitting the prefill and decode phases and evaluate its performance. A complementary line of work characterizes servers empirically rather than analytically. Lazuka et al. [14] perform extensive benchmarking and build a system for charac-terizing and predicting performance. Such black-box predictors can be accurate within their training configurations, but each new model–accelerator pair requires another measurement campaign. Our three-parameter formulation is intended to reduce that calibration burden. 
+
+b) Queueing models of inference serving: Mitzenmacher and Shahout [20] provide an overview of the challenges and open problems in LLM performance modeling and analysis. Yang et al. [28] use a queueing model to evaluate LLM request latency, and Ao et al. [2] develop a fluid approximation of LLM serving and introduce a scheduling algorithm with near-optimal performance. Closest to our work is Inoue [10], who gives a closed-form characterization of a GPU-based inference server under dynamic batching, where a batch is assembled, executed, and completed as a unit, with a batch-size-dependent processing time. Our setting differs in three ways that require a different analysis, not just different parameters. First, under continuous batching a request joins and departs at iteration boundaries, so the batch composition is a mixture of requests at different points in their lifetime instead of a set of jobs that enter and leave together. Second, an autoregressive request remains active through one or more prefill iterations and then through a separate decode iteration for each generated token. These two phases have very different computational costs, so the request cannot be represented as a single processing step. Third, the cost of each iteration grows with the number of prompt and generated tokens stored in the active requests’ KV caches. Prompt length and generated response length therefore affect TTFT and ITL differently. Consequently our service time is state-dependent through both the occupancy and the token budget, and the model predicts two latency metrics rather than one. 
+
+c) Model-driven autoscaling: Using a performance model to drive resource allocation has a long history outside LLM serving. Gandhi et al. [6] build an adaptive, model-driven autoscaler for cloud applications that refines a queueing-model estimate from live measurements. Our control loop adopts a similar separation between model analysis and online tuning. Gujarati et al. [9] target machine learning inference specifically, using a model of per-request demand to autoscale while meeting service level agreements with high resource efficiency. Both predate the two-phase autoregressive workload and KV-cache pressure of LLM serving, which our model explicitly represents. Among recent autoscalers and serving systems for LLM inference, related goals include GPU heterogeneity for cost [7], joint placement and scaling for SLO compliance [21], [25], mixed-SLO and multi-class workloads [3], [30], [31], prefill-decode multiplexing [4], and energy efficiency [24]. Most directly related is SageServe [11], which combines hourly forecasts of per-model regional token demand with bench-marked model–accelerator throughput capacities in an integer linear program that coordinates long-timescale model placement and request routing across data centers. It complements this planner with utilization-triggered scaling, shared capacity for interactive and non-interactive workloads, and deadline-aware request scheduling. SageServe therefore addresses where model capacity should be placed across regions ahead of forecast demand, whereas our work addresses how many replicas a particular serving configuration requires to satisfy explicit TTFT and ITL constraints. Its online allocation formulation operates on forecasted throughput capacity. Our analyzer instead models continuous batching, prefill and decode work, and KV-cache access to predict both latency metrics, with its three parameters continuously re-estimated from observed latencies. The approaches are complementary. SageServe-style forecasts could supply demand one provisioning delay ahead to our analyzer, while our queueing model could provide latency-aware capacity constraints to a global placement planner. The same self-tuning analyzer can therefore support different models and accelerators without training a separate black-box latency predictor for each deployment. IV. S YSTEM MODEL 
+
+Consider an LLM server whose requests arrive as a Poisson process with rate λ. This assumption is what reduces the occupancy process to a birth–death chain, and it is therefore what makes the resulting latency expressions closed form. It is also the arrival model used by the closed-form queueing analyses of inference serving reviewed in Section III. Measured production traffic is more variable than this. A 213-day trace of Azure OpenAI services fits its request arrivals with a Gamma interarrival distribution whose fitted shape, and therefore whose coefficient of variation, changes sharply from one 20-minute window to the next, and reports higher arrival burstiness than a Microsoft Azure Functions trace at the same mean request rate [27]. A Poisson process holds its coefficient of variation fixed at one, so it represents neither that level of variability nor its drift over time. At a fixed mean rate our waiting-time and TTFT predictions are therefore optimistic under bursty arrivals, and increasingly so as load rises toward saturation. Nevertheless, Poisson arrivals are what let the model act as a control primitive, for three reasons. First, the only arrival statistic a controller can measure cheaply and continuously is the mean rate, so a richer arrival model would carry parameters that no routine measurement identifies. Second, representing correlated arrivals would either enlarge the state beyond the single occupancy variable, as an arrival process modulated by its own Markov chain does, or give up the closed-form occupancy distribution for a numerical matrix-analytic solution. Either way the model must be solved afresh for every candidate replica count a controller considers, and the closed form is what keeps that affordable. Third, the sign of the resulting error is known rather than arbitrary, since positive arrival correlation raises queueing delay, so an operator can absorb it in the SLO margin. Re-estimating the rate limits the exposure further. Our con-troller refreshes λ from measured arrivals at regular intervals, so demand variation on timescales longer than one interval, including diurnal variation, is tracked by re-estimation rather than left to the arrival model. What the model does not capture is arrival correlation within a single interval, and this is the case for eventually making arrival variability an explicit model input. Each request has an input length n > 0 and an output length m > 0, which we assume are mutually independent. Throughout the analysis, we set n and m to the workload’s mean input and output lengths. The resulting homogeneous-batch approximation assigns every request the work of an average request. During its lifetime in the server, an (n, m ) request first waits in a queue, then passes through n prefill-token stages and m
+
+decode-token stages. A decode iteration advances the request by one stage, whereas a prefill iteration may process any number of stages in {1, . . . , n }, depending on the scheduling discipline. The request therefore waits until it is admitted, completes prefill in one or more iterations, and then completes exactly m decode iterations. Our analysis uses three model–accelerator-specific param-eters that convert work to wall-clock time, namely α, β,and γ. Parameter α represents the baseline time per itera-tion irrespective of batch composition, accounting for kernel launch latencies, synchronization barriers, and weight-loading overhead. Parameter β is the compute time per token during the forward pass, governed by the accelerator’s peak floating-point throughput, and γ is the KV-cache memory access time per token, governed by its memory bandwidth. Since all three parameters carry units of time, work quantities derived from them are expressed directly in units of time, consistent with the standard queueing-theoretic notion of workload as service time. We consider the general case where a maximum token budget limits the total number of tokens processed per iteration. A request with input length n tokens and output length m tokens is represented by c ≥ 1 equal-sized effective prefill stages of n/c 
+
+tokens [1], followed by m decode stages. This representation approximates the latency-smoothing effect of chunked prefill without treating c as the literal number of chunks selected by the runtime scheduler. We derive the occupancy-dependent mean-field approximation c(i) in Appendix A. With unlimited token capacity, prefill completes in a single iteration. This is the special case c = 1 , as shown in Appendix B. V. A NALYSIS 
+
+A. Per-iteration work model 
+
+We characterize the state of a request during a given iteration by its processing age a ∈ A , with state space 
+
+A = {01, 02, . . . , 0c, 1, 2, . . . , m },
+
+where 0j denotes that the j-th prefill chunk is being processed and k ∈ { 1, . . . , m } denotes that the k-th decode step is in progress. The request departs the system upon completing state 
+
+m. Within the effective-stage approximation, a request advances by one stage per iteration and spends one effective iteration in each of its c + m states. Across its effective iterations, the request is therefore equally likely to be in any state. The probability pa that an active request is in state a is pa =1/(c + m) for every a ∈ A . The work model below uses this per-iteration distribution to average a request’s contribution. The work contributed by a request in a given iteration depends on its current state. During prefill chunk j, for 
+
+j = 1 , . . . , c , the system computes the KV vectors of n/c 
+
+tokens at compute cost βn/c and writes them to the KV cache at memory cost γn/c . Computing attention scores additionally requires reading the KV vectors of the (j − 1) n/c tokens already processed in prior chunks, at cost γ(j − 1) n/c , so the total work for prefill chunk j is W0j = βn/c + γjn/c .The memory term γjn/c grows with j, since early chunks attend over a small KV cache while later chunks read all previously cached tokens, making later chunks progressively more memory-bound. Summing over all c chunks gives the total prefill work 
+
+Wpref =
+
+> c
+
+X
+
+> j=1
+
+W0j = βn + γn c + 1 2 . (1) Throughout the analysis we reserve j for the prefill chunk index, 
+
+k for the decode step index, and i for the system occupancy state of the Markov chain. During decode step k, for k = 1, . . . , m , the system computes the KV vectors of the new output token at cost 
+
+β, reads the KV cache holding all n prefill tokens plus the 
+
+k−1 tokens generated so far at cost γ(n+k−1) , and writes the new token’s KV vectors to the cache at cost γ. The total work for decode step k is therefore Wk = β + γ(n + k). Summing over all m decode steps gives 
+
+Wdec =
+
+> m
+
+X
+
+> k=1
+
+Wk = βm + γm 
+
+
+
+n + m + 1 2
+
+
+
+. (2) The decode work scales with the output length m. Each token incurs compute cost β and an increasing memory cost as the KV cache grows. Summing (1) and (2), the total work over the request’s lifetime is 
+
+Wtotal = Wpref + Wdec 
+
+= β(n + m) + γ
+
+ n(c + 1) 2 + m
+
+
+
+n + m + 1 2
+
+ 
+
+.
+
+(3) The compute term β(n + m) reflects the cost of processing all 
+
+n + m tokens in the forward pass. The memory term has two parts. The first part, γn (c + 1) /2, is the attention read cost accumulated across all prefill chunks, growing with c, and the second part, γm (n + ( m + 1) /2) , is the attention read cost across all decode steps, growing with both n and m.Let δ be the marginal cost of adding a concurrent request to the batch. Under the assumption that each of the c + m states is equally likely, this cost is 
+
+δ = Wtotal 
+
+c + m . (4) When the batch holds X active requests, each contributes mean work δ per iteration, and the iteration time is 
+
+T (X) = α + Xδ. (5) This linearity has been observed experimentally [2], [14], [28]. 
+
+B. State-dependent Markovian analysis 
+
+We now derive two latency metrics, namely time to first token, TTTFT , from request arrival to the first output token, and inter-token latency, TITL , the mean interval between successive output tokens. Define prefill latency, Tp, as the time from admission to the batch until completion of the prefill phase. We treat the prefill phase as building the KV cache, with the first decode step producing the first output token. Thus, TTTFT 
+
+is the sum of the time a request waits in the queue, its prefill time Tp, and one TITL for the first token. 
+
+a) The queueing model: We model the server as a birth– death Markov chain (Figure 1) whose state i ≥ 0 is the number of requests in the system. Up to B requests are served together as a batch, where B is the maximum batch size, and the rest wait in a queue. Arrivals produce upward transitions at rate 
+
+λ in every state. A request in a batch of i has service time 
+
+τ (i) and therefore completes at rate μ(i) = 1 /τ (i). With i
+
+requests present, the down-transition rate is i μ (i), saturating 0 1 2 · · · B B+1 · · ·                        
+
+> λλλλλλμ(1) 2μ(2) Bμ (B)Bμ (B)Bμ (B)
+> Fig. 1. Birth–death Markov chain over the number of requests iin the system. Arrivals occur at rate λand raise the state by one. With μ(i)the per-request departure rate in state i, the total departure rate is i μ (i)while the batch is below the maximum size B, saturating at B μ (B)for i > B .
+
+at B μ (B) for i > B . The rate is load-dependent, so the chain is state-dependent. We derive τ (i) next. 
+
+b) Prefill and inter-token latency: A request completes c
+
+prefill iterations followed by m decode iterations. We follow one such request through the system and call it the tagged request. Each iteration includes the tagged request’s work for its current stage and the baseline plus the work of the other 
+
+i − 1 requests, represented by T (i − 1) . Summing the tagged request’s work over its c prefill iterations gives 
+
+Tp(i) = c T (i − 1) + Wpref . (6) During decode, the inter-token latency is the iteration time due to the other i − 1 requests plus the tagged request’s mean decode-step work 
+
+TITL (i) = T (i − 1) + 1
+
+m
+
+> m
+
+X
+
+> k=1
+
+Wk. (7) 
+
+c) Service time: A request’s service time is its prefill latency plus its m inter-token gaps, 
+
+τ (i) = Tp(i) + m T ITL (i), 1 ≤ i ≤ B. (8) Substituting equations (6) and (7) into (8) and using (3) gives 
+
+τ (i) = ( c + m) T (i − 1) + Wtotal 
+
+= ( c + m) T (i), 1 ≤ i ≤ B. (9) The second line follows from two facts. First, T (i − 1) = 
+
+T (i) − δ, so each of the c + m iterations was charged at δ
+
+below the full iteration time T (i). Second, the request’s total work is Wtotal = ( c + m)δ, which is exactly δ for each of those 
+
+c + m iterations. Adding Wtotal therefore restores the missing 
+
+δ to every iteration, turning each T (i − 1) into a full T (i), so the service time is simply c + m iterations at batch size i.The effective prefill-stage count is also state-dependent. Because the token budget couples it to the batch size, we evaluate c = c(i) from Appendix A at each state i and compute 
+
+Wpref , Wtotal , δ, T (i), and τ (i) = ( c(i) + m)T (i) at that state’s 
+
+c(i), so the telescoping above holds within each state. The chain stays one-dimensional because c(i) is a deterministic function of the occupancy i rather than an added state variable. 
+
+d) Steady state: Let πi be the steady-state probability of finding i requests in the system. Writing 
+
+g(i) = λi μ (i) , i = 1 , 2, . . . , B, 
+
+the balance equations give 
+
+πi =
+
+
+
+π0
+
+Qil=1 g(l), i = 1 , 2, . . . , B, π0
+
+QBl=1 g(l)
+
+
+
+g(B) i−B , i > B, 
+
+with π0 fixed by the normalization P∞ 
+
+> i=0
+
+πi = 1 . When all B
+
+batch slots are occupied, the server completes requests at rate 
+
+B/τ (B). Writing the offered load as 
+
+ρ = λ τ (B)
+
+B , (10) a steady state therefore exists only when ρ < 1, equivalently 
+
+λ < B/τ (B). All steady-state quantities below assume this condition, and we refer to ρ as the utilization throughout. 
+
+e) Latency metrics: Requests are queued only when more than B are present, which happens with probability Pw =P 
+
+> i>B
+
+πi. We summarize the chain by the mean number of requests in the system N , the mean number in service (or mean batch size) X, and the mean number waiting QN =
+
+> ∞
+
+X
+
+> i=0
+
+i π i,X =
+
+> B
+
+X
+
+> i=0
+
+i π i + B P w,Q = N − X. 
+
+Here X is the steady-state mean of the batch occupancy i used above, so it plays the role of the working batch size. The mean 
+
+N adds the requests that are merely waiting. By Little’s law the mean service time and mean waiting time are S = X/λ 
+
+and W = Q/λ , respectively. The mean batch size X also gives the average iteration time, 
+
+T (X) = α + Xδ. 
+
+From τ (i) = ( c+m)T (i) and S = X/λ , the mean service time obeys X ≈ λ(c + m)T (X), which solves to T (X) ≈ α/ (1 −
+
+λ(c + m)δ) when the batch is unsaturated. Its denominator requires λ(c + m)δ = λW total < 1.Because Tp(i) is linear in i at a fixed chunk count, the mean prefill latency PBi=0 πi Tp(i) + Pw Tp(B) is approximated by 
+
+Tp(X). Evaluating the metrics at the mean batch size X and its chunk count c(X), we obtain 
+
+TITL (X) = S − Tp(X)
+
+m ,
+
+and 
+
+TTTFT = W + Tp(X) + TITL (X).
+
+We read TITL off the mean service time as (S − Tp(X)) /m 
+
+rather than from equation (7) directly. The two agree when the batch is rarely full, and the former also captures how queueing changes the effective batch size. Model α β γ ITL err TTFT err Llama-3.1-8B 6.68 2.01 ×10 −2 5.52 ×10 −5 4.6% 13 .6%          
+
+> Qwen2.5-14B 10 .14 3.68 ×10 −28.48 ×10 −57.9% 15 .8%
+> TABLE I JOINT FIT OF {α, β, γ }IN MILLISECONDS ON A 16-SWEEP GRID FOR TWO MODELS ON AN H100 GPU.
+
+VI. E XPERIMENTAL VALIDATION 
+
+To validate the model, we ran separate experiments on a vLLM [13], [26] server with an H100 GPU, serving Llama-3.1-8B [15] in one experiment and Qwen2.5-14B [23] in the other. GuideLLM [8] generated the traffic. We placed the GuideLLM generator on the same node as the vLLM server to keep network jitter out of the latency measurements. For each experiment, we swept a 4 × 4 grid of mean input and output lengths drawn from {64 , 256 , 1024 , 4096 }, giving 16 length pairs. Within each sweep, every request drew its input and output lengths independently and uniformly from [x/ 2, 3x/ 2] 
+
+around the corresponding mean x. For each sweep, GuideLLM ran a synchronous case (one request at a time), a throughput-saturating case, and eight Poisson-arrival runs with rates spaced between these two extremes. We excluded the throughput-saturating run and the two highest-rate Poisson runs, which approach saturation and require very long traces for stable statistics. This left seven runs per sweep and 112 data points per model. Because the model takes scalar input and output lengths, we evaluated it at each run’s mean input and output token counts. Individual lengths therefore vary by a factor of three within a run, with a coefficient of variation near 0.29 , so the accuracy reported below is obtained under real length dispersion rather than with every request identical. That dispersion is what the homogeneous-batch approximation replaces with a single mean request. We evaluated the queueing model with a per-iteration token budget M = 8192 , which sets the chunk count 
+
+c, and a maximum batch size B = 256 . The value B = 256 
+
+is the vLLM default for max_num_seqs . We impose no smaller administrative cap, allowing the validation to exercise the model’s state-dependent region. Because the excluded runs are the ones nearest saturation, the accuracy figures reported below characterize light to moderate load rather than the regime ρ → 1. This is the regime the model exists to serve. Predicted latency diverges as ρ → 1, so any capacity decision that holds TTFT and ITL to finite targets keeps the server away from saturation, and the steady-state chain is undefined once ρ ≥ 1 in any case. Extending the validation toward saturation with longer traces would locate the accuracy boundary more precisely, and we leave that to future work. A Nelder-Mead optimizer fits the parameters θ = {α, β, γ }
+
+that minimize the per-point sum of squared relative errors in the predicted TTFT and ITL against the measurements. The relative form is scale-free, so the two metrics enter the loss on equal footing despite TTFT being roughly an order of magnitude larger than ITL in absolute terms. We start from 
+
+θ0 = {1, 10 −2, 10 −4}, scaling each parameter by its starting 0 50 100 150 200 250        
+
+> Measured TTFT (ms)
+> 050 100 150 200 250
+> Predicted TTFT (ms)
+> Llama-3.1-8B Qwen2.5-14B
+> 010 20 30
+> Measured ITL (ms)
+> 0510 15 20 25 30
+> Predicted ITL (ms)
+> Fig. 2. Predicted vs. measured TTFT (left) and ITL (right) for Llama-3.1-8B (blue circles) and Qwen2.5-14B (red triangles). The dashed line is y=x.
+
+value to keep the simplex well-conditioned across the orders of magnitude that separate them. The fitted parameters and the relative errors are reported in Table I, where each relative error is the mean absolute deviation divided by the mean measurement. The fitted β and γ are larger for Qwen2.5-14B than for Llama-3.1-8B, consistent with their interpretation as per-token compute and KV-cache access times. Parameter β should track the per-token compute of a forward pass, which is dominated by matrix multiplies through the model weights and therefore scales roughly with the parameter count. The two models have 8B and 14 B parameters, a ratio of 
+
+1.75 , and the fitted β rises from 2.01 × 10 −2 to 3.68 × 10 −2,a ratio of 1.83 . Parameter γ should track the per-token KV-cache access time, which is set by the KV-cache size that the attention kernel reads at each step. The KV-cache size per token is 2 × L × H × dh, where L is the number of transformer layers, H is the number of key-value heads, and dh is the head dimension. The two models share the same number of KV heads ( H = 8 ) and the same head dimension ( dh = 128 ) but have L = 32 and L = 48 layers, respectively, a ratio of 1.5.The fitted γ rises from 5.52 × 10 −5 to 8.48 × 10 −5, a ratio of 
+
+1.54 , in line with this architectural difference. We checked the physical plausibility of these values against H100 specifications. For Llama-3.1-8B, each token in the forward pass costs about 2 × 8 × 10 9 = 16 GFLOPs of work. This assumes that a forward pass costs roughly twice the parameter count in floating-point operations [12]. The H100 has a peak BF16 throughput near 989 TFLOPS. The resulting ideal compute time is about 1.6 × 10 −2 ms per token. The fitted β = 2 .01 × 10 −2 ms corresponds to about 80% of peak compute throughput. A similar check applies to γ. The KV cache stores 2LHd h values per token, which for Llama-3.1-8B in BF16 is about 128 KB per token. The H100 HBM bandwidth is roughly 3.35 TB/s. Reading one cached token at peak bandwidth therefore takes about 3.9 × 10 −5 ms. The fitted γ = 5 .52 × 10 −5 ms corresponds to about 71% of peak bandwidth. This is a check the fit could have failed. The parameters come from latency measurements alone, with no knowledge of the accelerator’s floating-point throughput or memory bandwidth, so nothing in the procedure prevents a three-parameter fit from returning a per-token time faster than the hardware allows, which would leave β and γ without the physical reading the model assigns them. Both instead land on the slow side of their bounds, by margins appropriate to the operation each one represents. For γ that operation is a streaming read. A microbenchmark attains 90% and 91% of nominal peak memory bandwidth on A100 and H800 parts [19], so the 71% implied by γ sits below the practical ceiling, which is where an attention kernel belongs when it reads a KV cache held in noncontiguous blocks rather than streaming contiguous memory. For β that operation is a dense matrix multiplication, since β tracks the per-token cost of the weight matrix multiplications. A tuned kernel for that operation reaches 80% to 90% of peak device throughput while an optimized attention kernel reaches only 50% to 73% [5], and the 80% implied by β sits at the base of that range. Two effects place it at the base of that range rather than the middle, and both work in the same direction. First, the ideal time assumes a forward pass costs twice the parameter count in floating-point operations, which omits attention and normalization work and so understates the work each token requires. Second, β is a fitted aggregate rather than a measured kernel time, so it absorbs per-token costs that the model does not represent separately. Each effect lowers the computed fraction, which makes 80% a lower bound on the achieved matrix-multiply efficiency rather than a point estimate. We read these figures as evidence that β and γ carry the physical meaning the model assigns them, not as measurements of kernel efficiency. A rigorous cross-check against kernel-level profiling is left to future work. Figure 2 compares predicted and measured TTFT and ITL across all 224 points. The points track y = x closely over two orders of magnitude in latency. The largest deviations occur for Qwen2.5-14B in the longest-sequence, highest-load sweeps, where the mean-field approximation is least accurate. VII. P ARAMETER ESTIMATION 
+
+The three model parameters α, β, and γ depend on the model and accelerator pair and on operational conditions that vary at runtime, such as KV-cache pressure and request batching. We therefore estimate them online with a model tuner , the component that keeps the queueing model calibrated from observed operating points as load and traffic mix evolve. Its input arrives on a repeating control cycle , which records, for each managed deployment, the arrival rate λ, the average input and output token counts, and the measured TTFT and ITL, producing one observation per cycle. The tuner uses an initial fit followed by an online sliding-window estimator. On first use of a (model, accelerator) pair, the tuner accumulates a configurable number of initial observations across consecutive control cycles and then runs a Nelder-Mead fit to find the parameter vector θ = {α, β, γ } that jointly minimizes the mean squared relative error in the predicted TTFT and ITL against the recorded observations. Variables are scaled by the starting point so the simplex is well-conditioned across parameters that span several orders of magnitude. We use multiple observations rather than solving for the three parameters from a single observation treated as queue-free. At moderate to high utilization the light-traffic assumption behind that shortcut breaks down and inflates α, because queueing delay present in the measurement is charged to the per-iteration overhead. The multi-observation fit does not require the assumption. After the initial fit, the tuner refreshes its parameter estimate at every control cycle by re-running the same Nelder-Mead optimization on the most recent Nw observations, where Nw
+
+is a configurable window size. The window provides enough operating points for a well-conditioned fit while letting the estimate respond to drift in α, β, or γ caused by changing batch composition, KV-cache occupancy, or background tenancy on the accelerator. The previous parameter vector initializes the next simplex, reducing the per-cycle optimization cost and encouraging continuity across cycles. Observations from saturated cycles are excluded because the steady-state queueing model is undefined when ρ ≥ 1.VIII. M ODEL -B ASED AUTOSCALING CONTROL LOOP 
+
+A. Description of model-based autoscaler 
+
+We embed the queueing model and parameter tuner in a closed-loop autoscaler that adjusts inference-deployment replica counts to meet ITL and TTFT SLOs at minimum cost. The autoscaler is part of the llm-inferno framework [16], [18]. Figure 3 shows its architecture. The framework consists of five cooperating microservices, namely the controller , collector ,
+
+tuner , analyzer (optimizer) , and actuator . They share the queueing models and act on the inference deployments. Each control period has four steps. First, the collector obtains each server’s arrival rate, average input and output token counts, and observed TTFT and ITL, and returns these measurements as serverData . Second, the tuner refreshes θ = {α, β, γ }
+
+for every model–accelerator pair using the techniques of Section VII. Third, the analyzer evaluates candidate replica counts and accelerator assignments with the tuned models and selects the least expensive configuration that satisfies the SLOs. The experiments in this paper exercise only the replica-count decision on a single accelerator type, so the accelerator-assignment path is implemented but not evaluated here. Fourth, the actuator translates the decision into Kubernetes scaling signals. Two configuration inputs constrain this process. The staticData specifies the available accelerator types and service-class SLOs, while the dynamicData records how many accelerators are currently available. IX. C OMPARISON WITH A DECODE -T HROUGHPUT 
+
+ANALYZER 
+
+We compare our queueing-model analyzer with the decode-throughput analyzer from the llm-d workload variant autoscaler (WVA) [17]. We implement its replica-sizing logic in our control loop. Both arms use the same collector and actuator, while each analyzer reads the metrics required by its own calculation. The comparison therefore isolates the two analyzers and does not evaluate the complete WVA system. The analyzer estimates how many decode tokens each replica can produce per second at a target KV-cache utilization. It then Collector   
+
+> Controller
+> Actuator
+> Analyzer
+> staticData
+> Inference Servers
+> deployments
+> decisions
+> serverData signals
+> numReplicas, accelerators,
+> maxBatchSize
+> arrvRates,
+> avgTokens,
+> statistics
+> 1
+> 3
+> 4
+> load
+> specs: accelerators, service classes
+> dynamicData
+> accelerator count
+> Tuner
+> 2
+> tune models
+> queueing models
+> update params analyze
+
+Fig. 3. Autoscaling control loop. Colored rectangles are the five microservices, orange parallelograms are configuration inputs, and ovals are shared state (queueing models and Kubernetes deployments). The numbered labels mark the four steps of one control cycle, namely collect (1), tune (2), optimize (3), and actuate (4). 
+
+compares the replicas’ combined capacity with the decode-token demand from arriving and queued requests and adjusts the replica count when the two differ. To estimate supply at the target utilization, the analyzer first models inter-token latency as a linear function of KV-cache utilization u
+
+dTITL (u) = a u + b, (11) where u ∈ [0 , 1] . Each observation is taken in one control cycle 
+
+t and pairs a measured utilization ut with the corresponding ITL yt. The analyzer estimates both a and b by least squares when its observation window contains at least Nmin points and satisfies max t ut − min t ut ≥ ∆u. This utilization-range condition prevents the analyzer from estimating a slope from points clustered near the same utilization. We call this two-parameter estimate the unconstrained fit. The window retains at most Nmax observations and discards points older than τage or outside [ulo , u hi ]. The lower utilization bound excludes near-idle measurements that provide little information about the slope, while the upper bound excludes measurements taken after the server is saturated. Because the ITL relationship also depends on request shape, the analyzer clears the window when the mean input or output length changes by more than the relative tolerance ϵshape .When the window cannot support the unconstrained fit, the analyzer uses the replicas’ observations from the current control cycle to estimate only the slope while holding the intercept at bp.We call this the constrained fit. Before the first unconstrained fit, bp is the hardware baseline b0, which represents near-zero-load ITL. After an unconstrained fit, the analyzer retains its fitted intercept as bp. If neither fit can be evaluated, our implementation keeps the current replica count. Configuration parameters of the throughput analyzer and their default values are provided in Table II. Using this ITL model, the analyzer calculates decode-token supply. For mean input and output lengths n and m, and a hit rate h for the reuse of cached prefixes shared across requests, the analyzer estimates the average KV-cache footprint of each active request as 
+
+Kreq = n(1 − h) + m
+
+2 . (12) The factor of one half accounts for the KV cache growing during decoding. At the target utilization usat , a replica with space for Kmax tokens supports 
+
+Nsat = usat Kmax 
+
+Kreq 
+
+, (13) active requests and supplies decode tokens at the rate 
+
+Crep = Nsat 
+
+dTITL (usat ) . (14) When dTITL is expressed in seconds per token, Crep is the decode capacity of one replica in tokens per second. Let r denote the number of ready replicas and q the provisioned replica count. The corresponding capacities are Cready = rC rep and 
+
+Cprov = qC rep , also in decode tokens per second. The analyzer uses provisioned capacity to avoid repeated scale-up requests while replicas start and ready capacity to prevent replicas that are not yet serving from creating a scale-down signal. The analyzer also checks whether the decode rate implied by the fitted model agrees with the rate reported by the serving engine. If their relative difference exceeds ϵrate for 
+
+Nver consecutive control cycles at utilization u ≥ uver , it clears the observation window and uses the constrained fit in the next cycle. The last fitted intercept is retained. The demand estimate has an arrival term and a queued-work term. At arrival rate λ each request eventually emits m tokens. A standing queue of Qw requests is assigned a drain horizon of ϕ dTITL (usat )m seconds. Multiplying the queued requests by 
+
+m tokens and dividing by this horizon cancels m, giving 
+
+D = λ m + Qw
+
+ϕ dTITL (usat ) . (15) Here λ is measured in requests per second, so D is decode-token demand in tokens per second. The thresholds ηup and ηdn are dimensionless fractions of capacity. The products ηup Cprov and ηdn Cready are therefore demand thresholds, both measured in tokens per second. The analyzer first tests whether D > η up Cprov and scales up if provisioned capacity is insufficient. Only when this test fails does it consider scale-down. It removes replicas if 
+
+D < η dn Cready and otherwise keeps the current allocation. Thus, the scale-down branch below requires both that no scale-up is pending and that ready capacity has sufficient slack. Our single-variant implementation selects 
+
+q′ =
+
+
+
+max 
+
+
+
+1,
+
+ Dηup Crep 
+
+ 
+
+, D > η up Cprov ,
+
+max 
+
+
+
+1, q − r +
+
+ Dηdn Crep 
+
+ 
+
+, D≤ηup Cprov ,D<η dn Cready ,q, otherwise. (16) The q − r term preserves provisioned replicas that are not yet ready. The lower bound of one replica belongs to our actuation TABLE II CONFIGURATION USED FOR THE THROUGHPUT ANALYZER , GROUPED BY ROLE . A LL VALUES EXCEPT h ARE PINNED UPSTREAM DEFAULTS [17]. W ESET h = 0 BY DISABLING PREFIX CACHING IN BOTH ARMS .Role Parameters and values ITL fit b0 = 6 ms, Nmin = 10 , Nmax = 20 , ∆u = 0 .30 ,                      
+
+> τage = 30 min, [ulo , u hi ] = [0 .15 ,0.85]
+> Fit reset ϵshape = 0 .20 ,ϵrate = 15% ,Nver = 3 ,uver = 0 .30
+> Supply and demand usat = 0 .85 ,ϕ= 2 .0,h= 0
+> Scaling ηup = 0 .85 ,ηdn = 0 .70
+
+harness, which cannot reactivate a deployment from zero without the ITL and KV-utilization measurements produced by a serving replica. The decode-throughput analyzer uses neither a TTFT nor an ITL SLO target. The fitted ITL calibrates decode-token supply rather than serving as a latency constraint. Input length affects 
+
+Kreq and therefore the estimated supply, but the analyzer does not translate input length into prefill latency. It accounts for an existing backlog through (15), but does not predict queueing delay or TTFT. The decode-throughput analyzer depends on fifteen con-figuration parameters across calibration, consistency checks, demand estimation, and scaling. WVA supplies these values as defaults, so users need not configure them individually. Nevertheless, the settings interact in determining when the ITL model is fitted or reset and when replicas are added or removed. We retain the pinned upstream defaults without tuning them for either scenario. Table II groups the settings by their role. Our implementation reproduces the decode-throughput an-alyzer described above with the configuration in Table II. During each control cycle, the evaluator reads ITL from vLLM’s histogram counters, while the collector obtains KV-cache utilization, waiting-request count, cache capacity, and the cumulative number of generated tokens from vLLM. The offered arrival rate is the rate configured at the load generator. The analyzer records one deployment-level observation per cycle. It averages utilization across replicas, sums their waiting-request counts and generated-token increments, and computes a throughput-weighted mean ITL. The ready count r counts ready replicas whose metric scrapes succeed, while q is the last replica count written by the actuator. The cache capacity Kmax 
+
+is the value reported by vLLM when it initializes the cache. Because the throughput analyzer performs its own calibration in (11), the parameter tuner of Section VII is inactive in the baseline arm. The analyzer returns only a replica count. We retain the current accelerator assignment and batch limit so that the comparison changes only the replica-sizing decision. Both arms serve Llama-3.1-8B with vLLM 0.21.0 on an OpenShift cluster of H100 GPUs, using one GPU per replica. Prefix caching is disabled, and vLLM reports Kmax ≈ 449 ,200 
+
+KV-cache tokens per replica. Each run uses a 30-second measurement interval and the 44-minute load profile in Table IV. A control cycle spans this measurement window together with metric collection and actuation, so one cycle occupies about 42 seconds of wall-clock time rather than the 30 seconds of                                                       
+
+> TABLE III THE TWO COMPARISON SCENARIOS . SLO TARGETS WERE CHOSEN BY EVALUATING THE MODEL OF SECTION VSO THAT THE INTENDED METRIC BINDS WITHIN THE LOAD RANGE .TTFT-bound ITL-bound input length n1024 128
+> output length m512 2048
+> TTTFT SLO (ms) 50 200
+> TITL SLO (ms) 25 13
+> arrival-rate range (RPM) 300 –1200 120 –480
+> max batch size B256 256
+> TABLE IV THE 44-MINUTE LOAD PROFILE . R ATES ARE THE SCENARIO -SPECIFIC BASELINE RATES OF TABLE III MULTIPLIED BY THE INDICATED FACTOR .Segment Duration Rate multiplier Baseline hold 5 min 1.0
+> Ramp up 3 min 1.0→2.5
+> Mid-load hold 8 min 2.5
+> Ramp up 3 min 2.5→4.0
+> Peak hold 8 min 4.0
+> Ramp down 3 min 4.0→2.5
+> Mid-load hold 6 min 2.5
+> Ramp down 3 min 2.5→1.0
+> Baseline hold 5 min 1.0
+
+the window alone. Within a scenario, both arms use the same controller image, configuration, and load-generator seed. Runs stop when the wall-clock profile ends rather than after a fixed cycle count, producing 63 or 64 complete control cycles per arm. We set the maximum batch size to B = 256 in vLLM and both analyzers, matching the offline validation in Section VI. Because vLLM admits at most B active requests and (12) assigns each request an average footprint of Kreq tokens, the KV-cache utilization that the analyzer itself models cannot exceed min {1, BK req /K max }, which is 0.73 for the TTFT-bound request shape and 0.66 for the ITL-bound one. These are ceilings on the analyzer’s own estimate rather than on the measured occupancy, since (12) charges every request the time-averaged footprint m/ 2 while requests late in generation hold more. The measured utilizations reported below can therefore sit slightly above the corresponding modeled ceiling. Table III summarizes the two scenarios. The long-prompt scenario is TTFT-bound. The short-prompt, long-generation scenario is ITL-bound and therefore evaluates the throughput analyzer on the metric calibrated by (11). During these runs, the throughput analyzer used its un-constrained fit in 27 of 64 TTFT-bound cycles and used the constrained fit throughout the ITL-bound scenario. The fitting band is the reason it relied on the constrained fit so often. Only 21 of the 64 TTFT-bound cycles and 26 of the 64 ITL-bound cycles produced a utilization sample inside [ulo , u hi ], since most cycles ran below ulo , and the ITL-bound samples span only 0.32 in total, barely more than the ∆u spread that the unconstrained fit requires. Figure 4 shows both scenarios, and Table V summarizes their outcomes. The results show a capacity–latency tradeoff. In the TTFT-bound scenario, the queueing-model analyzer exceeds the target in 7 of 64 cycles, compared with 22 of 64 for the throughput 10 2
+
+10 3
+
+10 4
+
+> TTFT (ms, log)
+> SLO = 50 ms
+
+Scenario A, TTFT-bound 
+
+10 1
+
+> ITL (ms, log)
+> SLO = 13 ms
+
+Scenario B, ITL-bound 
+
+0.0 0.2 0.4 0.6 0.8 1.0 
+
+> KV utilization
+> queueing model throughput analyzer
+> usat
+> ulo
+> throughput analyzer, queue
+
+0.0 0.2 0.4 0.6 0.8 1.0 
+
+> queue = 0 (both)
+> queueing model throughput analyzer
+> usat
+> ulo
+
+0 10 20 30 40 
+
+elapsed time (min) 
+
+12345
+
+> replicas
+> queueing model throughput analyzer arrival rate
+
+0 10 20 30 40 
+
+elapsed time (min) 
+
+1.0 1.5 2.0 2.5 3.0 queueing model throughput analyzer arrival rate 
+
+050 100 150 200 400 600 800 1000 1200 0.0 0.2 0.4 0.6 0.8 1.0 
+
+> requests waiting
+
+200 300 400 
+
+> arrival rate (RPM)
+
+queueing model throughput analyzer Fig. 4. Analyzer comparison on a real H100 vLLM deployment. Left column is the TTFT-bound scenario and right column the ITL-bound one. Top row is the binding latency metric against its SLO, middle row is KV-cache utilization with queue depth on the right axis, and bottom row is the ready replica count with offered arrival rate on the right axis. In the TTFT-bound scenario, the throughput arm’s queue buildup coincides with its TTFT excursion. Both queues remain empty in the ITL-bound scenario. 
+
+analyzer. In the ITL-bound scenario, the corresponding counts are 0 of 63 and 5 of 64 . Across both scenarios the queueing-model analyzer therefore misses a target in 7 of its 127 cycles against 27 of 128 , the union in each arm coinciding with its TTFT-bound count. The throughput analyzer uses 4% and 
+
+28% fewer mean replicas, 1.81 versus 1.88 in the TTFT-bound scenario and 1.64 versus 2.27 in the ITL-bound scenario. These comparisons use cycle-mean latency, not tail latency within a cycle. The middle row of Figure 4 shows the operating regimes behind these outcomes. In the TTFT-bound scenario, the queueing-model arm reaches KV utilization 0.40 with no queued requests, whereas the throughput arm reaches 0.74 
+
+and a queue of 194 requests. That queue buildup coincides with the large TTFT excursion. In the ITL-bound scenario, both queues remain empty, but the throughput arm reaches KV utilization 0.48 while the queueing arm remains at or below 
+
+0.15 . Thus queueing explains the largest excursion in the TTFT-bound scenario but not the five exceedances in the ITL-bound scenario. In the latter case, the throughput analyzer runs with TABLE V ANALYZER COMPARISON . L ATENCIES ARE CYCLE MEANS IN MILLISECONDS . M EDIANS AND 90 TH PERCENTILES ARE ACROSS CONTROL CYCLES . R EPLICA COUNTS ARE PROVISIONED REPLICAS .queueing model throughput analyzer                                         
+
+> TTFT-bound scenario, TTFT SLO = 50 ms
+> mean provisioned replicas 1.88 1.81
+> peak provisioned replicas 35
+> TTFT median 43 .844 .5
+> TTFT 90th percentile 50 .685 .1
+> TTFT worst 73 .47,767
+> cycles over TTFT SLO 7/64 22 /64
+> cycles over ITL SLO ( 25 )0/64 3/64
+> KV utilization range 0.05 –0.40 0.04 –0.74
+> peak queue depth 0194
+> ITL-bound scenario, ITL SLO = 13 ms
+> mean provisioned replicas 2.27 1.64
+> peak provisioned replicas 32
+> ITL median 8.39.0
+> ITL 90th percentile 9.312 .7
+> ITL worst 9.517 .2
+> cycles over ITL SLO 0/63 5/64
+> cycles over TTFT SLO ( 200 )0/63 0/64
+> KV utilization range 0.04 –0.15 0.06 –0.48
+> peak queue depth 00
+
+fewer replicas and higher occupancy, which increases batch iteration time even without a standing queue. The ITL-bound scenario also shows the difference between calibrating with ITL and constraining ITL. The throughput analyzer uses the fitted ITL to calculate decode-token capacity in (14), whereas the queueing-model analyzer uses the ITL target as a constraint when choosing replicas. The runs also provide a closed-loop accuracy check. Against measurements from the two queueing arms, the median relative errors of predicted TTFT are 3.0% and 4.7% , and those of predicted ITL are 4.3% and 8.2% , for the TTFT-bound and ITL-bound scenarios, respectively. These runs use the same 
+
+B = 256 as the offline validation, while the online tuner refreshes the parameters from the observations gathered under each fixed request shape. Each arm is a single run, so the replica and violation counts carry no variance estimate, and repeated trials are left to future work. Two things bound what that costs. The closed-loop accuracy figures above are per-cycle comparisons across the 
+
+127 control cycles of the two queueing arms rather than one measurement each. The difference in outcomes is also traced to an identified mechanism, namely the queue that forms once the throughput arm drives KV utilization to 0.74 , rather than inferred from the size of the gap alone. Moreover, we evaluate the upstream decode-throughput analyzer inside our collector and direct actuator, not the complete WVA system. Consequently, our experiment obtains the arrival rate from the load generator and the queue length from vLLM rather than from WVA’s routing and scheduling components. The comparison therefore characterizes these two analyzers under the stated harness and defaults, not every deployment or configuration of the upstream system. X. D ISCUSSION AND FUTURE WORK 
+
+The current model deliberately represents every request by the workload’s mean input and output lengths. This keeps the Markov chain one-dimensional because its state records only the number of requests in the system. Our validation varies individual lengths uniformly within [x/ 2, 3x/ 2] of each configured mean, but the closed-loop comparison uses one fixed input–output length pair per scenario. It therefore does not establish accuracy for workloads with wide or multimodal length distributions, where short and long requests may share the same batch. A trace-driven evaluation can test this boundary directly. If the mean-length approximation becomes inaccurate, the state can be extended with a small number of sequence-length classes rather than one class per request length. The same extension could use the occupancy probabilities {πi} to predict latency distributions and allow the controller to enforce percentile rather than only mean TTFT and ITL targets. The validation also covers light to moderate load under Poisson arrivals. We omit the runs nearest saturation because their queueing estimates require longer traces to stabilize. In that regime, the predicted delay is also more sensitive to the mean-occupancy approximation in Section V-B, which replaces the occupancy distribution with its mean X. Longer experiments near saturation, followed by bursty and production-trace arrivals, would show when this approximation ceases to be adequate. They would also reveal whether arrival variability must become an explicit model input instead of representing demand by its mean rate alone. Our analytical model replaces the occupancy distribution and request-length mixture with mean values. A discrete-event simulator would test the effect of these approximations by using the same measured per-iteration costs while explicitly replaying each request arrival, batch admission, prefill chunk, decode step, and departure. It would provide a higher-fidelity model of queue and batch evolution without requiring a new GPU experiment for every candidate allocation. A controlled study could compare both approaches with held-out GPU traces and with a black-box regressor trained on the same measurements. Prediction error, robustness after workload shifts, and evaluation time per candidate allocation would show when the analytical model’s compact form is preferable to the additional detail or flexibility of these alternatives. The analyzer comparison also identifies a specific control-design issue. In the ITL-bound scenario, neither analyzer observes a waiting queue, yet the decode-throughput analyzer operates at higher KV-cache utilization and exceeds the ITL target in five cycles. Larger active batches increase iteration time before a queue forms. Consequently, using measured ITL to calculate decode capacity does not ensure that a future allocation will satisfy an ITL target. A hybrid analyzer could retain the throughput estimate while rejecting allocations whose predicted TTFT or ITL exceeds the corresponding target. We held the decode-throughput analyzer’s fifteen settings at their upstream defaults and continuously re-estimated the queueing model’s three parameters. The current experiments do not show how errors or alternate choices in either set affect scaling decisions. A sensitivity study should vary the calibration-window requirements, reset criteria, utilization targets, and queue-drain factor alongside perturbations of α,
+
+β, and γ. This would identify which settings materially affect each analyzer and whether a smaller configuration interface can retain the same behavior. Finally, the closed-loop comparison uses one model– accelerator pair and one run per scenario. Repeating each profile would quantify run-to-run variation, while additional models, accelerators, and request-length distributions would test how well the conclusions generalize. Both analyzers also respond to the measured arrival rate. A forecast-driven controller could instead evaluate the capacity needed one replica-startup delay ahead and begin loading weights before an expected increase in traffic. XI. C ONCLUSION 
+
+We developed a tractable, parametrized queueing model of an LLM inference server. It predicts the two primary latency metrics, TTTFT and TITL , from three model–accelerator-specific parameters, namely α, β, and γ. The model combines mean-value analysis of per-iteration work with a state-dependent Markov chain over the active batch size and supports both unlimited and chunked prefill. We validated the model against measurements from a vLLM [13], [26] server running Llama-3.1-8B and Qwen2.5-14B on an H100 GPU, obtaining ITL relative errors below 8% and TTFT relative errors below 
+
+16% over a grid of input and output token distributions and request rates spanning light to moderate load. We estimated the parameters from observed latencies using both an initial, multi-observation Nelder-Mead fit and an online sliding-window fit that refreshes at every control cycle. We then built an SLO-driven autoscaling controller that combines the model tuner with a queueing-model analyzer and deployed it on an H100 vLLM cluster. We compared it against a decode-throughput analyzer under one ramping load profile applied at two scenario-specific rate ranges, while holding the rest of the control loop fixed. The throughput analyzer provisioned fewer replicas on average in both scenarios. The queueing-model analyzer recorded 7/64 TTFT-SLO violations versus 
+
+22 /64 for the throughput analyzer in the TTFT-bound scenario, and 0/63 ITL-SLO violations versus 5/64 in the ITL-bound scenario. These results show a capacity–latency tradeoff under the evaluated workloads rather than universal dominance of either analyzer. The tradeoff is asymmetric in one respect. The decode-throughput analyzer accepts no latency target, so its replica counts follow from sizing decode capacity rather than from meeting a stated TTFT or ITL bound, whereas the queueing-model analyzer treats both targets as constraints. At the time of writing, our queue analyzer and model tuner are available in experimental mode as components of the llm-d project [16], where they support SLO-aware inference orchestration. The extensions outlined in Section X would broaden the workload and operating regimes covered by the model while preserving its role as a tractable predictor inside the control loop. REFERENCES [1] A. Agrawal, N. Kedia, A. Panwar, J. Mohan, N. Kwatra, B. Gulavani, A. Tumanov, and R. Ramjee. Taming Throughput-Latency tradeoff in LLM inference with Sarathi-Serve. In 18th USENIX Symposium on Operating Systems Design and Implementation (OSDI 24) , pages 117–134, Santa Clara, CA, July 2024. USENIX Association. [2] R. Ao, G. Luo, D. Simchi-Levi, and X. Wang. Optimizing LLM inference: Fluid-guided online scheduling with memory constraints, 2026. arXiv:2504.11320. [3] S. Chen, Z. Jia, S. Khan, A. Krishnamurthy, and P. B. Gibbons. SLOs-Serve: Optimized serving of multi-SLO LLMs, 2025. arXiv:2504.08784. [4] Y. Chen, W. Cui, H. Zhao, Z. Xu, X. Fan, X. Chen, Y. Zhou, S. Sun, B. He, and Q. Chen. Towards high-goodput LLM serving with prefill-decode multiplexing, 2026. arXiv:2504.14489. [5] T. Dao. FlashAttention-2: Faster attention with better parallelism and work partitioning, 2023. arXiv:2307.08691. [6] A. Gandhi, P. Dube, A. Karve, A. Kochut, and L. Zhang. Adaptive, model-driven autoscaling for cloud applications. In 11th International Conference on Autonomic Computing (ICAC ’14) , pages 57–64. USENIX Association, 2014. [7] T. Griggs, X. Liu, J. Yu, D. Kim, W.-L. Chiang, A. Cheung, and I. Stoica. M´ elange: Cost efficient large language model serving by exploiting GPU heterogeneity. arXiv preprint arXiv:2404.14527 , 2024. [8] GuideLLM: SLO-aware benchmarking and evaluation platform for optimizing real-world LLM inference. https://github .com/vllm-project/ guidellm, 2024. Accessed 2026-08-24. [9] A. Gujarati, S. Elnikety, Y. He, K. S. McKinley, and B. B. Brandenburg. Swayam: distributed autoscaling to meet SLAs of machine learning inference services with resource efficiency. In Proceedings of the 18th ACM/IFIP/USENIX Middleware Conference , Middleware ’17, pages 109– 120. ACM, 2017. [10] Y. Inoue. Queueing analysis of GPU-based inference servers with dynamic batching: A closed-form characterization. Perform. Eval. ,147(C), May 2021. [11] S. Jaiswal, K. Jain, Y. Simmhan, A. Parayil, A. Mallick, R. Wang, R. St. Amant, C. Bansal, V. R¨ uhle, A. Kulkarni, S. Kofsky, and S. Rajmohan. SageServe: Optimizing LLM serving on cloud data centers with forecast aware auto-scaling. Proceedings of the ACM on Measurement and Analysis of Computing Systems , 9(3):1–24, 2025. [12] J. Kaplan, S. McCandlish, T. Henighan, T. B. Brown, B. Chess, R. Child, S. Gray, A. Radford, J. Wu, and D. Amodei. Scaling laws for neural language models, 2020. arXiv:2001.08361. [13] W. Kwon, Z. Li, S. Zhuang, Y. Sheng, L. Zheng, C. H. Yu, J. E. Gonzalez, H. Zhang, and I. Stoica. Efficient memory management for large language model serving with PagedAttention. In Proceedings of the 29th Symposium on Operating Systems Principles (SOSP) , pages 611–626, 2023. [14] M. Łazuka, A. Anghel, and T. Parnell. LLM-Pilot: Characterize and optimize performance of your LLM inference services. In SC24: International Conference for High Performance Computing, Networking, Storage and Analysis , pages 1–18. IEEE, 2024. [15] Llama Team, AI @ Meta. The Llama 3 herd of models, 2024. arXiv:2407.21783. [16] llm-d. https://github .com/llm-d/llm-d, 2025. Accessed 2026-08-24. [17] llm-d workload variant autoscaler. https://github .com/llm-d/llm-d-workload-variant-autoscaler, 2026. Commit bebbe88 , accessed 2026-08-13. [18] llm-inferno: Globally optimized accelerator assignment and scaling with service objectives. https://github .com/llm-inferno, 2025. Accessed 2026-08-24. [19] W. Luo, R. Fan, Z. Li, D. Du, Q. Wang, and X. Chu. Benchmarking and dissecting the Nvidia Hopper GPU architecture, 2024. arXiv:2402.13499. [20] M. Mitzenmacher and R. Shahout. Queueing, predictions, and llms: Challenges and open problems, 2025. arXiv:2503.07545. [21] C. Nie, R. Fonseca, and Z. Liu. Aladdin: Joint placement and scaling for SLO-aware LLM serving, 2024. arXiv:2405.06856. [22] P. Patel, E. Choukse, C. Zhang, A. Shah, ´ I. Goiri, S. Maleki, and R. Bianchini. Splitwise: Efficient generative LLM inference using phase splitting. In 2024 ACM/IEEE 51st Annual International Symposium on Computer Architecture (ISCA) , pages 118–132, 2024. [23] Qwen Team. Qwen2.5 technical report, 2025. arXiv:2412.15115. [24] J. Stojkovic, C. Zhang, ´ I. Goiri, J. Torrellas, and E. Choukse. Dy-namoLLM: Designing LLM inference clusters for performance and energy efficiency. In 2025 IEEE International Symposium on High Performance Computer Architecture (HPCA) , pages 1348–1362, 2025. [25] B. Turkkan, P. Murali, P. Harsha, R. Arora, G. Vanloo, and C. Narayanaswami. Optimal workload placement on multi-instance GPUs, 2024. arXiv:2409.06646. [26] vLLM: A high-throughput and memory-efficient inference and serving engine for LLMs. https://github .com/vllm-project/vllm, 2023. Accessed 2026-08-24. [27] Y. Wang, Y. Chen, Z. Li, X. Kang, Y. Fang, Y. Zhou, Y. Zheng, Z. Tang, X. He, R. Guo, X. Wang, Q. Wang, A. C. Zhou, and X. Chu. BurstGPT: A real-world workload dataset to optimize LLM serving systems, 2024. arXiv:2401.17644. [28] Y. Yang, Y. Xu, and L. Jiao. A queueing theoretic perspective on low-latency LLM inference with variable token length, 2025. arXiv:2407.05347. [29] G.-I. Yu, J. S. Jeong, G.-W. Kim, S. Kim, and B.-G. Chun. Orca: A distributed serving system for Transformer-Based generative models. In     
+
+> 16th USENIX Symposium on Operating Systems Design and Implemen-tation (OSDI 22) , pages 521–538, Carlsbad, CA, July 2022. USENIX Association. [30] W. Zhang, Z. Wu, Y. Mu, R. Ning, B. Liu, N. Sarda, M. Lee, and F. Lai. JITServe: SLO-aware LLM serving with imprecise request information. In 23rd USENIX Symposium on Networked Systems Design and Implementation (NSDI 26) , pages 825–848, Renton, WA, May 2026. USENIX Association. [31] K. Zhu, H. Shi, L. Xu, J. Shan, A. Krishnamurthy, B. Kasikci, and L. Xie. PolyServe: Efficient multi-SLO serving at scale, 2025. arXiv:2507.17769.
+
+APPENDIX AMEAN -FIELD APPROXIMATION OF PREFILL ITERATIONS 
+
+We use a conditional mean-field approximation to determine the effective number of equal-sized prefill iterations at a fixed total occupancy i. This quantity, denoted c(i), is an analytical service-time approximation rather than the literal number of chunks selected by the runtime scheduler. Let M
+
+be the maximum number of tokens processed per iteration, and condition on one tagged request being in one of its prefill iterations. The other i − 1 active requests form the background population. Under the homogeneous-request approximation, a back-ground request spends c effective iterations in prefill and m
+
+iterations in decode. At an iteration boundary, its mean token contribution is therefore 
+
+cc + mnc + mc + m = n + mc + m .
+
+We replace the random aggregate contribution of the back-ground requests by its expectation and approximate each prefill iteration of the tagged request by n/c tokens. The resulting conditional mean token load is 
+
+Λi(c) = ( i − 1) n + mc + m + nc . (17) The mean-field token-budget constraint is Λi(c) ≤ M . Because 
+
+Λi(c) is strictly decreasing for c > 0, the smallest feasible integer is obtained from the unique positive solution of Λi(c) = 
+
+M . Multiplying by c(c + m) yields 
+
+M c 2 + Φ ic − nm = 0 , Φi = m(M − i + 1) − in. 
+
+Hence the positive real-valued threshold is 
+
+cmin (i) = −Φi + pΦ2 
+
+> i
+
++ 4 M nm 
+
+2M , (18) and the effective prefill-iteration count used at occupancy i is 
+
+c(i) = ⌈cmin (i)⌉ . (19) The analysis assumes 1 ≤ i ≤ B ≤ M , so at least one token per active request can be accommodated. Since pΦ2 
+
+> i
+
++ 4 M nm > 
+
+|Φi|, the threshold in (18) is strictly positive and (19) is at least one. The limiting cases provide useful checks. With only the tagged request present ( i = 1 ), equations (18) and (19) reduce to c(1) = ⌈n/M ⌉. For long outputs, the background population is decode-dominated and consumes approximately i − 1 tokens per iteration, giving c(i) ≈ ⌈ n/ (M − i + 1) ⌉. For long inputs, 
+
+Φi ≈ − in and c(i) ≈ ⌈ in/M ⌉, reflecting competition among all i active requests for the token budget. APPENDIX BTHE UNLIMITED CASE AS A SPECIAL CASE 
+
+From equations (18) and (19), when M → ∞ , cmin (i) → 0+
+
+and therefore c(i) = 1 . The state space then reduces to A =
+
+{0, 1, . . . , m } with m + 1 equally likely states. Equation (1) reduces to Wpref c=1 = ( β + γ)n, equation (3) to Wtotal c=1 =
+
+β(n + m) + γ(m + 1)( n + m/ 2) , and equation (4) to δ c=1 =
+
+β(n + m)/(m + 1) + γ(n + m/ 2) . Within the model, setting 
+
+c = 1 saves γ(c−1) n/ 2 of repeated KV reads, so the unlimited case minimizes latency. Chunking is imposed only when M
+
+cannot fit an n-token prefill. This ordering follows from the model averaging each request’s work over its iterations. A larger c lowers δ and therefore each individual iteration time, but it raises the total work Wtotal and hence the service time 
+
+τ (i). What the averaging does not represent is the single long iteration that a full-prompt prefill produces inside a mixed batch, which is the practical motivation for chunking, so the model should not be read as an argument against it.
