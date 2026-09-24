@@ -1,0 +1,253 @@
+Title: Mamba-Family State-Space Model Kernels on a Programmable CGLA
+
+URL Source: https://arxiv.org/pdf/2609.27437v1
+
+Published Time: Thu, 24 Sep 2026 00:39:39 GMT
+
+Number of Pages: 6
+
+Markdown Content:
+# Mamba-Family State-Space Model Kernels on a Programmable CGLA 
+
+Takuto Ando, Yasuhiko Nakashima 
+
+Nara Institute of Science and Technology, 8916-5 Takayama-cho, Ikoma, Nara 630-0192, Japan 
+
+ando.takuto.an5@naist.ac.jp 
+
+Abstract —Edge and embedded inference is constrained by power and data movement. Mamba-family state-space models replace attention with sequence-linear recurrence, but their inference path combines dense projections, short-reduction SSD kernels, and recurrent-state updates. This paper maps these kernel groups onto IMAX, a programmable CPU-Grounded Linear Array (CGLA), and measures them from kernel execution to token-level integration. Projection kernels match the long-reduction IMAX pipeline, whereas SSD Step-1 is limited by short reductions and kernel-boundary overheads. Mamba-130M token-level integration identifies projection GEMV as the decode bottleneck. These results show that programmable CGLAs fit long-reduction projection kernels, while SSD and decode-time projection support require boundary reduction and persistent-weight execution. 
+
+Index Terms —Large language model, State space model, Mamba-2, CPU-Grounded Linear Array, Edge inference 
+
+I. I NTRODUCTION 
+
+Edge deployment of sequence models is constrained by inference power and data movement. Attention-based models are costly for long contexts on edge systems. State-space models (SSMs), including Mamba and Mamba-2 [1], [2], replace attention with sequence-linear recurrence. The hardware question is not whether an SSM layer is one accelerator kernel. A Mamba-2 layer mixes long dense projec-tions, short-reduction SSD kernels, and sequential recurrent-state updates. This mix stresses a programmable CGLA with-out requiring a fixed-function Mamba datapath. Although these kernels are mostly MAC-dominated, they differ in reduction length, pipeline occupancy, data movement, and recurrence dependency. We implement and measure the main Mamba-family ker-nel groups on IMAX [3]. IMAX is a programmable CPU-Grounded Linear Array (CGLA) that couples a host CPU to a one-dimensional streaming pipeline of processing elements (PEs) and Local Memory Modules (LMMs). The same execu-tion stack is used for projection, SSD Step-1, recurrent-state update, and token generation. The measurements report IMAX execution time, DMA-inclusive total time, an ARM Cortex-A72 software reference, and token-integration behavior. The focus is kernel suitability and bottleneck diagnosis rather than peak GPU competition. The main contributions of this paper are as follows:  
+
+> •
+
+We implement projection, SSD Step-1, Hadamard, and recurrent-state kernels on IMAX and measure them under a common profiling path.  
+
+> •
+
+We characterize which programmable-CGLA paths match long-reduction, short-reduction, and recurrent Mamba kernels.  
+
+> •
+
+We integrate an IMAX offload path in Mamba-130M autoregressive decoding and identify projection GEMV, rather than the recurrent state update, as the dominant decode bottleneck on the current programmable CGLA stack. The remainder of this paper is organized as follows. Sec-tion II reviews related work in Mamba hardware and pro-grammable dataflows. Section III introduces Mamba-370M, IMAX, and the measurement scope. Section IV describes the IMAX-Mamba mapping and the kernel-characterization setup. Section V reports performance against the ARM software reference and separates measured FPGA timing from ASIC model context. Section VI concludes the paper and outlines future work. II. R ELATED WORK 
+
+Dedicated accelerators such as TPU [13], DianNao [14], and Eyeriss [15] specialize in matrix-dominated inference workloads. Coarse-grained reconfigurable architectures pur-sue programmable spatial fabrics for loop kernels [16]–[18]. IMAX belongs to the programmable spatial-fabric line. Our prior IMAX studies evaluate GEMM, LLM, and Whisper workloads on a programmable CGLA [3], [11], [12]. Table I summarizes how the Mamba/SSM accelerators differ from the programmable-CGLA diagnostic scope of this work. Mamba-focused hardware studies include LightMamba [4] and FastMamba [5] for quantized FPGA dataflow. MARCA [6] and MARCA-v2 [7] target Mamba operator specialization. MambaOPU [8] targets SSD with an FPGA overlay and operator fusion. SpecMamba [9] targets SSM-specific speculative decoding. Each study modifies the model, the datapath, or the autoregressive execution strategy. EpochCore [10] adds dedicated processing elements for the recurrent integration alongside a systolic GEMM array. Fine-grained fusion studies also identify operator fusion and scheduling as central issues for SSM acceleration [19]. These designs treat Mamba inference as more than a GEMM problem. Long reductions, state recurrences, element-wise operations, and memory traffic expose different datapath needs. Unlike Mamba-specific FPGA and ASIC accelerators, this work treats Mamba inference as a diagnostic workload for an arXiv:2609.27437v1 [cs.AR] 23 Sep 2026 TABLE I POSITION OF THIS WORK RELATIVE TO MAMBA /SSM ACCELERATORS . T HIS PAPER IS A PROGRAMMABLE -CGLA DIAGNOSTIC STUDY RATHER THAN A DEDICATED MAMBA ACCELERATOR DESIGN .
+
+Work Datapath Primary strategy Contrast to this work 
+
+LightMamba [4] FPGA dataflow Quantization and hardware co-design Optimizes a Mamba-specific deployment path. FastMamba [5] FPGA dataflow Quantization and approximate nonlinear units Optimizes a Mamba-specific deployment path. MARCA [6] ASIC Mamba operator specialization Adds architecture support for the SSM operator. MARCA-v2 [7] ASIC Sparse element-wise support for SSMs Adds metadata and sparsity support for Mamba operators. MambaOPU [8] FPGA overlay SSD operator fusion and sparse skipping Builds an SSD-specific overlay path. SpecMamba [9] FPGA Speculative decoding for Mamba inference Changes the autoregressive execution strategy. EpochCore [10] Systolic + rec. PE Dedicated recurrence support with GEMM Adds recurrent-state processing elements. Our IMAX prior work [3], [11], [12] Programmable CGLA Linear pipeline for GEMM, LLM, and ASR workloads Does not evaluate Mamba kernels. 
+
+This work Programmable CGLA Diagnostic implementation without fixed-function SSM datapaths Separates projection, SSD, recurrence, and decode bottlenecks on one stack. TABLE II MAMBA -2 PHASES ON MAMBA -370M ( dMODEL =1 ,024 , dINNER =2 ,048 ,
+
+H=32 , dHEAD =64 , N =128 , Q=64 ). T HE TABLE LISTS KERNEL SHAPE ,
+
+> REDUCTION LENGTH
+
+, AND PIPELINE -FIT PREDICTION FOR A 64-STAGE 
+
+IMAX LANE .
+
+Phase Kernel Red. len. 64-stage fit 
+
+in-proj dense GEMM L=1 ,024 long, deep occupancy out-proj dense GEMM L=2 ,048 long, deep occupancy SSD Step-1 GEMM1+GEMM2 N, Q ≤128 short, setup-cost dominated Step-3 MV recurrence N (sequential) sequential dependency 
+
+existing programmable CGLA stack. It does so without model changes or fixed-function SSM units. The goal is to identify which Mamba phases fit the CGLA pipeline and which phases are limited by short reductions, kernel boundaries, or token-level projection GEMV. III. B ACKGROUND 
+
+A. Mamba-2 Layer with Three Kernel Shapes 
+
+The Mamba-2 model [2] reformulates selective SSMs as a Structured State Space Duality (SSD). A single layer has model dimension dmodel , inner dimension dinner = 2 dmodel , H
+
+heads of size dhead , state size N , and chunk size Q. It proceeds in the phases summarized in Table II. The projection phases are the dense in-proj and out-proj GEMMs. The input u ∈ RT ×dmodel is linearly projected to the concatenated features [z, x, B, C, ∆] .
+
+[z, x, B, C, ∆] = u W in , (1) where Win ∈ Rdmodel ×din and din = 2 dinner +2 N +H for standard SSD with ngroups = 1 . For Mamba-370M, the inner dimension of this GEMM is L = dmodel = 1 ,024 . The output projection is a second dense GEMM. 
+
+y = ( o ⊙ σ(z)) Wout , (2) with Wout ∈ Rdinner ×dmodel and inner dimension L = dinner =2,048 for Mamba-370M. Equations (1) and (2) are the dense projection kernels mapped to the IMAX GEMM path in Section IV. SSD Step-1 handles intra-chunk computation after the se-quence is divided into chunks of length Q.
+
+M = ( C · B⊤) ⊙ Λ (GEMM1 + Hadamard) , (3) 
+
+Y = M · X (GEMM2) . (4) In Eq. (3), C and B denote Q × N state factors, Λ denotes a Q × Q lower-triangular mask, X denotes the Q × dhead 
+
+input block, and Y denotes the Q × dhead output block. Here, ⊙ denotes element-wise multiplication. GEMM1 has reduction length N , while GEMM2 has reduction length Q.Both reductions are short relative to the 64-stage IMAX FMA chain. The measured Step-1 sweep uses these short reductions, and Section V reports the representative N =Q=64 kernel configuration separately from the full-layer FLOP. Step-3 updates the recurrent state h ∈ RN ×dhead sequentially across chunks. 
+
+hc = Achc−1 + B⊤ 
+
+> c
+
+Xc, (5) where Ac is an input-dependent diagonal matrix. The chunk dependency prevents parallel execution across chunks. This phase is therefore sequential. 
+
+B. IMAX Architecture and Compilation Model 
+
+IMAX is a programmable CPU-Grounded Linear Array accelerator. The evaluated IMAX3 prototype implements one CGLA lane on an AMD Versal Premium VPK180 FPGA with a 64-stage linear chain of PEs and a reported 512 KiB per-lane LMM capacity at 145 MHz. Fig. 1 shows the IMAX3 prototype, where the host ARM Cortex-A72 in the PS coordinates DMA and kernel launch for the PL array. Fig. 2 shows one compute lane with alternating PEs and LMMs in a one-dimensional array. The measured kernels execute on one 64-stage spatial pipeline. Each PE is assigned one static stage by the conv-c2d compiler and acts as an operand-load, arithmetic, or drain/store stage. The compiler maps the outer row loop, the reduction loop, and the output-column loop to these PE-stage assignments. Following the Fig. 1. IMAX3 FPGA prototype. The PL supports an eight-lane IMAX configuration, while the measurements in this paper use one CGLA lane.  
+
+> Fig. 2. Internal structure of one IMAX compute lane. PEs and LMMs are arranged alternately in a one-dimensional array. An execution data path connects adjacent PEs and a memory data path connects each PE to its neighboring LMMs.
+
+execution breakdown used in published IMAX studies, we dis-tinguish configuration, transfer, execution (EXEC), and write-back phases when discussing latency. Kernels with many small DMA transactions can retain PE-side speedup while showing limited end-to-end gain, so EXEC and DMA-inclusive total times are reported separately. 
+
+C. IMAX GEMM Mapping 
+
+The published IMAX GEMM kernel maps (M1 ×L)×(L×
+
+M2) onto the linear pipeline [3]. The decode-time projection GEMV used later in this paper corresponds to the special case 
+
+M2 = 1 . It first separates the M1 output rows, then advances the inner-product accumulation along the reduction dimension 
+
+L, and writes each output value when the accumulation over 
+
+L completes. In the projection kernels used in this paper, operand load, FMA-based partial-sum update, and result drain are distributed across a 64-stage one-dimensional pipeline. When L is long, these stages can remain active for many cycles. Published IMAX measurements report high pipeline occupancy when M1, L, and M2 are all at least 480 [3]. At L = 64 , the number of partial-sum updates is small, so pipeline fill, drain, and data-movement overhead become relatively large. IV. M APPING MAMBA -2 K ERNELS ONTO IMAX This section describes the IMAX mappings used for the projection, SSD Step-1, and recurrent-state measurements. 
+
+A. Projection GEMM (in-proj and out-proj) 
+
+Both projection phases reuse the standard IMAX GEMM template [3]. The outer row dimension is assigned across the available parallel work units. Accumulation then proceeds along the projection inner dimension. The output-feature di-mension is generated in the final loop. As summarized in the top panel of Fig. 3, the projection path uses stages 0– 63. Stages 2–61 form the 60-stage FMA chain. Stage 1loads operands. Stage 62 performs the final add and store. Stages 0 and 63 provide iteration control. The mapping reuses the existing GEMM datapath and changes only compile-time constants such as RMGRP , W, and BSTEP .
+
+B. SSD Step-1 Kernels 
+
+Equation (3) is mapped to three IMAX kernel calls. 1) GEMM1 , R ← C · B⊤ (Q × N ) × (N × Q) →
+
+(Q × Q)2) Hadamard , R ← R ⊙ Λ (element-wise masking) (a) Projection dense GEMM 0
+
+> control
+
+1
+
+> load
+
+2-61 
+
+> 60-stage FMA chain
+
+62 
+
+> store
+
+63 
+
+> loop
+
+(b) Step-1 custom kernels     
+
+> (b1) GEMM1
+> R=C⋅BT
+
+0
+
+> control
+
+1
+
+> load C, B T
+
+2
+
+> seed FML
+
+3-5 
+
+> 3-stage FMA chain
+
+6
+
+> final add / store R
+> 7 stages
+> (b2) Hadamard
+> R = R * Lambda
+
+0
+
+> control
+
+1
+
+> load R, Lambda
+
+2    
+
+> 2× FML + store R
+> 3 stages
+> (b3) GEMM2
+> Y=R⋅X
+
+0
+
+> control
+
+1
+
+> Load R, X
+
+2
+
+> seed FML
+
+3-5 
+
+> 3-stage FMA chain
+
+6
+
+> final add / store Y
+> 7 stages
+> Symbols: C = GEMM1 input, BT = transposed state factor, R = intermediate Q×Q matrix, Lambda = mask, X = GEMM2 input, Y = Step-1 output
+
+Fig. 3. Representative PE-stage view of the generated IMAX kernels used in the projection and Step-1 measurements. (Top) Projection occupies stages 0–63 with a 60-stage FMA chain. (Bottom) Step-1 uses shallow GEMM1, Hadamard, and GEMM2 kernels. Stage 63 is an iteration-control stage in the projection GEMM template, not an SSM recurrence loop. Stage numbers are compiler-generated, and physical PE IDs are placement-dependent. 
+
+3) GEMM2 , Y ← R · X (Q × Q) × (Q × d) → (Q × d)The bottom panel of Fig. 3 uses seven-stage pipelines for GEMM1 and GEMM2 and a three-stage pipeline for Hadamard. This section defines the mapping. Section V reports the measured boundary cost. For a single representative head, M1 = Q = 64 and the reduction length is only 64 in the measured Step-1 sweep. We therefore increase the outer batch axis to amortize per-launch cost. The aggregated outer dimension is 
+
+M1 = Nheads × Q. (6) The evaluation distinguishes the nominal all-head point from the largest sweep point. The concatenated C matrix remains row-major and follows the standard IMAX GEMM addressing rule. The IMAX Hadamard kernel reads R and Λ from LMM, computes R ← R ⊙ Λ, and writes R back in-place using two parallel OP_FML lanes ( Q/ 2 pairs per row). The original two-kernel path adds a DMA round trip because GEMM1 writes R
+
+to DRAM, the CPU applies the Hadamard mask, and GEMM2 reads the result again. Our imax_hadamard() path keeps this update on IMAX and writes the masked result back in place. Each call processes one row of the M1 × Q result matrix and advances the row pointer in the outer C loop. This organization avoids the conv-c2d restriction that load and store base addresses remain compile-time constants. Each iteration processes Q/ 2 element pairs with two parallel OP_FML lanes, giving 0.25 FLOP/byte arithmetic intensity and removing one DMA round trip per chunk. The measured boundary overhead still motivates a fused Hadamard–GEMM2 path. Section V 
+
+TABLE III PER -LAYER FLOP DISTRIBUTION , M AMBA -370M ( dMODEL = 1 ,024 ,
+
+dINNER = 2 ,048 , H = 32 , dHEAD = 64 , N = 128 , Q = 64 ). 
+
+Phase FLOP expression T =512 (MF) in-proj 2T d model din 4,598 out-proj 2T d inner dmodel 2,147 SSD Step-1 GEMM1 2T HQN 268 SSD Step-1 GEMM2 2T HQd 134 Step-3 (state) 2T N d head H 268 
+
+Total 7,415 Proj. share 91% 
+
+reports per-kernel EXEC and wall-clock time for all three IMAX kernels. 
+
+C. Step-3 Recurrent State Update 
+
+The inter-chunk recurrence (5) is a small N × d matrix-vector product per chunk with sequential dependency, so transfer scheduling rather than peak compute determines its cost. For Mamba-370M, the per-head shape is only 128 × 64 ,which is too small to saturate the 64-stage FMA pipeline. For the layer-level composition, Step-3 stays on the host CPU. Section V-B reports IMAX recurrent-state runs as a separate transfer-scheduling study. If more of this phase is moved to IMAX, double-buffered LMM use and ping-pong scheduling are the main next directions. During decode at T = 1,projection GEMV becomes less compute dense, but transfer overhead still dominates the current FPGA implementation. TABLE IV EVALUATION PLATFORMS AND ASIC MODEL CONTEXT .                         
+
+> Device Host / CPU Role Process Clock setting Memory Measurement scope (nm) (MHz or mode) ARM Cortex-A72 (on Versal) Cortex-A72 CPU reference 71400 DDR4 Measured software time
+> IMAX FPGA prototype Cortex-A72 Kernel and dispatch path 7145 8 GB + 4 GB DDR4 Measured FPGA time
+> IMAX ASIC model –Context only 28 840 –Design Compiler core estimate
+
+V. E XPERIMENTS 
+
+A. Experimental Setup 
+
+Table III reports nominal Mamba-370M FLOP account-ing with Q=64 . Table IV lists the platform scope used in the evaluation. The ARM Cortex-A72 software path is the correctness and CPU-timing reference. IMAX latency and correctness are measured on the FPGA prototype. The ASIC context in Table IV comes from synthesis of the CGLA core with Synopsys Design Compiler and a 28 nm standard-cell flow, with a reported maximum clock of 840 MHz [3], [20]. It is not a silicon or board-power measurement and excludes the host CPU, DDR, DMA, and board components. Consequently, this paper does not use that core estimate for cross-platform system-energy claims. All kernels use FP32. The projection values are means of three archived runs. Their DMA-inclusive min–max spread is below 0.1% for both projection kernels. The Step-1 and token-generation values are representative runs, and no confidence interval is claimed for them. Outputs are checked against the ARM Cortex-A72 software reference. The recurrent-state measurements report end-to-end IMAX time because that kernel performs inline DMA. The layer composition uses a pipeline-aligned timing setting, T =120 and Q=60 . Mamba-370M is used for layer-level kernel characterization, and Mamba-130M is used for the token-generation run. 
+
+B. IMAX Kernel Measurements 
+
+Projection GEMM. Projection GEMM latency is measured using the IMAX GEMM kernel [3]. Dimensions are rounded to pipeline-aligned values ( L to a multiple of 60 and M2 to a mul-tiple of 8). For in-proj, the IMAX run records 37.8 ms EXEC and 1.17 s DMA-inclusive total time, so DMA dominates the measured total time rather than arithmetic. The archived repeated projection runs have a min–max spread below 0.1% in DMA-inclusive total time for both Mamba-370M projection kernels. Projection is the long-reduction CGLA fit in this workload, while DMA remains the current in-proj cost. 
+
+SSD Step-1. We sweep M1 from 64 to 4,096 with the representative Step-1 kernel setting N = Q = dhead = 64 . The unfused three-kernel Step-1 path is not end-to-end beneficial. GEMM1, Hadamard, and GEMM2 record 7,068, 1,178, and 7,052 μ s EXEC, respectively ( Q=N =dhead =64 , batch size 16 ,FP32), but boundary transfers raise the aggregate wall-clock time to 48,922 μ s. The matched CPU reference in this rerun takes 19,407 μ s. In the separate single-GEMM sweep, the EXEC component achieves a 1.43 × speedup over the ARM Cortex-A72 reference at the largest sweep point ( M1=4 ,096 ), but this component-only result does not overcome boundary and transfer overheads. The limiting factors are short reduc-tions and kernel boundaries. Fusing Hadamard with GEMM2 is the next optimization target. Representative recurrent-state runs use Q=64 , N =128 , and 
+
+dhead =64 with inline DMA. Block autotuning changes wall-clock time from 29.3 to 28.1 ms for Mamba-370M and from 124.4 to 107.0 ms for Mamba-1.4B relative to the default block setting. The resulting speedup range is 1.04–1.16 ×, and 
+
+max |∆| = 3 .46 × 10 −3 between IMAX and CPU reference outputs. The 1.04 × Mamba-370M change should be treated as no measurable gain without run-to-run variance support. The 1.16 × Mamba-1.4B trend identifies Step-3 as a transfer-scheduling target rather than a compute-bound one. 
+
+C. Phase Bottlenecks and Scope 
+
+At the pipeline-aligned timing setting T =120 , Q=60 , pro-jection remains the dominant FLOP component and dominates IMAX EXEC time. SSD Step-1 remains a smaller FLOP component and is limited by short reductions and kernel boundaries. The comparison is therefore made against the co-located ARM reference from the same kernel programs rather than against a GPU system with a different power boundary. Because only FP32 is evaluated, the results do not establish the behavior of FP16, BF16, or quantized edge-inference paths. 
+
+D. Token-Level Integration with IMAX Offload 
+
+We place the IMAX offload path inside a standalone C Mamba-130M autoregressive decoding program on the IMAX FPGA platform. The program loads the model weights and tokenizer, runs greedy decoding, and dispatches the profiled kernels to IMAX. The run preserves the ARM Cortex-A72 software-reference greedy token sequence and reports zero output errors. Throughput reaches 0.345 tokens/s for the 200-token generation run, and Fig. 4 identifies projection GEMV as the bottleneck. This integration run has no matched end-to-end CPU or GPU throughput measurement under the same program and run conditions, so it is not used to claim system-level acceleration. In-proj and out-proj account for 66.8% and 32.7% of decode time, while x-proj, dt-proj, state update, and convolution are each below 0.3%. Future work will evaluate persistent trans-posed weights, wider row grouping, Step-1 kernel fusion, and reduced-precision execution under matched end-to-end ARM Cortex-A72 and Jetson AGX Orin baselines. These directions Fig. 4. Mamba-130M decode-stage time share for the IMAX hardware-dispatch path. In-proj and out-proj account for 66.8% and 32.7% of the time, while each remaining segment is below 0.3%. 
+
+target projection GEMV and transfer boundaries rather than the SSM state update itself. VI. C ONCLUSION 
+
+This paper measured Mamba-family SSM kernels on the IMAX programmable CGLA from kernel execution to token generation. The results separate long-reduction projections that fit the pipeline, unfused SSD Step-1 limited by short reductions and kernel boundaries, and autoregressive decoding dominated by projection GEMV. The single-lane Mamba-130M run reaches 0.345 tokens/s while preserving the ARM reference greedy token sequence. The unfused Step-1 path is slower than its ARM reference after boundary transfers, and the token run has no matched end-to-end throughput base-line. DMA-inclusive execution and kernel-boundary overheads limit the FPGA prototype, so this is a suitability and bottleneck study rather than a demonstrated system-level acceleration. The FP32-only evaluation and core-only ASIC model do not support reduced-precision or board-energy conclusions. Future work will evaluate persistent projection weights, wider row grouping, Step-1 fusion, and reduced precision with matched system-level baselines. ACKNOWLEDGMENT 
+
+This work was supported by the JST-ALCA-Next Program (Grant Number JPMJAN23F4) and JSPS KAKENHI (Grant No. 22H00515). We also acknowledge the activities of VDEC, The University of Tokyo, in collaboration with NIHON SYN-OPSYS G.K. REFERENCES [1] A. Gu and T. Dao, “Mamba: Linear-time sequence modeling with selective state spaces,” in Proc. Conference on Language Modeling (COLM) , 2024. [2] T. Dao and A. Gu, “Transformers are SSMs: Generalized models and efficient algorithms through structured state space duality,” in Proc. 41st Int. Conf. Machine Learning (ICML) , ser. Proc. Machine Learning Research, vol. 235, 2024, pp. 10 041–10 071. [3] T. Akabe, V. Trung Duong LE, and Y. Nakashima, “IMAX: A power-efficient multilevel pipelined CGLA and applications,” IEEE Access ,vol. 13, pp. 31 899–31 911, 2025. [4] R. Wei, S. Xu, L. Zhong, Z. Yang, Q. Guo, Y. Wang, R. Wang, and M. Li, “LightMamba: Efficient Mamba acceleration on FPGA with quantization and hardware co-design,” in Proc. Design, Automation and Test in Europe (DATE) , 2025. [5] A. Wang, H. Shao, S. Ma, and Z. Wang, “FastMamba: A high-speed and efficient Mamba accelerator on FPGA with accurate quantization,” in Proc. IEEE Computer Society Annual Symposium on VLSI (ISVLSI) ,2025. [6] J. Li, S. Huang, J. Xu, J. Liu, L. Ding, N. Xu, and G. Dai, “MARCA: Mamba accelerator with reconfigurable architecture,” in 
+
+Proc. IEEE/ACM Int. Conf. Computer-Aided Design (ICCAD) , 2024, pp. 1–9, doi: 10.1145/3676536.3676798. [7] J. Li, S. Huang, J. Xu, J. Liu, N. Xu, and G. Dai, “MARCA-v2: Mamba accelerator with complementary state space model sparsity and reconfigurable architecture,” IEEE Trans. Comput.-Aided Design Integr. Circuits Syst. , 2025, Early Access, doi: 10.1109/TCAD.2025.3624278. [8] S. Lu, X. Yu, T. Zhao, S. Miao, X. Sheng, C. Wu, L. Zhao, T.-J. Lin, and L. He, “MambaOPU: An FPGA overlay processor for state-space-duality-based Mamba models,” in Proc. ACM/IEEE Design Automation Conference (DAC) , 2025, pp. 1–7. [9] L. Zhong, S. Xu, H. Wen, T. Xie, Q. Guo, Y. Wang, and M. Li, “SpecMamba: Accelerating Mamba inference on FPGA with speculative decoding,” in Proc. IEEE/ACM International Conference on Computer-Aided Design (ICCAD) , 2025, pp. 1–9. [10] S. Raja, C. Demirkiran, A. Sarkar, M. Popovic, and A. Joshi, “Sys-tolic array-based accelerator for structured state-space models,” 2025, arXiv:2507.21394. [11] T. Ando, Y. Eto, A. Takeuchi, and Y. Nakashima, “Efficient kernel mapping and comprehensive system evaluation of LLM acceleration on a CGLA,” IEEE Access , vol. 13, pp. 199 631–199 646, 2025. [12] T. Ando, Y. Eto, A. Takeuchi, and Y. Nakashima, “Energy-efficient hardware acceleration of Whisper ASR on a CGLA,” in Proc. 13th Int. Symp. Computing and Networking (CANDAR) , 2025, pp. 85–91. [13] N. P. Jouppi, G. Kurian, S. Li, P. Ma, R. Nagarajan, L. Nai, N. Patil, S. Subramanian, A. Swing, B. Towles, C. Young, X. Zhou, Z. Zhou, and D. Patterson, “TPU v4: An optically reconfigurable supercomputer for machine learning with hardware support for embeddings,” in Proc. 50th Annu. Int. Symp. Computer Architecture (ISCA) , 2023, pp. 1147–1160, doi: 10.1145/3579371.3589350. [14] T. Chen, Z. Du, N. Sun, J. Wang, C. Wu, Y. Chen, and O. Temam, “Di-anNao: A Small-Footprint High-Throughput Accelerator for Ubiquitous Machine-Learning,” in Proceedings of the 19th International Conference on Architectural Support for Programming Languages and Operating Systems (ASPLOS) , 2014, pp. 269–284. [15] Y.-H. Chen, J. Emer, and V. Sze, “Eyeriss: A spatial architecture for energy-efficient dataflow for convolutional neural networks,” in 
+
+Proceedings of the 43rd Annual International Symposium on Computer Architecture , 2016, pp. 367–379. [16] A. Podobas, K. Sano, and S. Matsuoka, “A survey on coarse-grained reconfigurable architectures from a performance perspective,” IEEE Access , vol. 8, pp. 146 719–146 743, 2020. [17] C. Torng, P. Pan, Y. Ou, C. Tan, and C. Batten, “Ultra-elastic CGRAs for irregular loop specialization,” in Proc. IEEE Int. Symp. High-Perform. Comput. Archit. (HPCA) , 2021, pp. 412–425. [18] J. Lee and J. Lee, “Specializing CGRAs for light-weight convolutional neural networks,” IEEE Trans. Comput.-Aided Design Integr. Circuits Syst. , vol. 41, no. 10, pp. 3387–3399, 2022. [19] R. Geens, A. Symons, and M. Verhelst, “Fine-grained fusion: The missing piece in area-efficient state space model accelera-tion,” in Proc. 34th International Conference on Parallel Architec-tures and Compilation Techniques (PACT) , 2025, pp. 281–291, doi: 10.1109/PACT65351.2025.00034. [20] Synopsys, Inc., “Design Compiler: Concurrent Timing, Area, Power, and Test Optimization,” [Online]. Available: https://www.synopsys.com/ implementation-and-signoff/rtl-synthesis-test/dc-ultra.html, accessed: May 25, 2025.
