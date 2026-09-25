@@ -1,0 +1,381 @@
+Title: Cross-Model Autoscaling for Shared LLM Serving
+
+URL Source: https://arxiv.org/pdf/2609.29160v1
+
+Published Time: Fri, 25 Sep 2026 00:42:45 GMT
+
+Number of Pages: 11
+
+Markdown Content:
+# Cross-Model Autoscaling for Shared LLM Serving 
+
+Xin Zhang, Xianyan Xie, Zhen He, Xijin Yin, Xingtong Lin, Bangbo Liang, Zequn Cheng, Peihao Huang, Guo Chen ∗
+
+Hunan University 
+
+Abstract —Multi-model LLM serving is moving toward shared MaaS clusters, where co-hosted models compete for a fixed GPU budget while each model experiences time-varying demand and must satisfy its own latency SLO. Existing LLM autoscalers remain largely model-local: their signals expose local runtime activity or delayed latency outcomes, and their scale-up or provisioning decisions do not directly determine how shared capacity should be allocated across competing models. We present the Token-service-share Rebalancing Engine (TRE), a control-plane framework for hot-switched multi-model LLM serving. TRE introduces Token Service Share (TSS), a calibrated, demand-normalized signal that estimates effective token service per active or queued request and yields a com-parable health score across heterogeneous models and SLO classes. Guided by TSS, TRE coordinates bounded receiver– donor capacity movement under a fixed GPU budget: it separates fast rescue from slower rebalancing and incrementally reallocates active replicas toward models with the largest calibrated service deficits. We implement TRE on a Kubernetes-based hot-switch serv-ing stack without modifying the inference scheduler. Across seven LLM serving traces, TRE reduces P95 end-to-end la-tency by 11.9–79.0% and P99 latency by 12.5–72.6% com-pared with a state-of-the-art KV-cache-based reactive autoscaler running on the same hot-switch runtime. The gains hold on both targeted stress probes and production-derived con-versation/code traces, where TRE reduces P95/P99 latency by 50.8/63.7% and 79.0/72.6%, respectively. These results show that effective hot-switched autoscaling requires not only fast replica actuation, but also calibrated service-deficit sig-nals and coordinated cross-model capacity arbitration. Our code and artifacts are available at https://github.com/zxzx9898/ Token-service-share_Rebalancing_Engine. 
+
+Index Terms —large language model serving, autoscaling, hot switching, resource reallocation, Kubernetes 
+
+I. I NTRODUCTION 
+
+Online LLM serving is moving from single-model clusters to shared Model-as-a-Service (MaaS) platforms, where a fixed GPU pool hosts multiple heterogeneous models, each with time-varying demand and its own latency service-level objec-tive (SLO) [1]–[5]. This shared setting makes autoscaling no longer a per-model sizing problem: when the cluster is fully occupied, scaling up one model requires reclaiming capac-ity from another. The fundamental objective is therefore maximizing overall SLO attainment under a fixed GPU budget—a global optimization that existing autoscalers cannot perform because they are designed to be model-local. 
+
+Reactive systems like Llumnix [6] trigger scaling from local runtime pressure (e.g., KV-cache utilization, queue length), 
+
+> ∗Guo Chen is the corresponding author.
+
+while prediction-based systems like PreServe [7] provision replicas independently for each model’s forecasted load. These approaches work when idle GPUs are available, but under contention, multiple models may simultaneously demand more resources with no mechanism to arbitrate which deficit is more urgent. The root cause is the lack of a cross-model comparable service-deficit signal : queue length, throughput, and cache-side metrics each expose only a local symptom and do not preserve a stable ordering of service health across heterogeneous models (§II-B). Without such a signal, the controller cannot rank which model most needs capacity in service of the global SLO objective. Realizing global SLO-aware autoscaling raises two core challenges. First, how can the controller construct a unified deficit ranking across models with different sizes, SLO classes, and prefill/decode mixtures? Raw token throughput and queue length are not directly comparable: a 7B model’s tokens per second and a 70B model’s tokens per second represent differ-ent effective service, and an interactive SLO class demands a different service share than a best-effort class. A small model can report high throughput while being deeply under-served, or a large model can show low queue pressure while its prefill backlog silently degrades TTFT. Second, even with a comparable deficit ranking, how should the controller execute cross-model capacity reallocation under a fixed budget? It must choose a receiver, identify an eligible donor, and pace each transfer so that capacity moves respond to persistent service deficits rather than short-lived fluctuations. We present the Token-service-share Rebalancing Engine (TRE), a control-plane framework for hot-switched multi-model LLM serving. To address the first challenge, we intro-duce Token Service Share (TSS), which estimates the effective token service available per outstanding request and normalizes it against a model-specific healthy boundary calibrated from its SLO. This normalization is the key: by expressing each model’s service state as a fraction of its own minimum healthy requirement, TSS places heterogeneous models on a single comparable scale —a score of 0.5 means the model is receiving half the per-request service it needs to meet its SLO, regardless of whether it is a 7B chat model or a 70B code model. To address the second challenge, TRE coordinates receiver– donor capacity movement through two mechanisms: (1) dual-speed control, which separates fast rescue for critical SLO risk from slower deficit-guided rebalancing; and (2) bounded pairwise transfer, which incrementally moves capacity from a selected donor to the most under-served receiver. Together, arXiv:2609.29160v1 [cs.DC] 24 Sep 2026 these mechanisms determine when reallocation is needed and limit how quickly capacity moves across models. We implement TRE on a Kubernetes-based hot-switch serv-ing stack (AIBrix + vLLM) without modifying the inference scheduler [8]. Across seven LLM serving traces, TRE reduces P95 end-to-end latency by 11.9–79.0% and P99 latency by 12.5–72.6% versus a state-of-the-art KV-cache-based reac-tive autoscaler. On production-derived conversation and code traces, the gains reach 50.8/63.7% and 79.0/72.6% (P95/P99), respectively. This paper makes the following contributions:  
+
+> •
+
+We propose TSS, a demand-normalized service-deficit signal that enables cross-model comparison of effective token service, providing the missing abstraction for global SLO-aware autoscaling.  
+
+> •
+
+We design TRE, a TSS-guided control framework that combines dual-speed control with bounded pairwise re-allocation to coordinate cross-model capacity movement under a fixed GPU budget.  
+
+> •
+
+We evaluate TRE on a hot-switched serving stack, demonstrating consistent tail-latency improvements across synthetic stress probes and production-derived workloads. II. B ACKGROUND AND MOTIVATION 
+
+A. SLOs, Token-Level Demand, and Hot Switching Online LLM serving objectives: In shared LLM serving platforms, SLOs specify latency bounds that inference requests must meet. Common SLO metrics include time-to-first-token (TTFT), time-per-output-token (TPOT), and end-to-end (E2E) latency, typically enforced as tail percentiles (e.g., P95 TTFT 
+
+≤ X, P95 TPOT ≤ Y ) [9]. Each hosted model may have its own SLO class: an interactive chat model demands low TTFT, while a code-generation model may tolerate higher TTFT but require low TPOT. When these models share a fixed GPU pool, the cluster-wide objective is to maximize overall SLO attainment by reducing violations of each model’s latency bounds rather than optimizing any model in isolation. 
+
+Token-level demand variability: In LLM inference, the computational cost of a request is not fixed at arrival; it is determined by the token-level service the request ultimately consumes. A request spans two distinct phases: the prefill phase processes input prompt tokens mostly in parallel, while the decode phase generates output tokens autoregressively. The output length—and thus the total decode work—is unknown until generation completes. Furthermore, the runtime main-tains a KV cache for ongoing sequences, and multiplexes re-quests through continuous batching and chunked prefill [10]– [12]. Continuous batching and chunked prefill further couple requests inside a replica. Consequently, two windows with similar arrival rates or request counts can impose very different demand on the same replica set: one may contain short decode sequences, while another may contain long prompts or a growing waiting population. Autoscaling must therefore reason jointly about token-level service progress and the active 0.0 0.4 0.8      
+
+> SLO health
+> 0200 400
+> Queue pressure (reqs)  Queue KV Cache
+> 012345
+> Trace rank (SLO health high to low)
+> 02000
+> Tokens/s  Prefill Decode
+> 0.0 0.5 1.0
+> KV Cache (%)
+> Fig. 1. Fixed-capacity trace segments ordered from healthier to more degraded SLO states. Queue pressure denotes the running-plus-waiting request popu-lation, and KV-cache pressure denotes raw cache usage. Queue population, cache pressure, and prefill/decode throughput do not change monotonically with the SLO-derived health ordering; red circles mark representative non-monotone points. These local signals change non-monotonically because they expose different runtime symptoms rather than a common service state.
+
+and waiting requests competing for that service, rather than using request count or arrival rate as a sufficient load proxy. 
+
+Hot switching: Cold replica startup requires container startup, runtime initialization, model-weight loading, memory planning, and execution-state warmup, which is too slow for burst-scale control on large models. Hot switching avoids this full cold-start path. It keeps a previously initialized replica in a warm-sleep state and later reactivates it by restoring reusable runtime state and reloading evicted weights. In this paper, hot switching is the mechanism that makes second-scale changes in routable serving capacity practical [13], [14]. 
+
+B. Why Existing Signals Fail as Cross-Model Control Signals 
+
+In a hot-switched multi-model cluster, the controller must decide where active serving capacity should move before tail-latency violations have accumulated. This decision requires a state that ranks the urgency of SLO violation across heteroge-neous models. 
+
+Local runtime signals do not preserve cross-model ordering: 
+
+Queue length, throughput, KV-cache utilization, and GPU utilization are useful diagnostics, but each exposes only one runtime symptom. None directly states whether a model’s active and waiting requests are receiving sufficient effective service, nor whether that model is more urgently under-served than another. A small model can report high throughput while being deeply under-served, or a large model can show low queue pressure while its prefill backlog silently degrades TTFT. Raw token throughput and queue length are not directly comparable across models: a 7B model’s tokens per second and a 70B model’s tokens per second represent different effective service, and an interactive SLO class demands a different service share than a best-effort class. We test this requirement using fixed-capacity trace segments that vary load intensity and prefill/decode mixture while ex-cluding controller feedback. We order the segments by SLO-derived health, from healthier to more degraded service. A 012       
+
+> Request (tokens/s)
+> 1e4 025 50 75 100
+> Time (s)
+> 0123
+> TTFT (ms)
+> 1e4
+> Server-side Client-side Trace load Fig. 2. Latency is a delayed outcome under a controlled prefill-pressure step. The retrospective client-side TTFT attributes delay to request arrival time, while the online server-side metric observes TTFT only after first-token service occurs.
+
+signal suitable for cross-model allocation should preserve this ordering: a model ranked as more urgent should face greater SLO-violation pressure. Figure 1 shows that the running-plus-waiting queue population, KV-cache pressure, and pre-fill/decode throughput all vary non-monotonically with this ordering. The red open circles mark points where a local signal disagrees with the health ordering, showing that these metrics cannot by themselves produce a reliable health ranking. In one prefill-heavy/decode-heavy pair, the prefill-heavy case violates the target SLO while the decode-heavy case remains healthy, yet their raw running-plus-waiting queues are similar (40.6 vs. 42.4 requests). The waiting-only raw inverse is 1.0 in every window for both traces, which only proves that the original average waiting queue is at most one request under the signal’s floor, not that it is exactly one. Their KV-cache pressure is also close in the raw trace (0.236% vs. 0.121%). The degraded prefill-heavy case reports higher prefill TPS (2852.1 vs. 831.5 tokens/s) and lower decode TPS (1002.5 vs. 1540.0 tokens/s), illustrating why aggregate token progress alone obscures the workload regime. These raw signals cannot serve as a shared scale for comparing which model’s SLO violation is more urgent. 
+
+Latency metrics are outcomes, not control states: TTFT, TPOT, and tail E2E latency are the ultimate objectives that the system seeks to bound. However, they are observed only after requests have waited, received tokens, or completed service. Latency therefore confirms that degradation has occurred, but it is a poor early state for preemptive resource reallocation. To make this timing issue concrete, Figure 2 compares two TTFT views under a controlled prefill-pressure step. The dashed line is a retrospective client-side view: requests are bucketed by their arrival second, but each request’s TTFT is known only after the first token is returned. The solid line is the online server-side metric view: the vLLM TTFT histogram receives a sample only when the first-token event occurs. The server-side view therefore rises after affected requests have already begun waiting and remains elevated while delayed observations drain during recovery. Latency remains essential for SLO accounting and for evaluating control outcomes, but it is too delayed to serve as the primary state for proactive cross-model allocation. The controller instead needs an earlier state that couples current token service with active and waiting demand, which Section III instantiates as TSS. 
+
+C. Why Fixed-Budget Reallocation Requires Coordinated Control 
+
+A comparable cross-model signal is necessary but not sufficient. When no idle GPU is available, adding routable capacity to one model requires capacity to move from another. Autoscaling under a fixed GPU budget is therefore not a collection of independent per-model replica-sizing decisions; it is a shared capacity-allocation problem. The controller must compare service deficits across models, select a receiver and a donor, and limit the amount and pace of each transfer. 
+
+Model-local autoscaling does not resolve contention: Re-active systems such as Llumnix trigger scaling from local runtime pressure, while prediction-based systems such as PreServe provision replicas independently from forecasted load [6], [7]. These approaches can add capacity when idle GPUs exist, but they do not coordinate a shared allocation decision when the cluster is fully occupied. Under contention, multiple models may simultaneously request more capacity. Local signals and per-model forecasts do not determine which deficit should take priority, which lower-pressure model should yield capacity, or how quickly capacity should move between the two. 
+
+The core control challenge: Fixed-budget reallocation there-fore links two decisions: the controller must rank relative service deficits across heterogeneous models and translate that ranking into bounded receiver–donor capacity movement. The first decision requires a comparable service-deficit signal, which TSS provides in Section III. The second requires a coordinated control framework, which TRE provides in Section IV, to separate urgent rescue from slower rebalancing and to move capacity incrementally under a fixed GPU budget. Together, Sections II-B and II-C define the two linked requirements for global SLO-aware autoscaling: a comparable service-deficit signal across heterogeneous models, provided by TSS in Section III, and a coordinated control framework, provided by TRE in Section IV, that translates this ranking into bounded receiver–donor capacity reallocation under a fixed GPU budget. III. T OKEN SERVICE SHARE : A D EMAND -N ORMALIZED 
+
+SERVICE STATE 
+
+Section II showed that existing online signals fail in four ways: queue and throughput decouple supply from demand; cache and GPU metrics expose only local resource symptoms; latency is the correct objective but arrives too late as afeedback signal; and none of these signals is cross-model comparable because the same token rate can represent different effective service for different models. A usable control signal must therefore (i) couple token-level supply with per-request demand, (ii) be computable before violations accumulate, and (iii) normalize onto a common scale so that a controller can rank heterogeneous models by a single urgency score. We introduce Token Service Share (TSS) for this purpose. TSS is not a per-request latency predictor, nor a direct SLO measurement. It is a control-side proxy that estimates the effective token service available to each request that is either being served or already waiting at the front door. Its role is to provide a leading, comparable, and actionable service-deficit ranking. 
+
+A. Design Rationale and Definition Why a ratio, not a raw metric: Aggregate throughput can remain high even when it is divided among too many requests, while queue length does not reveal how quickly that backlog is being served. What matters for SLO health is the ratio of effective token service to the population of requests competing for it. This directly addresses the supply–demand decoupling identified in Section II-B. For model m, let Am(t) be the number of active requests receiving runtime service, and let Wm(t) be the number of waiting requests at the model’s front-door queue. Over a mon-itoring window of width ∆, the controller observes prefill and decode token counts. We write rprefill  
+
+> m
+
+(t, ∆) and rdecode  
+
+> m
+
+(t, ∆) 
+
+for the corresponding token-service rates, computed as the observed token counts divided by ∆. The complete raw TSS ratio is 
+
+TSS raw  
+
+> m
+
+(t) = wprprefill  
+
+> m
+
+(t, ∆) + rdecode  
+
+> m
+
+(t, ∆) 
+
+Am(t) + wq Wm(t) . (1) 
+
+The numerator: effective token service: Prefill and decode are not interchangeable: prefill is parallel computation that determines TTFT, whereas decode is sequential generation that determines TPOT. Treating them as a single effective-service unit is a deliberate engineering simplification: TSS targets cross-model ranking of service deficit rather than precise per-request latency prediction, and a linear aggregation with the model-specific weight wp is sufficient for this control purpose while remaining online-computable. Because prefill can process many prompt tokens in parallel, one prefill token generally contributes less to per-request SLO health than one decode token. Accordingly, the calibrated prefill weight wp is generally less than one. Its value is constrained by the model’s prefill parallelism and the SLO class’s relative sensitivity to TTFT versus TPOT, rather than fitted as an open-ended degree of freedom. 
+
+The denominator: effective outstanding demand: Active re-quests are counted at full weight because they already occupy execution slots and memory bandwidth. Waiting requests do not yet consume runtime resources, but they represent com-mitted demand: their latency budgets are being spent before they receive token service, and they must still be admitted and executed. The calibrated waiting weight wq , generally above one, maps this admission-side risk into the same outstanding-demand unit. It does not imply that waiting requests directly slow the current iteration; it makes queued work visible before its latency impact appears in telemetry. Eq. (1) is therefore the service-share state used by the controller. A lower value means that less effective token service is available per active or waiting request, indicating a larger model-level service deficit. A model can report higher aggregate throughput but lower TSS when that throughput is shared by a sufficiently larger active and waiting population. 
+
+Why this ratio preserves the SLO-health ordering that aggregate throughput lacks: The prefill-heavy/decode-heavy pair in Figure 1 illustrates why this normalization is needed. Aggregate TPS ranks the pair in the wrong direction because parallel prefill dominates raw token progress. TSS avoids this inversion by discounting prefill progress according to its lower per-request SLO contribution and normalizing the resulting effective service by the urgency-weighted outstand-ing population. The prefill-heavy case consequently receives a lower TSS than the healthy decode-heavy case, consistent with its observed SLO violation. Within a fixed model and SLO class, decreasing TSS indicates increasing service deficit and a higher risk of tail-latency violations. 
+
+Scope and limitation: TSS is a proxy that assumes ordinary request-level heterogeneity is absorbed by the runtime’s con-tinuous batching policy. Extreme length skew or physically disaggregated prefill/decode resources may require a stage-aware service state; Section VIII discusses this boundary. 
+
+B. Smoothing, Normalization, and Calibration 
+
+Continuous batching, chunked prefill, and decode comple-tion can create short-window token-service spikes. The con-troller therefore applies exponential smoothing with parameter 
+
+α: each window’s TSS combines the current raw ratio with the previous smoothed value, avoiding transient oscillations while preserving control-loop reactivity. Raw TSS is model-local. Calibration defines a healthy boundary θm for each model and SLO class: 
+
+Zm(t) = TSS m(t)
+
+θm
+
+. (2) 
+
+Zm(t) measures service share relative to the model’s own healthy requirement: values above one indicate service above the calibrated requirement, whereas values below one indicate service below it. This directly addresses the cross-model comparability problem identified in Section II-B. Calibration: 
+
+The profile is derived from offline profiling across the healthy-to-degraded transition. The parameters are constrained by physical and control-side invariants: wp by prefill parallelism and observed TTFT–TPOT tradeoffs; wq by the urgency of waiting work under the target SLO class; α by the control-loop reaction time; and θm by the smallest smoothed TSS that achieves target SLO reliability. The profile contains only six scalars per model–SLO pair and is loaded before online execution. Recalibration is a slow-path maintenance action, not a per-tick fitting procedure. The controller partitions Zm(t) with hysteresis thresholds 
+
+τcrit < 1 < τ surplus : critical identifies receiver-side pressure, surplus identifies preferred donor candidates, and nominal provides a stable region around the healthy boundary. These regions stabilize receiver–donor selection by preventing small control logic validation infrastructure         
+
+> Metrics Collector
+> Token Throughput Queue Length Latency KV Cache Utilization
+> TRE Control Plane
+> TSS
+> Raw TSS / Zm
+> Online Compute State Classifier
+> slow loop (10s)
+> Rebalancing Controller
+> fast loop (5s)
+> Rescue Controller Kubernetes / Hot Switch
+> Critical Nominal Surplus Fig. 3. Overview of the TRE control plane. The signal layer derives normalized service states Zm(t)and classifies models as critical, nominal, or surplus. The control layer uses a fast rescue path and a slower rebalancing path to issue bounded routable-capacity transitions. The actuation layer applies local donor-side guards before committing a capacity release.
+
+fluctuations around Zm(t) = 1 from triggering a capacity transition. The control profile is derived offline for each model–SLO pair across the healthy-to-degraded transition. The parame-ters are constrained by physical and control-side semantics: 
+
+wp reflects prefill parallelism and the observed TTFT–TPOT tradeoff; wq reflects the urgency of waiting work under the target SLO class; α reflects the desired control-loop reaction time; and θm is the smallest smoothed TSS value consistent with target SLO reliability. The profile contains six scalars per model–SLO pair and is loaded before online execution; it is not re-fitted at each control tick. IV. TRE: TSS-G UIDED CROSS -M ODEL AUTOSCALING 
+
+TRE is a control-plane framework that translates cross-model service-deficit rankings into bounded capacity real-location. It has two core control mechanisms: dual-speed control separates emergency rescue from routine rebalancing, and bounded pairwise transfer incrementally moves capacity without oscillation. Before a selected donor-side release is committed, the actuation layer applies local guardrails; these checks can defer or reject the release but do not determine global allocation. 
+
+A. Overview and Control Objective 
+
+TRE aims to maximize overall SLO attainment under a fixed GPU budget. When idle GPUs exist, this reduces to independent per-model scaling, as in local reactive or forecast-based provisioning approaches [6], [7]. Under contention, the problem becomes cross-model arbitration: increasing one model’s routable capacity requires another model to release it. This is approximately a calibrated max–min service-share problem: capacity should move toward the model with the lowest normalized service share, subject to fixed-budget fea-sibility, minimum routable-replica floors, and local donor-side guardrails. The two core mechanisms below address this objective at different time scales. Dual-speed control (Section IV-B) deter-mines when intervention is needed, while bounded pairwise transfer (Section IV-C) selects a receiver–donor transition and limits its pace. TSS provides the shared signal for these allocation decisions. KV-cache utilization and tail latency remain local guardrails that can exclude a candidate donor release; they do not determine which model receives capacity or the cross-model direction of reallocation. 
+
+B. Dual-Speed Control 
+
+A single control cadence cannot serve both emergency rescue and routine rebalancing. A cadence tuned for rescue would let routine rebalancing chase short-lived fluctuations and increase replica churn, whereas a cadence tuned for stability would leave critical deficits unresolved for multiple service intervals. TRE therefore separates a fast rescue loop from a slower deficit-guided rebalancing loop. 
+
+Rescue: When a model enters the critical region, breaches a latency guardrail, or loses routable capacity, TRE enters the fast rescue path. Rescue selects the most urgent receiver: the model with the lowest Zm(t) among critical models, while hard-guard violations preempt all other events. It acquires capacity in least-disruptive order: first idle hot-switch capacity, then non-routable warm replicas, and only then donor-side release. This ordering minimizes the probability of triggering unsafe donor shrink during an emergency. The fast loop runs at a 5 s cadence in our prototype. 
+
+Deficit-guided rebalancing: When no rescue is pending, the controller runs the slower rebalancing loop at a 10 s cadence. It selects the receiver as 
+
+mrecv = arg min  
+
+> m
+
+Zm(t), (3) i.e., the model with the largest calibrated service deficit. It then searches for an eligible donor, preferring surplus models and considering nominal models only when no surplus or idle capacity exists. A candidate donor is released only if its local guardrails permit a routable-capacity transition at actuation time. The two loops are mutually exclusive: when rescue is pending, the slow loop defers all donor-side operations to avoid reclaiming capacity from a model that is itself under pressure. Conversely, a rebalancing transfer in progress is not preempted by a new rescue request unless the target model breaches a hard guardrail. 
+
+C. Bounded Pairwise Transfer 
+
+Even after selecting a receiver and a donor, TRE does not re-solve a global allocation problem at every control tick. Workload conditions can change before a multi-model plan is fully enacted, and hot-switch actuation is inherently discrete. TRE therefore uses a greedy, quantized pairwise rule. The normalized deficit determines the direction of move-ment rather than a fractional replica count. For a selected receiver–donor pair, the controller issues at most one GPU-budget-feasible routable-capacity transition per tick. A transi-tion is considered only when the receiver is below its healthy boundary, the donor remains above its minimum routable-replica floor, local donor-side guardrails permit the release, and the GPU footprints of the released and activated capacity satisfy the fixed cluster budget. The transition is therefore not assumed to be a one-to-one replica exchange across heterogeneous models. After each transition, the controller observes the resulting 
+
+Zm(t) values and re-evaluates at the next tick. This bounded rule prevents oscillatory corrections while preserving the max– min direction. This small-step policy limits corrective churn and reduces the risk of overshoot, without claiming a closed-form global optimum or formal convergence under changing demand. 
+
+Donor-side release guard: The donor-side release guard does not rank models or choose a receiver. For a se-lected donor-side release, the adapter enforces the minimum-routable-replica guard, hides the candidate from new-request routing while in-flight requests drain, and observes local la-tency, KV-cache, and donor-health conditions. If a guardrail is violated, the adapter restores routing and defers the transition; otherwise, it commits the release by sleeping the replica. This guard constrains the actuation of a selected transfer rather than defining a separate control policy. V. I MPLEMENTATION 
+
+We implement TRE as a Kubernetes-based control-plane service on top of an AIBrix serving stack and a vLLM hot-switch runtime. AIBrix provides the serving and gateway layer, while vLLM provides the inference runtime and sleep/wake primitives. TRE does not modify the intra-replica inference scheduler: it does not change vLLM’s continuous batching, prefill/decode scheduling, or token execution path. Instead, it operates at the serving-layer routing and replica-lifecycle level. 
+
+A. System Boundary and Replica State 
+
+The prototype has two components. The TRE controller consumes per-model telemetry, applies the calibrated TSS profile, classifies each model into a service region, and issues bounded requests for routable-capacity transitions. A service-manager adapter translates these requests into AIBrix routing changes and vLLM sleep/wake calls. This split keeps the serving stack responsible for request execution, while TRE controls model-level routable capacity and the adapter enforces local donor-side release guards during actuation. The control unit is a serving replica, implemented as a Ku-bernetes Pod running a vLLM process for one model. A replica may use one or more GPUs depending on the model-parallel placement configured by the serving stack; TRE does not change this internal placement. The controller distinguishes created replicas from routable replicas. A created replica may still be hidden, sleeping, or reactivating, and therefore is not counted as immediate serving capacity. Only runtime-ready and gateway-visible replicas are counted as routable. TRE follows the lifecycle concepts used in the design. An active replica is routable and can receive new requests. A hid-den replica is still awake but excluded from new-request rout-ing; in the adapter this is implemented with a custom gateway-consumed Pod annotation, aibrix.ai/route-hidden . A sleeping replica remains hidden and has been committed to vLLM sleep, so it acts as warm standby. A reactivating replica is being woken and becomes routable only after runtime readiness and gateway visibility are restored. Sleeping releases GPU memory in the vLLM runtime but does not release the Kubernetes Pod or its scheduler-level GPU allocation. The service-manager adapter therefore performs hot-switch capacity accounting above Kubernetes. It treats GPUs whose assigned replicas are all sleeping as available for hot-switch capacity planning, while TRE continues to reason about routable capacity rather than raw Kubernetes GPU requests alone. 
+
+B. Telemetry and Controller Execution 
+
+The prototype exports per-Pod vLLM metrics to a Redis-backed store, and the controller aggregates them into per-model control-window observations. Prompt-token and decode-token counters are converted into window deltas for TSS computation. Running and waiting request counts rep-resent outstanding demand. KV-cache utilization, swapped-request counts, and latency histograms are retained as guard and diagnostic telemetry. Replica counts and routing visibility are obtained from the service-manager adapter because run-time metrics alone do not expose lifecycle state. Each model has a static control profile generated by the slow-path calibration procedure in Section III-B. The profile contains the quantities used by the online TSS computation: 
+
+wp, wq , α, θm, and the critical/surplus thresholds. The con-troller does not re-fit these parameters in the fast loop; it only applies the loaded profile to fresh telemetry, updates Zm,and classifies the model into the critical, nominal, or surplus region. The controller uses one main polling loop with two logical cadences. Each tick refreshes replica state, collects metrics, updates TSS, and emits bounded transition requests. The fast cadence handles rescue for critical models or hard-guard violations. The slower cadence performs routine rebalancing when no rescue action is pending. Requests for additional routable replicas are sent to the adapter. Requests that reduce routable capacity are subject to local donor-side release guards, which may defer or reject a selected transition. KV-cache utilization and tail latency are not merged into TSS; they remain local guardrails that can veto a donor release, but do not change the cross-model allocation ranking. 
+
+C. Gateway Integration and Donor-Side Release Guard 
+
+The service-manager adapter exposes a small set of lifecycle operations. To add routable capacity, it wakes a hidden sleep-ing replica when one is available, checks that reactivation does not conflict with GPU-memory availability, invokes vLLM wake-up, and restores gateway visibility only after the runtime is ready. For routable-capacity release, the adapter enforces the local donor-side guard introduced in Section IV-C. It first en-forces the minimum-routable-replica floor, then hides the se-lected replica from new-request routing through the gateway-consumed aibrix.ai/route-hidden annotation. This routing-only transition keeps the vLLM process awake while in-flight requests drain during a bounded interval. The adapter observes local donor-side conditions, including latency, queue growth, and KV-cache state. If a guardrail is violated, it restores gateway visibility and defers the release; otherwise, it commits the transition by invoking vLLM sleep. These checks constrain the actuation of a selected donor release but do not recompute the global allocation decision. If a committed sleep interrupts unfinished work after the drain interval, the current prototype recovers it through reissue rather than cross-replica KV-cache migration. This path may recompute part of the prefill work and is a prototype limitation discussed in Section VIII. VI. E VALUATION 
+
+We evaluate TRE through three research questions that address the validity of its cross-model control signal, its end-to-end effectiveness, and its deployment cost.  
+
+> •
+
+RQ1: Does TSS provide a correct and cross-model compa-rable ranking?  
+
+> •
+
+RQ2: Does TRE improve tail latency in end-to-end serving?  
+
+> •
+
+RQ3: What deployment overhead is introduced by TRE’s control loop and hot-switch actuation? 
+
+A. Experimental Setup Testbed: All experiments run on two machines, each equipped with four NVIDIA A100 40 GB GPUs connected by NVLink. The serving stack is a Kubernetes-based multi-model runtime built on vLLM [11] with hot-switch support following the AIBrix design [15]. We serve three models simulta-neously: dsllama-8b , dsqwen-7b , and dsqwen-14b .These models are chosen deliberately: they differ in GPU foot-print (one versus two replica-group GPUs), which exercises TRE’s cross-model allocation under heterogeneous capacity costs. 
+
+Workloads: We use seven traces. The first five are stress probes , each designed to isolate a specific autoscaling failure mode. Sinusoidal tests whether the controller can track grad-ual, periodic pressure without overreacting. Decode sustains a decode-heavy burst to expose TPOT amplification under KV-cache pressure. Prefill introduces prompt/decode mix shifts to create per-model stage skew. Alternating holds aggregate load constant while rotating the hot model across the cluster, isolating the cross-model transfer decision from any change in total offered load. Simul-Spike injects repeated synchronized spikes to stress the emergency rescue path under shared contention. The final two traces, Real-Conv and Real-Code , are derived from production traffic; they test whether conclusions drawn from the stress probes hold under irregular arrivals and heavy token distributions that were not explicitly targeted by the probe design. Each trace runs for approximately 720 s. 
+
+Baseline: Our primary comparison is KV-Auto , a state-of-the-art reactive autoscaler that follows the Llumnix-style design [6]: each model is scaled independently when its local KV-cache utilization crosses a fixed threshold, with no cross-model allocation objective. KV-Auto runs on the 0.0 0.5 1.0 Llama-8B       
+
+> 0.0 0.5 1.0 Qwen-7B
+> S1 S2 S3 S4 S5 S6
+
+Trace rank (SLO health high to low)   
+
+> 0.0 0.5 1.0 Qwen-14B
+> Normalized signal value
+> TSS Queue KV Cache Prefill TPS Decode TPS SLO health
+> Fig. 4. Validating TSS against local runtime signals across per-model trace ranks. Each panel corresponds to one model. The solid line shows min–max normalized TSS, translucent dashed lines show local runtime signals, and the black dashed line shows SLO health ordered from high to low.
+
+identical serving runtime, request scheduler, and hot-switch infrastructure as TRE—only the control policy differs—so any latency difference is attributable to the autoscaling de-cision logic rather than to infrastructure variation. We do not include prediction-based systems such as PreServe [7] as end-to-end comparisons, because their design targets a different operating regime. PreServe’s workload predictor uses fixed 10-minute windows and a proactive scaler that rolls predictions forward to the next provisioning window, targeting coarse-grained cold-start planning. We reproduced the released mLSTM predictor on our Azure-code and Azure-conv traces at 5 s windows—the control interval relevant to hot-switch rebalancing. At 5 s granularity, mLSTM is no more accurate than simply using the most recent observed load as the next-window prediction (Azure-code MAPE: 17.8% vs. 18.1%; Azure-conv: both 10.4%), so it provides little additional value for seconds-scale rebalancing. 
+
+Metrics: Our primary metrics are P95 E2E latency, since autoscaling failures appear as short tail excursions that the mean dilutes; we also report mean E2E latency to confirm tail gains do not hurt average behavior. We decompose results into P95 TTFT and P95 TPOT to separate prefill-side admission pressure from decode-side service quality. Percentiles are computed over successful requests only, with success rate reported separately. 
+
+B. RQ1: TSS Ranking Correctness and Cross-Model Compa-rability 
+
+The first question is whether TSS is only a within-model health indicator, or whether it can also support cross-model arbitration. This distinction matters for TRE because 10 0 10 1 10 2 10 3
+
+> 0.0 0.5 1.0
+> E2E (s) CDF
+
+Sinusoidal    
+
+> 10 010 110 210 3
+
+Decode    
+
+> 10 010 110 210 3
+
+Prefill    
+
+> 10 010 110 210 3
+
+Alternating     
+
+> 10 −1 10 010 110 210 3
+
+Simul-Spike     
+
+> 10 −1 10 010 110 210 3
+
+Real-Conv     
+
+> 10 −1 10 010 110 210 3
+
+Real-Code                                                                       
+
+> 10 −1 10 010 110 210 3
+> 0.0 0.5 1.0
+> TTFT (s) CDF
+> 10 −2 10 −1 10 010 110 210 −1 10 010 110 210 310 −2 10 −1 10 010 110 210 −2 10 −1 10 010 110 210 310 −2 10 −1 10 010 110 210 310 −2 10 −1 10 010 110 2
+> 10 −2 10 −1 10 010 110 210 3
+> 0.0 0.5 1.0
+> TPOT (ms) CDF
+> 10 −2 10 −1 10 010 110 210 310 −2 10 −1 10 010 110 210 310 −1 10 010 110 210 110 210 −2 10 −1 10 010 110 210 310 −2 10 −1 10 010 110 210 3
+> KV-Auto TRE
+
+Fig. 5. Request-level latency CDFs for TRE and KV-Auto across all seven traces. Rows show E2E latency, TTFT, and TPOT; columns show traces. CDFs are computed over successful requests only; all runs have 100.0%/100.0% success rate. E2E and TTFT use seconds, while TPOT uses milliseconds. 0123Norm. TSS  Llama-8B 
+
+0123
+
+Qwen-7B 
+
+0123
+
+Qwen-14B 
+
+1234Replicas 123412340 200 400 600 
+
+Time (s) 
+
+0100 200 P95 TPOT (ms) 0 200 400 600 
+
+Time (s) 
+
+0100 200 0 200 400 600 
+
+Time (s) 
+
+0100 200 
+
+SLO 
+
+> 80 160
+> GPU cache (%)
+
+TRE KV-Auto 
+
+Fig. 6. Per-model control dynamics under the Simul-Spike trace. Each column corresponds to one served model. Rows show the control signal (normalized TSS for TRE and GPU-cache pressure for KV-Auto), active replicas, and P95 TPOT. 
+
+a capacity-transfer decision compares heterogeneous models: the controller must decide whether, for example, a stressed 
+
+dsqwen-7b should receive capacity from a less stressed 
+
+dsllama-8b , even though their raw serving rates and queue dynamics live on different scales. We evaluate this property using per-model fixed-capacity trace ranks that cover each model’s transition from healthy to degraded service under its target SLO profile. The trace ranks are selected within each model’s operating range, so the comparison tests whether the same normalized TSS construc-tion preserves health ordering despite model-specific workload regimes. Figure 4 compares normalized TSS with local runtime signals over six trace ranks ordered from higher to lower SLO health for each model. Because queue pressure, KV-cache pressure, prefill TPS, decode TPS, and normalized TSS have different units before plotting, each curve is min–max scaled within the corresponding model; the dashed curve shows SLO health on the same 0–1 scale. Normalized TSS follows the SLO-health ordering most consistently across the three models. In contrast, the other metrics do not maintain a consistent relationship with health ordering: they change direction and flatten different prompt/decode mixtures, so they cannot reliably support health ranking. 
+
+C. RQ2: End-to-End Tail Latency 
+
+TRE converts the cross-model health ranking from TSS into concrete capacity-transfer decisions. We first ask whether those decisions improve end-to-end serving quality rather than merely changing controller internals. Figure 5 reports the request-level latency distributions across both targeted stress scenarios and production-derived workloads. Across all seven traces, TRE reduces P95 E2E latency by 11.9–79.0% and P99 E2E latency by 12.5–72.6% relative to KV-Auto. The gains are consistent across targeted stress probes and production-derived workloads: TRE outperforms KV-Auto on every trace, with particularly large reductions on Real-Conv (50.8%/63.7% P95/P99) and Real-Code (79.0%/72.6%). Mean E2E latency also improves by 14.8–73.0%, indicating that the tail gains do not come from sacrificing average-case behavior. We next examine Simul-Spike in detail because it simul-taneously stresses burst recovery and cross-model capacity arbitration. On this trace, TRE reduces aggregate P95/P99 E2E latency from 26.61/30.57 s to 18.41/19.49 s. The im-provement is not uniform across models: P95 E2E falls by 49.7% for dsllama-8b and 30.7% for dsqwen-7b , while 
+
+dsqwen-14b changes only slightly (2.0%). Thus, Simul-Spike is mainly a test of whether the controller can identify which synchronized bursts are most recoverable, rather than simply adding capacity to every pressured model. Figure 6 shows the corresponding per-model dynamics. KV-Auto reacts only to local cache pressure, so dsqwen-7b 
+
+and dsqwen-14b remain at one replica and dsllama-8b 
+
+is scaled reactively after pressure has already accumulated. In contrast, TRE uses normalized TSS to move capacity across models: it raises dsllama-8b to three replicas and 
+
+dsqwen-7b up to four replicas during spike periods. This removes window-level P95 TPOT excursions above the 75 ms SLO for dsllama-8b (41 windows under KV-Auto versus none under TRE) and reduces them for dsqwen-7b (46 to 13 windows). dsqwen-14b remains the hardest case—its spike-window TPOT excursions are comparable under both policies—but its request-level E2E tail does not worsen while the other two models improve substantially. In summary, TRE consistently reduces tail latency across all evaluated traces. The Simul-Spike breakdown shows that the end-to-end gain comes from selective cross-model recovery: TRE prioritizes the models where additional replicas most reduce tail latency, rather than uniformly suppressing every per-model spike. 
+
+D. RQ3: Control and Actuation Overhead 
+
+We quantify two sources of overhead: the latency cost of hot-switch actuation triggered by TRE, and the HBM footprint of sleeping replicas retained as warm standby capacity. 
+
+Actuation latency: We measure sleep and wake latencies for each model. Normal sleep completes in 1.87 s on aver-age and wake-up in 1.31 s on average, both within TRE’s 10 s rebalancing interval. Thus, a capacity transition initiated by the slow rebalancing loop can complete within a single control period in our testbed. The first sleep operation is slower (12.19 s on average) due to one-time runtime cleanup; subsequent transitions follow the fast warm path. 
+
+Memory footprint of sleeping replicas: Sleep releases 94.9– 97.0% of per-GPU model memory, leaving only 1.0–1.8 GB of reactivation metadata resident per sleeping replica. This allows the prototype to retain warm standby capacity with a limited HBM footprint. These numbers characterize actuation cost; controller decision latency is negligible because the TSS engine performs only arithmetic over per-window token counts and the rebalancing loop performs a greedy pairwise comparison over at most a few tens of model entries per tick. Overall, hot-switch actuation fits within the prototype’s control intervals, and sleeping replicas consume under 2 GB of HBM per replica. These costs support the feasibility of fine-grained capacity movement in the evaluated deployment. VII. R ELATED WORK 
+
+Cloud-native service autoscaling: Cloud-native autoscalers and SLO-aware managers adjust replica counts or resource allocations using utilization, request demand, latency, or application-tier feedback [16]–[19]. These inputs generally estimate pressure from request load, resource use, or observed application behavior. In LLM serving, however, effective de-mand continues to evolve after admission with prompt and decode work, continuous batching, and KV-cache residency. Rather than treating models as independent scaling targets, TRE uses TSS to compare current service deficits across co-hosted models and coordinate capacity reallocation when the GPU budget is contended. 
+
+LLM serving runtimes and schedulers: LLM serving sys-tems improve multi-model multiplexing and serving efficiency through runtime scheduling, KV-cache management, request admission, fairness, migration, routing, and placement [1], [2], [5], [6], [10]–[12], [15], [20], [21]. These systems optimize how requests and model state are executed within the serving substrate. TRE is complementary: it operates at the control plane above the request scheduler and uses a cross-model deficit ranking to determine when routable capacity should move between models under a fixed GPU budget. 
+
+LLM autoscaling signals and provisioning: Recent LLM autoscaling work explores reactive signals, such as queue-ing, utilization, throughput, and token progress [22]–[24], as well as predictive provisioning based on future workload or resource demand [7], [25]. These approaches capture local pressure, stage-specific bottlenecks, or future provisioning needs, but do not provide a common cross-model ordering of current service deficit under a fixed GPU budget. TSS instead estimates demand-normalized token service at each model’s front door, enabling TRE to compare under-service and guide replica transfers. 
+
+Disaggregation, hot switching, and GPU sharing: Disag-gregated and KV-cache-centric serving systems address stage separation, KV-cache transfer, and placement constraints [9], [26], [27]. Fast scaling and GPU-sharing systems reduce the cost of launching, migrating, or sharing serving capacity [4], [13], [14], [28]–[30]. These mechanisms are complementary to TRE, which uses hot switching for actuation and reallocates routable replicas across co-hosted models under a fixed GPU budget; stage-aware control for disaggregated deployments remains outside its current scope. VIII. D ISCUSSION AND LIMITATIONS 
+
+A. Deployment Insights 
+
+TRE’s benefit depends on workload conditions and the degree of GPU contention. In our evaluation, larger gains ap-pear when models experience irregular bursts, rapid popularity shifts, and sustained competition for a fixed GPU budget. In these settings, relative service deficits can persist long enough that coordinated reallocation improves on independent model-local reactions. The benefit is smaller when demand changes gradually and predictably, or when idle GPUs remain available. In those settings, adding capacity does not require a receiver– donor tradeoff, and independent per-model provisioning can be sufficient. Thus, our results position TRE as a control mech-anism for contended multi-model deployments, rather than a replacement for model-local autoscaling in every serving setting. 
+
+B. Limitations and Boundary Conditions Disaggregated serving: TRE’s replica-level abstraction as-sumes co-located prefill and decode. Extending it to dis-aggregated and KV-cache-centric serving systems, such as DistServe, Splitwise, and Mooncake, requires two changes [9], [26], [27]. First, TSS would need to become stage-aware: the scalar score would become a stage-specific vector that estimates prefill and decode service deficits separately, because physically distinct GPU pools may have independent queueing dynamics. Second, donor-side release guards would need to account for inter-stage coupling: reducing decode capacity must not create KV-cache-transfer or admission pressure that violates prefill-side service. The core concepts—demand-normalized deficit ranking and guarded capacity movement— remain applicable, but the unit of reallocation shifts from a routable replica to a stage-specific resource slice. 
+
+Calibration and operational drift: TSS is a calibrated proxy, not a queueing-theoretic identity. Its cross-model compara-bility depends on profiles that remain fixed during online execution. In production MaaS platforms, models are updated frequently and workload distributions shift with user behav-ior. The current slow-path recalibration assumes that these changes are infrequent relative to the control-loop timescale. A practical deployment would benefit from online adaptation, for example, a Bayesian update of TSS using streaming latency feedback, or lightweight canary replay on a fraction of replicas. We leave the exploration of online calibration with bounded perturbation to the live serving path to future work. 
+
+In-flight work during release: The donor-side release guard hides a candidate replica and lets in-flight requests drain before invoking sleep. In the common case, no request-level recovery is needed because the replica remains awake during the drain interval. If the bounded interval expires while long generations are still active, the prototype falls back to reissue rather than cross-replica KV-cache migration. This fallback may recom-pute part of the prefix and can be expensive for long-context workloads. We therefore treat reissue as a prototype boundary, not as part of TRE’s allocation policy. Production runtimes with KV-cache transfer could replace it with state migration, or choose between reissue and transfer using remaining gen-eration length, KV-cache size, and interconnect bandwidth. This boundary is orthogonal to TSS-guided receiver–donor selection. 
+
+C. Future Work 
+
+This work introduces two design elements that are not lim-ited to the current prototype: Token Service Share, a demand-normalized and cross-model comparable service-deficit signal, and a bounded control pattern that translates this ranking into receiver–donor capacity reallocation under a fixed GPU budget. We outline three directions for extending this design beyond the present work. 
+
+Stage-aware service shares for disaggregated serving: The most direct extension is to disaggregated prefill/decode serv-ing. Rather than maintaining one model-level state, the con-troller would maintain separate TSS states for prefill and decode, and coordinate stage-specific capacity across their corresponding GPU pools. This extension would expose bot-tlenecks that a co-located scalar can hide, but it would also require the controller to account for cross-stage queueing, KV-cache-transfer pressure, and placement constraints when selecting a capacity movement. 
+
+Finer-grained capacity movement and recovery: Future runtimes may move stage-specific resource slices or routing weights rather than whole routable replicas, and may recover in-flight work through reissue, delayed draining, or KV-cache transfer. Extending TRE to these operations would require a capacity model that represents their resource footprint, actu-ation delay, and recovery cost, while preserving the bounded receiver–donor nature of the control loop. Such a model could choose among recovery paths based on remaining generation length, cache-transfer cost, and user-visible interruption. IX. C ONCLUSION 
+
+We presented TRE, a control plane for cross-model capacity arbitration in shared LLM serving under a fixed GPU budget. TRE uses TSS, a calibrated token- and queue-aware measure of effective token service per outstanding request, to com-pare service deficits across heterogeneous models and SLO classes and guide bounded receiver–donor capacity transfers. Implemented on a Kubernetes-based AIBrix and vLLM stack without modifying the inference scheduler, TRE reduces P95 end-to-end latency by 11.9–79.0% and P99 latency by 12.5– 72.6% across seven stress and production-derived traces rel-ative to a state-of-the-art KV-cache-based reactive autoscaler on the same runtime. These results show that, under shared GPU contention, effective LLM autoscaling requires cross-model comparison of current service deficit and coordinated capacity movement, rather than independent reactions to each model’s local pressure. REFERENCES [1] J. Duan, R. Lu, H. Duanmu, X. Li, X. Zhang, D. Lin, I. Stoica, and H. Zhang, “Muxserve: flexible spatial-temporal multiplexing for multiple llm serving,” arXiv preprint arXiv:2404.02015 , 2024. [2] Z. Li, L. Zheng, Y. Zhong, V. Liu, Y. Sheng, X. Jin, Y. Huang, Z. Chen, H. Zhang, J. E. Gonzalez et al. , “ {AlpaServe }: Statistical multiplexing with model parallelism for deep learning serving,” in 17th USENIX Symposium on Operating Systems Design and Implementation (OSDI 23) , 2023, pp. 663–679. [3] S. Choi, S. Lee, Y. Kim, J. Park, Y. Kwon, and J. Huh, “Serving heterogeneous machine learning models on {Multi-GPU } servers with      
+
+> {Spatio-Temporal }sharing,” in 2022 USENIX Annual Technical Con-ference (USENIX ATC 22) , 2022, pp. 199–216. [4] S. Yu, J. Xing, Y. Qiao, M. Ma, Y. Li, Y. Wang, S. Yang, Z. Xie, S. Cao, K. Bao et al. , “Prism: Unleashing gpu sharing for cost-efficient multi-llm serving,” arXiv preprint arXiv:2505.04021 , 2025.
+
+[5] A. Patke, D. Reddy, S. Jha, H. Qiu, C. Pinto, C. Narayanaswami, Z. Kalbarczyk, and R. Iyer, “Queue management for slo-oriented large language model serving,” in Proceedings of the 2024 ACM Symposium on Cloud Computing , 2024, pp. 18–35. [6] B. Sun, Z. Huang, H. Zhao, W. Xiao, X. Zhang, Y. Li, and W. Lin, “Llumnix: Dynamic scheduling for large language model serving,” in 
+
+18th USENIX Symposium on Operating Systems Design and Implemen-tation (OSDI 24) , 2024, pp. 173–191. [7] Z. Jiang, Y. Huang, G. Yu, J. Huang, J. Gu, and M. R. Lyu, “Hierar-chical prediction-based management for lmaas systems,” arXiv preprint arXiv:2504.03702 , 2025. [8] “TRE code base,” 2026, available after paper accepted. [9] Y. Zhong, S. Liu, J. Chen, J. Hu, Y. Zhu, X. Liu, X. Jin, and H. Zhang, “{DistServe }: Disaggregating prefill and decoding for goodput-optimized large language model serving,” in 18th USENIX Symposium on Operating Systems Design and Implementation (OSDI 24) , 2024, pp. 193–210. [10] G.-I. Yu, J. S. Jeong, G.-W. Kim, S. Kim, and B.-G. Chun, “Orca: A distributed serving system for {Transformer-Based } generative models,” in 16th USENIX symposium on operating systems design and implemen-tation (OSDI 22) , 2022, pp. 521–538. [11] W. Kwon, Z. Li, S. Zhuang, Y. Sheng, L. Zheng, C. H. Yu, J. Gonzalez, H. Zhang, and I. Stoica, “Efficient memory management for large language model serving with pagedattention,” in Proceedings of the 29th symposium on operating systems principles , 2023, pp. 611–626. [12] A. Agrawal, N. Kedia, A. Panwar, J. Mohan, N. Kwatra, B. Gulavani, A. Tumanov, and R. Ramjee, “Taming {Throughput-Latency } tradeoff in {LLM } inference with {Sarathi-Serve },” in 18th USENIX symposium on operating systems design and implementation (OSDI 24) , 2024, pp. 117–134. [13] S. Zeng, M. Xie, S. Gao, Y. Chen, and Y. Lu, “Medusa: Accelerating serverless llm inference with materialization,” in Proceedings of the 30th ACM International Conference on Architectural Support for Program-ming Languages and Operating Systems, Volume 1 , 2025, pp. 653–668. [14] R. Stoyanov, V. Spišaková, A. Reber, W. Armour, M. Copik, and R. Bruno, “Engine-agnostic model hot-swapping for cost-effective llm inference,” in Proceedings of the SC’25 Workshops of the International Conference for High Performance Computing, Networking, Storage and Analysis , 2025, pp. 114–125. [15] T. A. Team, J. Shan, V. Gupta, L. Xu, H. Shi, J. Zhang, N. Wang, L. Xu, R. Kang, T. Liu et al. , “Aibrix: Towards scalable, cost-effective large lan-guage model inference infrastructure,” arXiv preprint arXiv:2504.03648 ,2025. [16] The Kubernetes Authors, “Horizontal pod autoscaling,” https://kubernetes.io/docs/concepts/workloads/autoscaling/ horizontal-pod-autoscale/, 2026, kubernetes documentation. Accessed: 2026-06-23. [17] H. Qiu, S. S. Banerjee, S. Jha, Z. T. Kalbarczyk, and R. K. Iyer, “{FIRM }: An intelligent fine-grained resource management framework for {SLO-Oriented } microservices,” in 14th USENIX symposium on operating systems design and implementation (OSDI 20) , 2020, pp. 805– 825. [18] Y. Zhang, W. Hua, Z. Zhou, G. E. Suh, and C. Delimitrou, “Sinan: Ml-based and qos-aware resource management for cloud microservices,” in 
+
+Proceedings of the 26th ACM international conference on architectural support for programming languages and operating systems , 2021, pp. 167–181. [19] R. Bhardwaj, K. Kandasamy, A. Biswal, W. Guo, B. Hindman, J. Gonza-lez, M. Jordan, and I. Stoica, “Cilantro: {Performance-Aware } resource allocation for general objectives via online feedback,” in 17th USENIX Symposium on Operating Systems Design and Implementation (OSDI 23) , 2023, pp. 623–643. [20] Y. Sheng, S. Cao, D. Li, B. Zhu, Z. Li, D. Zhuo, J. E. Gonzalez, and I. Stoica, “Fairness in serving large language models,” in 18th USENIX Symposium on Operating Systems Design and Implementation (OSDI 24) , 2024, pp. 965–988. [21] K. Jain, A. Parayil, A. Mallick, E. Choukse, X. Qin, J. Zhang, Í. Goiri, R. Wang, C. Bansal, V. Rühle et al. , “Performance aware llm load balancer for mixed workloads,” in Proceedings of the 5th Workshop on Machine Learning and Systems , 2025, pp. 19–30. [22] A. Patke, D. Reddy, S. Jha, C. Narayanaswami, Z. Kalbarczyk, and R. Iyer, “Hierarchical autoscaling for large language model serving with chiron,” arXiv preprint arXiv:2501.08090 , 2025. [23] R. Li, R. Du, Z. Chu, S. Zhao, C. Han, Z. Shi, Y. Shao, H. Han, L. Huang, Z. Liu et al. , “Taming the chaos: Coordinated autoscaling for heterogeneous and disaggregated llm inference,” arXiv preprint arXiv:2508.19559 , 2025. [24] R. Lai, H. Liu, C. Lu, Z. Liu, S. Cao, S. Shao, Y. Zhang, L. Mai, and D. Ustiugov, “Tokenscale: Timely and accurate autoscaling for disaggre-gated llm serving with token velocity,” arXiv preprint arXiv:2512.03416 ,2025. [25] S. Jaiswal, K. Jain, Y. Simmhan, A. Parayil, A. Mallick, R. Wang, R. S. Amant, C. Bansal, V. Ruhle, A. Kulkarni et al. , “Sageserve: Optimizing llm serving on cloud data centers with forecast aware auto-scaling,” 
+
+Proceedings of the ACM on Measurement and Analysis of Computing Systems , vol. 9, no. 3, pp. 1–24, 2025. [26] P. Patel, E. Choukse, C. Zhang, A. Shah, Í. Goiri, S. Maleki, and R. Bianchini, “Splitwise: Efficient generative llm inference using phase splitting,” in 2024 ACM/IEEE 51st Annual International Symposium on Computer Architecture (ISCA) . IEEE, 2024, pp. 118–132. [27] R. Qin, Z. Li, W. He, J. Cui, H. Tang, F. Ren, T. Ma, S. Cai, Y. Zhang, M. Zhang et al. , “Mooncake: A kvcache-centric disaggregated architecture for llm serving,” ACM Transactions on Storage , 2024. [28] Y. Fu, L. Xue, Y. Huang, A.-O. Brabete, D. Ustiugov, Y. Patel, and L. Mai, “ {ServerlessLLM }:{Low-Latency } serverless inference for large language models,” in 18th USENIX Symposium on Operating Systems Design and Implementation (OSDI 24) , 2024, pp. 135–153. [29] D. Zhang, H. Wang, Y. Liu, X. Wei, Y. Shan, R. Chen, and H. Chen, “{BlitzScale }: Fast and live large model autoscaling with o (1) host caching,” in 19th USENIX Symposium on Operating Systems Design and Implementation (OSDI 25) , 2025, pp. 275–293. [30] Y. Xiang, X. Li, K. Qian, Y. Yang, D. Zhu, W. Yu, E. Zhai, X. Liu, X. Jin, and J. Zhou, “Aegaeon: Effective gpu pooling for concurrent llm serving on the market,” in Proceedings of the ACM SIGOPS 31st Symposium on Operating Systems Principles , 2025, pp. 1030–1045.
