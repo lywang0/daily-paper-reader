@@ -1,0 +1,273 @@
+Title: Implementation and Evaluation of BitNet Inference on a CGLA by Signed-Int4 Instructions
+
+URL Source: https://arxiv.org/pdf/2609.27453v1
+
+Published Time: Thu, 24 Sep 2026 00:40:50 GMT
+
+Number of Pages: 7
+
+Markdown Content:
+# Implementation and Evaluation of BitNet Inference on a CGLA by Signed-Int4 Instructions 
+
+Takuto Ando, Yasuhiko Nakashima 
+
+Nara Institute of Science and Technology, Japan 
+
+Abstract —Large language model (LLM) inference transfers model weights and activations for every generated token, making memory traffic and its energy cost part of the decode path. BitNet b1.58 represents its low-bit weights by ternary values and uses integer activations. However, this arithmetic does not match conventional int8 or floating-point general matrix multiplication, and existing BitNet accelerators implement it in specialized datapaths. We instead map this operation to a CPU-Grounded Linear Array (CGLA), a programmable ASIC with explicit direct memory access, local memories, and reusable compiler-visible integer lanes. The mapping adds OP_SMA4 as a reusable signed-int4 multiply–accumulate instruction rather than a BitNet-only datapath. Each ternary weight occupies one signed 4-bit lane. Each int8 activation is split into two signed-int4 fragments and reconstructed by shift-and-add. Frequency scaling of the 145 MHz FPGA measurement to an 840 MHz 28 nm model gives a projected 0.390 ns per signed-int4 product. BitNet C++ decode with one offloaded call measures 2.52 tokens/s, with most execution remaining on the host. 
+
+Index Terms —BitNet, ternary quantization, integer dot prod-uct, signed int4, CGLA 
+
+I. I NTRODUCTION 
+
+Large language models (LLMs) are commonly served as autoregressive inference workloads on graphics processing units (GPUs), where every generated token requires another pass through model weights and activations. These repeated transfers consume memory bandwidth and power throughout token generation. As a result, decode latency and energy depend on memory bandwidth and memory-access energy as well as peak arithmetic throughput [1]. Low-bit quantization addresses the traffic volume by re-ducing the amount of data moved through the memory hi-erarchy [2], [3]. BitNet b1.58 uses ternary weights and low-precision integer activations, but it still evaluates dot products between model weights and activations [2]–[4]. The resulting arithmetic shape differs from conventional int8 or floating-point general matrix multiplication (GEMM). Dedicated Bit-Net accelerators accommodate that shape by placing ternary arithmetic and data movement in specialized datapaths [5]–[9]. Our objective is instead to map the ternary–int8 dot product to a low-power programmable accelerator without adding a BitNet-only datapath. To retain a programmable execution path, we use a CPU-Grounded Linear Array (CGLA). CGLA is a low-power programmable ASIC target with explicit DMA, local memory staging, and reusable compiler-visible integer lanes [1], [10]. CGLA presents ordered logical rows to the compiler, so the same array and software stack can implement a low-bit mapping through the existing instruction interface. The exist-ing CGLA backend for llama.cpp, a C/C++ LLM inference runtime, provides OP_SMA8 for signed-int8 dot products in its Q8 0 quantized format [1], [11]. When directly applied to BitNet, the existing OP_SMA8 path allocates an 8-bit field to each ternary weight, although only three values are needed. Therefore, we add OP_SMA4 , a reusable signed-int4 dot-product instruction. A ternary weight w ∈ {− 1, 0, +1 }
+
+occupies one signed-int4 lane, while an int8 activation is divided into a signed low-nibble residue and an adjusted high fragment. Two multiply–accumulate streams evaluate the frag-ments. The host combines their partial sums by shift-and-add and corrects positive values from 120 to 127. Although one 
+
+OP_SMA4 stream carries eight packed signed-int4 products per 32-bit lane, the exact BitNet mapping requires two streams to cover an int8 activation. The instruction accepts arbitrary signed-int4 operands, so its interface also supports non-ternary dot products. This reuse matters when one accelerator serves several quantized kernels through the same compiler, memory interface, and runtime. We integrate the mapping into the BitNet C++ runtime and separate three evaluation boundaries. Fixed-word measurements isolate the cost of signed-int4 prod-ucts. Tiled projections include the second activation stream and repeated local memory module (LMM) tiles. The integrated run adds the selected DMA/CGLA interval and the remaining host execution. The main contributions of this paper are as follows.  
+
+> •
+
+We implement and evaluate OP_SMA4 as a reusable signed-int4 dot-product instruction and project its 2.26 ns FPGA measurement to 0.390 ns per product at 840 MHz.  
+
+> •
+
+We validate the two-stream BitNet mapping over 4096 outputs using a sparse correction for values from 120 to 127.  
+
+> •
+
+We integrate the mapping into BitNet C++, where the 19-token decode measures 7.53 s and 2.52 tokens/s, including a 16.3 ms offload interval. The remainder of this paper is organized as follows. Sec-tion II reviews BitNet and programmable accelerator work. Section III describes the CGLA execution substrate and signed-int4 mapping, and Section IV evaluates the instruction and integrated runtime boundary. Section IV-E interprets the results and Section V concludes the paper. arXiv:2609.27453v1 [cs.AR] 23 Sep 2026 Grp.A Reg#0-15 (n+1) Grp.A Reg#0-15 (n) Grp.B Reg#0-15 (n) Grp.B Reg#0-15 (n+1) ALU2 ALU3 mask mask AG1 ALU1 mask mask Local Memory Modules (Double buffer) AXI-WRITE-IF AXI-READ-IF AG2 Local Memory Modules (Double buffer) mask mask mask mask Processing System User Space ARMv8 Cortex-A72 Kernel Space LPDDR4 Low 4GB High1 4GB High2 4GB Processing Element (PE) Local Memory Module (LMM) DMA Controller #0 #1 #2 #3 #4 #5 #6 #7 CGLA: 8 Lane AXI DMA READ AXI DMA WRITE Network-on-Chip (NoC) CGLA Configuration Execution data path Memory data path Previous PE Next PE PE architecture Double-buffered registers pass data between PEs, enabling continuous pipelined execution. Fig. 1. IMAX FPGA prototype and PE microarchitecture used in this work. The Processing System (PS) controls DMA transfers. The Programmable Logic (PL) contains the CGLA array. Each PE uses pipelined arithmetic logic units (ALUs), double-buffered registers, and local memories. 
+
+II. R ELATED WORK 
+
+A. BitNet Models and Software Runtimes 
+
+BitNet and BitNet b1.58 define the low-bit model family that includes the ternary-weight arithmetic implemented in this paper [2], [4]. The BitNet b1.58 2B-4T technical report provides the model reference, and BitNet C++ provides the runtime tensor layout used in our implementation [3], [12]. T-MAC and llama.cpp describe lookup, packing, and CPU-side low-bit execution around the arithmetic kernel [11], [13]. The evaluated BitLinear call combines packed I2 S ternary-weight blocks with q8 activation blocks. After the packed dot product, the runtime applies the activation and weight block scales to the integer partial sums. CGLA offload retains the runtime tensor order, block arithmetic, and scaling sequence. Model loading and token-generation control remain on the existing host path. 
+
+B. Dedicated BitNet Hardware 
+
+BitNet-oriented hardware papers primarily use dedicated datapaths. TeLLMe and TerEffic target ternary LLM inference on FPGA platforms [5], [6]. VitaLLM, BitROM, and LUT-based accelerator generation target ASIC, CiROM, or LUT-oriented designs [7]–[9]. These designs specialize the dat-apath for ternary-weight arithmetic. Bit Fusion dynamically composes bit-level processing elements to match the operand widths of different DNN layers [14]. Our mapping instead uses a fixed signed-int4 instruction and software decomposition of int8 activations on the ordered CGLA array. In contrast, our implementation uses a reusable signed-int4 instruction on a programmable spatial architecture. 
+
+C. Coarse-Grained Reconfigurable Arrays (CGRAs) and CGLA for LLMs 
+
+CGRA and CGLA systems have been evaluated for LLM and Transformer workloads. PICACHU targets nonlinear LLM operations on a plug-in CGRA [15]. NX-CGRA sup-ports representative Transformer kernels on a programmable CGRA [16]. Prior CGLA work evaluates LLM kernels and system-level transfer bottlenecks on a CGLA platform [1], [10]. These studies do not map BitNet-style ternary BitLinear kernels onto CGRA/CGLA. We map the ternary BitLinear kernel to a signed-int4 instruction and evaluate its instruction cost, tiled projection, and integrated-call boundary. 
+
+D. CGLA Architecture and Compilation Model 
+
+CGLA is a programmable ASIC architecture with a linear processing array and a software-controlled execution path [10]. CGLA reuses processing elements across kernels and presents its row-oriented linear array as ordered logical rows to the compiler. The loop bodies are mapped without a two-dimensional placement-and-routing search, which shortens compilation [10]. CGLA exposes a fixed instruction interface rather than a per-kernel FPGA implementation flow, although row count, supported operations, local-memory capacity, and transfer bandwidth remain physical constraints. Fig. 1 shows the AMD Versal VPK180 prototype, where programmable logic hosts the CGLA core and a network-on-chip connects it to the processing system. At 145 MHz, PEs and local memory modules (LMMs) form a multilevel linear pipeline that stages operands near the processing elements. Each PE combines pipelined arithmetic units with double-buffered register state, while LMMs hold the operands addressed by the generated row schedule. Intermediate values follow the ordered execution path shown in Fig. 1, so compilation selects the row instruc-tions and their data dependencies instead of two-dimensional PE coordinates. During an offloaded call, the processing sys-tem places packed operands in DMA-visible DDR buffers and controls transfers between DDR and the LMMs. The generated schedule advances the staged operands through ordered PE rows and drains the results to a host-visible buffer. Kernel changes are expressed by the instruction sequence and operand layout at this boundary rather than by implementing a new Main path (proposed): range-exact two-stream split       
+
+> ternary weight w∈{−1, 0, +1}
+> int8 activation a
+> a = 16 aₕᵢ + aₗₒ
+> signed int4 weight lane
+> aₕᵢ = (a − aₗₒ)/16
+> adjusted high fragment
+> aₗₒ = sign -ext. low residue signed int4 ∈[−8, 7]
+> measured kernel boundary:
+> DMA staging → row execution → drain OP_SMA4 stream 1
+> Σ w · aₕᵢ
+> OP_SMA4 stream 2
+> Σ w · aₗₒ
+> interleaved into
+> one OP_SMA4 pass
+> shift-and-add
+> 16 Σ(w aₕᵢ) + Σ(w aₗₒ)
+> integer partial sum (exact in stated range)
+> store split
+> same weights
+> Exact for −128 ≤ a ≤ 119: both fragments fit signed int4 [−8, 7], so the two int4 streams reconstruct
+> the original int8 activation and its integer dot product exactly; a ∈[120, 127] uses sparse host correction for exact reconstruction.
+> Activation-only comparison (not the main path): single-stream, one int4 stream
+> + per-block scale (approximate)
+
+Fig. 2. Ternary–int8 dot-product mapping and CGLA timing components for OP_SMA4 . A signed int4 lane stores the ternary weight, while the int8 activation is split into a signed low-nibble residue and an adjusted high fragment. The two OP_SMA4 streams compute products for the adjusted high fragment and signed low residue, followed by shift-and-add reconstruction. 
+
+FPGA bitstream for each operator. Prior CGLA work uses this organization for sparse and dense kernels, fast Fourier transform (FFT)-like kernels, convolutional neural networks (CNNs), and LLM kernels [1], [10]. For BitNet, we retain the DMA, LMM, synchronization, and row-scheduling path and add a reusable signed-int4 arithmetic instruction to the software-visible operation set. III. P ROPOSED METHOD 
+
+A. BitNet Ternary–int8 Dot Product 
+
+BitNet b1.58 uses ternary weights w ∈ {− 1, 0, +1 }, and the inner operation is the dot product y = P 
+
+> i
+
+wiai with an 8-bit activation ai [2]. OP_SMA4 packs eight signed-int4 products into one 32-bit lane, with each ternary weight stored directly and each int8 activation supplied as two fragments through the existing signed-lane interface. The CGLA operation remains a packed signed multiply–accumulate, while BitNet-specific processing is confined to operand packing and post-drain reconstruction. One original BitNet product wiai therefore corresponds to two signed-int4 fragment products in the exact path. We use “int4 product” for one fragment product in the fixed-word instruction measurement and “original MAC” for one ternary–int8 product in the layer projection. Exact layer projections count two fragment products for each original MAC. 
+
+B. Host–CGLA Execution Sequence 
+
+BitNet C++ retains model loading, tokenization, sampling, and layer scheduling on the host. A selected ternary dot product enters the CGLA software stack at the packed-buffer boundary. The host first prepares ternary weights and two activation fragments in DMA-visible buffers. DMA stages one operand tile from the cacheable DDR path exposed by 
+
+/dev/mem into the LMMs. A generated CGLA schedule then executes the signed dot products over the PE rows. After the 32-bit partial sums drain to a host-visible buffer, host code reconstructs and scales them before returning control to the BitNet C++ layer. OP_SMA4 reuses the existing CGLA transfer and synchronization path and changes the packed operand format and the arithmetic instruction issued within the row schedule. When one projection exceeds the LMM capacity, the software stack partitions it into tiles. Each tile repeats operand staging, row execution, and drain, and its returned partial contributes to the same layer output. Layer execution accumulates returned tile partials instead of retaining a full BitNet layer in the LMM. Reported CGLA time includes DMA staging, row execution, and drain rather than only arithmetic latency. Model loading, tokenization, sampling, and layer scheduling remain outside this interval. 
+
+C. OP SMA4 Instruction and Mapping 
+
+We implement the BitNet dot product using the CGLA signed-int4 dot-product instruction. For operand width p, each 32-bit lane contains 32 /p signed fields, and one 64-bit instruc-tion contains two lanes indexed by ℓ ∈ { 0, 1}. The instruction updates each 32-bit accumulator as follows. 
+
+d′ 
+
+> ℓ
+
+= dℓ +
+
+> 32 /p −1
+
+X
+
+> j=0
+
+sext p(xℓ,j ) sext p(zℓ,j ), (1) where dℓ is the previous accumulator value and xℓ,j and zℓ,j 
+
+are the jth signed fields of lane ℓ. Here sext p interprets a p-bit field as a signed two’s-complement integer and sign-extends it to the accumulator width. The proposed OP_SMA4 uses p = 4 ,so each lane accumulates eight signed-int4 products and the two lanes are updated independently. The BitNet path keeps each ternary weight in a signed int4 lane and represents each int8 activation with two signed int4 fragments, as shown in Fig. 2. Each ternary weight w is stored directly in a signed 4-bit lane. We split each int8 activation as a = 16 ahi + alo . Here 
+
+alo is the sign-extended low-nibble residue. The adjusted high fragment is ahi = ( a − alo )/16 . Both fragments fit signed int4 only when ahi and alo lie in [−8, 7] . For −128 ≤ a ≤
+
+119 , both fragments fit in signed int4, so the two streams reconstruct the original int8 activation exactly. Positive values from 120 to 127 make ahi = 8 , which is encoded as −8 in the signed-int4 stream. Encoding ahi = 8 as −8 lowers the reconstructed product by 256 w, so the host adds 256 w for each affected element after receiving the CGLA partial sums. Let 
+
+˜ahi denote the encoded signed high fragment, including −8
+
+when the adjusted high value is 8. The CGLA partial sums are shi = P 
+
+> i
+
+wi˜ahi ,i and slo = P 
+
+> i
+
+wialo ,i . Reconstruction produces a 32-bit integer partial dot, rather than an 8-bit output. We compute the sparse correction and reconstructed integer dot product as follows. 
+
+c = 256 X
+
+> i:ai∈[120 ,127]
+
+wi, y = 16 shi + slo + c. (2) The correction is zero when the activation block contains no value from 120 to 127. With correction c, the measured pro-jection reconstructs the complete int8 range exactly. The two activation streams pass through the same generated schedule and return separate 32-bit partial sums. Host code reconstructs the integer dot product by shifting the high-fragment sum by four bits and adding the low-fragment sum. For each q8 block, the reconstructed integer partial is multiplied by the activation scale, and the accumulated output is then multiplied by the I2 S weight scale. The following dataflow distinguishes arithmetic reconstruc-tion from transfer and scaling. 
+
+Location Operation Host Pack weights, low fragments, encoded high frag-ments, and correction c.CGLA Accumulate slo and shi using two OP_SMA4 
+
+streams. CGLA In the fused-output variant, form slo + 16 shi before output transfer. Host Add c, apply block scales, and accumulate the pro-jection output. 
+
+The unfused variant transfers the two sums separately and also performs their shift-and-add on the host. CPYOUT denotes the runtime operation that copies the CGLA output buffer back to host-visible memory. In the archived fused schedule, rows 0–1 calculate addresses and rows 2–3 issue the signed-int4 operations. Row 5 reduces the lane halves, row 6 shifts the high sum, and row 7 adds the low sum. Row 63 stores the combined partial, giving a 64-row span with unused intermediate rows. Sparse correction and block scaling remain on the host after this store and output transfer. 
+
+D. Activation-Only Int4 Comparison Baselines 
+
+Fig. 3 shows the algorithmic difference between the pro-posed exact two-stream mapping and the four activation-only single-stream int4 baselines. We compare the proposed exact two-stream mapping with four activation-only single-stream int4 baselines. The comparison measures path time and normalized partial-dot error after replacing two activation streams with one. Exact reconstruction requires two activation Proposed path exact two-stream Comparison paths lossy single-stream     
+
+> same operands: w
+> ∈{−1, 0, +1}, int8 a
+> split a = 16 aₕᵢ + aₗₒ
+> into two signed int4
+> two OP_SMA4 streams
+> Σ w aₕᵢ and Σ w aₗₒ
+> shift-and-add
+> 16 Σ w aₕᵢ + Σ w aₗₒ
+> correct 120 –127 exact int8 dot product select activation scale
+> (optional zero point)
+> quantiz e a → q₄
+> one signed int4 value one OP_SMA4 stream
+> s Σ w q₄
+> approximate dot (quantisation error)
+> 2 streams → exact 1 stream → lossy
+> Fig. 3. Algorithmic paths compared in this work. The proposed path splits each int8 activation into two signed-int4 fragments, evaluates two OP_SMA4
+> streams, and applies shift-and-add and sparse correction to reconstruct the ternary–int8 dot product exactly. The comparison paths quantize the activation to one signed-int4 stream and produce approximate dot products.
+
+streams because both signed-int4 fragments are required. For comparison, we implement four single-stream approximations that quantize each int8 activation block to one signed-int4 block q4 and use one OP_SMA4 stream. The single-stream paths use the same ternary weights, signed-int4 instruction, and CGLA call boundary as the exact path. Only the acti-vation representation and host-side reconstruction differ, with one OP_SMA4 stream replacing the two exact streams and producing an approximate dot product. Max-abs scaling uses 
+
+s = max |a|/7. Power-of-two scaling rounds this scale to the nearest power of two. Asymmetric affine scaling uses 
+
+s = ( amax − amin )/15 , z = clip [−8,7] (−8 − round( amin /s )) ,and q4,i = clip [−8,7] (round( ai/s ) + z). Affine reconstruc-tion computes the dot product as s(P 
+
+> i
+
+wiq4,i − z P 
+
+> i
+
+wi).Activation-MSE search evaluates ten scales from 0.5 to 2.0
+
+times the max-abs scale and selects the scale with the smallest activation-reconstruction mean squared error. For all four baselines, the quantization parameters are fixed before the CGLA call from the activation block alone. Weights, CGLA outputs, and the exact ternary–int8 dot product are not used to select these parameters. In affine reconstruction, P 
+
+> i
+
+wi only removes the zero point after the CGLA result and does not select s or z.IV. E XPERIMENTS AND DISCUSSION 
+
+A. Evaluation Setup 
+
+The evaluation separates instruction timing, layer projection, and one integrated BitNet C++ call so that arithmetic cost is not conflated with runtime overhead. Table I summarizes the CGLA, Xeon, and RTX 4090 hardware specifications [1]. TABLE I HARDWARE SPECIFICATIONS OF THE EVALUATED PLATFORMS .                            
+
+> Device Host Compute units Process Frequency Memory Power [W]
+> CGLA 28 nm model c–64 PEs a28 nm 840 MHz 32 KiB LMM b1.82 Intel Xeon W5-2465X –16 cores Intel 7 3.10 GHz 512 GB DDR5 65 NVIDIA RTX 4090 Xeon W5-2465X 16384 CUDA cores 5 nm 2520 MHz 24 GB GDDR6X 450
+> aThe CGLA compute-unit count denotes processing elements (PEs). bThe 32 KiB LMM entry is the synthesis point covering the measured 30.1 KiB resident window.
+> cInstruction and mapping timing is measured on the 145 MHz FPGA prototype. Only frequency-scaled timing and synthesis-power context use the 28 nm CGLA row.
+
+Measurements use the CGLA software stack and the cacheable double-data-rate (DDR) path exposed by 
+
+/dev/mem . Reported kernel times are repeated-invocation wall-clock medians that include input staging, array execution, and output drain for each int4 loaded-word count. Scalar host code checks the output. The integrated experiment runs BitNet b1.58 2B-4T with two host threads and records ten 19-token runs as five pairs after model warm-up and prompt evaluation. Tiled BitNet layer projections use the measured product costs. For the device comparison, CGLA energy assigns 0.6485 W to host execution and 2.07 W to active offload. CPU/GPU energy uses stated power or TDP-context estimates. At the reported sizes, the int4 microbenchmark matches its scalar host reference. The ternary ×int8 split path matches over 4096 outputs for tested inputs with −128 ≤ a ≤ 119 . In the selected projection comparison, positive values from 120 to 127 account for 2.07% of the processed activation elements and use the sparse correction described in Section III-C. All CGLA partial sums match the packed-int4 host reference. The corrected two-stream output has zero normalized integer-dot error. 
+
+B. Signed-Int4 Instruction Results 
+
+Each OP_SMA4 invocation includes input staging, array execution, and output drain. Here W denotes the number of loaded 32-bit operand words, each containing eight signed-int4 fields. At W = 64 , 1024 , 4096 , 16384 , and 32768 loaded 32-bit words, the kernel takes 15.0, 32.8, 87.5, 304, and 592 μs. A two-parameter fit over all five word counts gives a marginal cost of 0.0176 μs per loaded word with R2 > 0.999 . At 
+
+W = 32768 , the measured cost is 2.26 ns per signed-int4 product. Scaling only the clock from 145 to 840 MHz gives a projected cost of 0.390 ns per product for the 28 nm CGLA model. At W = 32768 , each operand buffer occupies 128 KiB in DDR, while each CGLA invocation uses a 30.1 KiB resident LMM window. The ASIC power row therefore uses the 32 KiB LMM point. 
+
+C. BitNet Projection and Integrated Measurement 
+
+A BitNet projection layer with m = 6912 and k = 2560 
+
+contains 1.77 × 10 7 original ternary–int8 multiply–accumulate (MAC) operations and does not fit one LMM tile. Multiplying the measured per-product cost by this operation count esti-mates 40 ms for one fragment stream at 145 MHz. This is a layer-time estimate, not a directly timed invocation of that complete layer. The exact OP_SMA4 mapping uses two frag-ment streams. It projects to approximately 0.08 s at 145 MHz and 14 ms at 840 MHz. Serial-row execution has a median elapsed time of 7.53 s for 19 generated tokens, or 2.52 tokens/s. The five-run summary for this configuration reports 8.88 ms of input staging, 5.82 ms of execution, and 1.64 ms of output drain. These phases form the 16.3 ms offload interval, leaving approximately 7.51 s on the host. The run enables one offloaded call after skipping 420 eligible calls, with two host threads and a 2560 × 2560 
+
+projection. Its operand tiling uses eight output rows per batch and 640 physical words per row. Output rows refer to matrix rows and must be distinguished from physical PE rows. The 7.53 s measurement is the runtime’s accumulated 19-token decode-evaluation time after prompt evaluation. It excludes model loading and prompt evaluation, so E2E below refers to this decode boundary. The offload interval sums input staging, array execution, and output drain inside that boundary. Embedding the CGLA call in the open-source BitNet C++ runtime preserves model loading, prompt evaluation, and token generation for direct E2E execution and measurement [3]. At the same packed-buffer boundary, the operand format, software-visible CGLA instruction, and generated row sched-ule can be changed without constructing a separate accelerator-specific inference runtime. Five pairs of 19-token runs compare the initial exact path with the eight-output-row fused-output exact path. Fused-output execution reduces E2E time in all five pairs, with the median falling from 8.91 to 7.53 s and active CGLA time from 551 to 16.3 ms. In a separate matched comparison, CGLA combines the two integer partials as slo + 16 shi at the same row granularity. This combination cuts CPYOUT volume from 1.56 to 0.78 MB and the counter-reported transfer total from 2.07 to 1.29 MB. Median drain time decreases from 2.34 to 1.64 ms, and the active interval decreases from 17.0 to 16.4 ms in all five pairs. Fig. 4 reports a fused CGLA median of 2.52 tokens/s and 0.258 J/token over five runs. For BitNet b1.58 2B-4T decode, the CPU/GPU rows span 8.17–406.5 tokens/s and 1.599–79.56 J/token. Under the reported energy estimates, CGLA is the lowest-energy row among the four imple-mentations. In Fig. 4, W2A8 provides 406.5 tokens/s com-pared with 2.52 tokens/s for CGLA, whose modeled energy is 0.258 J/token compared with 1.599 J/token. The preferred operating point therefore depends on the required decode rate and energy budget. Because almost all decode time remains 10 0
+
+> 10 2
+> tok/s (log)
+
+Throughput (higher is better)  
+
+> 2.52
+> 8.66 8.17 406.5
+> CGLA SMA4 (ASIC proj.) Xeon W5-2465X RTX 4090 I2_S RTX 4090 W2A8*
+> 10 −1
+> 10 0
+> 10 1
+> 10 2
+> J/token (log)
+
+Energy/token (lower is better)          
+
+> 0.258
+> 7.59 79.56 1.599 Fig. 4. BitNet b1.58 2B-4T decode throughput and estimated energy per token for the four evaluated implementations. The CGLA row uses the fused five-run median and the 28 nm CGLA projection. I2 S is the format-matched BitNet C++ CUDA path, whereas W2A8 is a PyTorch CUDA-graph reference. Energy values use the row-specific power assumptions described in Section IV-E. 0.0 0.5 1.0 1.5 2.0
+> measured path time [s]
+> 0.595 s
+> 0.425
+> 0.359 s
+> 0.142
+> 0.387 s
+> 0.141
+> 0.432 s
+> 0.142
+> 1.97 s
+> 0.142
+> Exact 2-stream Max-abs Power-of-two Affine Activation MSE 0.00 0.05 0.10
+> normalized error
+> 0 exact
+> 0.102 0.0979 0.0821 0.0942
+> CGLA phases host processing normalized error
+> Fig. 5. Measured path-time decomposition and normalized partial-dot error for the proposed exact mapping and activation-only int4 comparison baselines on one selected projection.
+
+on the host, this comparison does not establish an accelerator-induced full-model speedup or energy saving. 
+
+D. Activation-Only Baseline Comparison 
+
+We compare the proposed path and four activation-only baselines for one 2560 × 2560 projection with one decoded token and two host threads. Fifteen performance runs from three prompts and five repetitions per prompt determine the path-time medians. Three prompt-specific verification runs de-termine the error medians. For integer partial dots yj and their approximations ˆyj , normalized error is P 
+
+> j
+
+|ˆyj − yj |/ P 
+
+> j
+
+|yj |.Each j identifies an integer partial dot before runtime block scaling, rather than a generated token or an accuracy score. Each baseline fixes its quantization parameters before the CGLA call. The exact target is computed afterward only for reporting. Exact two-stream execution takes 0.595 s, including 0.425 s in CGLA phases, and has zero sparse-corrected inte-ger error. Max-abs execution takes 0.359 s, including 0.142 s in CGLA phases, and gives a normalized error of 0.102. Power-of-two scaling takes 0.387 s and gives a normalized error of 0.0979. Asymmetric affine execution takes 0.432 s, including 0.142 s in CGLA phases and host-side zero-point correction, and gives the lowest single-stream error of 0.0821. Activation-MSE gives an error of 0.0942 and takes 1.97 s because of host-side candidate evaluation. Its CGLA phases still take 0.142 s. One-stream execution reduces CGLA time but introduces normalized partial-dot error, as shown in Fig. 5. All four baselines have CGLA phases because each executes its quantized activation stream through the same OP_SMA4 
+
+kernel. No perplexity or downstream-task evaluation estab-lishes whether these approximation errors are acceptable for deployment. The exact two-stream path avoids this additional activation-quantization error at the integer-dot boundary. Its local arithmetic check does not replace a full-model quality evaluation. 
+
+E. Interpretation and Limitations 
+
+OP_SMA4 packs eight signed-int4 products per 32-bit lane and has a fitted marginal cost of 0.0176 μs per loaded word. Exact reconstruction evaluates two fragment products per original MAC. Fused in-array combination halves CPYOUT volume and reduces drain time from 2.34 to 1.64 ms. Input staging and array execution remain on the active path, so the active interval decreases only from 17.0 to 16.4 ms. For one selected projection, the activation-only baselines trade exact reconstruction for shorter path time. Affine quantization gives an error of 0.0821 at 27% lower path time than the exact path. The principal limitation is the evaluation boundary, which has three aspects. First, fixed-word timing measures one int4 stream, and the tiled layer values are projections. The inte-grated E2E run offloads one selected call rather than all BitNet layers. Second, the 840 MHz timing and 1.82 W CGLA values use the existing 28 nm model rather than silicon measurements. Frequency-only scaling assumes that the measured interval scales with the core clock, including transfer overheads that may scale differently in silicon. The instruction equation spec-ifies the software-visible behavior, but the evaluation does not isolate the incremental decoder, register-path, or arithmetic-unit area and power. Table I lists the 450 W device TDP of the RTX 4090. Fig. 4 retains the 650 W combined host-plus-GPU TDP context used by the reported energy comparison. Third, I2 S is the format-matched BitNet C++ CUDA path, whereas W2A8 is a separate PyTorch CUDA-graph reference. The four activation-only baselines are approximate paths excluded from the exactness result. Further runtime integration will apply sparse correction across the offloaded layers and evaluate full-model execution with run-to-run timing variation. V. C ONCLUSION 
+
+In this paper, we mapped BitNet ternary–int8 dot prod-ucts onto OP_SMA4 , a reusable signed-int4 instruction for a programmable CGLA. At W = 32768 , the 145 MHz FPGA measurement of 2.26 ns per product corresponds to 0.390 ns at 840 MHz under the frequency-only 28 nm CGLA projection. The open-source BitNet C++ runtime measures 2.52 tokens/s at the decode boundary with one offloaded call. The CGLA call separately reports input staging, array execution, and output drain for further optimization. Under the stated phase-accounted model, the fused CGLA path is estimated at 0.258 J/token, below the three CPU/GPU rows in the device comparison. Future work will optimize the measured host and DMA staging/drain intervals and extend the offload to full-model execution. REFERENCES [1] T. Ando, Y. Eto, A. Takeuchi, and Y. Nakashima, “Efficient kernel mapping and comprehensive system evaluation of LLM acceleration on a CGLA,” IEEE Access , vol. 13, pp. 199 631–199 646, 2025. [2] S. Ma et al. , “The era of 1-bit LLMs: All large language models are in 1.58 bits,” arXiv:2402.17764, 2024. [3] J. Wang, H. Zhou, T. Song, S. Cao, Y. Xia, T. Cao, J. Wei, S. Ma, H. Wang, and F. Wei, “bitnet.cpp: Efficient edge inference for ternary LLMs,” in Proc. 63rd Annual Meeting of the Association for Com-putational Linguistics (Volume 1: Long Papers) . Vienna, Austria: Association for Computational Linguistics, 2025, pp. 9305–9322. [4] H. Wang et al. , “BitNet: Scaling 1-bit transformers for large language models,” arXiv:2310.11453, 2023. [5] Y. Qiao, Z. Chen, Y. Zhang, Y. Wang, and S. Huang, “TeLLMe: An energy-efficient ternary LLM accelerator for prefilling and decoding on edge FPGAs,” arXiv:2504.16266, 2025. [6] C. Yin, Z. Bai, P. Venkatram, S. Aggarwal, Z. Li, and T. Mitra, “TerEffic: Highly efficient ternary LLM inference on FPGA,” arXiv:2502.16473, 2025. [7] Z.-W. Lin and T.-S. Chang, “VitaLLM: A versatile and tiny accelerator for mixed-precision LLM inference on edge devices,” arXiv:2605.00320, 2026, accepted in ISCAS 2026. [8] W. Zhang, X. Li, S. Ando, and K. Yoshioka, “BitROM: Weight reload-free CiROM architecture towards billion-parameter 1.58-bit LLM infer-ence,” arXiv:2509.08542, 2025, accepted in ASP-DAC 2026. [9] R. Geens, J. Heldens, J. Dumoulin, and M. Verhelst, “Hardware gen-eration and exploration of lookup table-based accelerators for 1.58-bit LLM inference,” arXiv:2604.25183, 2026, presented as ISPASS 2026. [10] T. Akabe, V. T. D. Le, and Y. Nakashima, “IMAX: A power-efficient multilevel pipelined CGLA and applications,” IEEE Access , vol. 13, pp. 31 899–31 911, 2025. [11] ggml-org, “llama.cpp: Inference of LLaMA models in pure C/C++,” https://github.com/ggml-org/llama.cpp, accessed July 8, 2026. [12] S. Ma et al. , “BitNet b1.58 2B4T technical report,” arXiv:2504.12285, 2025. [13] J. Wei et al. , “T-MAC: CPU renaissance via table lookup for low-bit LLM deployment on edge,” arXiv:2407.00088, 2024. [14] H. Sharma, J. Park, N. Suda, L. Lai, B. Chau, J. K. Kim, V. Chandra, and H. Esmaeilzadeh, “Bit Fusion: Bit-level dynamically composable architecture for accelerating deep neural networks,” in 2018 ACM/IEEE 45th Annual International Symposium on Computer Architecture (ISCA) ,2018, pp. 764–775. [15] J. Qin, T. Xia, C. Tan, J. Zhang, and S. Q. Zhang, “PICACHU: Plug-in CGRA handling upcoming nonlinear operations in LLMs,” in Proc. ACM International Conference on Architectural Support for Programming Languages and Operating Systems (ASPLOS) , 2025. [16] R. Prasad, “NX-CGRA: A programmable hardware accelerator for core transformer algorithms on edge devices,” arXiv:2511.17235, 2025, accepted in DATE 2026.
