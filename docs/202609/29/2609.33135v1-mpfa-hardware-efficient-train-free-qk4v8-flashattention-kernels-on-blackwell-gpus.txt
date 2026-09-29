@@ -1,0 +1,662 @@
+Title: MpFA: Hardware-Efficient Train-Free QK4V8 FlashAttention Kernels on Blackwell GPUs
+
+URL Source: https://arxiv.org/pdf/2609.33135v1
+
+Published Time: Tue, 29 Sep 2026 01:40:56 GMT
+
+Number of Pages: 13
+
+Markdown Content:
+# MpFA: Hardware-Efficient Train-Free QK4V8 FlashAttention Kernels on Blackwell GPUs 
+
+Chencheng Deng, Jianbin Fang, Dezun Dong *
+
+College of Computer Science and Technology, National University of Defense Technology Changsha, China 
+
+{chenchengdeng,j.fang,dong}@nudt.edu.cn 
+
+Abstract 
+
+Long-context LLM inference pushes modern GPU serving stacks into an attention-bound regime, where both compute and memory are dominated by the softmax–GEMM pipeline. On NVIDIA Blackwell GPUs, FP4 Tensor Cores offer high matmul throughput, but we find that fully FP4 attention often fails to translate this throughput into end-to-end speedups due to non-matmul costs: online quantization after softmax, tensor/shared-memory data movement, and contention on the softmax path. We present MpFA, a training-free FlashAt-tention kernel optimized for Blackwell. Guided by hard-ware characterization, MpFA uses mixed precision: NVFP4 for 𝑄𝐾 ⊤ and FP8 for 𝑃𝑉 (QK4PV8). This preserves low-bit 
+
+𝑄𝐾 ⊤ throughput while avoiding the conversion and scaling overheads of FP4 𝑃𝑉 . To recover accuracy without further stressing the softmax pipeline, MpFA introduces rank-one smoothing compensation implemented as an additional Ten-sor Core MMA. MpFA further improves performance with a fine-grained asynchronous pipeline, tensor-memory reuse, and adaptive parallel partitioning across prefill and decode. On an NVIDIA B200 and across 16K–128K contexts, MpFA improves prefill throughput over state-of-the-art BF16/FP8 baselines and increases end-to-end output throughput by 2.81 × over BF16 FA4 across Llama-3.1-8B and Qwen3-14B. Across five benchmark suites and two models, rank-one com-pensation recovers 62 .5% of the accuracy loss with about 2.0% kernel overhead. 
+
+Keywords: FlashAttention, Quantization, Blackwell GPU 
+
+1 Introduction 
+
+Applications such as retrieval-augmented generation, code understanding, and multi-turn agents increasingly rely on long contexts, making long-context inference an important LLM-serving workload [1, 12]. Meanwhile, AI infrastructure is adopting the Blackwell architecture. NVIDIA’s data-center B200 combines fifth-generation Tensor Cores, native low-bit computation, and tensor memory for storing operands and intermediate results. LLM inference consists of prefill and decode. Prefill pro-cesses the entire input sequence, so its attention computation grows approximately quadratically with context length. De-code generates one token at a time and repeatedly accesses        
+
+> *Corresponding author. Attention GEMM Others 1K 4K 16K 32K 64K 128K
+> context length
+> 025 50 75 100
+> GPU time share (%)
+> 811 26 40 57 73
+
+(a) prefill 1K 4K 16K 32K 64K 128K    
+
+> context length
+> 025 50 75 100
+> GPU time share (%)
+> 15 34 62 75 85 91
+
+(b) decode 
+
+Figure 1. Device-side GPU time breakdown for Llama-3.1-8B served by SGLang on a B200 with the BF16 FA4 backend. the growing KV cache, resulting in memory traffic that in-creases linearly with context length and low arithmetic in-tensity. We run Llama-3.1-8B with SGLang’s standard BF16 FA4 backend on a B200. As shown in Figure 1, attention accounts for 72 .5% of device-side GPU time in prefill and 91 .4% in decode at 128K tokens. Although FlashAttention-4 (FA4) [27] pipelines computation through tensor memory and fifth-generation Tensor Cores, the evaluated backend uses BF16 and does not exploit FP4 Tensor Cores for the two dominant matrix multiplications. Quantization-aware training can adapt a model to 4-bit attention, but requires costly per-model retraining and is difficult to deploy at scale. Post-training methods avoid re-training; for example, SageAttention3 [30] applies NVFP4 at-tention to the consumer Blackwell RTX 5090, while HiFA4 [6] targets the Ascend HIF4 NPU. However, neither is designed to exploit the B200’s tensor memory, fifth-generation Ten-sor Cores, and operand-delivery paths or to jointly support decode optimization, paged KV caches, and CUDA Graph capture. Efficient training-free FP4 attention therefore re-mains unavailable on data-center Blackwell GPUs. Our hardware characterization and profiling reveal two challenges in building training-free FP4 FlashAttention for data-center Blackwell GPUs. First, when fifth-generation Tensor Cores execute block-scaled FP4 matrix multiply-add (MMA), matrix operands must be supplied from shared mem-ory, whereas scale factors must come from tensor memory. Quantizing the softmax output 𝑃 to FP4 adds per-block amax computation, scale-factor generation, and data movement 
+
+> 1arXiv:2609.33135v1 [cs.DC] 27 Sep 2026
+
+between tensor and shared memory. These operations load the softmax path, preventing low-bit matrix-multiplication speedups from translating into end-to-end performance. Sec-ond, existing smoothing compensation methods place the compensation term on the softmax path. This extra element-wise work further loads the already saturated path, where it competes with other operations and offsets the benefit of FP4 computation. We present MpFA, a high-performance, training-free low-bit attention kernel for LLM inference on data-center Black-well GPUs. We characterize three precision assignments: NVFP4 for both matrix multiplications; NVFP4 for 𝑄𝐾 ⊤ with BF16 for 𝑃𝑉 ; and NVFP4 for 𝑄𝐾 ⊤ with FP8 for 𝑃𝑉 . Our evalu-ation shows that QK4PV8 provides the best balance between arithmetic throughput and non-matmul overhead on the B200, making it the hardware-efficient choice for FA4. FP8 
+
+𝑃𝑉 retains the benefits of low-precision Tensor Core exe-cution while avoiding the additional precision-conversion requirements of an FP4 probability matrix. BF16 𝑃𝑉 avoids these conversion requirements as well, but leaves Tensor Core throughput on the table because FP8 Tensor Cores pro-vide twice the throughput of BF16. MpFA therefore adopts QK4PV8 mixed precision and optimizes the FA4 pipeline for both inference stages: prefill uses a fine-grained asynchro-nous pipeline and tensor-memory column reuse to co-locate scale factors with double-buffered accumulators; decode re-stores parallelism through GQA packing, KV partitioning, and column-split softmax while avoiding exponential evalu-ations on padded rows. To reduce smoothing overhead, MpFA introduces a rank-one Tensor Core MMA compensation method that moves the correction from the saturated softmax path to otherwise underutilized Tensor Cores. It stores 𝐾 in NVFP4 and 𝑉 in FP8, consuming the low-bit KV cache without dequantization and reducing KV bytes per token to 1 /2.56 of BF16. Experiments on the B200 show that, across 16K–128K, MpFA achieves average prefill speedups of 1 .31–1 .33 × over BF16 FA4 and 1 .15–1 .17 × over FP8 FlashInfer. Across 8K– 128K, its decode kernel achieves a 2 .08 × average speedup over split-KV-enabled BF16 FA4. Across ten model–task pairs spanning five standard benchmarks, rank-one smoothing recovers 62 .5% of the accuracy loss on average, with about 2.0% average kernel overhead. MpFA achieves 2 .81 × the end-to-end output throughput of BF16 FA4 across both models and 16K–128K, and by 1 .06 × over FP8 FlashInfer across both models and 32K–128K contexts. This paper makes the following contributions: 1. We systematically analyze how attention kernels on data-center Blackwell GPUs become limited by non-matmul units, providing insight for optimizing other fused operators (§3). 2. We present MpFA, a high-performance QK4PV8 FlashAt-tention kernel for LLM inference, with tensor-memory reuse and stage-specific optimizations for prefill and decode (§5). 3. We introduce a rank-one Tensor Core smoothing al-gorithm that moves compensation from the saturated softmax path to MMA, recovering accuracy while main-taining hardware utilization (§4). 
+
+2 Background 
+
+2.1 Blackwell GPUs Blackwell is NVIDIA’s GPU architecture for next-generation AI computing. This paper focuses on the data-center B200 rather than the consumer RTX 5090. Both provide Blackwell Tensor Cores and low-bit formats, but differ in compute ca-pabilities and operand delivery. RTX 5090 attention kernels are optimized for the consumer GPU’s matrix multiply-add (MMA) path, whereas the B200 introduces on-chip tensor memory and tcgen05.mma . Consequently, RTX 5090 imple-mentations cannot fully exploit the B200, whose adoption re-quires attention kernels redesigned around its data path [13]. 
+
+From hardware to kernels. The B200’s Tensor Cores, ten-sor memory, and shared memory jointly determine the on-chip data path for attention. Figure 2 summarizes the ex-ecution path considered in this paper. In Figure 2(a), the asynchronous copy engine (TMA) first moves tiled 𝑄 , 𝐾 ,and 𝑉 from global memory to shared memory. Tensor Cores then use tcgen05.mma instructions to compute 𝑄𝐾 ⊤ and 𝑃𝑉 
+
+and write the intermediate results to tensor memory. CUDA cores and special function units execute online softmax and directly read from and write to the score, probability, and output accumulators in tensor memory. The final results are written back to global memory. The SS and TS labels in the figure denote two operand-delivery paths; as discussed in §3.1, these paths constrain the precision assignment. Unlike traditional execution models, which keep accumulators in registers, this design uses tensor memory as separate on-chip storage for results, allowing matrix multiplication and softmax to form an asynchronous pipeline with explicit role separation [27]. Figure 2(b) shows the capacity constraint: in our kernel configuration, each cooperative thread array (CTA) is allocated 128 rows × 512 columns, or 256 KB. Two attention score accumulators and two output accumulators, each with block size 128 and FP32 elements, consume all 512 columns. 
+
+Block-scaled FP4 matrix multiply-add. FP4 cannot rep-resent the full dynamic range of activations by itself, so the B200 uses block-scaled FP4 MMA. NVFP4 associates every consecutive 𝐺 =16 elements along the reduction dimension with one e4m3 scale factor; by comparison, MXFP4 uses 𝐺 =32 elements and one e8m0 scale factor. For a block 𝑥 𝑔 ∈ R𝐺 ,quantization and hardware reconstruction can be written as 
+
+𝑠 𝑔 = amax (𝑥 𝑔 )
+
+𝜌 , ˆ𝑥 𝑔 =
+
+j 𝑥 𝑔 
+
+𝑠 𝑔 
+
+m
+
+e2m1 , ˜𝑥 𝑔 = 𝑠 𝑔 ˆ𝑥 𝑔 , (1)                
+
+> 2SM
+> SS TS
+> 1 load 2QK ⊤and PV 3 softmax 4 store O
+> global memory
+> Q,K,V
+> TMA
+> shared memory
+> Q,K,Vtiles tensor memory
+> S,O,P
+> Tensor Core tcgen05 MMA CUDA core, SFU softmax
+> 1234
+
+(a) FlashAttention4 data path S0 S1 O0 O1
+
+> 512 columns / CTA, 4 bytes per column 4 warps × 32 two query stages in flight fill all 512 columns
+
+(b) Tensor memory architecture 
+
+Figure 2. Data path and tensor memory organization. where 𝜌 =6 is the maximum magnitude of e2m1 . In Equation 1, the Tensor Core performs the reconstruction ˜ 𝑥 𝑔 = 𝑠 𝑔 ˆ𝑥 𝑔 inter-nally during MMA. Block scaling limits quantization error locally, but introduces scale factors that must accompany the operands. We use NVFP4 because its 16-element blocks and scales better match attention activations than MXFP4 [30]. Different MMA precisions impose different operand-source and scale-factor requirements, making hardware details crit-ical to both precision selection and performance bottlenecks. 
+
+2.2 FlashAttention and Quantization 
+
+Self-attention comprises two matrix multiplications and one softmax: 
+
+𝑆 = 𝑄𝐾 ⊤/√𝑑, 𝑃 = softmax (𝑆 ), 𝑂 = 𝑃𝑉 (2) FlashAttention [3, 4] tiles 𝑄 , 𝐾 , and 𝑉 along the sequence dimension and processes KV blocks with online softmax, keeping intermediates on chip. Let the score for the 𝑡 -th KV block be 𝑆 (𝑡 ) = 𝑄𝐾 (𝑡 )⊤ /√𝑑 . FlashAttention maintains a row-wise maximum 𝑚 , normalization factor ℓ, and output accumulator 𝑂 :
+
+𝑚 (𝑡 ) = max  𝑚 (𝑡 −1) , rowmax (𝑆 (𝑡 ) ) (3) 
+
+𝑃 (𝑡 ) = 𝑒 𝑆 (𝑡 ) −𝑚 (𝑡 )
+
+(4) 
+
+ℓ (𝑡 ) = 𝑒 𝑚 (𝑡 −1) −𝑚 (𝑡 )
+
+ℓ (𝑡 −1) + rowsum  𝑃 (𝑡 )  (5) 
+
+𝑂 (𝑡 ) = diag  𝑒 𝑚 (𝑡 −1) −𝑚 (𝑡 ) 𝑂 (𝑡 −1) + 𝑃 (𝑡 )𝑉 (𝑡 ) (6) Row maximum, exponentiation, row sum, and output rescal-ing in Equations 3–6 form the non-matmul softmax path. FA3 [23] hides its latency through warp specialization, over-lapping a tile’s matmul with the preceding tile’s softmax. FA4 [27] reorganizes this pipeline for Blackwell tensor mem-ory and fifth-generation Tensor Cores (Figure 2(a)). 
+
+Quantized attention. Unlike static weights in linear-layer quantization, 𝑄 , 𝐾 , 𝑃 , and 𝑉 are runtime activations coupled by softmax, making quantized attention sensitive to outliers, normalization, and accumulation error. The SageAttention series [29–31] and HiFA4 [6] demonstrate that post-training quantization can accelerate attention without retraining. It can also consume low-bit KV caches directly [16], reducing memory use and avoiding dequantization. 
+
+3 Motivation 
+
+Low-bit attention can exploit the B200’s FP4 Tensor Cores while compressing the KV cache, reducing the compute and memory costs of long-context inference. However, Table 1 shows that existing systems target consumer Blackwell GPUs or NPUs, without addressing the B200’s tensor memory, operand-delivery paths, or serving-time decode. 
+
+3.1 Asymmetric Hardware Scaling 
+
+Blackwell’s gains concentrate in Tensor Cores: the B200 de-livers 2 .25 PFLOPS in BF16, compared with 1 PFLOPS on the H100, and 9 PFLOPS in FP4 [17, 19]. Exponential throughput and shared-memory bandwidth have not scaled proportion-ally [13, 18, 27], so reducing matmul precision yields no comparable reduction in softmax cost. The B200’s operand-delivery paths further amplify this asymmetry. Block-scaled FP4 MMA requires its operands to reside in shared memory and its scale factors to reside in tensor memory, whereas FP8 MMA can source its first operand directly from tensor mem-ory. Moreover, BF16 FA4 double buffers the queries, while its two FP32 score and output accumulators, each with a tile size of 128, already occupy all 512 tensor memory columns avail-able to each CTA, leaving limited capacity for additional scale factors. Precision selection is therefore jointly constrained by compute throughput, data movement, and contention for tensor memory capacity. We implement and measure four configurations on the B200: BF16 FA4, and three configurations that fix 𝑄𝐾 ⊤ to NVFP4 while using NVFP4, BF16, or FP8 for 𝑃𝑉 . Based only on Tensor Core MMA cycles, NVFP4 𝑃𝑉 should be fastest, followed by FP8 and then BF16, with theoretical speedups of 4.00 ×, 2 .67 ×, and 1 .60 ×, respectively. However, Figure 3(a) shows the opposite measured ordering. At 𝐿 =64K, NVFP4 +
+
+FP8 is 1 .38 × faster than BF16 FA4, NVFP4 + BF16 achieves 1.11 ×, while NVFP4 + NVFP4 reaches only 0 .87 × and is slower than BF16 FA4. The result demonstrates that precision selection on the B200 cannot be based on Tensor Core peak throughput alone. Figure 3(b) decomposes the SM cycles per KV-block itera-tion and explains why the theoretical matrix-multiplication speedup does not translate into end-to-end operator speedup. In the BF16 configuration, the two matrix multiplications consume 1024 cycles, or 60% of total operator time. The BF16 FA4 implementation already approximates the exponential with a third-order polynomial on the CUDA cores to reduce the cost of the softmax exponential, and we adopt the same 
+
+> 3
+
+Table 1. Positioning relative to the closest related systems. 
+
+Work Hardware 𝑄𝐾 ⊤ / 𝑃𝑉 Compensation Partitioned decode Workload FA4 [27] B200 BF16 / BF16 — Incompatible with graph capture Vision/language FlashInfer [26] B200 FP8 / FP8 — Graph-compatible Vision/language SageAttn [31] RTX 4090 INT8 / INT8 Softmax — Vision/language SageAttn2 [29] Hopper INT4 / FP8 Softmax — Vision/language SageAttn3 [30] RTX 5090 NVFP4 / NVFP4 Softmax — Vision HiFA4 [6] Ascend NPU HIF4 / HIF4 Softmax — Language 
+
+MpFA (ours) B200 NVFP4 / FP8 MMA Graph-compatible Language roofline (MMA only) measured MMA non-MMA PV : NVFP4 PV : BF16 PV : FP8 
+
+> 012345
+> speedup vs BF16 FA4
+> 4.00 1.60 2.67 0.88 1.11 1.38
+
+(a) 𝑄𝐾 ⊤ fixed to NVFP4 BF16 +BF16 NVFP4 +NVFP4 NVFP4 +BF16 NVFP4 +FP8  
+
+> 0500 1000 1500 2000
+> cycles per KV iteration
+> 60% 1707 13% 1938 41% 1545 31% 1235
+
+(b) Performance gap exp2 row max sum/rescale others   
+
+> 0100 200 300 400 500
+> cycles per KV iteration  417 93 85 256 MMA 384
+
+(c) Performance breakdown 
+
+Figure 3. Four precision assignments for causal prefill at 𝐿 =64K with GQA 32:8. technique. NVFP4 + FP8 reduces this component to 384 cy-cles, a 63% reduction, but total time falls only from 1707 to 1235 cycles, or 28%. Softmax, reductions, and data movement do not shrink with matrix-multiplication precision. Once attention enters the 4-bit regime, the dominant constraint therefore shifts from matrix multiplication to the softmax path. The reason NVFP4 + NVFP4 becomes slower is operand delivery rather than FP4 MMA throughput. If the probabil-ity matrix 𝑃 , just generated in tensor memory by softmax, is used as an operand for block-scaled NVFP4 MMA, three additional costs arise. First, 𝑃 must be quantized by com-puting an absolute maximum over every 16 elements and generating scale factors; this work is placed on the already busy softmax path. Second, block-scaled MMA requires both operands from shared memory, so 𝑃 must leave tensor mem-ory, be written to shared memory, and then be read by the matrix multiplication unit. Third, 𝑃 ’s scale factors need ten-sor memory capacity, competing with the score and output accumulators that already consume all 512 columns and re-quiring additional scale-factor transfers. The FP8 𝑃𝑉 path avoids all three costs. Without block scaling, FP8 MMA can read its first operand directly from tensor memory, allowing the probability matrix to remain in place. FP8 Tensor Cores also provide twice the through-put of BF16. Thus, an efficient B200 precision assignment must consider both data format and operand-delivery path: NVFP4 (𝑄𝐾 ⊤)+ FP8 (𝑃𝑉 ) is the hardware-efficient point. 
+
+3.2 Inefficient Accuracy Compensation 
+
+Figure 3(c) further breaks down the execution time of NVFP4 
+
++ FP8. We obtain the softmax-stage costs through a compile-time ablation chain: we first rebuild the kernel with exp2 
+
+disabled, then additionally disable the row-max and row-sum/rescale stages, and compute successive differences. This procedure makes the stage costs additive. The softmax path consumes 595 cycles, or 48% of total operator time, with exp2 alone accounting for 417 cycles, exceeding the 384 cycles of the two quantized matrix mul-tiplications. An 𝑀 =𝑁 =128 KV block contains 16384 score elements. At 16 elements per SM cycle, fully serialized expo-nential evaluation would require 1024 cycles. The measured 417 cycles are lower because CUDA core polynomial evalua-tion overlaps with exponential unit execution, while matrix multiplication overlaps with the softmax path. Thus, once attention enters the 4-bit regime, non-matmul computation, particularly the softmax path, becomes the dominant bottle-neck. Low-bit quantization still requires accuracy compensa-tion. Prior methods typically smooth outliers by subtracting the means of 𝑄 and 𝐾 and adding a compensation factor back to the attention scores. The compensation must be 
+
+> 4
+
+added before masking and before updating the running max-imum; otherwise it breaks online-softmax normalization. Existing approaches consequently place additional loads and element-wise additions on the softmax bottleneck. In our measurements, this placement costs 18 .6–22 .7% of opera-tor time, consuming more than half of the advantage of the unsmoothed low-bit attention. 
+
+3.3 Insights from Profiling and Analysis 
+
+The analysis yields three principles for low-bit attention on data-center Blackwell GPUs. 
+
+Principle 1: mixed precision. NVFP4 (𝑄𝐾 ⊤)+ FP8 (𝑃𝑉 ) ac-celerates 𝑄𝐾 ⊤ computation without quantizing 𝑃 to NVFP4, avoiding the associated data-movement and scale manage-ment overheads along the softmax path. 
+
+Principle 2: reduce non-matmul overhead. Rank-one Tensor Core MMA compensation moves the cost from soft-max to Tensor Cores, while a fine-grained pipeline improves utilization. 
+
+Principle 3: specialize prefill and decode. Prefill pro-cesses the complete query sequence and is primarily con-strained by the softmax path. Decode has only a small num-ber of valid query rows at each step and is primarily con-strained by insufficient parallelism and padded rows intro-duced by MMA atom. 
+
+4 Quantization Algorithm 
+
+Following the first two principles in §3, MpFA uses NVFP4 for 𝑄𝐾 ⊤, FP8 for 𝑃𝑉 , and sequence centering with BF16 rank-one Tensor Core MMA to compensate for channel-outlier-induced NVFP4 error in 𝑄 and 𝐾 .
+
+4.1 QK4PV8 Quantization 
+
+MpFA quantizes 𝑄 and 𝐾 to NVFP4 with one e4m3 scale fac-tor per 16 head-dimension elements, and quantizes 𝑃 and 
+
+𝑉 to FP8. The online softmax states 𝑚 , ℓ, and the 𝑃𝑉 accu-mulator remain FP32, and the operator returns BF16. This assignment reduces 𝑄𝐾 ⊤ computation and KV storage with-out the block-scale management required by fully NVFP4 
+
+𝑃𝑉 .Quantizing 𝑃 does not require a dynamically computed scale factor for each block, but should account for the limited range of FP8 e4m3 and the numerical degradation caused by attention sinks. From Equation 4, each unnormalized probability generated by online softmax satisfies 0 < 𝑃 (𝑡 ) 
+
+> 𝑖 𝑗
+
+= 𝑒 𝑆 (𝑡 )   
+
+> 𝑖 𝑗 −𝑚 (𝑡 )
+> 𝑖
+
+≤ 1.
+
+MpFA therefore uses a fixed scale factor 𝑠 𝑃 = 448 for 𝑃 :
+
+b𝑃 (𝑡 ) 
+
+> 𝑖 𝑗
+
+= cast e4m3 
+
+
+
+𝑠 𝑃 𝑃 (𝑡 )
+
+> 𝑖 𝑗
+
+
+
+/𝑠 𝑃 .
+
+Because 448 is the largest normal e4m3 value and 𝑃 (𝑡 ) 
+
+> 𝑖 𝑗
+
+≤ 1, this analytic scale applies across layers, heads, and inputs without runtime amax statistics, per-block scale generation, or calibration. The remaining concern is the lower end of the FP8 range: in a forward traversal, an early attention sink can raise the running maximum and push ordinary-token probabilities into the e4m3 subnormal range. MpFA therefore traverses 𝐾 and 𝑉 in reverse KV-block order to delay the sink block. Since online softmax is traversal-order invariant, reversal changes only the finite-precision rounding path, following FA3 [23]. 
+
+4.2 Outlier Structure and Sequence Smoothing 
+
+NVFP4 block scaling assigns the dynamic range of each 16-element block according to its amax. Stable channel outliers within a block can therefore directly reduce the effective precision of 4-bit quantization. Figure 4 shows activations collected from a running service: one head from one layer of each model over the first 256 tokens. The magnitudes of 𝑄 and 𝐾 form ridges along the channel dimension that persist across many tokens, while remaining approximately flat along the token dimension. Because NVFP4 blocks are partitioned along the channel axis, a small number of sta-ble outlier channels can consume most of the representable range of their blocks. These outliers are determined by fixed model parameters rather than transient input tokens, making them suitable for smoothing. In contrast, 𝑉 varies compara-bly across the channel and token dimensions and is therefore not smoothed, consistent with prior work [29]. As 𝑉 is not centered, it requires no mean recovery and is unaffected by rank-one compensation. It uses FP8 e4m3 (three mantissa bits versus one for NVFP4) with FP32 accumulation. Since 
+
+𝑂 = Í𝑗 𝑃 𝑗 𝑉 𝑗 is a convex combination, rounding errors in 𝑉 
+
+enter the output as a weighted average rather than a sum that grows linearly with sequence length. 
+
+Sequence centering. To mitigate the stable channel outlier structure, we subtract a sequence-level mean for each layer and head before quantization. For the set of valid tokens C,we define ¯𝐾 [ℎ, :] = 1
+
+|C| ∑︁ 𝑡 ∈ C 
+
+𝐾 [𝑡, ℎ, :], ¯𝑄 [ℎ, :] = 1
+
+|C| ∑︁ 𝑡 ∈ C 
+
+𝑄 [𝑡, ℎ, :] (7) The system obtains these two statistics during prefill and quantizes the centered values 
+
+𝑄 𝑐 = 𝑄 − ¯𝑄, 𝐾 𝑐 = 𝐾 − ¯𝐾 . 
+
+We partition 𝑄 𝑐 , 𝐾 𝑐 , and 𝑉 along the token dimension into 
+
+{𝑄 𝑐,𝑖 }, {𝐾 𝑐,𝑗 }, and {𝑉 𝑗 }, with quantized blocks ˆ 𝑄 𝑐,𝑖 , ˆ 𝐾 𝑐,𝑗 , and ˆ𝑉 𝑗 and scales 𝑠 𝑄,𝑖 and 𝑠 𝐾,𝑗 . The removed means become re-coverable compensation factors, while centering is fused into the quantization write path. 
+
+4.3 Rank-One Tensor Core Compensation 
+
+When both 𝑄 and 𝐾 are centered, the removed mean terms must be restored before softmax. Expanding 𝑆 = 𝑄𝐾 ⊤ and defining a key-dependent compensation vector gives 
+
+𝑆 = 𝑄 𝑐 𝐾 ⊤ 
+
+> 𝑐
+
++ 1𝑀 
+
+  ¯𝑄𝐾 ⊤
+
+> 𝑐
+
+ +  𝑄 ¯𝐾 ⊤1⊤ 
+
+> 𝑁
+
+(8)   
+
+> 5050 100
+> channel
+> 0100 200
+> token
+> 024
+
+(a) Llama-3.1-8B |𝑄 |0 50 100  
+
+> channel
+> 0100 200
+> token
+> 0510 15
+
+(b) Llama-3.1-8B |𝐾 |0 50 100  
+
+> channel
+> 0100 200
+> token
+> 0246
+
+(c) Qwen3-14B |𝑄 |0 50 100  
+
+> channel
+> 0100 200
+> token
+> 0.0 2.5 5.0 7.5
+
+(d) Qwen3-14B |𝐾 |
+
+Figure 4. Distributions of |𝑄 | and |𝐾 | for one head at layer 16 of Llama-3.1-8B and layer 20 of Qwen3-14B. 
+
+Δ𝑆 [ 𝑗 ] ≜ ¯𝑄 · 𝐾 𝑐 [ 𝑗, :]⊤ (9) Here Δ𝑆,𝑗 denotes the entries of Δ𝑆 [ 𝑗 ] in KV block 𝑗 ; GQA uses one Δ𝑆 vector per query head. The third term is constant across keys within each soft-max row and cancels because softmax (𝑥 + 𝑐 1) = softmax (𝑥 ).Only the key-dependent second term must be restored after centering: ˆ𝑆 = deq   ˆ𝑄 𝑐 ˆ𝐾 ⊤
+
+> 𝑐
+
+ + 1𝑀 Δ𝑆 (10) Here Δ𝑆 is added before masking and before updating the running maximum. This ordering prevents compensation from reaching masked positions and keeps the running max-imum consistent with the normalized scores. 
+
+Rank-one MMA implementation. The compensation term in Equation 10 is the outer product 1𝑀 Δ𝑆 within a score tile. Rather than adding it element-wise after computing ˆ 𝑄 𝑐 ˆ𝐾 ⊤ 
+
+> 𝑐
+
+,we first issue a BF16 Tensor Core MMA instruction on the same score accumulator: 
+
+𝑆 acc ← 1𝑀 Δ𝑆 , 𝑆 acc += deq   ˆ𝑄 𝑐 ˆ𝐾 ⊤
+
+> 𝑐
+
+. (11) For the BF16 MMA reduction granularity 𝐾 =16, the constant 
+
+𝐴 operand has 1 only in its first column, with the remaining columns and corresponding Δ𝑆 components zeroed. The ac-cumulation is therefore exactly 1𝑀 Δ𝑆 , moving compensation from the softmax path to otherwise idle Tensor Cores with-out changing online softmax. Compared with element-wise addition, this introduces one BF16 rounding with relative error at most 2 −8.
+
+5 High Performance QK4PV8 FA Kernel 
+
+This section presents MpFA’s unified QK4PV8 computation flow, followed by tensor memory reuse, rank-one compensa-tion placement, and decode-specific optimizations. 
+
+5.1 Fine-Grained Pipeline 
+
+Algorithm 1 describes MpFA’s two-stage execution flow. The first stage runs outside the attention operator: it computes ¯𝑄 and ¯ 𝐾 , centers 𝑄 and 𝐾 , quantizes 𝑄 𝑐 and 𝐾 𝑐 to NVFP4, quantizes 𝑉 to FP8, and computes the per-token compen-sation vector Δ𝑆 with one GEMV according to Equation 9. 
+
+Algorithm 1 Algorithm design of MpFA. Δ𝑆,𝑗 is the com-pensation vector. The 1 /√𝑑 factor is folded into the 𝜆 .
+
+Input: 𝑄, 𝐾, 𝑉 in BF16; block sizes 𝐵 𝑞 , 𝐵 𝑘𝑣 ; 𝑇 𝑚 = ⌈𝑁 𝑞 /𝐵 𝑞 ⌉ query blocks and 𝑇 𝑛 = ⌈𝑁 𝑘𝑣 /𝐵 𝑘𝑣 ⌉ KV blocks; 𝑀 = 𝐵 𝑞 
+
+Output: 𝑂 in BF16  
+
+> 1:
+
+¯𝑄 ← mean (𝑄 ), ¯𝐾 ← mean (𝐾 ) ⊲ outside kernel  
+
+> 2:
+
+𝑄 𝑐 ← 𝑄 − ¯𝑄, 𝐾 𝑐 ← 𝐾 − ¯𝐾  
+
+> 3:
+
+(𝑠 𝑄 , ˆ𝑄 𝑐 ) ← Quant NVFP4 (𝑄 𝑐 ); (𝑠 𝐾 , ˆ𝐾 𝑐 ) ← Quant NVFP4 (𝐾 𝑐 ) 
+
+> 4:
+
+ˆ𝑉 ← Quant FP8 (𝑉 ) ⊲ fused into KV-cache write  
+
+> 5:
+
+Δ𝑆 ← GEMV bf16 
+
+  ¯𝑄, 𝐾 ⊤
+
+> 𝑐
+
+ ⊲ Equation 9  
+
+> 6:
+
+for 𝑖 = 1 to 𝑇 𝑚 do ⊲ kernel main loop  
+
+> 7:
+
+𝑚 𝑖, 0 ← −∞ , ℓ 𝑖, 0 ← 0, 𝑂 𝑖, 0 ← 0 
+
+> 8:
+
+for 𝑗 = 1 to 𝑇 𝑛 do  
+
+> 9:
+
+load ˆ 𝑄 𝑐,𝑖 , 𝑠 𝑄,𝑖 , ˆ𝐾 𝑐,𝑗 , 𝑠 𝐾,𝑗 , ˆ𝑉 𝑗 , Δ𝑆,𝑗 ⊲ Equation 11  
+
+> 10:
+
+𝑆 𝑖,𝑗 ← MMA bf16 (1𝑀 , Δ𝑆,𝑗 ) + MMA fp4 ( ˆ𝑄 𝑐,𝑖 , 𝑠 𝑄,𝑖 , ˆ𝐾 𝑐,𝑗 , 𝑠 𝐾,𝑗 ) 
+
+> 11:
+
+𝑚 𝑖,𝑗 ← max  𝑚 𝑖,𝑗 −1, rowmax (𝑆 𝑖,𝑗 ) 
+
+> 12:
+
+𝑃 𝑖,𝑗 ← 2𝜆 (𝑆 𝑖,𝑗 −𝑚 𝑖,𝑗 ) , 𝜆 = log 2𝑒 /√𝑑 ⊲ 1/√𝑑 folded here  
+
+> 13:
+
+ℓ𝑖,𝑗 ← 2𝜆 (𝑚 𝑖,𝑗 −1 −𝑚 𝑖,𝑗 ) ℓ𝑖,𝑗 −1 + rowsum (𝑃 𝑖,𝑗 ) ⊲ FP32 𝑃 𝑖,𝑗  
+
+> 14:
+
+ˆ𝑃 𝑖,𝑗 ← Quant FP8 (𝑃 𝑖,𝑗 ) 
+
+> 15:
+
+𝑂 𝑖,𝑗 ← diag 
+
+
+
+2𝜆 (𝑚 𝑖,𝑗 −1 −𝑚 𝑖,𝑗 )
+
+
+
+𝑂 𝑖,𝑗 −1 + MMA fp8 ( ˆ𝑃 𝑖,𝑗 , ˆ𝑉 𝑗 ) 
+
+> 16:
+
+end for  
+
+> 17:
+
+𝑂 𝑖 ← diag (ℓ𝑖,𝑇 𝑛 )−1𝑂 𝑖,𝑇 𝑛  
+
+> 18:
+
+end for  
+
+> 19:
+
+return 𝑂 = {𝑂 𝑖 }𝑇 𝑚 
+
+> 𝑖 =1
+
+This work is fused with the inference framework’s KV-cache write path (§6), keeping its overhead low. The second stage is the attention main loop, which consumes only the quantized data and compensation factors. In the algorithm, 𝑖 and 𝑗 index query blocks and KV blocks, respectively. ˆ 𝑄 𝑐,𝑖 is the 𝑖 -th quantized centered query block; ˆ𝐾 𝑐,𝑗 and ˆ 𝑉 𝑗 form the 𝑗 -th KV block; and 𝑠 𝑄,𝑖 and 𝑠 𝐾,𝑗 are their NVFP4 block scale factors. 𝑆 𝑖,𝑗 and 𝑂 𝑖,𝑗 denote the score and output states after processing KV block 𝑗 , while 𝑚 𝑖,𝑗 and ℓ𝑖,𝑗 
+
+are the running maximum and normalization factor of online softmax. The only quantization inside the loop converts 𝑃 𝑖,𝑗 
+
+to FP8. Since its range has a known upper bound (§4.1), this conversion uses a fixed scale factor.                                                                                                                                    
+
+> 6KV block jj+1 j+2
+> TMA load MMA
+> sQ,sKcopy tcgen05.cp softmax WG0 softmax WG1 correction epilogue ̂
+> KcNVFP4 + sK·̂ VFP8 Qbuf 0 ΔS,ĵKcNVFP4 + sK·̂ VFP8 Qbuf 1 ΔS,ĵKcNVFP4 + sK·̂ VFP8 Qbuf 0 ΔS,j
+> seed ΔŜQĉK⊤
+> c0̂ P̂V0seed ΔŜQĉK⊤
+> c1̂ P̂V1seed ΔŜQĉK⊤
+> c0̂ P̂V0seed ΔŜQĉK⊤
+> c1̂ P̂V1seed ΔŜQĉK⊤
+> c0̂ P̂V0seed ΔŜQĉK⊤
+> c1̂ P̂V1
+> s(0) →S(1) s(1) →S(0) s(0) →S(1) s(1) →S(0) s(0) →S(1) s(1) →S(0)
+> tensor memory 512 columns O(0) 128 col O(1) 128 col s(1) ̂P(0) 64 col
+> S(0) 128 col s(0) ̂P(1) 64 col
+> S(1) 128 col
+> stage 0: mask · exp · Σ · → FP8 stage 1: mask · exp · Σ · → FP8 stage 0: mask · exp · Σ · → FP8 stage 1: mask · exp · Σ · → FP8
+> ⋯⋯
+> rescale Oby emj− 1 −mjrescale Oby emj− 1 −mjO/ℓ
+> O→ BF16 QK 0/1 write S(0) /S(1) , FP8 PV reads ̂ Pback softmax drains S, writes ̂ Pinto its upper half correction rescales Oin place s(r)borrows stage 1− r's Scolumns
+
+Figure 5. MpFA’s steady-state pipeline. The seven execution channels for five warp roles within one CTA advance over consecutive KV blocks, together with their tensor memory accesses. 
+
+Warp specialization. MpFA retains the five warp roles of FA4 [27], but adapts them for QK4PV8: load, MMA, softmax, correction, and epilogue, as shown in Figure 5. The load warp issues asynchronous copies of ˆ 𝐾 𝑐,𝑗 , 𝑠 𝐾,𝑗 , ˆ 𝑉 𝑗 , the current query block and its scale factor, and Δ𝑆,𝑗 from global memory to on-chip memory. The MMA warp issues two MMAs for the current score state: a rank-one BF16 MMA first writes Δ𝑆,𝑗 ,followed by a block-scaled NVFP4 MMA that accumulates ˆ𝑄 𝑐,𝑖 ˆ𝐾 ⊤ 
+
+> 𝑐,𝑗
+
+; an FP8 MMA then computes ˆ 𝑃 𝑖,𝑗 ˆ𝑉 𝑗 . The two softmax warpgroups apply the mask, update 𝑚 𝑖,𝑗 and ℓ𝑖,𝑗 , and convert 
+
+𝑃 𝑖,𝑗 to ˆ 𝑃 𝑖,𝑗 in place. The correction warpgroup rescales the output state and performs final normalization, while the epilogue warp writes the BF16 output back to global memory. We double-buffer the query blocks ( 𝑄 𝑐 ) to overlap MMA with softmax. One CTA processes two query stages, indexed by 𝑟 ∈ { 0, 1}. Each stage owns one 𝑆 (𝑟 ) and one 𝑂 (𝑟 ) , corre-sponding to an (𝑆 𝑖,𝑗 , 𝑂 𝑖,𝑗 ) state in the algorithm. The proba-bility matrix ˆ 𝑃 𝑖,𝑗 receives no separate tensor-memory allo-cation; it is written into the upper half of the current 𝑆 (𝑟 )
+
+region, and the FP8 𝑃𝑉 MMA reads it back from that region. Thus, stage 𝑟 ’s NVFP4 𝑄𝐾 ⊤ writes only 𝑆 (𝑟 ) , its softmax reads 𝑆 (𝑟 ) and writes ˆ 𝑃 (𝑟 ) in the upper half, and its FP8 𝑃𝑉 
+
+MMA reads ˆ 𝑃 (𝑟 ) from the same region. The two stages alter-nate between 𝑆 (0) / ˆ𝑃 (0) and 𝑆 (1) / ˆ𝑃 (1) , allowing one stage’s softmax to overlap with the other stage’s matrix multiplica-tion. This double buffer hides softmax latency and enables reuse of the scale factors described next. 
+
+Asynchronous pipeline for scale factors in tensor mem-ory. Each CTA is allocated 512 tensor memory columns. The score and output states of the two query stages require 128 columns each, so the four accumulators consume the entire capacity. NVFP4 scale factors for 𝑄 and 𝐾 cannot receive independent allocations. MpFA resolves this conflict by ex-ploiting asymmetric lifetimes: 𝑆 (𝑟 ) and 𝑂 (𝑟 ) must remain res-ident through a long softmax or main-loop interval, whereas 
+
+𝑠 𝑄,𝑖 and 𝑠 𝐾,𝑗 are read only when the corresponding NVFP4 MMA is issued. We asynchronously place FP8 scale factors in reused stor-age. The scale factors needed by stage 𝑟 are not placed on its own 𝑆 (𝑟 ) region; instead, they borrow columns from 𝑆 (1−𝑟 ) :
+
+𝑠 (0) occupies the starting columns of 𝑆 (1) , and 𝑠 (1) occupies those of 𝑆 (0) (the dashed cells at the left of the score regions in Figure 5). The double-buffer timing makes this safe. While stage 𝑟 issues 𝑄𝐾 ⊤, stage 1 − 𝑟 ’s score region is in the gap after softmax and 𝑃𝑉 have consumed it but before the next MMA overwrites it. In contrast, 𝑆 (𝑟 ) is the target of the cur-rent MMA and cannot simultaneously hold its scale factors. Scale-factor reads and writes form an independent pipeline with a phase distinct from data loading and matrix multiplica-tion. Each query stage owns a set of tcgen05.cp copies and its own barrier phase (the two 𝑠 𝑄 , 𝑠 𝐾 copy boxes in Figure 5). Copies are issued early enough for the factors to arrive before the corresponding MMA; their transfer overlaps with the other stage’s softmax and matrix multiplication and there-fore does not enter the critical path. Correctness follows from two phase conditions: scale factors must arrive before their MMA is issued, and a new write to a score region can occur only after that region has been consumed by softmax and the 𝑃𝑉 MMA. The probability matrix 𝑃 uses the same lifetime reuse but occupies only the upper half of the score region, requiring no additional tensor-memory allocation. This allows scale factors, attention scores, and outputs to remain resident within the fixed 512-column budget. 
+
+Other attention optimizations. MpFA builds the kernel on the CUTLASS and CuTe programming primitives. For causal attention, MpFA balances the triangular workload 
+
+7using longest-processing-time-first scheduling and overlaps TMA and MMA with a ping-pong KV pipeline. It also dis-tributes softmax exponentiation between a polynomial ap-proximation and hardware 2 𝑥 instructions to balance the FMA and SFU pipelines. Moreover, attention scaling is fused into exponentiation: 𝑄 and 𝐾 remain in the unscaled inner-product domain, and the softmax constant 𝜆 = log 2𝑒 /√𝑑 
+
+is folded into the exponent (2 𝜆 (𝑆 −𝑚 ) = 2𝜆𝑆 −𝜆𝑚 ), avoiding separate scaling of the scores and compensation term Δ𝑆,𝑗 .
+
+5.2 MMA Compensation 
+
+For each (𝑖, 𝑗 ), the MMA warp first issues MMA bf16 (1𝑀 , Δ𝑆,𝑗 ),then accumulates the NVFP4 MMA nvfp4 ( ˆ𝑄 𝑐,𝑖 , 𝑠 𝑄,𝑖 , ˆ𝐾 𝑐,𝑗 , 𝑠 𝐾,𝑗 )
+
+into the same score state 𝑆 𝑖,𝑗 . Because the compensation has already been written to the score accumulator before softmax, the softmax warp reads complete scores without an additional element-wise addition or a change to the online-softmax instruction sequence. The compensation vector Δ𝑆,𝑗 is much smaller than ˆ 𝐾 𝑐,𝑗 
+
+and ˆ 𝑉 𝑗 . The loading warp prefetches it and publishes it with the same barrier phase as the current KV block. Rank-one MMA and NVFP4 𝑄𝐾 ⊤ consequently share one dependency and require no additional synchronization. Relative to the same build without smoothing, the prefill attention operator adds only 1 .3–2 .5%; placing compensation on the softmax warp costs 18 .6–22 .7% (§7.4). 
+
+5.3 Decode-Specific Optimizations 
+
+Decode uses the same representations and MMA precisions as prefill but is parallelism-bound. MpFA packs GQA heads, partitions the KV dimension, removes softmax work from padded rows, and merges the resulting local states. GQA lets 𝐻 𝑞 /𝐻 𝑘𝑣 query heads share one KV head, so MpFA packs each group into the MMA 𝑀 dimension and assigns one (request, KV-head) pair to each CTA. It partitions the history into fixed 8 × 128-token chunks; each CTA maintains local (𝑚, ℓ, 𝑂 ) states in preallocated workspaces, making the path CUDA Graph capturable and increasing parallelism over split-KV-disabled BF16 FA4. For GQA 32:8, FP4 MMA fixes 𝑀 = 128 although each group has only four real rows. MpFA replicates these rows and processes their corresponding columns as four diago-nal 32 × 32 tiles, reducing softmax work from 32 × 128 to 32 × 32 per row range and the full-tile 2 𝑥 evaluations from 128 × 128 to 128 × 32. The four warps produce four states per partition, yielding 4 𝑁 𝑝 states merged by log-sum-exp. Eight independent state streams and shared-memory scale prefetching hide the reduction’s memory latency; the same strategy extends to other model shapes. 
+
+6 LLM Serving System 
+
+Serving system. To evaluate end-to-end performance, we integrate MpFA into SGLang [32] as an attention backend, following prior work [20]. The backend supports paged pre-fill and decode, GQA, masking, and CUDA Graph capture, while SGLang handles the remaining model execution. Dur-ing decode, fixed-size cache pages and preallocated tensors keep the number of KV partitions constant after graph cap-ture. MpFA returns BF16 outputs through the standard atten-tion interface. With smoothing, the per-token compensation 
+
+Δ𝑆 follows the KV cache’s physical page-table indices and resides in a side cache directly accessed during decode. 
+
+Online quantization. MpFA fuses NVFP4 quantization of 
+
+𝑄 , low-bit 𝐾 /𝑉 cache writes, and compensation generation into SGLang’s cache-write path. It stores 𝐾 in NVFP4 with one e4m3 scale byte per 16 elements and 𝑉 in FP8, allow-ing direct consumption without dequantization. For equal-dimensional 𝐾 and 𝑉 , the layout uses 1 /2.56 of the BF16 KV-cache footprint: 1 /2 + 1/16 bytes per 𝐾 element and one byte per 𝑉 element, versus two bytes per element for each BF16 tensor. With smoothing, prefill computes per-layer, per-head ¯ 𝑄 and ¯ 𝐾 over valid tokens and freezes them for the sequence lifetime. Decode centers only the newly appended token against these per-request means without re-computing them. This avoids degenerate single-token query centering that would shift the entire score correction to Δ𝑆 .For the new token, centering and compensation generation are fused into the cache-write kernel. Without smoothing, no side cache is allocated. Kernel measurements exclude quan-tization statistics and compensation generation; end-to-end measurements include quantization, sequence centering, and KV-cache writes. 
+
+7 Evaluation 
+
+7.1 Experimental Setup Hardware and software. We conduct all experiments on a single NVIDIA B200 using CUDA 13 .0, PyTorch 2 .11 .0, and SGLang 𝑣 0.5.15. For end-to-end experiments, we enable CUDA Graph capture and disable Radix Cache [32]. 
+
+Models and accuracy tasks. We evaluate Llama-3.1-8B and Qwen3-14B, covering GQA 32:8 and 40:8; both have 128-dimensional heads. We extend Qwen3-14B from its native 40K to 128K using YaRN, while Llama-3.1-8B uses its native 128K context. This extension may affect accuracy but not performance measurements. We evaluate MMLU [11] (5-shot, all 57 subjects), Hel-laSwag [28] (20-shot), WinoGrande [22] (0-shot), GSM8K [2] (5-shot with generated reasoning), and RULER-QA [12], which pads SQuAD and HotpotQA passages to 64K tokens. Each backend uses the same examples and prompts with greedy decoding ( 𝑡𝑒𝑚𝑝𝑒𝑟𝑎𝑡𝑢𝑟𝑒 = 0). 
+
+Baselines. We compare BF16 FA4, FP8 FlashInfer, and three precision assignments for 𝑄𝐾 ⊤ and 𝑃𝑉 : NVFP4 +NVFP4, NVFP4 +BF16, and NVFP4 +FP8. MpFA is the complete QK4PV8 design with rank-one smoothing. For decode kernel tests, we tune BF16 FA4’s split count per context length and use      
+
+> 8BF16 FA4 BF16 FA4 + split-KV (tuned) FlashInfer FP8 NVFP4+NVFP4 NVFP4+BF16 NVFP4+FP8 MpFA(smoothing) 4K 8K 16K 32K 64K 128K
+
+sequence length 
+
+> 01000 2000
+> TFLOPS
+> 0.64× 0.90× 1.06× 1.13× 1.16× 1.17× 0.43× 0.61× 0.73× 0.82× 0.88× 0.91× 0.66× 0.96× 1.05× 1.09× 1.11× 1.11× 0.76× 1.12× 1.27× 1.37× 1.38× 1.39× 0.73× 1.09× 1.26× 1.31× 1.33× 1.34×
+
+(a) causal prefill 4K 8K 16K 32K 64K 128K 
+
+sequence length  
+
+> 010 20 30
+> TFLOPS
+> 2.25× 2.98× 2.92× 2.15× 1.36× 1.14× 2.81× 3.46× 3.13× 2.48× 1.43× 1.26× 2.60× 3.45× 3.12× 2.45× 1.29× 1.14×
+
+(b) decode 
+
+Figure 6. Attention-kernel throughput on a B200 with GQA 32:8 and ℎ𝑒𝑎𝑑 _𝑑𝑖𝑚 =128, the shape of Llama-3.1-8B. Speedups above the bars use BF16 FA4 in (a) and split-KV-enabled BF16 FA4 in (b). BF16 FA4 BF16 FA4 + split-KV (tuned) FlashInfer FP8 NVFP4+NVFP4 NVFP4+BF16 NVFP4+FP8 MpFA(smoothing) 4K 8K 16K 32K 64K 128K 
+
+sequence length 
+
+> 0500 1000 1500 2000
+> TFLOPS
+> 0.77× 0.98× 1.11× 1.15× 1.17× 1.18× 0.48× 0.63× 0.76× 0.84× 0.89× 0.92× 0.75× 1.00× 1.08× 1.11× 1.12× 1.12× 0.87× 1.17× 1.34× 1.37× 1.38× 1.39× 0.83× 1.14× 1.29× 1.33× 1.34× 1.35×
+
+(a) causal prefill 4K 8K 16K 32K 64K 128K 
+
+sequence length  
+
+> 010 20 30 40
+> TFLOPS
+> 2.43× 1.65× 1.64× 1.64× 1.34× 1.11× 2.94× 3.87× 3.18× 2.55× 1.43× 1.25× 2.66× 3.53× 3.17× 2.39× 1.30× 1.14×
+
+(b) decode 
+
+Figure 7. Attention-kernel throughput for Qwen3-14B (GQA 40:8). The baselines and speedup denominators match Figure 6. FlashInfer’s default split-KV policy. MpFA instead uses fixed KV-partition and column-split configurations. For end-to-end tests, BF16 FA4 runs one CTA per request because its split-KV path preallocates workspaces per num_splits and cannot be captured by CUDA Graph. FlashInfer and MpFA use graph-compatible split-KV, with FlashInfer using an FP8 KV cache. Integrated as an SGLang attention backend, MpFA supports the same production features as the baselines: con-tinuous batching, paged KV cache, CUDA Graph capture, and head_dim (128 for both models). We measure prefill/decode kernel throughput, time to first token (TTFT), time per output token (TPOT), output-token throughput (OTPS) across concurrency levels, end-to-end accuracy, and ablations. Following prior work [5], we report the mean of five performance runs. 
+
+7.2 FlashAttention Kernel Performance 
+
+Figure 6 compares causal prefill and decode throughput across precision configurations, using BF16 FA4 and split-KV-enabled BF16 FA4 as their respective denominators. NVFP4 +
+
+FP8 is the hardware-efficient prefill assignment; decode also depends on KV partitioning and softmax scheduling. MpFA includes smoothing, while direct NVFP4 + FP8 isolates its compensation cost. 
+
+Prefill workloads. At 16K and above, measured through-put follows direct NVFP4 + FP8 > MpFA > NVFP4 + BF16 
+
+> BF16 > NVFP4 + NVFP4, consistent with §3.1. Across 16K–128K, MpFA sustains 1672–1817 TFLOPS and achieves a 1 .31 × geometric-mean speedup over BF16 FA4; the direct variant reaches 1 .35 ×, showing that smoothing preserves most of the gain. FP8 FlashInfer reaches 1 .12 × over BF16, while MpFA is 1 .17 × faster than FlashInfer. The benefit fol-lows from reducing the compute-intensive 𝑄𝐾 ⊤ from FP8 to NVFP4. Qwen3-14B’s GQA 40:8 shape shows the same trend (Figure 7), with 1 .33 ×/1 .15 × speedups over BF16 FA4/FP8 FlashInfer. Fixed overhead limits short sequences: at 4K, MpFA and its direct variant reach only 0 .74 × and 0 .76 × of BF16, ver-sus 1 .09 × and 1 .12 × at 8K. The crossover therefore falls between 4K and 8K, below which matrix multiplication does not dominate. MpFA is thus suited to end-to-end inference at sequence lengths beyond 8K. NVFP4 + BF16 reaches 1 .05– 1.11 × at ≥ 16K, confirming the benefit of quantizing 𝑄𝐾 ⊤
+
+alone. Relative to FP8, however, its 𝑃𝑉 MMA and shared-memory traffic for 𝑉 both double, and it cannot use a low-bit 
+
+𝑉 cache. Fully NVFP4 is slowest from 4K onward, reach-ing only 0 .87–0 .90 × BF16 at long sequences because of the additional 𝑃𝑉 execution-path costs identified in §3.1. 
+
+Decode workloads. At 128K, MpFA and its direct variant reach only 22 .8 and 25 .1 TFLOPS, respectively, confirming that long-context decode is parallelism-bound rather than 
+
+9Llama-3.1-8B, FlashInfer FP8 Qwen3-14B, FlashInfer FP8 Llama-3.1-8B, MpFA(direct) Qwen3-14B, MpFA(direct) Llama-3.1-8B, MpFA(smoothing) Qwen3-14B, MpFA(smoothing) 4K 8K 16K 32K 64K 128K 
+
+> input length
+> 0.25 0.50 0.75 1.00 1.25
+> speedup
+
+(a) Time to first token (TTFT) 4K 8K 16K 32K 64K 128K  
+
+> input length
+> 01234567
+> speedup
+
+(b) Time per output token (TPOT) 
+
+Figure 8. End-to-end latency speedup over BF16 FA4 at concurrency 1. Tensor-Core-bound. We compare against three baselines with distinct deployment constraints. The first is production-deployable BF16 FA4. Its split-KV path preallocates workspaces according to num_splits and cannot be captured by CUDA Graph, so SGLang uses one CTA to process the full history sequentially. Relative to this configuration, MpFA improves throughput from 2 .63 × at 4K to 13 .04 × at 128K; the direct variant reaches 2 .83 × and 14 .37 ×, respectively. The second is BF16 FA4 with split-KV enabled. We sweep 
+
+num_splits ∈ { 1, . . . , 32 } and select the best value at each length; the optimum is 16 or 32 at ≥ 8K. Against this per-length-tuned baseline, MpFA achieves a 2 .08 × average speedup across 8K–128K without per-length tuning, compared with 2.17 × for the direct variant. MpFA peaks at 3 .45 × at 8K and remains 1 .14 × faster at 128K, due to GQA packing, fixed KV partitions, column splitting, and parallel state merging. The speedup decreases with sequence length: partitioning exposes substantially more parallelism than the baseline at short-to-medium lengths, whereas longer KV histories make both systems HBM-bandwidth-bound, limiting the benefit of NVFP4 compute. The third is FlashInfer’s FP8 Blackwell FlashAttention, which supports split-KV under CUDA Graph. MpFA achieves a 1 .06 × geometric-mean speedup across 8K–128K, leading by 1.11–1 .14 × through 32K but falling to 0 .95 × at 64K and near parity (0 .99 ×) at 128K. The direct variant reaches 1 .11 × in geometric mean and remains 1 .05 ×/1 .09 × faster at 64K/128K. The gap reflects smoothing: the Δ𝑆 side cache adds about 4% KV traffic, which is mostly absorbed by L2 through 32K but reaches HBM beyond 64K, making MpFA about 10% slower than the direct variant. The modest margin over FlashInfer also reflects the decode regime: at concurrency 1, reading the KV history dominates, so NVFP4’s compute advantage over FP8 is largely unused. Moreover, block-scaled FP4 MMA requires 𝑀 =128, while a GQA group has only 𝐻 𝑞 /𝐻 𝑘𝑣 real query rows; row replication and column splitting cannot eliminate all padded work. These decode results generalize to GQA 40:8 (Figure 7): MpFA peaks at 3 .53 × over split-KV BF16 FA4 at 8K and stays 1 .14 × at 128K. Its larger query-to-KV MpFA(smoothing) FlashInfer FP8 conc. 1 conc. 8 conc. 16 4K 8K 16K 32K 64K 128K 
+
+> input length
+> 1.0 1.5 2.0 2.5 3.0 3.5
+> OTPS speedup
+
+Figure 9. Output throughput of SGLang serving relative to BF16 FA4 for Qwen3-14B. ratio feeds more compute per KV read, yielding 0 .97 ×/1 .02 ×
+
+of FP8 FlashInfer at 64K/128K. 
+
+7.3 End-to-End Inference Performance Latency. Figure 8 compares MpFA, its direct variant, BF16 FA4, and FP8 FlashInfer under identical serving parame-ters. Across both models and 16K–128K, MpFA improves TTFT and TPOT over BF16 by 1 .11 × and 3 .30 × in geometric mean. At 128K, TPOT falls from 42 .4 to 6 .5 ms for Llama-3.1-8B (6 .58 ×) and from 53 .8 to 9 .5 ms for Qwen3-14B (5 .67 ×), slightly exceeding FlashInfer’s 6 .38 ×/5 .59 ×.Prefill gains are smaller because non-attention computa-tion remains unchanged: at 128K, MpFA improves TTFT by 1.16 ×/1 .14 ×. Although FP8 FlashInfer outperforms BF16 FA4 (Figure 6), separately producing its FP8 KV cache offsets this kernel gain end to end, giving 0 .91–0 .96 × BF16 TTFT. MpFA fuses sequence centering, quantization, and cache writes (Figure 11), improving TTFT by up to 1 .16 × over BF16 FA4 and 1 .16–1 .27 × over FP8 FlashInfer at 32K–128K. Fixed overhead limits both latency metrics at short se-quences, so we make no stable speedup claim for inputs of 
+
+≤ 2K. Relative to MpFA (direct), smoothing adds 1 .5–7 .3% to TTFT and 3 .0–6 .2% to TPOT over 4K–128K; reduced KV traffic dominates as context grows. 
+
+Throughput. Figure 9 reports output throughput relative to end-to-end BF16 FA4 with fixed input length and 1024 output tokens. At concurrency 1, MpFA achieves a 2 .81 ×
+
+geometric-mean speedup across both models and 16K–128K, 
+
+> 10
+
+Table 2. End-to-end accuracy. Rec. is the fraction of NVFP4 +FP8 loss (vs. BF16) that MpFA recovers. 
+
+Llama-3.1-8B Qwen3-14B Dataset BF16 FP8 NVFP4 +FP8 MpFA Rec. BF16 FP8 NVFP4 +FP8 MpFA Rec. MMLU 0.685 0.683 0.644 ( −0.041) 0.674 (−0.011) 73% 0.787 0.787 0.776 ( −0.011) 0.785 (−0.002) 82% HellaSwag 0.785 0.785 0.765 ( −0.020) 0.780 (−0.005) 75% 0.774 0.774 0.768 ( −0.006) 0.773 (−0.001) 83% WinoGrande 0.752 0.751 0.735 ( −0.017) 0.745 (−0.007) 59% 0.727 0.726 0.712 ( −0.015) 0.720 (−0.007) 53% GSM8K 0.761 0.757 0.653 ( −0.108) 0.736 (−0.025) 77% 0.887 0.882 0.877 ( −0.010) 0.882 (−0.005) 50% RULER-QA 0.624 0.619 0.533 ( −0.091) 0.578 (−0.047) 49% 0.656 0.656 0.592 ( −0.064) 0.607 (−0.049) 24% 
+
+reaching 4 .47 ×/3 .76 × at 128K (Llama-3.1-8B/Qwen3-14B). Absolute throughput then increases from 21 .2 to 94 .8 tok/s and from 16 .2 to 61 .0 tok/s. The smaller throughput gain than TPOT reflects the more modest 1 .14–1 .16 × TTFT speedup. This speedup is measured against the production-deployable BF16 FA4, whose split-KV path cannot be graph-captured. However, the controlled kernel comparison with per-length split-KV tuning (Figure 6b) shows that MpFA remains faster at every length (2 .08 × on average and 1 .14 × at 128K), con-firming that split-KV does not change the end-to-end per-formance ordering. Relative to FP8 FlashInfer, MpFA leads across 32K–128K by a 1 .06 × geometric mean, reaching 1 .11–1 .12 × at 128K on both models. The margin grows with context as sequence centering, quantization, and cache writes amortize and MpFA’s lower KV-cache traffic comes to dominate. Higher concurrency narrows MpFA’s advantage over BF16 but preserves the long-context benefit: at concurrency 8, it achieves a 1 .33 × average speedup across both models and 8K–128K, reaching 1 .70 ×/1 .89 × at 128K. For Qwen3-14B at concurrency 16, it overtakes BF16 at 16K (1 .04 ×) and reaches 1.13 × at the fully resident 32K point. Batching supplies BF16 with parallelism, while the 2 .56 × KV-byte reduction persists. The trend relative to FlashInfer holds under batching: at concurrency 8 the advantage is a 1 .12 × geometric mean across 8K–128K, from parity at 8K to 1 .18–1 .31 × at 128K; for Qwen3-14B at concurrency 16 it is 1 .09 ×/1 .17 × at the fully resident 16K/32K points. Points beyond 32K at concurrency 16 are capacity constrained because the KV pool admits only 11 and 5 requests at 64K and 128K, so we exclude them from aggregate results. 
+
+Accuracy. Table 2 compares four backends across five bench-marks and two models. FP8 FlashInfer stays within 0 .006 of BF16 for every model–task pair. Direct NVFP4 + FP8 loses most on Llama-3.1-8B GSM8K (0 .108) and RULER-QA (0 .091); MpFA recovers 62 .5% of the loss on average (24%–83% per pair). It recovers 49%–77% on Llama-3.1-8B, trailing FP8 by at most 0 .009 on knowledge and commonsense tasks. Qwen3-14B has smaller direct losses (0 .006–0 .015 on single-token tasks), with 50%–83% recovery on the four shorter tasks and 24% on RULER-QA. Across both models the residual concentrates on RULER-QA and GSM8K, where RULER-QA on the softmax warps (prior work) on the Tensor Core (ours) 16K 32K 64K 
+
+> sequence length
+> 0510 15 20 25
+> added time (% of kernel)
+> 18.9 18.9 22.7 1.3 2.5 2.3
+
+(a) Relative overhead 16K 32K 64K  
+
+> sequence length
+> 10 −2
+> 10 −1
+> 10 0
+> 10 1
+> added time (ms, log)
+> 0.27 0.98 4.55 0.02 0.12 0.45
+
+(b) Absolute overhead 
+
+Figure 10. Cost of the two compensation placements for causal prefill with the Llama-3.1-8B shape. 16K 32K 64K 
+
+> sequence length
+> 0510 15 20 25 30 35 40
+> prefill time per layer (ms)
+> 1.00× 1.00× 1.00× 1.22× 1.34× 1.37× 1.08× 1.22× 1.28×
+> BF16 FA4 NVFP4+FP8 quantize / cache write MpFA(smoothing)
+
+Figure 11. Per-layer prefill cost, including attention and the quantization / cache-write pass (Llama-3.1-8B). recovery is 24%–49%: at 64K, error accumulated across many attention steps is less amenable to per-channel rank-one com-pensation. MpFA thus trades a few points on long-context and multi-step reasoning for a 2 × lower-precision 𝑄𝐾 ⊤ path that is faster than FP8 FlashInfer (§7.2), while restoring most of the accuracy loss without retraining. 
+
+7.4 Ablation Study Compensation placement. Figure 10 compares two place-ments of the same compensation term Δ𝑆 in QK4PV8 FA4. Staging compensation in shared memory, synchronizing af-ter each KV block, and adding it element-wise incurs 20 .1% 
+
+> 11
+
+geometric-mean overhead across 16K–64K. With rank-one compensation, BF16 MMA first writes to tensor memory and NVFP4 𝑄𝐾 ⊤ accumulates into it, reducing overhead to 2 .0%. At 64K, absolute overhead falls from 4 .55 ms to 0 .45 ms, or from more than half of the direct kernel’s prefill advantage to less than one tenth. Both placements compute the same term: element-wise placement uses FP32 scalar addition, whereas rank-one placement carries Δ𝑆 in BF16 and accumulates into FP32, adding one BF16 rounding with relative error no larger than 2 −8. Table 2 includes this effect because MpFA uses rank-one compensation by default. 
+
+Quantization overhead. Quantization, sequence centering, and compensation generation remain part of end-to-end inference; MpFA fuses them with cache writes. Figure 11 includes this pass in the per-layer prefill cost and labels the resulting speedup over BF16 FA4. Across 32K and 64K, MpFA achieves a 1 .25 × geometric-mean speedup, compared with 1.34 × for direct NVFP4 + FP8, preserving most of the kernel gain. 
+
+8 Related Work 
+
+FlashAttention [3, 4] reduces global-memory traffic through tiling and online softmax, and later work optimizes paral-lelism and data reuse for different GPUs. FlashAttention-3 (FA3) [23] adds warp specialization on Hopper to over-lap matrix multiplication and softmax across warps, and FlashAttention-4 (FA4) [27] redesigns the pipeline for Black-well tensor memory, fifth-generation Tensor Cores, and asym-metric hardware scaling, serving as our direct B200 baseline. Other work adapts FlashAttention to the cache and data-reuse characteristics of Arm multicore CPUs [9], while a parallel line designs dedicated attention accelerators, such as the approximation- and pruning-based sparse-attention architectures SpAtten [24] and ELSA [10]. Collectively, these systems show that attention performance depends on co-designing algorithmic tiling with the hardware data path rather than optimizing solely for matrix multiplication peak throughput. MpFA retains FlashAttention’s online softmax and FA4’s B200 execution model but addresses a different problem. While FA4 primarily uses BF16, MpFA moves 𝑄𝐾 ⊤
+
+and 𝑃𝑉 to low-bit matrix multiplication paths and analyzes how block scaling, tensor memory capacity, and operand delivery jointly constrain the precision assignment. Prior low-bit LLM quantization methods, including MR-GPTQ [7], AWQ [15], GPTQ [8], and SmoothQuant [25], target weights and activations in linear layers rather than at-tention activations. SageAttention [31] studies post-training quantization for attention: it smooths channel outliers in 𝐾 ,quantizes 𝑄𝐾 ⊤ to INT8, and keeps the more error-sensitive 
+
+𝑃𝑉 in FP16 with an FP16 accumulator. SageAttention2 [29] further quantizes 𝑄𝐾 ⊤ to INT4, represents 𝑃 and 𝑉 in FP8, and applies more extensive outlier smoothing to recover accuracy. These systems share a post-training, plug-and-play approach and do not require both matrix multiplica-tions to use the same precision. SageAttention3 [30] extends this approach to consumer Blackwell GPUs, using NVFP4 matrix multiplication for both 𝑄𝐾 ⊤ and 𝑃𝑉 , together with 
+
+𝑄 /𝐾 smoothing and probability quantization. HiFA4 [6] also provides training-free 4-bit attention, but targets the As-cend HIF4 NPU and its platform-specific formats and exe-cution units. These systems do not address tensor memory, operand delivery, or asymmetric scaling between matmul and non-matmul units on data-center Blackwell GPUs. KV-cache quantization methods such as KIVI [16] lower cache precision to save memory and traffic, complementing quan-tized attention that consumes a low-bit cache without de-quantization. At the serving level, schedulers exploiting the distinct prefill and decode profiles—through phase disaggre-gation [21] or prefill-decode overlap [14]—are orthogonal to MpFA, which accelerates the attention operator each phase relies on. Different from prior work, MpFA is a high performance QK4PV8 attention kernel for data-center Blackwell GPUs. We characterize the B200 data path and hardware behavior of low-bit attention, build mixed-precision pipelines spe-cialized for prefill and decode, and integrate them into an end-to-end serving system. MpFA further applies rank-one Tensor Core MMA smoothing compensation, which recovers accuracy without placing additional compensation work on the already saturated softmax path. 
+
+9 Conclusion 
+
+We present MpFA, a training-free QK4PV8 FlashAttention kernel optimized for data-center Blackwell GPUs. Despite the B200’s substantially higher 4-bit Tensor Core throughput, the overheads of online quantization, data movement, and tensor memory contention make fully NVFP4 attention inefficient. MpFA instead adopts mixed-precision NVFP4 (𝑄𝐾 ⊤)+FP8 (𝑃𝑉 )
+
+and addresses its performance challenges through a fine-grained asynchronous pipeline, tensor memory reuse, and stage-specific optimizations for prefill and decode. To re-duce quantization error without further stressing the soft-max path, MpFA introduces rank-one Tensor Core MMA smoothing compensation. On the B200, this compensation recovers 62 .5% of the accuracy loss with only 2 .0% average kernel overhead. Across 16K–128K contexts, MpFA achieves average prefill speedups of 1 .31–1 .33 × over BF16 FA4 and 1.15–1 .17 × over FP8 FlashInfer for GQA 32:8 and 40:8, and achieves 2 .81 × the end-to-end output throughput of BF16 FA4 across both evaluated models. 
+
+References   
+
+> [1] Yushi Bai, Xin Lv, Jiajie Zhang, Hongchang Lyu, Jiankai Tang, Zhidian Huang, Zhengxiao Du, Xiao Liu, Aohan Zeng, Lei Hou, Yuxiao Dong, Jie Tang, and Juanzi Li. 2024. LongBench: A Bilingual, Multitask Benchmark for Long Context Understanding. In Proceedings of the
+> 12
+
+62nd Annual Meeting of the Association for Computational Linguistics (ACL) .[2] Karl Cobbe, Vineet Kosaraju, Mohammad Bavarian, Mark Chen, Hee-woo Jun, Lukasz Kaiser, Matthias Plappert, Jerry Tworek, Jacob Hilton, Reiichiro Nakano, Christopher Hesse, and John Schulman. 2021. Train-ing Verifiers to Solve Math Word Problems. arXiv:2110.14168 (2021). [3] Tri Dao. 2024. FlashAttention-2: Faster Attention with Better Paral-lelism and Work Partitioning. In International Conference on Learning Representations (ICLR) .[4] Tri Dao, Daniel Y. Fu, Stefano Ermon, Atri Rudra, and Christopher Ré. 2022. FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness. In Advances in Neural Information Processing Systems (NeurIPS) .[5] Chencheng Deng, Weiling Yang, Jianbin Fang, and Dezun Dong. 2026. Demystifying ARM SME to Optimize General Matrix Multiplications. In 2026 IEEE International Parallel and Distributed Processing Sympo-sium (IPDPS) .[6] Hui Dong, Yanzhao Li, Jie Gao, Chunlu Li, Zhiyuan Zhang, Yupeng Sun, Zhenyuan Chen, and Zhiqiang Zou. 2026. HiFA4: Training-Free 4-bit FlashAttention on Ascend HIF4 NPUs for LLM Inference. 
+
+arXiv:2607.04302 (2026). [7] Vage Egiazarian, Roberto L. Castro, Denis Kuznedelev, Andrei Panferov, Eldar Kurtic, Shubhra Pandit, Alexandre Marques, Mark Kurtz, Saleh Ashkboos, Torsten Hoefler, and Dan Alistarh. 2026. Bridging the Gap Between Promise and Performance for Microscaling FP4 Quantization. In International Conference on Learning Representations (ICLR) .[8] Elias Frantar, Saleh Ashkboos, Torsten Hoefler, and Dan Alistarh. 2023. GPTQ: Accurate Post-Training Quantization for Generative Pre-trained Transformers. In International Conference on Learning Rep-resentations (ICLR) .[9] Xiao Fu, Weiling Yang, Dezun Dong, and Xing Su. 2024. Optimizing Attention by Exploiting Data Reuse on ARM Multi-core CPUs. In Pro-ceedings of the 38th ACM International Conference on Supercomputing (ICS) .[10] Tae Jun Ham, Yejin Lee, Seong Hoon Seo, Soosung Kim, Hyunji Choi, Sung Jun Jung, and Jae W. Lee. 2021. ELSA: Hardware-Software Co-design for Efficient, Lightweight Self-Attention Mechanism in Neural Networks. In 2021 ACM/IEEE 48th Annual International Symposium on Computer Architecture (ISCA) . 692–705. [11] Dan Hendrycks, Collin Burns, Steven Basart, Andy Zou, Mantas Mazeika, Dawn Song, and Jacob Steinhardt. 2021. Measuring Massive Multitask Language Understanding. In International Conference on Learning Representations (ICLR) .[12] Cheng-Ping Hsieh, Simeng Sun, Samuel Kriman, Shantanu Acharya, Dima Rekesh, Fei Jia, Yang Zhang, and Boris Ginsburg. 2024. RULER: What’s the Real Context Size of Your Long-Context Language Models?. In Conference on Language Modeling (COLM) .[13] Aaron Jarmusch and Sunita Chandrasekaran. 2026. Microbenchmark-ing NVIDIA’s Blackwell Architecture: An In-depth Architectural Anal-ysis. arXiv:2512.02189 (2026). [14] Aditya K. Kamath, Ramya Prabhu, Jayashree Mohan, Simon Peter, Ramachandran Ramjee, and Ashish Panwar. 2025. POD-Attention: Unlocking Full Prefill-Decode Overlap for Faster LLM Inference. In 
+
+Proceedings of the International Conference on Architectural Support for Programming Languages and Operating Systems (ASPLOS) .[15] Ji Lin, Jiaming Tang, Haotian Tang, Shang Yang, Wei-Ming Chen, Wei-Chen Wang, Guangxuan Xiao, Xingyu Dang, Chuang Gan, and Song Han. 2024. AWQ: Activation-aware Weight Quantization for On-Device LLM Compression and Acceleration. In Proceedings of Machine Learning and Systems (MLSys) .[16] Zirui Liu, Jiayi Yuan, Hongye Jin, Shaochen Zhong, Zhaozhuo Xu, Vladimir Braverman, Beidi Chen, and Xia Hu. 2024. KIVI: A Tuning-Free Asymmetric 2bit Quantization for KV Cache. In International Conference on Machine Learning (ICML) .[17] NVIDIA. 2022. NVIDIA H100 Tensor Core GPU Architecture .[18] NVIDIA. 2024. CUDA C++ Programming Guide, Version 12.4 .[19] NVIDIA. 2024. NVIDIA Blackwell Architecture Technical Brief . Techni-cal Report. NVIDIA. [20] Zaifeng Pan, Yitong Ding, Yue Guan, Zheng Wang, Zhongkai Yu, Xulong Tang, Yida Wang, and Yufei Ding. 2025. FastTree: Optimizing Attention Kernel and Runtime for Tree-Structured LLM Inference. In 
+
+Proceedings of Machine Learning and Systems (MLSys) .[21] Pratyush Patel, Esha Choukse, Chaojie Zhang, Aashaka Shah, Í nigo Goiri, Saeed Maleki, and Ricardo Bianchini. 2024. Splitwise: Efficient Generative LLM Inference Using Phase Splitting. In 51st Annual Inter-national Symposium on Computer Architecture (ISCA) .[22] Keisuke Sakaguchi, Ronan Le Bras, Chandra Bhagavatula, and Yejin Choi. 2020. WinoGrande: An Adversarial Winograd Schema Challenge at Scale. In Proceedings of the AAAI Conference on Artificial Intelligence (AAAI) .[23] Jay Shah, Ganesh Bikshandi, Ying Zhang, Vijay Thakkar, Pradeep Ramani, and Tri Dao. 2024. FlashAttention-3: Fast and Accurate At-tention with Asynchrony and Low-Precision. In Advances in Neural Information Processing Systems (NeurIPS) .[24] Hanrui Wang, Zhekai Zhang, and Song Han. 2021. SpAtten: Efficient Sparse Attention Architecture with Cascade Token and Head Pruning. In 2021 IEEE International Symposium on High-Performance Computer Architecture (HPCA) . 97–110. [25] Guangxuan Xiao, Ji Lin, Mickael Seznec, Hao Wu, Julien Demouth, and Song Han. 2023. SmoothQuant: Accurate and Efficient Post-Training Quantization for Large Language Models. In International Conference on Machine Learning (ICML) .[26] Zihao Ye, Lequn Chen, Ruihang Lai, Wuwei Lin, Yineng Zhang, Stephanie Wang, Tianqi Chen, Baris Kasikci, Vinod Grover, Arvind Krishnamurthy, and Luis Ceze. 2025. FlashInfer: Efficient and Cus-tomizable Attention Engine for LLM Inference Serving. In Proceedings of Machine Learning and Systems (MLSys) .[27] Ted Zadouri, Markus Hoehnerbach, Jay Shah, Timmy Liu, Vijay Thakkar, and Tri Dao. 2026. FlashAttention-4: Algorithm and Kernel Pipelining Co-Design for Asymmetric Hardware Scaling. In Proceed-ings of Machine Learning and Systems (MLSys) .[28] Rowan Zellers, Ari Holtzman, Yonatan Bisk, Ali Farhadi, and Yejin Choi. 2019. HellaSwag: Can a Machine Really Finish Your Sentence?. In Proceedings of the 57th Annual Meeting of the Association for Com-putational Linguistics (ACL) .[29] Jintao Zhang, Haofeng Huang, Pengle Zhang, Jia Wei, Jun Zhu, and Jianfei Chen. 2025. SageAttention2: Efficient Attention with Thorough Outlier Smoothing and Per-Thread INT4 Quantization. In International Conference on Machine Learning (ICML) .[30] Jintao Zhang, Jia Wei, Pengle Zhang, Xiaoming Xu, Haofeng Huang, Haoxu Wang, Kai Jiang, Jun Zhu, and Jianfei Chen. 2025. SageAtten-tion3: Microscaling FP4 Attention for Inference and an Exploration of 8-Bit Training. In Advances in Neural Information Processing Systems (NeurIPS) .[31] Jintao Zhang, Jia Wei, Pengle Zhang, Jun Zhu, and Jianfei Chen. 2025. SageAttention: Accurate 8-Bit Attention for Plug-and-Play Inference Acceleration. In International Conference on Learning Representations (ICLR) .[32] Lianmin Zheng, Liangsheng Yin, Zhiqiang Xie, Chuyue Sun, Jeff Huang, Cody Hao Yu, Shiyi Cao, Christos Kozyrakis, Ion Stoica, Joseph E. Gonzalez, Clark Barrett, and Ying Sheng. 2024. SGLang: Efficient Execution of Structured Language Model Programs. In Ad-vances in Neural Information Processing Systems (NeurIPS) .13

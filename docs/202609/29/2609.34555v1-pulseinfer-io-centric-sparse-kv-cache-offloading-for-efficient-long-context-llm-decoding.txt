@@ -1,0 +1,626 @@
+Title: PulseInfer: I/O-Centric Sparse KV Cache Offloading for Efficient Long-Context LLM Decoding
+
+URL Source: https://arxiv.org/pdf/2609.34555v1
+
+Published Time: Tue, 29 Sep 2026 03:37:09 GMT
+
+Number of Pages: 16
+
+Markdown Content:
+# PulseInfer: I/O-Centric Sparse KV Cache Offloading for Efficient Long-Context LLM Decoding 
+
+## Qiuyang Zhang ∗
+
+Huazhong University of Science and Technology Wuhan, China 
+
+qyzhang@hust.edu.cn 
+
+## Kai Zhou ∗
+
+Huazhong University of Science and Technology Wuhan, China 
+
+kezzy@hust.edu.cn 
+
+## Kai Lu †
+
+Huazhong University of Science and Technology Wuhan, China 
+
+kailu@hust.edu.cn 
+
+## Haocheng Lu 
+
+Huazhong University of Science and Technology Wuhan, China 
+
+haocheng_lu@hust.edu.cn 
+
+## Jian Zhou 
+
+Huazhong University of Science and Technology Wuhan, China 
+
+jianzhou@hust.edu.cn 
+
+## Yuanpeng Su 
+
+UCloud Technology Co., Ltd. Shanghai, China 
+
+chris.su@ucloud.cn 
+
+## Kun Bao 
+
+UCloud Technology Co., Ltd. Shanghai, China 
+
+kun.bao@ucloud.cn 
+
+## Jiguang Wan 
+
+Huazhong University of Science and Technology Wuhan, China 
+
+jgwan@hust.edu.cn 
+
+## Fei Wu 
+
+Huazhong University of Science and Technology Wuhan, China 
+
+wufei@mail.hust.edu.cn 
+
+## Abstract 
+
+Long-context LLM serving is increasingly bottlenecked by decode, where large KV caches limit batch size and under-utilize GPUs. Sparse KV cache offloading expands effective capacity by storing most historical KV blocks in CPU DRAM and recalling only selected blocks on demand. However, we find that existing offloading systems shift the bottleneck to CPU-GPU recall I/O: recall volume varies widely across layers, decode steps and requests, while headwise sparse selection fragments recalls into many small PCIe transfers. This paper presents PulseInfer, an I/O-centric sparse KV cache offloading system. PulseInfer hides variable recall la-tency with interruptible layer-wise scheduling, adapts of-floading decisions with IO-Adaptive Offloading Admission, and coalesces fragmented transfers using SoloHead sparse selection and a gather-scatter I/O engine. Implemented on SGLang, PulseInfer improves decode throughput by up to 4.7× over SGLang and 2.6× over the best existing offloading baseline, while reducing TPOT by up to 76% and preserving near-lossless accuracy. 
+
+## 1 Introduction 
+
+Large language model (LLM) serving has become a domi-nant workload in modern data centers [13, 14, 37, 39, 51], driven by the widespread adoption of chatbots [26], code assistants [4, 5, 8], and personal AI agents [3, 32]. Meanwhile, two trends are reshaping inference workloads. On the input side, context windows have expanded from thousands of tokens to hundreds of thousands or even millions, enabling 
+
+> ∗Both authors contributed equally to this research.
+> †Corresponding Author: Kai Lu (kailu@hust.edu.cn)
+
+long-document understanding, retrieval-augmented genera-tion, and multi-turn agentic histories [21]. On the output side, reasoning models [12, 27] and inference-time scaling [38, 48] make generation increasingly long, with models often pro-ducing thousands of chain-of-thought tokens before the final answer. Together, longer inputs and outputs shift inference cost toward the decode phase, which executes once per gen-erated token over an ever-growing context and can account for over 90% of end-to-end inference time. High-throughput decoding relies on large batch sizes to amortize per-token overheads and fully utilize GPU compute. However, long-context requests require large KV caches whose memory footprint grows linearly with context length, leaving GPU memory space for only a few concurrent re-quests. This batch-size constraint makes long-context de-coding memory-capacity-bound , severely degrading serving throughput. Sparse KV cache offloading is a promising approach to this problem [9, 20, 47]. Instead of keeping the entire KV cache in GPU memory, it offloads most historical KV blocks to CPU DRAM while retaining only digests and hot blocks on the GPU. During decode, a sparse attention selector iden-tifies important historical blocks for the current query, and the system recalls missing KV blocks from CPU DRAM to GPU memory before attention computation. By offloading temporarily unimportant tokens to CPU, this design extends the effective KV capacity beyond GPU memory. However, KV cache offloading shifts the bottleneck from GPU memory capacity to CPU–GPU recall I/O. For every layer in every decode step, the system must transfer miss-ing KV blocks from host DRAM to GPU memory over PCIe, 
+
+> 1arXiv:2609.34555v1 [cs.LG] 28 Sep 2026
+
+whose effective bandwidth is one to two orders of magnitude lower than HBM, especially for small transfers. In synchro-nous recall systems such as ArkVale [9] and PQCache [47], the GPU stalls until the required blocks arrive, often driving GPU utilization to around 35%. Even InfiniGen [20], which prefetches KV entries one layer ahead, achieves only around 45% GPU utilization under realistic serving workloads, be-cause a static pipeline cannot fully hide variable recall la-tency. As a result, recall-I/O stalls can offset the capacity benefit of offloading: under realistic workloads, existing KV cache offloading systems often fail to improve throughput and may even underperform non-offloading baselines. We find that this poor utilization stems from two funda-mental I/O pathologies in existing sparse offloading systems. 
+
+First, the volume of recall I/O is inherently dynamic. 
+
+The number of recalled tokens varies across decode steps, lay-ers, requests, and batches because sparse selection is query-dependent and workload composition changes over time. For a single request, recall I/O follows a highly right-skewed, long-tailed distribution: most layers and steps require moder-ate recall, while a non-negligible fraction incurs much larger transfers. This distribution also varies significantly across layers, with median recall load differing by up to 5 ×. At the serving level, shifting request-length distributions further change the number of offloaded sequences in each batch, causing aggregate recall I/O to fluctuate over time. Such variability makes recall latency difficult to hide with a fixed pipeline. 
+
+Second, the granularity of recall I/O is too small. Ex-isting sparse attention mechanisms select important tokens independently for each KV head, producing many small, scat-tered transfers rather than a few large contiguous ones. This headwise granularity is algorithmically natural but system-ically inefficient: it drastically reduces effective PCIe band-width, reaching only around 6 GB/s on PCIe 5.0 ×16. It also requires each head to keep its own digest metadata resident in GPU memory. Together, these pathologies turn recall I/O into a critical-path stall, causing KV cache offloading to un-derutilize expensive GPUs and reduce system throughput. To address these issues, we propose PulseInfer , an I/O-centric KV cache offloading system for high-throughput long-context LLM decoding. PulseInfer rethinks KV cache offload-ing from an I/O perspective: recall I/O is not a secondary concern, but the central bottleneck that must be scheduled ,
+
+controlled , and coalesced . Accordingly, PulseInfer decom-poses the problem into three goals: hiding variable recall latency, adapting offloading decisions to workload dynamics, and improving the efficiency of each recall transfer. To hide variable recall latency, PulseInfer introduces in-terruptible layer-wise scheduling . Instead of relying on a fixed one-layer-ahead pipeline, PulseInfer partitions requests into normal batches, whose KV caches remain GPU-resident, and offload batches, whose historical KV caches reside in CPU memory, and interleaves their execution at layer gran-ularity. Inspired by the OS interrupt model [6], PulseInfer treats recall I/O as an asynchronous event rather than a blocking operation. When an offload batch issues recall re-quests, GPU execution immediately switches to a normal batch. The normal batch continues execution while check-ing for I/O-completion interrupts at layer boundaries, and switches back to the offload batch once recall completes. This interruptible execution hides variable recall latency behind useful computation while preserving transformer decoding semantics. To adapt to workload dynamics, PulseInfer introduces 
+
+IO-Adaptive Offloading Admission (IOAA) . The effec-tiveness of interruptible scheduling depends on the balance between normal and offload batches: the normal batch must provide enough computation to absorb the recall I/O gen-erated by the offload batch. However, as request-length dis-tributions drift over time, any static offloading threshold becomes suboptimal. Offloading too aggressively creates more recall I/O than the normal batch can hide, while of-floading too conservatively leaves GPU memory pressure un-resolved. IOAA formulates batch admission as a throughput-maximization problem. It builds a quantitative throughput model parameterized by the overlap depth , i.e., the number of normal-batch layers needed to cover one round of recall I/O, and searches for the best normal/offload assignment at runtime using a pruned binary-tree search. Together, IRQ and IOAA allow PulseInfer to hide recall latency effectively under shifting workload mixes, thereby addressing dynamic recall volume. To improve recall I/O efficiency, PulseInfer coalesces recall I/O at both the algorithm and engine levels. At the algorithm level, we leverage the observation that attention heads spe-cialize into retrieval heads and streaming heads. Based on this, we propose SoloHead sparse selection , which uses Middle Attention Mass (MAM) to identify the strongest re-trieval head in each layer and lets that head select a shared set of top-𝑘 blocks for all KV heads. SoloHead replaces inde-pendent headwise selection with a single layer-level decision, converting fine-grained per-head transfers into coarser per-layer transfers and eliminating per-head digest storage. By avoiding noisy selections from streaming heads, SoloHead can even improve accuracy over headwise selection across a range of LLM benchmarks. At the engine level, a gather-scatter transfer engine gathers scattered KV blocks into a pinned staging buffer and transfers them through a single large DMA operation, improving effective PCIe bandwidth by over 2× compared with per-block asynchronous copies. Together, these mechanisms convert fragmented per-head recall I/O into coarse-grained, bandwidth-efficient transfers. We implement PulseInfer on SGLang [52] and evaluate it against state-of-the-art baselines on three frontier mod-els ranging from 14B to 230B parameters [22, 35], using both synthetic workloads and real industrial traces [29, 40]. 
+
+> 2
+
+PulseInfer improves decode throughput by up to 4.7× over SGLang and 2.6× over the best existing offloading system, sustains ~95% GPU utilization, and reduces TPOT by up to 76% compared with existing offloading systems, while achieving near-lossless accuracy relative to full attention. In summary, this paper makes the following contributions: 
+
+• We identify recall I/O as the key bottleneck of sparse KV cache offloading and characterize its two root pathologies: dynamic recall volume and fragmented transfers. 
+
+• We propose interruptible layer-wise scheduling (IRQ), an OS-inspired execution model that adaptively hides variable recall latency behind normal-batch computation. 
+
+• We propose IOAA, a throughput-model-driven policy that dynamically partitions requests between normal and of-fload batches, and SoloHead with a gather-scatter engine to coalesce fragmented recalls into efficient transfers. 
+
+• We implement PulseInfer on SGLang, achieving up to 2.6× higher throughput than state-of-the-art offloading systems with near-lossless accuracy. 
+
+## 2 Background 
+
+2.1 LLM Inference and Sparse Attention 
+
+LLM inference consists of a compute-intensive prefill phase and a memory-bound decode phase [36]. During decode, each generated token attends to all previous tokens through the KV cache, whose size grows linearly with sequence length and batch size. Long-context and reasoning work-loads therefore make decode increasingly memory-capacity-bound: large KV caches restrict the batch size that can fit in GPU memory, limiting serving throughput. Modern serv-ing systems increasingly adopt prefill-decode (PD) disag-gregation [28, 54], where prefill and decode are executed on separate GPU instances to independently optimize compute-intensive and memory-intensive workloads. This paper fo-cuses on the decode instance in such a PD-disaggregated serving setup. Sparse attention reduces the decode memory traffic by selecting only a subset of historical tokens or blocks for at-tention [23, 34, 42, 45, 50]. For example, Quest [34] partitions the KV cache into fixed-size blocks, maintains compact per-head digests, and lets each KV head independently select its top-𝑘 blocks for the current query. While this query-aware selection reduces attention computation, it still assumes that the full KV cache remains GPU-resident. 
+
+2.2 Sparse KV Cache Offloading 
+
+Although sparse attention reduces the amount of memory access during attention computation, it still requires the full KV cache to reside in GPU memory. With the rise of agen-tic applications [46], inference requests increasingly bundle environmental information, user memory, project files, and multiple rounds of conversation, easily pushing sequence lengths to tens or even hundreds of thousands of tokens and CPU GPU       
+
+> Q
+> 18910 14 GPU KV Full KV 346
+> Score & Top-K ... Digest X
+> : [3, 4, 6, 9, 14]
+
+\
+
+> X
+> ❶❷❸
+> : [1, 8, 9, 10, 14] : [3, 4, 6]
+
+Figure 1. Illustration of sparse KV cache offloading. 1 2 3
+
+> Time (s)
+> 050 100
+> GPU Utilization (%)  FullKV InfiniGen PQCache PulseInfer
+
+Figure 2. GPU utilization across different methods. <= 8192 > 8192 
+
+> Sequence Length
+> 0100 200 300 400 500
+> TPOT (ms) FullKV InfiniGen PQCache PulseInfer
+
+Figure 3. TPOT for short and long requests. causing the KV cache to become enormous [30, 40, 44, 49]. For example, a single 128K-token sequence in the Qwen-3 14B model requires 20 GB of KV cache. Because each decod-ing step performs very little computation, large batch sizes are needed to achieve high overall throughput; however, the substantial KV-cache footprint limits the number of concur-rent requests that can fit in GPU memory, making the decode phase memory-capacity-bound. Sparse KV cache offloading [9, 20, 47] addresses this bot-tleneck by storing the full KV cache in CPU DRAM while keeping only compact digests and frequently accessed hot blocks on the GPU. Building on the sparse-attention work-flow, offloading systems add a recall stage. As shown in Figure 1, after sparse selection ( ➊) identifies the top-k blocks 
+
+𝐵 𝑡𝑜𝑝𝑘 for the current query, the system computes the set difference between 𝐵 𝑡𝑜𝑝𝑘 and the GPU-resident hot blocks 
+
+𝐵 𝑔𝑝𝑢 (➋), obtaining the blocks that must be recalled ( 𝐵 𝑟𝑒𝑐𝑎𝑙𝑙 ). These missing blocks are then transferred from DRAM to the GPU ( ➌). For example, ArkVale builds on Quest’s [34] sparse-attention mechanism (§2.1) to offload the KV cache. During attention computation, it uses synchronous recall I/O to load the re-quired tokens. PQCache [47] formulates KV selection as ap-proximate retrieval and uses product quantization to search offloaded cache. InfiniGen [20] further improves KV-cache offloading with one-layer-ahead prefetching, trying to hide     
+
+> 30200 400 600 0.0 0.2 0.4 0.6 0.8 1.0
+> Cumulative Probability (CDF)
+> 1400 0919 29 39 Layer
+> I/O Load (tokens)
+
+Figure 4. Per-layer CDF of recalled to-kens on Qwen-3 14B. 0 10k 20k 30k 40k 50k 60k 
+
+> Input Length (tokens)
+> 0.00 0.25 0.50 0.75 1.00
+> Cumulative Probability (CDF)
+> Mooncake trace ServeGen trace
+
+Figure 5. Input-length CDFs of realistic serving workloads. 0-10 10-20 20-30 30-40 40-50 50-60 
+
+> Time (min)
+> 020k 40k 60k
+> Input Length
+
+Figure 6. Input-length distributions vary over time. I/O latency behind the computation of the preceding layer. To enable this prefetching, InfiniGen [20] approximates the input to the next layer using the current layer’s hidden state, derives the next layer’s attention query from this approxi-mation, and predicts the next layer’s top-k important blocks with the estimated query to initiate prefetching. 
+
+## 3 Motivation 
+
+3.1 Offloading Shifts the Bottleneck to Recall I/O 
+
+Sparse KV cache offloading promises to break the GPU mem-ory capacity barrier by storing most of the KV cache on CPU DRAM and recalling only a small subset of important blocks on each decode step. However, this recall is not free [16]. Figure 2 shows the GPU utilization of two state-of-the-art offloading systems, PQCache [47] and InfiniGen [20], com-pared to a full-attention baseline. Despite enabling larger batch sizes, both systems suffer from substantial GPU idle time. This idle time stems directly from the GPU waiting for KV cache data to be transferred from CPU memory, high-lighting the severity of the recall I/O bottleneck. In effect, offloading shifts the primary bottleneck from GPU memory capacity to recall I/O latency. Existing systems exacerbate this bottleneck by coupling all requests within a batch. In PQCache and InfiniGen, when any request in the batch triggers recall I/O, the entire batch waits. This includes short requests of only a few thousand tokens that require little to no offloaded data and could otherwise complete quickly. Figure 3 quantifies this head-of-line block-ing. Specifically, we group requests by sequence length to compare their TPOT (time-per-output-token) under mixed-batch offloading against isolated, non-offloaded full attention execution. Compared with a no-offloading baseline, short requests of fewer than 8K tokens experience a 5× increase in TPOT when co-scheduled with long requests. These requests do not trigger recall I/O themselves, yet they are forced to stall while waiting for recall transfers initiated by longer requests in the same batch. 
+
+3.2 Dynamic Recall I/O Defeats Fixed Prefetching 
+
+InfiniGen attempts to hide recall I/O through one-layer-ahead prefetching, using the computation of the current layer to cover the I/O needed by the next layer. As shown in Figure 2, however, this fixed overlap window fails to sustain high GPU utilization. The reason is that recall I/O is dynamic: its volume changes across layers, steps, and requests, making a static one-layer pipeline mismatched to the workload. Figure 4 shows the CDF of recalled tokens across layers under a 2K token budget on Qwen-3 14B. For each layer, the recall I/O load is far from fixed; instead, it follows a highly right-skewed, long-tailed distribution. This is because the attention query changes at every decode step. Although the selected important tokens overlap substantially across steps, the non-overlapping portion varies and is difficult to predict. In addition, the recall-I/O distribution differs significantly across layers, with the median number of recalled tokens varying by up to 5×. This layer-level variation arises from different attention patterns: some layers focus on more stable contextual information, while others attend to more dynamic, query-dependent tokens. This variability makes it difficult for a fixed prefetch pipeline to consistently hide recall I/O. 
+
+3.3 Workload Drift Breaks Static Offloading Policies 
+
+LLM serving workloads introduce another layer of dynamism. First, realistic workloads contain requests with widely differ-ent lengths: short conversations of only a few hundred tokens coexist with coding agent requests spanning hundreds of thousands of tokens. Figure 5 shows the request-length CDFs of two publicly available industrial traces, Mooncake [29] and ServeGen [40]. Across these traces, request lengths rou-tinely span more than three orders of magnitude. Second, the request-length distribution also changes over time. Figure 6 shows the input-length distribution within a one-hour window of the ServeGen trace. Both the median and the spread shift noticeably across windows, indicating that the ratio of short to long requests does not remain stable during serving. These workload dynamics further amplify recall-I/O vari-ability. To demonstrate this, we evaluate existing offloading systems under two distinct configurations: a synthetic work-load with a uniform 32K-token input length, and a real-world workload replayed from the ServeGen trace. As shown in 
+
+> 4Fixed Length Realistic Trace 0200 400
+> Throughput (tok/s)  FullKV InfiniGen PQCache
+
+Figure 7. Decode through-put under synthetic and real workloads. 4K 16K 64K256K 1M 4M 
+
+> Transfer Size (bytes)
+> 020 40 60
+> H2D Bandwidth (GB/s)
+> PCIe 4x16 PCIe 5x16
+
+Figure 8. Host-to-device PCIe bandwidth under differ-ent transfer granularities. Figure 7, while InfiniGen and PQCache outperform the full-attention baseline under the uniform synthetic workload, their performance degrades substantially under the real in-dustrial trace, even falling below the baseline. This contrast underscores that static offloading strategies become inher-ently fragile when the request mix and recall-I/O demand vary over time. 
+
+3.4 Headwise Selection Fragments Recall I/O 
+
+Existing sparse-attention methods typically perform head-wise selection, where each KV head independently selects its own top-𝑘 important tokens or blocks. While algorith-mically natural, this design is systemically inefficient for KV offloading. Because different heads often select differ-ent blocks, recall I/O is broken into many small, scattered transfers, sometimes as small as a single block for one layer and one KV head. Under a typical configuration with a block size of 16 tokens, a head dimension of 128, and bfloat16 pre-cision, the KV cache for such a transfer is only 8 KB. Such fine-grained transfers are poorly matched to CPU–GPU data movement: as shown in Figure 8, despite the 64 GB/s theoret-ical peak bandwidth of PCIe 5.0×16, 8 KB transfers achieve only about 6 GB/s effective bandwidth. Beyond transfer inefficiency, headwise selection also weak-ens the memory benefit of offloading. It requires per-block digests to be stored separately for each KV head in GPU memory, and with small block sizes these digests grow into a noticeable fraction of the GPU memory footprint, reducing the savings that offloading would otherwise provide. 
+
+## 4 Design and Implementation 
+
+4.1 Design Overview 
+
+We propose PulseInfer , an I/O-centric sparse KV cache offloading system that treats recall I/O as a first-class schedu-lable event. As illustrated in Figure 9, PulseInfer decomposes the I/O bottleneck into three goals— hide , control , and coa-lesce —each addressed by a dedicated mechanism. SoloHead Sparse Selection GPU-resident KV cache    
+
+> normal batch offload batch
+> DRAM IO-Adaptive Offloading Admission Semi-Sync Interrupt Detect KV cache offloading Gather-Scatter I/O Engine IRQ Layer-wise Scheduler
+> GPU
+> resume yield
+> CPU
+> Hide I/O Schedule I/O Coalesce I/O 11132233
+
+Figure 9. Overall architecture of PulseInfer. 
+
+Hide (§4.2): PulseInfer partitions requests into a normal batch and an offload batch , and interleaves them at layer gran-ularity following an OS-style interrupt model, adaptively hiding variable recall I/O behind useful computation. 
+
+Control (§4.3): IO-Adaptive Offloading Admission (IOAA) 
+
+dynamically searches for the normal/offload batch split that maximizes expected throughput under shifting workloads and GPU memory constraints. 
+
+Coalesce (§4.4): SoloHead uses a single retrieval head per layer to select a shared top-𝑘 block set for all KV heads, and a gather-scatter transfer engine coalesces scattered blocks into a single large DMA transfer, jointly improving PCIe bandwidth utilization and reducing digest memory. 
+
+4.2 Hide: Interruptible Layer-wise Scheduling 
+
+As established in §3.1–§3.2, recall I/O is the dominant cause of GPU underutilization in KV cache offloading. The fun-damental challenge is that recall I/O volume is inherently dynamic: it varies across layers, decode steps, requests, and serving workloads. A fixed prefetch pipeline, such as Infini-Gen’s one-layer-ahead strategy, cannot reliably absorb this variability. The problem of hiding variable I/O latency behind useful computation is not unique to LLM serving, it is a well-studied problem in operating systems. When a CPU process issues an I/O request, the OS does not spin-wait until the request completes. Instead, it blocks the waiting process, schedules another ready process, and resumes the original process only after an I/O completion interrupt. This interrupt-driven execution hides unpredictable I/O latency without requiring the OS to predict the duration of each I/O operation.           
+
+> 5topk m+1 attn mmlp m
+> recall m
+> idle GPU PCIe topk mattn m
+> recall m
+> idle GPU PCIe topk m+2
+> recall m+1
+> topk mattn nmlp nattn n+i mlp n+i attn mGPU PCIe ... interrupt normal batch offload batch
+> (a) ArkVale: synchronous recall I/O (b) In fi niGen: one-layer-ahead recall I/O prefetch
+> (c) PulseInfer:interruptible layer-wise scheduling
+> mlp m
+> mlp m
+> idle
+> recall m...
+
+Figure 10. Execution pipelines of different methods. Inspired by this, we propose interruptible layer-wise scheduling (IRQ) for LLM decoding. The key analogy is straightforward: a CPU process corresponds to an inference batch. To realize this interrupt-driven model in LLM serv-ing, IRQ classifies decode requests into two types: normal requests , which are relatively short requests that keep their KV cache on the GPU and incur no recall I/O, and offload requests , which are relatively long requests that store their full KV cache in CPU memory while retaining a fixed-size set of hot blocks on the GPU, consisting of sink tokens, local tokens, and hot middle tokens. This split follows directly from the observation in §3.1: short requests often require no offloading, yet in existing single-batch systems they are forced to stall while waiting for recall I/O triggered by co-scheduled long requests. By batching normal and offload requests separately, IRQ overlaps recall I/O with normal-batch computation and avoids exposing short requests to unnecessary I/O stalls. 
+
+4.2.1 Layer-wise Scheduling. The layer-wise nature of recall I/O motivates a layer-wise scheduler: instead of switch-ing only at token boundaries, IRQ allows execution to switch at transformer-layer boundaries. Figure 10 illustrates the resulting execution flow. The offload batch and the normal batch advance through transformer layers independently. When the offload batch reaches layer 𝑚 , it first performs sparse selection to identify the top-𝑘 important blocks and determines which of them are missing from GPU memory. It then submits data-transfer requests to recall the missing KV blocks from CPU memory. After issuing these transfers, the offload batch yields the GPU, and the scheduler immediately switches to the normal batch, which resumes execution from its current layer 𝑛 .At each subsequent layer boundary of the normal batch, the scheduler checks whether the offload batch’s recall I/O has completed. If the I/O is still in flight, the normal batch proceeds to the next layer and repeats the check. Once com-pletion is detected, the scheduler switches back to the offload batch. The offload batch then performs attention and FFN attn m mlp m            
+
+> mlp m-1
+> long switch delay
+> ...
+> GPU attn m
+> attn m+1 mlp m+1
+> mlp mattn m+1 mlp m+1 attn n
+> attn mmlp m
+> mlp m-1
+> ...
+> attn m
+> attn n
+> attn mattn n
+> attn mmlp m
+> mlp m-1
+> ...
+> attn m
+> attn n
+> mlp mattn n
+> (b) Asynchronous Interrupt Detection
+> attn n
+> sync sync context switch
+> I/O check point normal batch offload batch kernel launch kernel execute
+> context switch context switch
+> I/O fi nish (a) Synchronous Interrupt Detection
+> (c) Semi-Synchronous Interrupt Detection
+> CPU GPU CPU GPU CPU
+> ... ...
+> ...
+> idle
+
+Figure 11. Comparison of interrupt detection methods. computation for layer 𝑚 using the recalled KV blocks. Af-ter finishing this layer, it proceeds to layer 𝑚 + 1, performs sparse selection, triggers the next round of recall I/O, and yields the GPU again. The normal batch later resumes from the layer where it was interrupted. This design has two important properties. First, the over-lap depth , defined as the number of normal-batch layers executed during one recall-I/O wait, is not fixed. Instead, it is determined by the actual I/O completion time. This adaptive overlap contrasts with fixed prefetch pipelines, whose over-lap window cannot adjust to varying recall loads. Second, the normal batch is isolated from offload-batch I/O. As a result, short requests no longer suffer head-of-line blocking caused by recall transfers that they do not need. 
+
+4.2.2 Semi-Synchronous Interrupt Detection. The in-terrupt detection mechanism at layer boundaries faces a tension between two goals: minimizing GPU idle time dur-ing context switches, and minimizing the delay from I/O completion to batch resumption. These two goals compete because of the asynchronous nature of GPU execution [24]. GPU tasks are submitted by the CPU into a command queue (e.g., a CUDA stream), and sustaining high GPU utilization requires that this queue never run empty. A synchronous approach (Figure 11(a)) would require CPU–GPU synchronization at every layer boundary to check I/O completion before deciding the next task. While this keeps the switch timely, the frequent synchronization drains the GPU pipeline and hurts utilization. An asynchronous al-ternative (Figure 11(b)) avoids synchronization entirely: the CPU keeps pushing normal-batch tasks and polls I/O status between enqueues. This preserves high utilization but delays 
+
+> 6
+
+the context switch—by the time I/O completion is detected, several normal-batch layers may already be queued, forcing the offload batch to wait. IRQ adopts a semi-synchronous interrupt detection 
+
+strategy (Figure 11(c)). After submitting the attention and FFN kernels of a normal-batch layer, the CPU waits only for the attention kernel to complete, rather than synchroniz-ing on the entire layer. When this synchronization returns, the GPU has finished attention but still has the FFN kernel queued or running. The scheduler uses this interval to check whether the offload batch’s recall I/O has completed and de-cides which task to enqueue next. By making the scheduling decision while the GPU continues executing FFN, this semi-synchronous design preserves high GPU utilization while bounding the delay of offload-batch resumption. 
+
+4.3 Control: I/O-Adaptive Offloading Admission 
+
+IRQ scheduling relies on having sufficient normal-batch com-putation to hide offload-batch recall I/O. However, realistic serving workloads do not provide a stable request mix. As shown in §3.3, request-length distributions drift over time, causing the ratio of normal to offload candidates to vary continuously. A static length threshold can thus become sub-optimal: it may offload too many requests and generate more recall I/O than the normal-batch computation can absorb, or offload too few requests and leave GPU memory pressure unresolved. This motivates a dynamic offloading scheduler that decides which requests to offload based on the current recall-I/O load and GPU memory pressure. To determine the optimal scheduling policy, we first ex-amine how throughput depends on the sizes of normal and offload batches. During decoding, each request generates one token per step, and step latency varies only mildly with batch size because sparse attention shifts the primary bottleneck away from compute and memory bandwidth. Consequently, system throughput is roughly proportional to the effective batch size. Under IRQ, one offload-batch layer is overlapped with 𝑚 normal-batch layers, where 𝑚 denotes the overlap depth. Throughput is therefore approximately proportional to the weighted average of the two batch sizes: Throughput ∝ 𝑚 𝑚 + 1 · 𝐵 𝑛 + 1
+
+𝑚 + 1 · 𝐵 𝑜 , (1) where 𝐵 𝑛 and 𝐵 𝑜 are the normal-batch and offload-batch sizes, respectively. Since 𝑚 ≥ 1, the normal batch consis-tently receives a larger weight. Holding 𝑚 fixed, increasing 
+
+𝐵 𝑛 therefore brings a larger throughput gain than increasing 
+
+𝐵 𝑜 .However, the optimal choice is not simply to maximize 𝐵 𝑛 .Increasing 𝐵 𝑜 can free GPU memory and allow the system to admit a larger total batch size. This can increase either 
+
+𝐵 𝑛 or 𝐵 𝑜 , improving overall throughput. At the same time, a larger offload batch introduces more recall I/O, which drives up the overlap depth 𝑚 . As 𝑚 grows, throughput becomes increasingly dominated by 𝐵 𝑛 , diminishing the throughput benefit of additional offload requests. To adapt to the dynamics of workload and balance the tradeoff between offloading and non-offloading decisions, we propose IO-Adaptive Offloading Admission (IOAA) . The core idea is to simulate different admission decisions for the waiting requests using the quantitative throughput model (Eq. 1), and select the assignment that yields the highest expected throughput. 
+
+4.3.1 Binary-Tree Search with Early Stopping. For a queue of 𝑛 waiting requests, admission is a combinatorial assignment problem with up to 2 𝑛 normal/offload configu-rations. IOAA models this process as a binary search tree, where each level decides the placement of one request, with the two outgoing branches corresponding to normal admis-sion and offloading, and each root-to-leaf path represents a complete assignment. IOAA evaluates Eq. 1 at each feasible leaf and selects the assignment with the highest throughput. To avoid exhaustive search, IOAA applies two pruning rules. First, branches that exceed the remaining GPU mem-ory budget are pruned immediately. Second, IOAA enforces a length-based monotonicity rule: once a longer request is admitted to the normal batch, shorter requests are not ex-plored for offloading. This matches the threshold structure of the problem and removes unnatural assignments. Together, these rules make the search lightweight: with 30 waiting requests, IOAA visits only 3.16 nodes on average. 
+
+4.3.2 Overlap Depth Profiling. The throughput model above requires the overlap depth 𝑚 for each candidate as-signment. By definition, 𝑚 = ⌈𝑡 𝑖𝑜 /𝑡 𝑙𝑎𝑦𝑒𝑟 ⌉, where 𝑡 𝑖𝑜 is the recall I/O latency and 𝑡 𝑙𝑎𝑦𝑒𝑟 is the time to execute one layer of the normal batch. The recall latency 𝑡 𝑖𝑜 mainly depends on the number of recalled tokens, which grows with the offload-batch size 𝐵 𝑜 . In contrast, 𝑡 𝑙𝑎𝑦𝑒𝑟 is relatively stable and changes mildly with the normal-batch size 𝐵 𝑛 . There-fore, for a given model and hardware platform, the expected overlap depth can be estimated as a function of (𝐵 𝑜 , 𝐵 𝑛 ).IOAA obtains this function through offline profiling. Fig-ure 12 shows the profiled overlap depth for Qwen-3 14B on an NVIDIA RTX PRO 6000. Since different layers have differ-ent recall-load distributions, 𝑚 is not necessarily an integer; we use the average overlap depth across layers. When 𝐵 𝑜 is small, recall I/O is short enough to be hidden by one normal-batch layer, so 𝑚 remains close to 1. As 𝐵 𝑜 increases, the recall volume grows and 𝑚 increases nearly linearly. For the same 𝐵 𝑜 , larger 𝐵 𝑛 slightly increases 𝑡 𝑙𝑎𝑦𝑒𝑟 , so the required overlap depth decreases modestly. Based on this smooth relationship, IOAA profiles 𝑚 only on a discrete grid of (𝐵 𝑜 , 𝐵 𝑛 ) values. At runtime, when eval-uating a candidate assignment with a specific 𝐵 𝑜 and 𝐵 𝑛 ,IOAA estimates its overlap depth by interpolating from the nearest profiled points.    
+
+> 725 50 75
+> Offload Batch Size ( )
+> 1.0 1.5 2.0 2.5 3.0
+> I/O Overlap Depth (  ) =10
+> =20
+> =30
+> =40
+
+Figure 12. Overlap depth of Qwen-3 14B. 0 1 2 3 4 5 6 7 
+
+> KV Head
+> 03710 14 17 21 24 28 31 35 39
+> Layer
+> Qasper dataset
+> 0 1 2 3 4 5 6 7
+> KV Head
+> QMSum dataset
+> 0.2 0.4 0.6 Middle Attention Mass
+
+Figure 13. Middle Attention Mass (MAM) across KV heads and layers on Qwen-3 14B. staging buffer staging buffer I/O Poller Thread I/O Worker Threads   
+
+> I/O Task Queue
+> GPU Memory DRAM
+> gather scatter cudaMemcpyAsync
+> control fl ow data fl ow
+> UVM
+> KV cache KV cache
+> ❶❷❸❹❺❻
+
+Figure 14. Illustration of gather-scatter trans-fer (§4.4.2) and zero-sync I/O submission (§4.5). 
+
+4.4 Coalesce: SoloHead and Gather-Scatter Transfer 4.4.1 SoloHead Sparse Selection. As discussed in §3.4, existing systems perform sparse selection independently for each attention head. This headwise design fragments recall I/O into transfers as small as one KV block for one head in one layer, only 8 KB under typical settings, severely degrading PCIe bandwidth utilization. It also requires every KV head to keep its own digest in GPU memory; with small block sizes, these per-head digests become a noticeable fraction of the GPU memory footprint. This raises a systems question: is per-head selection truly necessary for accurate recall, or can it be simplified for better I/O efficiency? Prior work shows that attention heads in long-context LLMs naturally specialize into two roles [33, 41]. Stream-ing heads mainly attend to sink tokens and local tokens, which we always keep GPU-resident and do not require re-call. Retrieval heads attend to broad middle-context tokens, which contain semantically rich information and may reside in CPU memory. Since KV offloading only needs to select recall-relevant middle tokens, sparse selection should be driven primarily by retrieval heads. Moreover, IMPRESS [10] finds that token-importance rankings are highly similar across query heads, with Jaccard overlap between retrieval heads often exceeding 0.8 on OPT-family models. These observa-tions suggest that per-head independent selection may be unnecessary: a well-chosen retrieval head could guide recall for all KV heads in the layer. To identify such heads, we define Middle Attention Mass (MAM) . For each query head 𝑞 , we compute its attention mass over middle tokens: MAM 𝑞 =∑︁  
+
+> 𝑖 ∈middle
+
+𝐴 𝑞 (𝑖 ), (2) where 𝐴 𝑞 (𝑖 ) is the attention weight assigned to middle posi-tion 𝑖 . For each KV head ℎ, its MAM is the average MAM 𝑞 
+
+over all query heads mapped to ℎ by GQA (Grouped-Query Attention) [2]. A high-MAM KV head is a strong retrieval head because its associated query heads focus on middle to-kens that may require recall; a low-MAM KV head behaves more like a streaming head and contributes little to recall selection. Figure 13 plots the per-head MAM across all layers of Qwen-3 14B, measured on two different datasets: Qasper [11], a question-answering dataset, and QMSum [53], a summa-rization dataset. Two properties stand out. First, MAM varies substantially across heads within the same layer: the gap between the highest- and lowest-MAM heads ranges from 1.5× to 12×, averaging 3.5× across layers. This confirms that head specialization is a structural property of the model. Second, the MAM patterns are stable across the two evalu-ated datasets, suggesting that head roles are largely model-structural rather than input-specific. Therefore, representa-tive heads can be selected offline once per model. Building on this insight, we design SoloHead sparse se-lection , which retains block digests for only one strong retrieval KV head per layer. During decoding, this represen-tative head selects the top-𝑘 blocks, and the selected block set is shared by all KV heads in the layer. By replacing per-head selection with a single layer-level decision, SoloHead coalesces recall I/O from head-wise transfers into token-wise transfers, eliminates per-head digest storage, and reduces sparse-selection computation while preserving the retrieval behavior needed for sparse attention. To quantify the accuracy loss introduced by this shared selection, we use a logit-difference metric. For each layer 𝐿 ,we apply sparse attention only to that layer while keeping all other layers in full attention, and compare the final output logits with full attention: 
+
+𝐷 𝐿 = 𝐾𝐿 (𝑝 full , 𝑝 𝐿 
+
+> sparse
+
+), (3) where 𝑝 full is the output probability distribution produced by full attention, and 𝑝 𝐿  
+
+> sparse
+
+is the output distribution when sparse attention is applied only at layer 𝐿 . 𝐾𝐿 (·) denotes the Kullback-Leibler divergence [19]. Since this metric is   
+
+> 8020 40
+> Layer
+> 0.0 0.5 1.0 1.5
+> KL Divergence ( × − )
+> -
+
+Figure 15. Logit-difference across sparse-selection meth-ods. 4 16 64 256 1K 4K Transfer Blocks 015 30 45 Effective Bandwidth (GB/s) 
+
+> cudaMemcpyAsync Gather-Scatter
+
+Figure 16. Effective band-width of cudaMemcpyAsync 
+
+and gather-scatter transfer. computed on the final output distribution, it directly mea-sures the perturbation caused by sparse selection in layer 
+
+𝐿 . A smaller 𝐷 𝐿 means the sparse result better preserves full-attention behavior. We evaluate four selection strategies: 
+
+• 𝐷 headwise : each query head independently selects its own top-𝑘 tokens, representing conventional headwise methods such as ArkVale. 
+
+• 𝐷 average : query-digest scores are averaged across all heads, and the top-𝑘 tokens under the averaged score are shared by all heads. 
+
+• 𝐷 SoloHead : the KV head with the highest MAM selects the top-𝑘 tokens, and the selected token set is shared by all heads. 
+
+• 𝐷 SoloHead-reversed : the same as SoloHead, but using the 
+
+lowest -MAM KV head. Figure 15 reports these metrics on Qwen-3 14B across layers. 𝐷 SoloHead is close to 𝐷 headwise and 𝐷 average for most layers, showing that a single strong retrieval head is sufficient to guide shared top-𝑘 selection. In contrast, 𝐷 SoloHead-reversed 
+
+consistently incurs the largest divergence, confirming that MAM effectively distinguishes retrieval-oriented heads from non-retrieval heads. 
+
+4.4.2 Gather-Scatter Transfer Engine. To further im-prove recall I/O efficiency, PulseInfer employs a gather-scatter transfer engine. Since recalled KV blocks are scattered across DRAM, issuing one DMA per block would create many small PCIe transfers with poor bandwidth utilization. PulseInfer in-stead gathers the requested blocks into a contiguous pinned CPU staging buffer, transfers them to a GPU staging buffer with one large DMA, and then uses a lightweight GPU scat-ter kernel to place them into the GPU KV cache. Although this adds extra CPU gather and GPU scatter copies, these copies run at DRAM and HBM bandwidth, respectively, and are much faster than fragmented PCIe transfers. As shown in Figure 16, when transferring more than 512 blocks, gather-scatter achieves over 2× higher effective bandwidth than threaded cudaMemcpyAsync under a block size of 16. 
+
+4.5 Implementation 
+
+We implement PulseInfer on SGLang [52], a widely used LLM inference engine. The entire implementation is around ~9 K lines of code. 
+
+IRQ scheduling. PulseInfer implements IRQ scheduling with a two-level scheduler. The outer scheduler partitions requests into a normal batch and an offload batch, control-ling which requests are assigned to each batch. It is invoked only when a batch completes a decode step, where it may adjust the batch composition. The inner scheduler operates at layer granularity and uses layer boundaries as cooperative context-switch points. When switching from one batch to an-other, the inner scheduler records the suspended batch state, including the current layer index, intermediate activations, and forward metadata. 
+
+Zero-sync I/O engine. PulseInfer uses zero-sync I/O sub-mission to remove recall submission from the GPU schedul-ing critical path (Figure 14). A small Unified Virtual Memory (UVM) [25] buffer is shared between the GPU and CPU to store a ready flag and the selected KV block indices. After sparse selection, the selection kernel writes the selected in-dices into this buffer and sets the ready flag. A dedicated CPU polling thread detects the flag, constructs the corre-sponding recall task, and asynchronously submits it to I/O worker threads. As a result, the main inference thread can continue enqueuing normal-batch kernels without waiting for recall-task construction or submission. 
+
+## 5 Evaluation 
+
+Models. We evaluate three frontier LLMs: Qwen-3 14B [35], Qwen-3 30B-A3B (a Mixture-of-Experts [31] model with 30B total parameters and 3B active per token), and MiniMax M2.5 (230B-A10B) [22]. These models span total parameter counts from 14B to 230B, cover both dense and MoE architectures, and represent two distinct model families. 
+
+Setup. All experiments are conducted on a single GPU server equipped with an Intel Xeon Platinum 8470Q CPU, 1 TB of DRAM, and four NVIDIA RTX PRO 6000 GPUs (96 GB each) connected via PCIe 5.0 ×16. For Qwen-3 14B and Qwen-3 30B-A3B, we use a single GPU; for MiniMax-M2.5, we use tensor parallelism across all four GPUs. 
+
+Workloads. We evaluate performance on two types of workloads: (a) synthetic workloads generated from truncated log-normal distributions with a pronounced right skew in input length. Such distributions closely match the charac-teristics of realistic traces described in ServeGen [40]. We generate multiple synthetic workloads under different mean input lengths; (b) realistic workloads that replay open-source industrial traces from Mooncake [29] and ServeGen [40], each containing the timestamp, input length, and output length of every request. 
+
+Baselines. We consider a diverse set of baselines:                  
+
+> 916K 32K 64K ServeGen Mooncake 16K 32K 64K ServeGen Mooncake 16K 32K 64K ServeGen Mooncake 012345Throughput Speedup
+> 324 171 81 236 330 390 188 83 282 312 160 82 36 76 224
+> Qwen-3 14B Qwen-3 30B-A3B MiniMax M2.5 Vanilla ArkVale InfiniGen PQCache PulseInfer
+
+Figure 17. End-to-end decode throughput speedup across models and workloads. 16K 32K 64K ServeGen Mooncake 16K 32K 64K ServeGen Mooncake 16K 32K 64K ServeGen Mooncake 0500 1000 TPOT (ms) Qwen-3 14B Qwen-3 30B-A3B MiniMax M2.5 Vanilla ArkVale InfiniGen PQCache PulseInfer 
+
+Figure 18. End-to-end TPOT across models and workloads. 
+
+• Vanilla . Standard SGLang inference with full attention and GPU-resident KV cache. 
+
+• ArkVale [9] . Sparse attention with KV cache offloading; identifies important KV entries using lightweight attention metadata and performs synchronous recall I/O. 
+
+• InfiniGen [20] . Sparse attention with KV cache offload-ing; predicts important KV entries ahead of execution and prefetches recall I/O one layer ahead. 
+
+• PQCache [47] . Sparse attention with KV cache offloading; uses product quantization [15] and asymmetric distance computation (ADC) to identify important KV entries. We implement ArkVale, InfiniGen, and PQCache in SGLang to the best of our ability. Since our evaluation focuses on the decoding stage, we skip the prefill phase to emulate a decode instance in a prefill-decode disaggregated setting. Unless otherwise specified, each offloaded request is as-signed a 2,048-token GPU KV-cache budget, comprising 16 sink tokens, 128 local tokens, and 1,904 important middle tokens. Sink and local tokens remain resident on the GPU, while only the selected middle tokens are subject to CPU-to-GPU recall. The block size is set to 16, and the CPU-side KV cache capacity is set to 10× the GPU-side capacity. 
+
+5.1 End-to-End Performance 5.1.1 Overall Throughput. We first evaluate end-to-end decode throughput under both synthetic and realistic work-loads. For the synthetic workloads, the mean input lengths are set to 16K, 32K, and 64K tokens. Figure 17 reports through-put speedup over Vanilla across three models. PulseInfer consistently achieves the highest throughput across all models and workloads, improving decode through-put by 1.5x–4.7× over Vanilla and 1.1×–2.6× over the best existing offloading baseline. The gains increase with input length because Vanilla becomes increasingly constrained by GPU KV-cache capacity. For example, on Qwen-3 14B, when the mean input length grows from 16K to 64K, Vanilla throughput drops from 324 tok/s to 81 tok/s, while PulseInfer only decreases from 488 tok/s to 380 tok/s. This is because IOAA admits more offloaded requests under tighter GPU memory pressure, while IRQ hides the additional recall I/O behind normal-batch computation. Existing offloading baselines benefit from larger CPU-side KV capacity, but their throughput remains limited by block-ing and inefficient recall I/O. On shorter workloads, this over-head can even outweigh the batching benefit; for instance, at 16K mean input length on Qwen-3 14B, the best offloading baseline reaches only 0.7× the throughput of Vanilla. Infini-Gen generally performs best among prior offloading systems because one-layer-ahead prefetching hides part of the recall latency, but its fixed overlap window cannot robustly cover recall volume that varies across layers, requests, and batches. Across models, PulseInfer obtains the largest relative gain on Qwen-3 14B. Compared with the MoE models, Qwen-3 14B has more activated computation per token, giving IRQ more layer computation to overlap each recall transfer and   
+
+> 10 <= 8192 > 8192 0100 200 300 400 500 600
+> TPOT (ms)
+> Vanilla InfiniGen ArkVale PulseInfer PQCache
+
+Figure 19. TPOT breakdown by request length. 0 50 100    
+
+> Percentage (%)
+> Vanilla ArkVale InfiniGen PQCache PulseInfer Attn FFN TopK Idle
+
+Figure 20. Latency break-down. 0 1 2 3   
+
+> Time (s)
+> 040 80
+> GPU Utilization (%)  Vanilla InfiniGen PulseInfer ArkVale PQCache
+
+Figure 21. GPU utilization across different methods. Time  
+
+> 020 40 60 80
+> Batch Size
+> Vanilla PulseInfer (Normal) PulseInfer (Offload)
+
+Figure 22. Batch size during decoding. reducing the required overlap depth. The relative gain is smaller on MiniMax M2.5 because it is served with tensor parallelism across four GPUs, which distributes KV heads and effectively increases aggregate recall bandwidth for all offloading methods. Nevertheless, PulseInfer remains the fastest across all evaluated models. PulseInfer also maintains strong gains on realistic Serve-Gen and Mooncake traces, where random arrivals and time-varying input-length distributions continuously change the normal/offload mix and aggregate recall-I/O load. Static of-floading policies and fixed prefetch pipelines become unsta-ble under such drift. In contrast, PulseInfer combines IRQ to hide variable recall latency at layer granularity with IOAA to dynamically adjust the normal/offload split under changing workload and memory pressure. 
+
+5.1.2 Per-Token Latency. Figure 18 reports the mean TPOT in the end-to-end evaluation. Across all models and workloads, InfiniGen is the strongest existing offloading base-line, while PulseInfer consistently achieves lower TPOT than all offloading baselines. Compared with InfiniGen, PulseInfer reduces TPOT by 16.0%–76.4%, corresponding to 1.19–4.23× lower per-token latency. This confirms that PulseInfer im-proves end-to-end throughput not by blindly increasing the number of offloaded requests, but by substantially reducing the per-token stalls introduced by recall I/O. Compared with Vanilla, PulseInfer increases mean TPOT by 2.2× on average. This is expected because Vanilla keeps all KV cache on the GPU and thus incurs neither recall I/O nor normal/offload batch switching overhead. PulseInfer there-fore intentionally trades a moderate increase in per-token Base +GS +IRQ +SS +SH 0250 500 Throughput (tok/s) 
+
+Figure 23. Ablation study. Base denotes ArkVale, a syn-chronous offloading baseline. 500 600 700 800 Throughput (tok/s) 4K 6K 8K 10K IOAA 4K 6K 8K 10K IOAA ServeGen Mooncake 
+
+Figure 24. Throughput com-parison of IOAA and fixed ad-mission thresholds. 20 30 40 50 60 
+
+> KV Cache Memory (GB)
+> 0200 400 600
+> Throughput (tok/s)  Vanilla InfiniGen PulseInfer TPOT 0150 300
+> TPOT (ms)
+
+Figure 25. Impact of GPU KV cache capacity on throughput and TPOT. 0.4x0.6x0.8x1.0x 0200 400 600 
+
+> Throughput (tok/s)  Vanilla InfiniGen PulseInfer TPOT 0250 500 750
+> TPOT (ms)
+
+Figure 26. Impact of PCIe bandwidth (relative to PCIe 5x16). latency for substantially higher throughput. We consider this tradeoff acceptable for long-context decode serving: Vanilla achieves low TPOT only by admitting very few concurrent requests under GPU memory pressure, whereas PulseInfer improves decode throughput by up to 4.7× while keeping TPOT much lower than existing offloading systems. Additionally, Figure 19 breaks down TPOT by request length on Qwen-3 14B under the Mooncake trace. For re-quests shorter than 8K tokens, PulseInfer increases TPOT by only 1.5× over Vanilla; for requests longer than 8K tokens, the increase is 2.3×. In contrast, existing offloading baselines increase TPOT by 6.7–8.3× for both short and long requests. This demonstrates that PulseInfer effectively isolates short requests from recall-I/O stalls through IRQ-style scheduling. 
+
+5.2 Performance Analysis 
+
+In this section, we conduct a series of experiments and mea-surements to analyze the performance of PulseInfer. Unless otherwise specified, all evaluations in this section are per-formed on Qwen-3 14B using the ServeGen trace. 
+
+GPU utilization and latency breakdown. We break down decoding latency and measure runtime GPU utiliza-tion, as shown in Figures 20 and 21. ArkVale and PQCache synchronously wait for recall I/O, so recall stalls dominate their latency and keep GPU utilization low. InfiniGen tries to hide recall latency with one-layer-ahead K/V prefetching, but the fixed prefetch window cannot keep up with dynamic recall I/O and still leaves noticeable idle periods. In contrast, PulseInfer uses IRQ scheduling to overlap recall I/O with 
+
+> 11
+
+Table 1. Accuracy comparison across Document QA, Summarization, Few-shot Learning, and Retrieval benchmarks.                                                                                                                                                                                                   
+
+> Model Method Document QA Summarization Few-shot Learning Retrieval Avg. Score Qasper 2WikiMQA HotpotQA GovReport VCSUM TREC TriviaQA RetrievalZH RetrievalEN
+> Qwen-3 14B
+> Full Attention 47.97 74.45 67.38 29.16 20.80 75.63 90.82 100.00 100.00 67.36 ArkVale 46.13 76.61 70.57 29.39 21.00 74.11 90.61 99.50 100.00 67.55 InfiniGen 44.81 75.22 69.39 29.50 20.58 77.15 90.22 99.50 99.50 67.32 PQCache 46.84 75.78 70.29 29.05 20.88 76.14 91.38 99.50 99.50 67.71
+> PulseInfer 46.88 76.06 69.78 29.28 20.64 77.16 90.45 100.00 99.50 67.75
+> +reversed rank 43.75 72.80 64.67 28.34 19.72 71.57 90.40 99.50 97.50 65.36
+> Qwen-3 30B-A3B
+> Full Attention 48.12 77.54 66.89 28.73 20.71 77.16 92.17 100.00 81.50 65.87 ArkVale 47.22 75.23 67.05 29.05 21.47 80.20 91.92 99.00 91.50 66.96 InfiniGen 48.49 78.51 66.82 28.81 21.10 79.19 91.33 99.50 82.00 66.19 PQCache 47.65 78.75 66.55 29.10 21.19 78.68 92.00 99.50 90.50 67.10
+> PulseInfer 48.73 78.03 68.60 29.12 21.12 76.65 92.70 100.00 91.50 67.38
+> +reversed rank 46.27 76.22 63.51 28.43 20.02 71.57 91.17 99.50 83.50 64.47
+> MiniMax M2.5 (230B-A10B)
+> Full Attention 50.10 80.57 72.61 33.04 23.94 78.43 91.67 100.00 100.00 70.04
+> ArkVale 51.20 79.88 71.89 32.80 23.94 76.65 91.61 100.00 100.00 69.77 InfiniGen 49.30 79.80 70.61 33.06 24.32 80.20 91.83 100.00 100.00 69.90 PQCache 50.17 78.66 70.15 33.05 23.94 77.16 91.92 100.00 100.00 69.45
+> PulseInfer 51.07 79.93 71.99 33.02 23.96 77.66 91.98 100.00 100.00 69.96 +reversed rank 50.10 76.83 64.77 30.91 22.15 71.83 91.82 98.50 95.75 66.96
+
+normal GPU execution, largely eliminating recall-induced idle time and sustaining GPU utilization close to Vanilla. 
+
+Batch size. We record the normal- and offload-batch sizes during inference. As shown in Figure 22, PulseInfer achieves a total batch size 4.7× larger than Vanilla, with both batches individually exceeding the Vanilla batch size. This is because Vanilla must keep all KV caches on the GPU, so a few long requests can quickly exhaust GPU memory. PulseInfer of-floads long requests to CPU memory, releasing GPU capacity for more short requests in the normal batch while further expanding serving capacity with the offload batch. 
+
+Ablation study. Figure 23 shows the ablation study of PulseInfer, where GS denotes gather-scatter transfer (§4.4.2), IRQ denotes interruptible layer-wise scheduling (§4.2), SS denotes semi-synchronous interrupt detection (§4.2.2), and SH denotes SoloHead (§4.4.1). All components contribute to end-to-end throughput improvement. Together, they raise throughput to over 3 × that of Vanilla, demonstrating that PulseInfer’s gains come from the combined effect of more ef-ficient recall transfers, adaptive I/O hiding, lower scheduling overhead, and coalesced sparse selection. 
+
+Effectiveness of IOAA. We compare IOAA with fixed short/long admission thresholds on the ServeGen and Moon-cake traces. As shown in Figure 24, IOAA consistently achieves the highest throughput on both traces. Moreover, the best fixed threshold differs between the two traces, indicating that a static admission policy cannot generalize across workload distributions. In contrast, IOAA dynamically searches for the best offloading admission decision at runtime, allowing PulseInfer to adapt to workload-dependent memory pressure and recall-I/O demand. 
+
+Impact of GPU memory size. Figure 25 shows through-put and TPOT under different available GPU KV cache ca-pacities. For InfiniGen, larger capacity does not improve throughput: it admits more offloaded requests, but the re-sulting recall I/O increases GPU idle time, as reflected by its nearly linear TPOT growth. This indicates that InfiniGen is bottlenecked by recall I/O, so larger batches cannot translate into higher throughput. In contrast, PulseInfer continues to improve throughput with higher KV cache capacity because IRQ scheduling hides recall latency and prevents the system from becoming I/O-bound. 
+
+Impact of PCIe bandwidth. We throttle the available I/O bandwidth to quantify the impact of PCIe bandwidth. Figure 26 reports throughput and TPOT under different band-width scaling factors. Higher bandwidth improves both In-finiGen and PulseInfer by shortening recall I/O. However, PulseInfer remains faster than Vanilla even at 0.4× band-width, whereas InfiniGen only matches Vanilla under un-constrained bandwidth. Moreover, at 0.4× bandwidth, Infini-Gen’s TPOT increases by 2.2×, while PulseInfer’s increases by only 1.7×. This shows that PulseInfer is more robust to limited I/O bandwidth thanks to IRQ scheduling. 
+
+5.3 Accuracy 
+
+We evaluate the accuracy of PulseInfer on a diverse set of LLM benchmarks spanning multiple domains. Specifically, we use LongBench [7], a widely used benchmark suite for long-context LLMs, covering document question answering, meeting and report summarization, few-shot learning, and passage retrieval tasks. Table 1 reports the results on three models. Each dataset is evaluated using its corresponding 
+
+> 12
+
+metric, and higher scores indicate better accuracy. We enable chain-of-thought reasoning for all three models and set the thinking budget to 2048 tokens for every dataset. As shown in Table 1, PulseInfer achieves near-lossless accuracy across benchmarks. On the two Qwen-3 models, PulseInfer even slightly outperforms full attention. This indi-cates that a strong retrieval head identifies important middle-context tokens more accurately, avoiding the noisy selections that streaming heads would otherwise introduce. As a result, the shared top-𝑘 blocks capture the recall-relevant context needed for sparse attention more effectively. We further validate the MAM-based head selection by eval-uating a reversed configuration, where PulseInfer chooses the lowest-MAM KV head as the SoloHead instead of the highest-MAM head. As shown by the reversed rank result in Table 1, this choice causes a substantial accuracy drop. This confirms that MAM effectively separates retrieval-oriented heads from streaming heads, and that middle-context recall should be guided by retrieval heads rather than heads that primarily attend to GPU-resident sink and local tokens. 
+
+## 6 Related Work 
+
+KV cache offloading. ArkVale [9] backs up evicted KV pages in CPU memory and recalls them using compact page digests. InfiniGen [20] predicts next-layer important KV en-tries and prefetches them ahead of use. PQCache [47] formu-lates KV selection as approximate retrieval and uses product quantization to search offloaded cache. These systems op-timize KV selection, indexing, caching, or prefetching, but recall I/O can still stall execution under dynamic demand and fragmented transfers. PulseInfer addresses this missing systems layer with an I/O-centric design that jointly hides, controls, and coalesces sparse KV recalls. 
+
+Fine-grained scheduling for LLM serving. Sarathi-Serve [1] chunks long prefills and interleaves them with decodes, NanoFlow [55] uses operation-level nano-batches to overlap compute, memory, and communication, and NEO [18] overlaps CPU-side decoding attention with GPU execution through asymmetric CPU–GPU pipelining. These systems refine scheduling granularity for batching efficiency, prefill– decode overlap, or CPU–GPU load balance. PulseInfer in-stead schedules at layer boundaries to react to sparse-recall I/O completion and hide unpredictable PCIe latency while keeping attention computation on the GPU. 
+
+Head-aware sparse attention. MInference [17] exploits head-specific sparse patterns, DuoAttention [41] separates retrieval heads from streaming heads, and LServe [43] com-bines head-aware sparsity with query-centric KV-page se-lection. While these works use head specialization to reduce attention cost, PulseInfer uses it to coalesce KV-cache recall I/O: SoloHead selects one retrieval-oriented head per layer to guide block selection for all KV heads. 
+
+## 7 Conclusion 
+
+We present PulseInfer, an I/O-centric sparse KV cache of-floading system for long-context LLM decoding. PulseInfer combines interruptible layer-wise scheduling, IO-Adaptive Offloading Admission and SoloHead sparse selection to ex-plicitly schedule, control, and coalesce recall I/O. Evaluation shows that PulseInfer improves decode throughput and GPU utilization while preserving near-lossless accuracy. 
+
+## References            
+
+> [1] Amey Agrawal, Nitin Kedia, Ashish Panwar, Jayashree Mohan, Nipun Kwatra, Bhargav S. Gulavani, Alexey Tumanov, and Ramachandran Ramjee. 2024. Taming Throughput-Latency Tradeoff in LLM Inference with Sarathi-Serve. In 18th USENIX Symposium on Operating Systems Design and Implementation, OSDI 2024, Santa Clara, CA, USA, July 10-12, 2024 , Ada Gavrilovska and Douglas B. Terry (Eds.). USENIX Association, 117–134. https://www.usenix.org/conference/osdi24/ presentation/agrawal
+> [2] Joshua Ainslie, James Lee-Thorp, Michiel de Jong, Yury Zemlyanskiy, Federico Lebrón, and Sumit Sanghai. 2023. GQA: Training Generalized Multi-Query Transformer Models from Multi-Head Checkpoints. In
+> Proceedings of the 2023 Conference on Empirical Methods in Natural Language Processing, EMNLP 2023, Singapore, December 6-10, 2023 ,Houda Bouamor, Juan Pino, and Kalika Bali (Eds.). Association for Computational Linguistics, 4895–4901. doi: 10.18653/V1/2023.EMNLP-MAIN.298
+> [3] Anthropic. 2025. Claude: An AI Assistant by Anthropic with Tool Use and Agentic Capabilities. https://www.anthropic.com/claude
+> [4] Anthropic. 2025. Claude Code. https://code.claude.com/docs/en/ overview
+> [5] Anysphere. 2024. Cursor: The AI Code Editor. https://cursor.com
+> [6] Remzi H. Arpaci-Dusseau and Andrea C. Arpaci-Dusseau. 2018. Oper-ating Systems: Three Easy Pieces . CreateSpace Independent Publishing Platform, North Charleston, SC, USA. [7] Yushi Bai, Xin Lv, Jiajie Zhang, Hongchang Lyu, Jiankai Tang, Zhidian Huang, Zhengxiao Du, Xiao Liu, Aohan Zeng, Lei Hou, Yuxiao Dong, Jie Tang, and Juanzi Li. 2024. LongBench: A Bilingual, Multitask Bench-mark for Long Context Understanding. In Proceedings of the 62nd An-nual Meeting of the Association for Computational Linguistics (Volume 1: Long Papers), ACL 2024, Bangkok, Thailand, August 11-16, 2024 , Lun-Wei Ku, Andre Martins, and Vivek Srikumar (Eds.). Association for Compu-tational Linguistics, 3119–3137. doi: 10.18653/V1/2024.ACL-LONG.172
+> [8] Mark Chen, Jerry Tworek, Heewoo Jun, Qiming Yuan, Henrique Pondé de Oliveira Pinto, Jared Kaplan, Harri Edwards, Yuri Burda, Nicholas Joseph, Greg Brockman, Alex Ray, Raul Puri, Gretchen Krueger, Michael Petrov, Heidy Khlaaf, Girish Sastry, Pamela Mishkin, Brooke Chan, Scott Gray, Nick Ryder, Mikhail Pavlov, Alethea Power, Lukasz Kaiser, Mohammad Bavarian, Clemens Winter, Philippe Tillet, Fe-lipe Petroski Such, Dave Cummings, Matthias Plappert, Fotios Chantzis, Elizabeth Barnes, Ariel Herbert-Voss, William Hebgen Guss, Alex Nichol, Alex Paino, Nikolas Tezak, Jie Tang, Igor Babuschkin, Suchir Balaji, Shantanu Jain, William Saunders, Christopher Hesse, An-drew N. Carr, Jan Leike, Joshua Achiam, Vedant Misra, Evan Morikawa, Alec Radford, Matthew Knight, Miles Brundage, Mira Murati, Katie Mayer, Peter Welinder, Bob McGrew, Dario Amodei, Sam McCan-dlish, Ilya Sutskever, and Wojciech Zaremba. 2021. Evaluating Large Language Models Trained on Code. CoRR abs/2107.03374 (2021). arXiv:2107.03374 https://arxiv.org/abs/2107.03374
+> [9] Renze Chen, Zhuofeng Wang, Beiquan Cao, Tong Wu, Size Zheng, Xiuhong Li, Xuechao Wei, Shengen Yan, Meng Li, and Yun Liang. 2024. ArkVale: Efficient Generative LLM Inference with Recallable
+> 13
+
+Key-Value Eviction. In Advances in Neural Information Process-ing Systems 37: Annual Conference on Neural Information Process-ing Systems 2024, NeurIPS 2024, Vancouver, BC, Canada, Decem-ber 10 - 15, 2024 , Amir Globersons, Lester Mackey, Danielle Bel-grave, Angela Fan, Ulrich Paquet, Jakub M. Tomczak, and Cheng Zhang (Eds.). http://papers.nips.cc/paper_files/paper/2024/hash/ cd4b49379efac6e84186a3ffce108c37-Abstract-Conference.html 
+
+[10] Weijian Chen, Shuibing He, Haoyang Qu, Ruidong Zhang, Siling Yang, Ping Chen, Yi Zheng, Baoxing Huai, and Gang Chen. 2025. IMPRESS: An Importance-Informed Multi-Tier Prefix KV Storage System for Large Language Model Inference. In 23rd USENIX Conference on File and Storage Technologies, FAST 2025, Santa Clara, CA, February 25-27, 2025 ,Haryadi S. Gunawi and Vasily Tarasov (Eds.). USENIX Association, 187–201. https://www.usenix.org/conference/fast25/presentation/ chen-weijian-impress 
+
+[11] Pradeep Dasigi, Kyle Lo, Iz Beltagy, Arman Cohan, Noah A. Smith, and Matt Gardner. 2021. A Dataset of Information-Seeking Questions and Answers Anchored in Research Papers. In Proceedings of the 2021 Conference of the North American Chapter of the Association for Compu-tational Linguistics: Human Language Technologies, NAACL-HLT 2021, Online, June 6-11, 2021 , Kristina Toutanova, Anna Rumshisky, Luke Zettlemoyer, Dilek Hakkani-Tür, Iz Beltagy, Steven Bethard, Ryan Cot-terell, Tanmoy Chakraborty, and Yichao Zhou (Eds.). Association for Computational Linguistics, 4599–4610. doi: 10.18653/V1/2021.NAACL-MAIN.365 
+
+[12] DeepSeek-AI. 2025. DeepSeek-R1: Incentivizing Reasoning Capability in LLMs via Reinforcement Learning. CoRR abs/2501.12948 (2025). arXiv:2501.12948 doi: 10.48550/ARXIV.2501.12948 
+
+[13] Yao Fu, Leyang Xue, Yeqi Huang, Andrei-Octavian Brabete, Dmitrii Ustiugov, Yuvraj Patel, and Luo Mai. 2024. ServerlessLLM: low-latency serverless inference for large language models. In Proceedings of the 18th USENIX Conference on Operating Systems Design and Implemen-tation (Santa Clara, CA, USA) (OSDI’24) . USENIX Association, USA, Article 8, 19 pages. [14] Bin Gao, Zhuomin He, Puru Sharma, Qingxuan Kang, Djordje Jevdjic, Junbo Deng, Xingkun Yang, Zhou Yu, and Pengfei Zuo. 2024. Cost-Efficient Large Language Model Serving for Multi-turn Conversations with CachedAttention. In Proceedings of the 2024 USENIX Annual Tech-nical Conference, USENIX ATC 2024, Santa Clara, CA, USA, July 10-12, 2024 , Saurabh Bagchi and Yiying Zhang (Eds.). USENIX Association, 111–126. https://www.usenix.org/conference/atc24/presentation/gao-bin-cost 
+
+[15] Hervé Jégou, Matthijs Douze, and Cordelia Schmid. 2011. Product Quantization for Nearest Neighbor Search. IEEE Trans. Pattern Anal. Mach. Intell. 33, 1 (2011), 117–128. doi: 10.1109/TPAMI.2010.57 
+
+[16] Chaoyi Jiang, Lei Gao, Hossein Entezari Zarch, and Murali Annavaram. 2025. KVPR: Efficient LLM Inference with I/O-Aware KV Cache Partial Recomputation. In Findings of the Association for Computational Lin-guistics, ACL 2025, Vienna, Austria, July 27 - August 1, 2025 (Findings of ACL) , Wanxiang Che, Joyce Nabende, Ekaterina Shutova, and Moham-mad Taher Pilehvar (Eds.). Association for Computational Linguistics, 19474–19488. doi: 10.18653/V1/2025.FINDINGS-ACL.997 
+
+[17] Huiqiang Jiang, Yucheng Li, Chengruidong Zhang, Qianhui Wu, Xufang Luo, Surin Ahn, Zhenhua Han, Amir H. Abdi, Dongsheng Li, Chin-Yew Lin, Yuqing Yang, and Lili Qiu. 2024. MInfer-ence 1.0: Accelerating Pre-filling for Long-Context LLMs via Dy-namic Sparse Attention. In Advances in Neural Information Pro-cessing Systems 37: Annual Conference on Neural Information Pro-cessing Systems 2024, NeurIPS 2024, Vancouver, BC, Canada, Decem-ber 10 - 15, 2024 , Amir Globersons, Lester Mackey, Danielle Bel-grave, Angela Fan, Ulrich Paquet, Jakub M. Tomczak, and Cheng Zhang (Eds.). http://papers.nips.cc/paper_files/paper/2024/hash/ 5dfbe6f5671e82c76841ba687a8a9ecb-Abstract-Conference.html 
+
+[18] Xuanlin Jiang, Yang Zhou, Shiyi Cao, Ion Stoica, and Minlan Yu. 2025. NEO: Saving GPU Memory Crisis with CPU Offloading for Online LLM Inference. In Proceedings of the Eighth Conference on Machine Learn-ing and Systems, MLSys 2025, Santa Clara, CA, USA, May 12-15, 2025 ,Matei Zaharia, Gauri Joshi, and Yingyan (Celine) Lin (Eds.). OpenRe-view.net/mlsys.org. https://openreview.net/forum?id=umgy9tWBLA 
+
+[19] S. Kullback and R. A. Leibler. 1951. On Information and Sufficiency. 
+
+The Annals of Mathematical Statistics 22, 1 (1951), 79 – 86. doi: 10.1214/ aoms/1177729694 
+
+[20] Wonbeom Lee, Jungi Lee, Junghwan Seo, and Jaewoong Sim. 2024. InfiniGen: Efficient Generative Inference of Large Language Models with Dynamic KV Cache Management. In 18th USENIX Symposium on Operating Systems Design and Implementation, OSDI 2024, Santa Clara, CA, USA, July 10-12, 2024 , Ada Gavrilovska and Douglas B. Terry (Eds.). USENIX Association, 155–172. https://www.usenix.org/conference/ osdi24/presentation/lee 
+
+[21] Patrick Lewis, Ethan Perez, Aleksandra Piktus, Fabio Petroni, Vladimir Karpukhin, Naman Goyal, Heinrich Küttler, Mike Lewis, Wen-tau Yih, Tim Rocktäschel, Sebastian Riedel, and Douwe Kiela. 2020. Retrieval-Augmented Generation for Knowledge-Intensive NLP Tasks. In Advances in Neural Information Processing Systems 33: Annual Conference on Neural Information Processing Systems 2020, NeurIPS 2020, December 6-12, 2020, virtual , Hugo Larochelle, Marc’Aurelio Ranzato, Raia Hadsell, Maria-Florina Balcan, and Hsuan-Tien Lin (Eds.). https://proceedings.neurips.cc/paper/2020/hash/ 6b493230205f780e1bc26945df7481e5-Abstract.html 
+
+[22] MiniMax-AI. 2026. MiniMax-M2.5. https://github.com/MiniMax-AI/ MiniMax-M2.5 . GitHub repository. Accessed: 2026-06-11. [23] Piotr Nawrot, Robert Li, Renjie Huang, Sebastian Ruder, Kelly Marchi-sio, and Edoardo M. Ponti. 2026. The Sparse Frontier: Sparse At-tention Trade-offs in Transformer LLMs. arXiv:2504.17768 [cs.CL] 
+
+https://arxiv.org/abs/2504.17768 
+
+[24] NVIDIA. 2026. CUDA C++ Programming Guide . NVIDIA. https: //docs.nvidia.com/cuda/cuda-c-programming-guide/ 
+
+[25] NVIDIA Corporation. 2025. CUDA C++ Programming Guide: Unified Memory. https://docs.nvidia.com/cuda/cuda-c-programming-guide/ index.html . https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#um-unified-memory-programming Accessed: 2026-06-11. [26] OpenAI. 2023. GPT-4 Technical Report. CoRR abs/2303.08774 (2023). arXiv:2303.08774 doi: 10.48550/ARXIV.2303.08774 
+
+[27] OpenAI. 2024. OpenAI o1 System Card. CoRR abs/2412.16720 (2024). arXiv:2412.16720 doi: 10.48550/ARXIV.2412.16720 
+
+[28] Pratyush Patel, Esha Choukse, Chaojie Zhang, Aashaka Shah, Íñigo Goiri, Saeed Maleki, and Ricardo Bianchini. 2024. Splitwise: Efficient Generative LLM Inference Using Phase Splitting. In 2024 ACM/IEEE 51st Annual International Symposium on Computer Architecture (ISCA) .118–132. doi: 10.1109/ISCA59077.2024.00019 
+
+[29] Ruoyu Qin, Zheming Li, Weiran He, Jialei Cui, Feng Ren, Mingxing Zhang, Yongwei Wu, Weimin Zheng, and Xinran Xu. 2025. Mooncake: Trading More Storage for Less Computation - A KVCache-centric Architecture for Serving LLM Chatbot. In 23rd USENIX Conference on File and Storage Technologies, FAST 2025, Santa Clara, CA, February 25-27, 2025 , Haryadi S. Gunawi and Vasily Tarasov (Eds.). USENIX Association, 155–170. https://www.usenix.org/conference/fast25/ presentation/qin 
+
+[30] Timo Schick, Jane Dwivedi-Yu, Roberto Dessí, Roberta Raileanu, Maria Lomeli, Eric Hambro, Luke Zettlemoyer, Nicola Cancedda, and Thomas Scialom. 2023. Toolformer: language models can teach themselves to use tools. In Proceedings of the 37th International Conference on Neural Information Processing Systems (New Orleans, LA, USA) (NIPS ’23) .Curran Associates Inc., Red Hook, NY, USA, Article 2997, 13 pages. [31] Noam Shazeer, Azalia Mirhoseini, Krzysztof Maziarz, Andy Davis, Quoc V. Le, Geoffrey E. Hinton, and Jeff Dean. 2017. Outrageously 
+
+> 14
+
+Large Neural Networks: The Sparsely-Gated Mixture-of-Experts Layer. (2017). https://openreview.net/forum?id=B1ckMDqlg 
+
+[32] Peter Steinberger and OpenClaw Community. 2026. OpenClaw: Per-sonal AI Assistant. https://github.com/openclaw/openclaw . Open-source self-hosted AI assistant gateway. Accessed: 2026-06-11. [33] Hanlin Tang, Yang Lin, Jing Lin, Qingsen Han, Danning Ke, Shikuan Hong, Yiwu Yao, and Gongyi Wang. 2025. RazorAttention: Efficient KV Cache Compression Through Retrieval Heads. In The Thirteenth International Conference on Learning Representations, ICLR 2025, Sin-gapore, April 24-28, 2025 . OpenReview.net. https://openreview.net/ forum?id=tkiZQlL04w 
+
+[34] Jiaming Tang, Yilong Zhao, Kan Zhu, Guangxuan Xiao, Baris Kasikci, and Song Han. 2024. QUEST: Query-Aware Sparsity for Efficient Long-Context LLM Inference. In Forty-first International Conference on Machine Learning, ICML 2024, Vienna, Austria, July 21-27, 2024 (Proceedings of Machine Learning Research) , Ruslan Salakhutdinov, Zico Kolter, Katherine A. Heller, Adrian Weller, Nuria Oliver, Jonathan Scarlett, and Felix Berkenkamp (Eds.). PMLR / OpenReview.net, 47901– 47911. https://proceedings.mlr.press/v235/tang24l.html 
+
+[35] Qwen Team. 2025. Qwen3 Technical Report. CoRR abs/2505.09388 (2025). arXiv:2505.09388 doi: 10.48550/ARXIV.2505.09388 
+
+[36] Ashish Vaswani, Noam Shazeer, Niki Parmar, Jakob Uszkoreit, Llion Jones, Aidan N. Gomez, Lukasz Kaiser, and Illia Polosukhin. 2017. Attention is All you Need. In Advances in Neural Information Pro-cessing Systems 30: Annual Conference on Neural Information Pro-cessing Systems 2017, December 4-9, 2017, Long Beach, CA, USA , Is-abelle Guyon, Ulrike von Luxburg, Samy Bengio, Hanna M. Wal-lach, Rob Fergus, S. V. N. Vishwanathan, and Roman Garnett (Eds.). 5998–6008. https://proceedings.neurips.cc/paper/2017/hash/ 3f5ee243547dee91fbd053c1c4a845aa-Abstract.html 
+
+[37] Jiahao Wang, Jinbo Han, Xingda Wei, Sijie Shen, Dingyan Zhang, Chenguang Fang, Rong Chen, Wenyuan Yu, and Haibo Chen. 2025. KVCache cache in the wild: characterizing and optimizing KVCache cache at a large cloud provider. In Proceedings of the 2025 USENIX Conference on Usenix Annual Technical Conference (Boston, MA, USA) 
+
+(USENIX ATC ’25) . USENIX Association, USA, Article 28, 18 pages. [38] Jason Wei, Xuezhi Wang, Dale Schuurmans, Maarten Bosma, Brian Ichter, Fei Xia, Ed H. Chi, Quoc V. Le, and Denny Zhou. 2022. Chain-of-Thought Prompting Elicits Reasoning in Large Language Mod-els. In Advances in Neural Information Processing Systems 35: Annual Conference on Neural Information Processing Systems 2022, NeurIPS 2022, New Orleans, LA, USA, November 28 - December 9, 2022 , Sanmi Koyejo, S. Mohamed, A. Agarwal, Danielle Belgrave, K. Cho, and A. Oh (Eds.). http://papers.nips.cc/paper_files/paper/2022/hash/ 9d5609613524ecf4f15af0f7b31abca4-Abstract-Conference.html 
+
+[39] Yuxing Xiang, Xue Li, Kun Qian, Yufan Yang, Diwen Zhu, Wenyuan Yu, Ennan Zhai, Xuanzhe Liu, Xin Jin, and Jingren Zhou. 2025. Aegaeon: Effective GPU Pooling for Concurrent LLM Serving on the Market. In 
+
+Proceedings of the ACM SIGOPS 31st Symposium on Operating Systems Principles (Lotte Hotel World, Seoul, Republic of Korea) (SOSP ’25) .Association for Computing Machinery, New York, NY, USA, 1030–1045. doi: 10.1145/3731569.3764815 
+
+[40] Yuxing Xiang, Xue Li, Kun Qian, Yan Zhang, Wenyuan Yu, Ennan Zhai, Xin Jin, and Jingren Zhou. 2026. ServeGen: Workload Characterization and Generation of Large Language Model Serving in Production. In 
+
+23rd USENIX Symposium on Networked Systems Design and Implemen-tation, NSDI 2026, Renton, WA, May 4-6, 2026 , Srikanth Kandula and Hakim Weatherspoon (Eds.). USENIX Association, 1845–1859. https: //www.usenix.org/conference/nsdi26/presentation/xiang-servegen 
+
+[41] Guangxuan Xiao, Jiaming Tang, Jingwei Zuo, Junxian Guo, Shang Yang, Haotian Tang, Yao Fu, and Song Han. 2025. DuoAttention: Efficient Long-Context LLM Inference with Retrieval and Streaming Heads. In 
+
+The Thirteenth International Conference on Learning Representations, ICLR 2025, Singapore, April 24-28, 2025 . OpenReview.net. https:// openreview.net/forum?id=cFu7ze7xUm 
+
+[42] Guangxuan Xiao, Yuandong Tian, Beidi Chen, Song Han, and Mike Lewis. 2024. Efficient Streaming Language Models with Attention Sinks. In The Twelfth International Conference on Learning Represen-tations, ICLR 2024, Vienna, Austria, May 7-11, 2024 . OpenReview.net. 
+
+https://openreview.net/forum?id=NG7sS51zVF 
+
+[43] Shang Yang, Junxian Guo, Haotian Tang, Qinghao Hu, Guangxuan Xiao, Jiaming Tang, Yujun Lin, Zhijian Liu, Yao Lu, and Song Han. 2025. LServe: Efficient Long-sequence LLM Serving with Unified Sparse Attention. In Proceedings of the Eighth Conference on Machine Learning and Systems, MLSys 2025, Santa Clara, CA, USA, May 12-15, 2025 , Matei Zaharia, Gauri Joshi, and Yingyan (Celine) Lin (Eds.). Open-Review.net/mlsys.org. https://openreview.net/forum?id=KQ4pJFFqT1 
+
+[44] Shunyu Yao, Jeffrey Zhao, Dian Yu, Nan Du, Izhak Shafran, Karthik R. Narasimhan, and Yuan Cao. 2023. ReAct: Synergizing Reasoning and Acting in Language Models. In The Eleventh International Conference on Learning Representations, ICLR 2023, Kigali, Rwanda, May 1-5, 2023 .OpenReview.net. https://openreview.net/forum?id=WE_vluYUL-X 
+
+[45] Jingyang Yuan, Huazuo Gao, Damai Dai, Junyu Luo, Liang Zhao, Zhengyan Zhang, Zhenda Xie, Yuxing Wei, Lean Wang, Zhiping Xiao, Yuqing Wang, Chong Ruan, Ming Zhang, Wenfeng Liang, and Wangding Zeng. 2025. Native Sparse Attention: Hardware-Aligned and Natively Trainable Sparse Attention. In Proceedings of the 63rd Annual Meeting of the Association for Computational Linguistics (Vol-ume 1: Long Papers), ACL 2025, Vienna, Austria, July 27 - August 1, 2025 , Wanxiang Che, Joyce Nabende, Ekaterina Shutova, and Moham-mad Taher Pilehvar (Eds.). Association for Computational Linguistics, 23078–23097. doi: 10.18653/V1/2025.ACL-LONG.1126 
+
+[46] Daoguang Zan, Zhirong Huang, Wei Liu, Hanwu Chen, Shulin Xin, Linhao Zhang, Qi Liu, Li Aoyan, Lu Chen, Xiaojian Zhong, Siyao Liu, Yongsheng Xiao, Liangqiang Chen, Yuyu Zhang, Jing Su, Tianyu Liu, RUI LONG, Ming Ding, and liang xiang. 2025. Multi-SWE-bench: A Multilingual Benchmark for Issue Resolving. In Advances in Neural Information Processing Systems , D. Belgrave, C. Zhang, H. Lin, R. Pascanu, P. Koniusz, M. Ghassemi, and N. Chen (Eds.), Vol. 38. Curran Associates, Inc. https://proceedings.neurips.cc/paper_ files/paper/2025/file/5afa9cb1e917b898ad418216dc726fbd-Paper-Datasets_and_Benchmarks_Track.pdf 
+
+[47] Hailin Zhang, Xiaodong Ji, Yilin Chen, Fangcheng Fu, Xupeng Miao, Xiaonan Nie, Weipeng Chen, and Bin Cui. 2025. PQCache: Product Quantization-based KVCache for Long Context LLM Inference. Proc. ACM Manag. Data 3, 3 (2025), 201:1–201:30. doi: 10.1145/3725338 
+
+[48] Qiyuan Zhang, Fuyuan Lyu, Zexu Sun, Lei Wang, Weixu Zhang, Wenyue Hua, Haolun Wu, Zhihan Guo, Yufei Wang, Niklas Muen-nighoff, Irwin King, Xue Liu, and Chen Ma. 2025. A Survey on Test-Time Scaling in Large Language Models: What, How, Where, and How Well? arXiv:2503.24235 [cs.CL] https://arxiv.org/abs/2503.24235 
+
+[49] Zeyu Zhang, Quanyu Dai, Xiaohe Bo, Chen Ma, Rui Li, Xu Chen, Jieming Zhu, Zhenhua Dong, and Ji-Rong Wen. 2025. A Survey on the Memory Mechanism of Large Language Model-based Agents. ACM Trans. Inf. Syst. 43, 6, Article 155 (Sept. 2025), 47 pages. doi: 10.1145/ 3748302 
+
+[50] Zhenyu Zhang, Ying Sheng, Tianyi Zhou, Tianlong Chen, Lianmin Zheng, Ruisi Cai, Zhao Song, Yuandong Tian, Christopher Ré, Clark W. Barrett, Zhangyang Wang, and Beidi Chen. 2023. H2O: Heavy-Hitter Oracle for Efficient Generative Inference of Large Language Mod-els. In Advances in Neural Information Processing Systems 36: Annual Conference on Neural Information Processing Systems 2023, NeurIPS 2023, New Orleans, LA, USA, December 10 - 16, 2023 , Alice Oh, Tristan Naumann, Amir Globerson, Kate Saenko, Moritz Hardt, and Sergey Levine (Eds.). http://papers.nips.cc/paper_files/paper/2023/hash/ 6ceefa7b15572587b78ecfcebb2827f8-Abstract-Conference.html 
+
+[51] Ranran Zhen, Juntao Li, Yixin Ji, Zhenlin Yang, Tong Liu, Qingrong Xia, Xinyu Duan, Zhefeng Wang, Baoxing Huai, and Min Zhang. 
+
+> 15
+
+2025. Taming the Titans: A Survey of Efficient LLM Inference Serv-ing. In Proceedings of the 18th International Natural Language Gener-ation Conference, INLG 2025, Hanoi, Vietnam, October 29 - Novem-ber 2, 2025 , Lucie Flek, Shashi Narayan, Lê Hong Phuong, and Ji-ahuan Pei (Eds.). Association for Computational Linguistics, 522–541. 
+
+https://aclanthology.org/2025.inlg-main.32/ 
+
+[52] Lianmin Zheng, Liangsheng Yin, Zhiqiang Xie, Chuyue Sun, Jeff Huang, Cody Hao Yu, Shiyi Cao, Christos Kozyrakis, Ion Stoica, Joseph E. Gonzalez, Clark W. Barrett, and Ying Sheng. 2024. SGLang: Efficient Execution of Structured Language Model Programs. In Advances in Neural Information Processing Systems 37: Annual Conference on Neural Information Process-ing Systems 2024, NeurIPS 2024, Vancouver, BC, Canada, Decem-ber 10 - 15, 2024 , Amir Globersons, Lester Mackey, Danielle Bel-grave, Angela Fan, Ulrich Paquet, Jakub M. Tomczak, and Cheng Zhang (Eds.). http://papers.nips.cc/paper_files/paper/2024/hash/ 724be4472168f31ba1c9ac630f15dec8-Abstract-Conference.html 
+
+[53] Ming Zhong, Da Yin, Tao Yu, Ahmad Zaidi, Mutethia Mutuma, Rahul Jha, Ahmed Hassan Awadallah, Asli Celikyilmaz, Yang Liu, Xipeng Qiu, and Dragomir R. Radev. 2021. QMSum: A New Benchmark for Query-based Multi-domain Meeting Summarization. In Proceed-ings of the 2021 Conference of the North American Chapter of the As-sociation for Computational Linguistics: Human Language Technolo-gies, NAACL-HLT 2021, Online, June 6-11, 2021 , Kristina Toutanova, Anna Rumshisky, Luke Zettlemoyer, Dilek Hakkani-Tür, Iz Beltagy, Steven Bethard, Ryan Cotterell, Tanmoy Chakraborty, and Yichao Zhou (Eds.). Association for Computational Linguistics, 5905–5921. doi: 10.18653/V1/2021.NAACL-MAIN.472 
+
+[54] Yinmin Zhong, Shengyu Liu, Junda Chen, Jianbo Hu, Yibo Zhu, Xu-anzhe Liu, Xin Jin, and Hao Zhang. 2024. DistServe: Disaggregating Prefill and Decoding for Goodput-optimized Large Language Model Serving. In 18th USENIX Symposium on Operating Systems Design and Implementation, OSDI 2024, Santa Clara, CA, USA, July 10-12, 2024 , Ada Gavrilovska and Douglas B. Terry (Eds.). USENIX Association, 193– 210. https://www.usenix.org/conference/osdi24/presentation/zhong-yinmin 
+
+[55] Kan Zhu, Yufei Gao, Yilong Zhao, Liangyu Zhao, Gefei Zuo, Yile Gu, Dedong Xie, Zihao Ye, Keisuke Kamahori, Chien-Yu Lin, Ziren Wang, Stephanie Wang, Arvind Krishnamurthy, and Baris Kasikci. 2025. NanoFlow: Towards Optimal Large Language Model Serving Throughput. In 19th USENIX Symposium on Operating Systems Design and Implementation, OSDI 2025, Boston, MA, USA, July 7-9, 2025 , Li-dong Zhou and Yuanyuan Zhou (Eds.). USENIX Association, 749–765. 
+
+https://www.usenix.org/conference/osdi25/presentation/zhu-kan
