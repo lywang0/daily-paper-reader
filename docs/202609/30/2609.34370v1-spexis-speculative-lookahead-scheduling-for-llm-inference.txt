@@ -1,0 +1,609 @@
+Title: Spexis: Speculative Lookahead Scheduling for LLM Inference
+
+URL Source: https://arxiv.org/pdf/2609.34370v1
+
+Published Time: Tue, 29 Sep 2026 03:31:40 GMT
+
+Number of Pages: 12
+
+Markdown Content:
+# Spexis: Speculative and Lookahead Scheduling for LLM Inference 
+
+Hyungyu Jung 1, Jaehyeok Yu 1, Hoonseo Choi 2, Sungkyun Kim 2, Jinho Lee 1, Jiwon Seo 1
+
+> 1
+
+Seoul National University, 2Hanyang University 
+
+Abstract 
+
+Spexis is a multi-GPU LLM inference frame-work that improves the efficiency of pipeline and tensor parallelism through speculative par-allelism. Rather than using speculative decod-ing only to accelerate token generation, Spexis runs speculation in parallel with normal execu-tion, introducing a new parallelism axis without increasing KV-cache memory usage. This im-proves memory efficiency and helps mitigate the bottlenecks of multi-GPU inference. Spexis further uses lookahead scheduling to predict speculation quality and future memory pressure, allowing it to reduce wasted spec-ulation, KV-cache eviction, and recomputa-tion. Built on top of vLLM, Spexis largely improves serving performance across a range of GPU configurations, achieving speedups of up to 34% over a baseline that uses the optimal combination of pipeline and tensor parallelism. Spexis’s source code is publicly available at https://github.com/mlsys-seo/spexis. 
+
+1 Introduction 
+
+LLMs are compute-intensive and are thus typically served on GPUs or other hardware accelerators. Recent models have also grown significantly in parameter size and KV cache memory demand, requiring multiple GPUs for their execution. For multi-GPU inference, model parallelism is widely used, notably tensor parallelism (TP) and pipeline parallelism (PP). However, both face per-formance bottlenecks: TP incurs synchronization overhead, while PP suffers from reduced batch sizes. The problem becomes worse as more GPUs are used. In PP, adding more pipeline stages increases memory pressure from micro-batches, while in TP, using more GPUs incurs higher com-munication overhead. We propose Spexis, a scheduling technique that extends speculative decoding for scalable LLM in- 
+
+> Correspondence: Jiwon Seo < seojiwon@snu.ac.kr >
+
+ference. Spexis introduces speculative parallelism as a new scheduling primitive and executes specula-tion in parallel with normal execution. This design provides additional parallelism without increasing KV cache memory usage, making multi-GPU exe-cution more memory-efficient. To further improve memory efficiency, Spexis uses prediction-based scheduling to estimate future memory pressure and determine when to run new requests. This helps reduce eviction and recompu-tation overhead while improving batch efficiency. Our evaluation shows that Spexis achieves up to a 34% speedup. Our contributions are as follows. 
+
+Speculative-parallel scheduling. We introduce speculative-parallel (SP) scheduling, a new parallel execution axis that complements pipeline and ten-sor parallelism. We further improve it with selec-tive speculation and remaining-length prediction. 
+
+Analytic cost model. We develop cost models for PP, TP, and SP to efficiently combine these meth-ods. We also develop an eviction-aware model that captures recomputation costs to determine when to schedule incoming requests for higher throughput. 
+
+Implementation and evaluation. We implement Spexis on top of vLLM, a widely used LLM inference system. Across NVIDIA A40, RTX PRO 6000, H100, A100 and L40S GPUs, Spexis achieves speedups of up to 34%. The rest of the paper is organized as follows. Section 2 reviews related work. Section 3 presents the motivation for our work. Section 4 intro-duces Spexis and speculative parallelism. Section 5 describes our lookahead scheduling optimization. Section 6 presents our prototype implementation. Section 7 evaluates Spexis and Section 8 concludes. 
+
+2 Related Work 
+
+Scheduling for single-node LLM inference. 
+
+The unique execution characteristics of LLMs (par-ticularly the distinct prefill and decode phases and arXiv:2609.34370v1 [cs.LG] 28 Sep 2026 highly variable sequence lengths) make it challeng-ing to fully utilize computational resources. Prior work has addressed these challenges, including low decode utilization (Yu et al., 2022), fluctuating prefill overhead (Agrawal et al., 2024), and KV cache memory inefficiency (Kwon et al., 2023). While these approaches significantly improve per-formance in single-node deployments, they do not address the additional bottlenecks on distributing LLM inference across multiple GPUs or nodes. 
+
+Parallelism strategy for distributed inference. 
+
+When an LLM exceeds the memory capacity of a single GPU, it must be distributed across multi-ple GPUs. Tensor parallelism (TP) (Shoeybi et al., 2020) partitions the weight matrices of each Trans-former layer across GPUs for concurrent execution. In multi-node deployments, pipeline parallelism (PP) (Huang et al., 2019) is commonly used to par-tition model layers into multiple stages. Because TP and PP suffer from scalability limitations due to synchronization overhead and memory bottle-necks, respectively, hybrid PP+TP configurations have become standard in practice (vLLM Team, 2025). However, it still does not fully eliminate the bottlenecks of PP and TP. Spexis mitigates these bottlenecks with its memory-efficient speculative-parallel execution. 
+
+Scheduling with length prediction. In LLMs, KV cache memory grows proportionally with se-quence length, yet total available memory is fixed and output length is unknown, making memory-aware scheduling inherently challenging. To miti-gate this, prior work has explored generation length prediction to improve scheduling efficiency. S3 (Jin et al., 2023) enables larger batch sizes, LTR and TRAIL (Fu et al., 2024; Shahout et al., 2024) re-duce average latency by prioritizing shorter re-quests in the scheduling queue. In contrast, our work uses predicted length information to reduce KV-cache eviction overhead and improve serving throughput. When the predicted lengths indicate that admitting a new request would exceed mem-ory capacity, its prefill can be deferred. To guide this decision, we develop a cost model that explic-itly balances the delay of new requests against the recomputation cost of evicted ones. 
+
+Speculative decoding. Speculative decoding has been proposed and extensively studied to over-come the autoregressive nature of transformer-based models (Leviathan et al., 2023). In spec-Param KV(B) Mem       
+
+> Sync Overhead
+> Time Param KV(B3) KV(B2) KV(B1) Mem Time B1 B2 B3 B1 B2 B3 B1 B2 B3 …GPU 1 GPU 2 GPU 3 …
+> Figure 1: Execution timeline and memory usage of pipeline parallel execution (left) and tensor parallel exe-cution (right) using three GPUs.
+
+ulative decoding, a lightweight draft model pre-dicts multiple tokens ahead, and the base model verifies them in parallel to accelerate generation. Various self-speculative approaches have been ex-plored to eliminate the overhead of maintaining a separate draft model (Zhang et al., 2024; Elhoushi et al., 2024; Liu et al., 2024). For example, Kanga-roo (Liu et al., 2024) reuses the early layers of the base model as a draft model while the remaining layers verify the drafted tokens. We adopt a simi-lar self-speculative approach and apply speculative decoding to pipeline-parallel execution, effectively filling the pipeline idle time that causes the bubble problem in PP. 
+
+3 Motivation: Bottleneck in LLM Serving 
+
+LLM serving often requires multiple GPUs due to large parameters and KV cache memory demand. Multi-GPU inference commonly uses pipeline par-allelism (PP) or tensor parallelism (TP), but both face scalability bottlenecks: PP from memory pres-sure and TP from communication overhead. 
+
+Memory capacity bottleneck. In pipeline-parallel execution, consecutive layers are grouped into stages and assigned across GPUs. To reduce pipeline bubbles caused by inter-stage dependen-cies, PP uses micro-batching, as illustrated in Fig-ure 1. The main bottleneck in PP is the KV cache memory used by the micro-batches. Because dif-ferent micro-batches process different sequences, each micro-batch requires its own KV cache en-tries, as shown in the figure. As a result, the size of each micro-batch must be much smaller than the batch size achievable without micro-batching. These small micro-batch sizes lead to low GPU utilization and, consequently, lower throughput. 
+
+Communication bottleneck. In tensor-parallel execution, each layer and its weight parameters are partitioned across multiple GPUs. After each partitioned computation, the partial outputs are syn-Input token ti-1 Output Token ti Veriϐication t𝒊 ෝ=ti ? 
+
+> Layer 1 Layer 2 Layer 3 Layer 4 Adapter Draft token t𝒊 ෝGPU2 GPU1 t3 ෝt2 t2 ෝt1 ෝTime t2 ෝ≠t2 t2 t3 ෝ=t3 t1 t3 t0 t1 ෝ=t1
+
+Figure 2: Overview of the self-speculative model and its execution timeline in Spexis under a two-stage pipeline. The timeline shows the execution of a single request: orange arrows indicate speculative execution, and black arrows indicate normal execution after speculation re-jection. 
+
+chronized across the GPUs. For LLMs, this syn-chronization is required twice per transformer layer. As shown in Figure 1, GPUs remain idle during these synchronization steps, degrading overall re-source utilization. High-bandwidth interconnects such as NVLink can mitigate this overhead, but the bottleneck is not fully eliminated. In particular, within a node, communication bandwidth is often non-uniform across GPU pairs, and all-reduce col-lectives across the local NVLink-connected GPU domain can still become a bottleneck. These bottlenecks become worse as the degree of PP and TP increases. As a result, simply in-creasing model parallelism does not necessarily improve serving throughput and may even reduce it. This motivates a new parallel execution strategy that alleviates both bottlenecks while retaining the scalability benefits of multi-GPU execution. 
+
+4 Spexis: Speculative-Parallel Execution 
+
+To mitigate the bottlenecks of pipeline and tensor parallelism, we introduce a new scheduling axis, speculative parallelism (SP). By jointly optimizing pipeline parallelism (PP), tensor parallelism (TP), and speculative parallelism (SP), Spexis effectively minimizes these bottlenecks. 
+
+Self-speculation and parallel scheduling. Self-speculative models use their earlier layers for draft-ing and the rest layers for verifying drafted tokens as part of their normal execution path. Similar to conventional speculative decoding, self-speculation drafts multiple tokens and then verify them jointly. In Spexis, we execute speculation in parallel with normal model execution (i.e., verification) while running the entire model in a pipeline- and/or Time T0 T1 T2 𝒔𝟎 𝒂 𝒔𝟏 𝒂 𝒔𝟏 𝒓 𝒏𝟐 𝒔𝟐 𝒂 𝒔𝟐 𝒓 𝒔𝟑 𝒂 𝒔𝟑 𝒓 𝒏𝟑 𝒔ଵ 𝒔𝟎 𝒂 𝒔𝟏 𝒂 𝒔𝟏 𝒓 𝒔𝟐 𝒏𝟐 𝒔𝟐 𝒂 𝒔𝟐 𝒓 𝒔𝟑 𝒔𝟑 𝒂 𝒔𝟑 𝒓 𝒏𝟑 𝒏𝟐 𝒏𝟑 
+
+Figure 3: Example speculative-parallel execution over iterations 0–3. Here, st denotes the amount of specu-lative execution at iteration t; the superscripts a and r
+
+denote accepted and rejected speculation, respectively; and nt denotes the amount of normal execution at t.Below the timeline, we illustrate how tokens accepted at iteration i are used for speculative execution in iteration 
+
+i+1 (sai → si+1 ), while rejected tokens are re-executed in iteration i + 1 (sri → ni+1 , denoted by red arrow). 
+
+tensor-parallel manner. As a simple example, Fig-ure 2 shows a self-speculative model and its exe-cution in Spexis using a two-stage pipeline on two GPUs. After generating draft tokens from the first stage, Spexis immediately begins speculative exe-cution for those tokens in the first stage, in parallel with their verification in the second stage. Because speculative execution does not require a separate KV cache and instead shares the cache with normal execution, it supports larger batch sizes, leading to higher throughput. In compari-son, PP’s micro-batching uses separate KV caches for each micro-batch, which incurs the memory-capacity bottleneck discussed in Section 3. Further-more, when SP is applied, the required degree of TP can be reduced, which in turn lowers its com-munication overhead. The effectiveness of SP scheduling largely de-pends on the acceptance rate of draft tokens. In speculative decoding, the first few draft tokens, es-pecially in self-speculative models, tend to have relatively high acceptance rates. For example, prior work reports a maximum acceptance rate of 85% for the first draft token in EAGLE (Li et al., 2024b), while our evaluation shows a maximum acceptance rate of 78% for the first draft token. These high early-token acceptance rates make SP practical and allow it to be combined effectively with TP and PP to optimize LLM inference. 
+
+Cost model for PP, TP, and SP. We develop a cost model for the steady-state decoding throughput of TP, PP, and SP, each using N GPUs. PP and SP both use N pipeline stages. For simplicity, we assume all sequences have equal length. Let B denote the maximum number of se-quences that can be processed in a batch under PP TP SP SP α
+
+B/N Tpp (B/N )
+
+BTtp (B)
+
+B⋆
+
+> eff
+
+Tsp (B)
+
+B⋆
+
+> eff ,α
+
+Tsp (B⋆α)
+
+Table 1: Estimation of throughput for PP, TP, SP and SP α. N denotes the number of pipeline stages, B the maximum batch size, and T∗(·) the single-stage decod-ing time for a given batch size. SP α incorporates selec-tive speculation described in Section 5.1. 
+
+TP. For PP, assuming N pipeline stages with N
+
+micro-batches, the effective batch size per stage be-comes B/N . For SP, we estimate its effective batch size, defined as the expected number of accepted to-kens in a batch, using the recurrence relation shown below and illustrated by the example in Figure 3. 
+
+sat = ( sat−1 + nt−1)Θ t−1,srt = 
+
+> N−1
+
+X
+
+> i=1
+
+(sat−i + nt−i)(1 − Θt−i),nt = ( sat−N + nt−N )(1 − Θt−N ),
+
+(1) Here, s∗ 
+
+> t
+
+and nt denote the numbers of sequences processed by speculative execution and normal exe-cution, respectively, at iteration t, where s∗ 
+
+> t
+
++ nt =
+
+B. Similarly, sat and srt denote the numbers of ac-cepted and rejected speculative executions, respec-tively. Let Θt denote the speculation accuracy at iteration t. For simplicity, we assume that the spec-ulation accuracy is time-invariant, i.e., Θt = Θ .The effective batch size at iteration t is therefore 
+
+Beff (t) = sat + nt, and the steady-state effective batch size B⋆ 
+
+> eff
+
+is given as follows. 
+
+B⋆ 
+
+> eff
+
+= lim  
+
+> t→∞
+
+Beff (t) = BN − Θ( N − 1) . (2) We next estimate the decoding throughput of PP, TP, and SP using their effective batch sizes, which correspond to the numbers of decoded tokens, to-gether with their execution times. To this end, we obtain the decoding-latency functions Tpp (·),
+
+Ttp (·), and Tsp (·) for PP, TP, and SP, respectively, through profiling. Table 1 summarizes the resulting throughput estimates, which we use to determine the optimal combination of PP, TP, and SP. The estimation captures the memory overhead of PP from micro-batching and the synchroniza-tion overhead of TP, as illustrated in Figure 4 (left). The right plot compares estimated and measured throughput. The estimates are highly accurate, with only small errors, mostly due to batch-size varia-tion, supporting its use for selecting the optimal parallel configuration. 0 100 200 300 400 500 Batch Size 1.0 2.0 3.0 4.0 Throughput ( 10 3 tokens/s)     
+
+> TP ovh. due to sync PP ovh. due to μ-batch
+> Ideal (no memory or sync. bottleneck) TP
+> TP PP SP 0.0 0.5 1.0 1.5 Throughput ( 10 3 tokens/s)
+> 1163 1230 1486 1133 1191 1516
+> Estimated (BS=128) Measured (BS=128)
+
+Figure 4: Throughput overheads of PP and TP (left), and comparison of the throughput estimated by our cost model (Table 1) and the measured throughput (right). 
+
+5 Lookahead Scheduling Optimization 
+
+We further improve the efficiency of speculative-parallel execution using two prediction-based tech-niques. The first predicts the acceptance proba-bility of draft tokens and selects which tokens to speculate on to maximize throughput. The sec-ond predicts the remaining output length of each sequence and uses this information to delay the scheduling of incoming requests when necessary, thereby minimizing evictions of running requests. 
+
+5.1 Acceptance-Guided Selective Speculation 
+
+In self-speculative models, the confidence of a draft token is often used to estimate its acceptance prob-ability (Liu et al., 2024; Li et al., 2024a). Spexis also uses this confidence, but rather than explicitly predicting acceptance, it ranks drafted tokens by confidence, discards low-ranked tokens, and specu-lates only on high-ranked ones. More specifically, Spexis drops a fixed α fraction of drafted tokens in a batch and performs specula-tion on the remaining tokens. Our analysis shows that a small fraction of low-confidence draft tokens in each batch has little chance of being accepted; thus, dropping them largely improves speculation accuracy. To determine α, we profile the accep-tance rate of the retained draft tokens. By jointly considering this acceptance rate and the latency of speculation, we identify the optimal α. In our eval-uation, we used an α value in the range of 0.15–0.3. We extend the cost model in the previous sec-tion to reflect selective speculation. Let α ∈ [0 , 1) 
+
+denote the drop ratio, Θα the speculation accuracy under α (with Θ0 = Θ ), and Bt the total batch size at iteration t, including both speculative and normal executions. The steady-state batch size B⋆α
+
+is then computed by the recurrence relation below (for simplicity, and since α is small, we assume that dropping affects only speculative execution): Bt+1 = αB t+1 −N + (1 − α)Bt,B⋆α = lim  
+
+> t→∞
+
+Bt = B
+
+1 + α(N − 1) , (3) The expected effective batch size, counting only accepted tokens from speculative and normal exe-cutions, is then computed using Equations 2 and 3: 
+
+B⋆ 
+
+> eff ,α
+
+= αB ⋆α + (1 − α)B⋆α
+
+N − Θα(N − 1) . (4) Finally, the throughput of SP with selective specula-tion is computed as the effective batch size divided by the latency of processing the total batch size, i.e., B⋆ 
+
+> eff ,α
+> Tsp (B⋆α)
+
+as shown in Table 1 under SP α.
+
+5.2 Remaining-Length-Aware Scheduling 
+
+SP is memory-efficient because speculative execu-tion shares its KV cache with the normal execution. It further reduces memory pressure by predicting the remaining lengths of running sequences and using this information to delay the scheduling of new requests. Specifically, we estimate the approx-imate remaining lengths of running sequences to predict their KV cache usage in upcoming decod-ing iterations. Based on this estimate, we determine when to schedule new requests to prevent eviction of running sequences and their KV cache entries. For remaining-length prediction, rather than pre-dicting the exact length, we use ordinal-threshold prediction to estimate whether the remaining length falls below 4, 8, 16, 32, and 64 tokens, or exceeds 64 tokens. To make this prediction, we train a three-layer MLP that takes the hidden state of the draft layer as input and outputs five confidence scores corresponding to the five thresholds (4–64). For each threshold, we choose a confidence cutoff such that, when the model predicts that the remaining length falls below that threshold, the prediction attains high precision (83%, as shown in our evalu-ation) while maintaining reasonable recall. With the predicted remaining lengths, we esti-mate KV cache memory usage over the next 64 de-coding iterations and determine whether admitting a new request during that window would require eviction (Algorithm 1 describes this estimation pro-cess in detail). We jointly consider the throughput benefit of admitting the new request earlier and the recomputation cost incurred by evicting running sequences. Although the recomputation penalty is often larger in practice, the benefit of admitting a 
+
+Algorithm 1 Look-ahead memory estimation over future iterations                                                                                                  
+
+> Input: B: set of running requests rpp : pipeline depth; θ: speculation accuracy
+> E(·): length prediction precision
+> ℓ(r), τ (r): current and remaining length of request r
+> Output: M: list of estimated memory usage (in tokens) in next 1..64 iterations
+> Notation: Per request, let wcount speculation rejections;
+> ti,w ≜i−pp w ▷# accepted tokens at iteration iki,w ≜ti,w +w▷# generated tokens at iteration ipi,w ≜ ki,w
+> ti,w
+> θti,w (1 −θ)w▷Pr[# generated =ki,w ]
+> 1[·]: indicator function ▷1if true, 0otherwise
+> 1: M ← [ ] ,Ltotal ←X
+> r∈B
+> ℓ(r)
+> 2: for all i∈ { 1, . . . , 64 }do
+> 3: wmax ← ⌊ i/pp ⌋
+> ▷expected #generated tokens per request
+> 4: E[Lgen ]←
+> wmax X
+> w=0
+> ki,w pi,w
+> ▷completion probability of each request r∈ B
+> 5: P(r)fin ← E (τ(r))
+> wmax X
+> w=0
+> 1ki,w ≥τ(r)pi,w
+> 6: E[Nfin ]←X
+> r∈B
+> P(r)fin ▷expected #finished requests
+> 7: E[Lfin ]←X
+> r∈B
+> ℓ(r)P(r)fin ▷memory they release
+> ▷memory estimate at look-ahead iteration i
+> 8: Mest ←Ltotal + |B| − E[Nfin ]E[Lgen ]−E[Lfin ]
+> 9: Append Mest to M
+> 10: end for
+> 11: return M
+
+new request earlier may sometimes outweigh the penalty. Hence we explicitly model this trade-off. 
+
+Analytic model for length-aware scheduling. We estimate the throughput over the period between two request arrivals. Let I denote the number of iterations in this period, bs the number of running decode requests before the new arrival, and td and 
+
+tp the latency of one decode iteration and one pre-fill, respectively. Then the prefill-to-decode (or recompute-to-decode) ratio is pdr := tp/t d.We compare two scheduling policies: aggr (ag-gressive), which runs the new request immediately and may later incur eviction and recomputation, and delay (ours), which runs the request at the earli-est expected iteration that does not trigger eviction. We consider the case where n(> 0) evictions oc-cur under aggr during the period. Let ik 
+
+> evict
+
+and ik
+
+> rec
+
+denote the eviction iteration and the subsequent re-computation iteration for the k-th eviction, respec-tively. We define ik 
+
+> wait
+
+:= ik 
+
+> rec
+
+−ik 
+
+> evict
+
+as the number of iterations the k-th evicted sequence remains un-scheduled before recomputation. Let idelay denote the earliest scheduling iteration under delay that avoids eviction. The throughput ratio, or gain, G,of delay over aggr is then computed as follows. 
+
+G = I + ( n + 1)( pdr − 1) 
+
+I + pdr − 1 ·
+
+bs + 1 − idelay 
+
+Ibs + 1 − nP
+
+> k=1
+
+ik
+
+> wait
+
+I
+
+The details are provided in the appendix. The left term of the product captures the recomputation overhead, while the right term captures the cost of delaying scheduling in delay relative to waiting in 
+
+aggr . Since bs is typically much larger than the subtracted terms, the right term is usually close to one, making the recomputation overhead the main factor in the gain of delay . However, if evictions are rare (e.g., only one) and idelay ≫ iwait , the gain can be less than one. We account for both effects when scheduling new requests. 
+
+6 Implementation 
+
+We implemented our prototype on vLLM (v0.8.4) and Ray (v2.53.0) by extending GPURunner to add speculative-parallel execution. Our implementation remains compatible with existing optimizations in vLLM and Ray, particularly Ray’s compiled DAG optimization, which reduces RPC overhead. How-ever, because the current DAG implementation ex-poses stage outputs only after the full model execu-tion completes, we use a separate IPC mechanism to obtain the first-stage output for drafting. Spexis places an LM head at the first and last pipeline stages. Because the additional LM head can imbalance the pipeline stages, we offload the input embedding, whose parameter size is compa-rable to that of the LM head, to host memory and perform the lookup on the CPU. This adds only a few hundred microseconds of overhead and has little impact on overall performance. For the drafting adapter, we follow prior work (Liu et al., 2024) and design it with a lin-ear layer and an attention layer, followed by the (pre-trained) LM head. We trained the adapter on the ShareGPT dataset using the AdamW optimizer for five epochs. For Llama-3.3-70B, this training took about 12 hours on a single H200 GPU. For the length prediction model, we use a three-layer MLP with two GELU activations. We train the model on ShareGPT to predict the confidence that the remaining length is below 4, 8, ..., and 64 tokens. For training, we first generate the full output sequence from each input and then use the generated output to derive the remaining lengths. We train the model for 20 epochs, which took about 15 hours on a single H100 GPU. 
+
+7 Evaluation 
+
+We evaluate Spexis against PP and TP, including their optimal combinations. We conduct experi-ments using resources from both our private cluster and a public cloud platform. Across these environ-ments, we evaluate two widely adopted model fami-lies, Llama 3.3 (Meta AI, 2024) and Qwen3 (Qwen Team, 2025). We use SpecBench (Xia et al., 2024), LMSYS-Chat (Zheng et al., 2023) and Ul-traChat (Ding et al., 2023) as evaluation datasets. Our private cluster provides two configurations: (1) an inter-node configuration with two nodes, each equipped with one NVIDIA RTX PRO 6000 GPU and connected via 1 Gb Ethernet; and (2) an intra-node configuration with a single node equipped with eight NVIDIA A40 GPUs commu-nicating over PCIe 4.0 ×16. We use these configu-rations to measure the overall performance gains of Spexis and provide detailed breakdowns. To cover a broader range of GPU and intercon-nect configurations, we use four hardware config-urations on Runpod (Runpod Inc., 2026), a GPU cloud provider offering access to a diverse range of accelerator instances. Each configuration con-sists of a single eight-GPU node: (1) H100 SXM with an NVSwitch-based NVLink fabric; (2) A100 SXM with an NVSwitch-based NVLink fabric; (3) RTX PRO 6000 with PCIe 5.0 ×16; and (4) L40S with PCIe 4.0 ×16. On these instances, we com-pare TP and SP to assess the effectiveness of SP on standard single-node, multi-GPU servers across diverse GPU and interconnect configurations. 
+
+7.1 Overall Performance Improvements 
+
+We evaluated the speedup of Spexis in both inter-node and intra-node settings on our private clus-ter. To evaluate end-to-end serving performance, we conducted a standard load-scaling experiment. Specifically, for each request rate, we submitted requests from SpecBench or LMSYS-Chat to the serving engine, with request arrivals following a Poisson process. We varied the request rate across runs and measured the latency metrics for each run. As the latency metric, we report mean normalized latency, i.e., the average end-to-end latency of each request normalized by its output length. This met-ric is widely used for evaluating LLM inference 2.0 3.0 4.0         
+
+> Request rate (req/s)
+> 0.0 0.5 1.0 1.5 2.0
+> Mean norm latency (s)
+> (a) Llama (70B), Specbench
+> 1.0 1.5 2.0 2.5
+> Request rate (req/s)
+> 0.0 0.5 1.0 1.5 2.0
+> (b) Llama (70B), Lmsyschat
+> 2.0 4.0 6.0
+> Request rate (req/s)
+> 0.0 0.5 1.0 1.5 2.0
+> (c) Qwen (32B), Specbench
+> 2.0 3.0 4.0
+> Request rate (req/s)
+> 0.0 0.5 1.0 1.5 2.0
+> (d) Qwen (32B), Lmsyschat Baseline (PP) Spexis
+
+Figure 5: Mean normalized latency of Spexis and PP as the request rate increases in the inter-node setting. 16 32 64 100             
+
+> Batch size
+> 0250 500 750 1000
+> Throughput (tokens/s) (a) Llama (70B), Specbench
+> 16 32 64 100
+> Batch size
+> 0250 500 750 1000
+> (b) Llama (70B), Lmsyschat
+> 16 32 64 128 256
+> Batch size
+> 01000 2000
+> (c) Qwen (32B), Specbench
+> 16 32 64 128 256
+> Batch size
+> 01000 2000
+> (d) Qwen (32B), Lmsyschat Baseline (PP) Spexis
+
+Figure 6: Decoding throughput of Spexis and PP as the batch size increases in the inter-node setting. 2.0 2.5 3.0 3.5 4.0    
+
+> Request rate (req/s)
+> 0.0 0.5 1.0 1.5 2.0
+> Mean norm latency (s)
+> (a) Llama (70B), 8 GPU
+> PP2-TP4 TP8 Spexis
+> 1.0 1.5 2.0 2.5
+> Request rate (req/s)
+> 0.0 0.5 1.0 1.5 2.0
+> (b) Llama (70B), 4 GPU
+> PP2-TP2 TP4 Spexis
+
+Figure 7: Mean normalized latency of Spexis, TP, and PP, including their best TP+PP configuration, as the request rate increases in the intra-node setting. 
+
+performance (Yu et al., 2022; Kwon et al., 2023). We first report the results in the inter-node set-ting. Figure 5 shows the mean normalized la-tency of Llama and Qwen on the SpecBench and LMSYS-Chat datasets. The baseline uses a two-stage pipeline with two micro-batches. Spexis also uses a two-stage pipeline, with all optimizations in Section 5 enabled. We use a drop rate α of 0.15 for Llama and 0.3 for Qwen. We see from the fig-ure that Spexis can serve up to 34% higher request rates than the baseline. The largest gain is observed for Qwen on LMSYS-Chat, where Spexis serves 34% more requests per second. We report decoding performance separately in Figure 6. Under disaggregation, prefill and decod-ing run on separate devices, making overall perfor-mance largely dependent on decoding throughput. We compare the decoding throughput of the base-line and Spexis as the batch size increases from 16 to 256. Spexis consistently outperforms the baseline across all batch sizes, with larger gains at higher batch sizes. At batch sizes of 64–100 for Llama and 128–256 for Qwen, Spexis achieves up to 54% higher throughput. Now we report the serving performance for the intra-node setting. Figure 7 compares the normal-ized latency of Spexis with those of PP and TP, including their optimal combination, for Llama-3.3-70B. The left plot shows the results on eight GPUs, where Spexis outperforms the other two settings by 8% and 16%. On four GPUs, Spexis outperforms the PP+TP configuration with both degrees set to two, but remains slower than the TP-only setting. The cost model in Table 1 explains this small gap. For TP, communication latency is captured by the TTP term, which is relatively small in the four-GPU configuration without inter-socket communication; using the profiled value of TTP ,the cost model estimates the throughput overhead as 21%. For SP, the speculation accuracy obtained from offline profiling determines B⋆
+
+eff , which trans-lates into a 21.5% throughput overhead. This small difference in modeled overhead is consistent with the slight measured advantage of TP-4 over SP. Overall, these results show that, in intra-node envi-ronments, Spexis is particularly effective for larger models that require eight or more GPUs. 
+
+7.2 Performance Breakdown 
+
+We examine the effects of the two components of the lookahead scheduling optimization described in Section 5: selective speculation and remaining-length-aware scheduling. For this breakdown, we measure performance as we incrementally add speculative-parallel execution, selective specula-tion, and remaining-length-aware scheduling to the baseline, using Llama-3.3-70B and Qwen3-32B on SpecBench. Figure 8 shows the resulting performance break-down. Speculative-parallel execution alone im-proves performance by 10–15%. Selective specu-lation provides additional gains of 3 pp and 12 pp for Llama and Qwen, respectively, by dropping the α fraction of low-confidence draft tokens. It has a larger impact on Qwen, as the model has lower speculation accuracy. Remaining-length-aware scheduling provides a further 3 pp gain for both models by delaying admissions that would oth-erwise evict running requests and require KV-cache recomputation. Baseline +SP +Selective +Length-Aware 0.00 1.00 2.00 3.00 4.00 
+
+> Maximum Request Rate (req/s)
+> +10% +13% +16%
+> (a) Llama (70B), Specbench
+> Baseline +SP +Selective +Length-Aware 0.00 2.00 4.00 6.00
+> +15% +27% +30%
+> (b) Qwen (32B), Specbench
+
+Figure 8: Performance breakdown of Spexis on SpecBench. From left to right, we incrementally add speculative-parallel execution (SP), selective specula-tion (Selective), and remaining-length-aware scheduling (Length-Aware), with percentages showing cumulative improvements over the baseline. 
+
+7.3 Performance on Cloud GPUs 
+
+We report experiments on cloud GPU instances to assess the effectiveness of Spexis across di-verse intra-node GPU and interconnect config-urations. Based on a survey of representative single-node, eight-GPU offerings from major cloud providers, we select four Runpod configurations— H100 SXM, A100 SXM, RTX PRO 6000, and L40S—covering both NVSwitch-based NVLink fabrics and PCIe interconnects. For each configu-ration, we compare Spexis against TP-only using Llama-3.3-70B and Qwen3-32B on SpecBench. Due to resource constraints, we report fixed-batch decoding throughput rather than the serving perfor-mance measured on our private cluster. Table 2 reports the results. Spexis outperforms TP-only in five of the eight model–hardware pairs.                               
+
+> GPU Interconnect Model Thpt. (tokens/s) Speedup Spexis TP H100 SXM NVLink via NVSwitch L70 3587 3652 0.98 ×
+> Q32 2402 5068 0.47 ×
+> A100 SXM NVLink via NVSwitch L70 1228 966 1.27 ×
+> Q32 1454 2058 0.71 ×
+> RTX PRO 6000 PCIe 5.0
+> ×16 L70 1492 1236 1.21 ×
+> Q32 2201 2062 1.07 ×
+> L40S PCIe 4.0
+> ×16 L70 993 930 1.07 ×
+> Q32 1509 1473 1.02 ×
+
+Table 2: Fixed-batch decoding throughput (tokens/s) of Spexis and TP-only on single-node, eight-GPU Runpod configurations, measured at a fixed batch size of 64. Speedup is computed as Spexis throughput divided by TP throughput; bold indicates the higher throughput. 
+
+In particular, Spexis is faster in all four PCIe cases, achieving speedups of 1.02–1.21 ×, and achieves a 1.27 × speedup for Llama-3.3-70B on A100 SXM. TP remains faster in the other three SXM cases because its communication overhead is lower than the speculation-failure overhead incurred by Spexis. Overall, these results demonstrate the effectiveness of Spexis across a range of intra-node GPU and interconnect configurations: Spexis consistently outperforms TP on the evaluated PCIe systems and can also outperform TP in a certain high-bandwidth SXM configuration. 
+
+7.4 Accuracy of Drafting Adapter 
+
+We evaluate the speculation accuracy of the self-speculative models used in our experiments. We fine-tune the models following prior work, while inserting the drafting adapter at the 1/2 point of the model for two-stage pipeline execution and at the 1/4 point for four-stage pipeline execution. Table 3 reports the speculation accuracy across all SpecBench subtasks for Llama-70B and Qwen-32B. When the first half of the model is used for drafting, the accuracy is moderately high, ranging from 0.60 to 0.79. When only the first quarter is used, the accuracy decreases to 0.51–0.63. Spexis further improves speculation accuracy by selectively applying speculation to a subset of se-quences, as described in Section 5.1. Specifically, we rank the sequences in a batch by their specu-lation confidence and drop the lowest α fraction, speculating only on the higher-confidence ones. Figure 9 shows the acceptance ratio of tokens as a function of their confidence rank, along with the 
+
+α values selected for the two models. The results show that dropping the lowest-confidence α frac-tion and speculating only on the higher-ranked se-quences improves speculation accuracy by 8–14%. 
+
+Model Exit Task Accuracy Avg. Math QA Sum RAG Tran Mult L70 1/2 .840 .743 .760 .788 .774 .793 .785 
+
+1/4 .680 .629 .581 .622 .570 .656 .634 
+
+L8 1/2 .800 .776 .660 .727 .644 .759 .759 
+
+1/4 .665 .609 .487 .547 .461 .625 .596 
+
+Q32 1/2 .682 .535 .565 .619 .609 .603 .596 
+
+1/4 .597 .471 .474 .489 .427 .550 .511 
+
+Q8 1/2 .674 .559 .598 .608 .586 .620 .637 
+
+1/4 .601 .494 .515 .521 .469 .557 .532 
+
+Table 3: Speculation accuracy on SpecBench for Llama-3.3-70B-Instruct (L70), Llama-3.1-8B-Instruct (L8), Qwen3-32B (Q32), and Qwen3-8B (Q8). The draft-ing adapter (Exit) is inserted at either the halfway point (1/2) or the one-quarter point (1/4) of the model. 1 32 64 96 128     
+
+> Rank
+> 020 40 60 80 100
+> Accuracy (%)  Selected=83.3% Total=75.5%
+> Llama3.3-70B
+> 132 64 96 128
+> Rank
+> 020 40 60 80 100
+> Selected=76.7% Total=62.6%
+> Qwen3-32B
+
+Figure 9: Speculation accuracy ranked by confidence score on SpecBench Dataset (both 1/2 exited). The value of cutoff α is specified by dotted vertical lines. 
+
+7.5 Accuracy of Length Prediction 
+
+We evaluate the accuracy of our remaining-length prediction method. For the prediction, we trained a three-layer MLP model that outputs confidence scores for each sequence if its remaining length falls below 4, 8, 16, 32, and 64 tokens. Then we choose a confidence cutoff for each threshold (4, 8, ..., 64) based on profiling to predict if the remaining length is below the corresponding threshold. Table 4 shows the precision and recall of the pre-diction method. The MLP is trained on a subset of ShareGPT, and the reported scores are measured on the remaining ShareGPT data as well as the full SpecBench and UltraChat datasets. The precision is generally high across datasets and length thresh-olds, mostly ranging from 70% to 90.7%. The recall is also moderately high ranging 40–71%.                                                                                
+
+> ShareGPT SpecBench UltraChat Model Thresh. Prec. Recall Prec. Recall Prec. Recall L70
+> L < 479.0% 53.4% 82.6% 59.7% 76.3% 56.0%
+> L < 878.6% 55.2% 80.3% 59.5% 78.1% 57.6%
+> L < 16 81.2% 58.1% 85.8% 59.4% 81.5% 61.9%
+> L < 32 83.5% 64.0% 88.9% 61.3% 82.9% 68.6%
+> L < 64 85.2% 67.6% 90.7% 67.5% 85.8% 71.1% Q32
+> L < 476.1% 53.9% 70.0% 39.8% 63.5% 52.2%
+> L < 878.4% 58.8% 73.9% 43.7% 67.5% 54.5%
+> L < 16 82.6% 65.8% 77.6% 52.4% 73.0% 61.5%
+> L < 32 87.0% 69.0% 83.5% 60.8% 80.1% 69.3%
+> L < 64 85.7% 62.8% 83.1% 67.7% 82.3% 71.0%
+
+Table 4: Precision (Prec.) and recall for the remaining-length prediction using thresholds of 4, ..., 64 tokens (L70: Llama-3.3-70B-Instruct, Q32: Qwen3-32B). 
+
+8 Conclusion 
+
+We present Spexis, a multi-GPU scheduling frame-work that improves the efficiency of LLM infer-ence by integrating speculative decoding with dis-tributed execution. Spexis introduces speculative parallelism, which overlaps speculative and normal execution to expose an additional axis of paral-lelism without increasing KV-cache memory us-age. It further incorporates lookahead scheduling to make admission and execution decisions based on predicted speculation quality and near-future memory pressure, thereby reducing wasted specu-lation, KV-cache eviction, and recomputation. Our evaluation shows that Spexis consistently improves serving performance across diverse GPU configurations, achieving up to 34% speedups over the baseline using the optimal combination of pipeline and tensor parallel execution. The results show that speculative decoding can be leveraged not only as an algorithmic acceleration technique, but also as an effective systems mechanism for improving the performance of distributed LLM in-ference. 
+
+Limitations 
+
+Our exploration of Spexis leaves several areas for future investigation. First, the framework re-quires training auxiliary components—specifically, a drafting adapter and a length predictor. While this preliminary overhead is relatively small, it in-troduces an extra step in the deployment pipeline. Second, the performance of Spexis is inherently sensitive to speculation accuracy. Although we mit-igate the impact of low-accuracy scenarios using the fallback mechanisms described in Section 5.1, significant domain shifts may still reduce the ex-pected throughput gains. Finally, the relative advan-tage of Speculative Parallelism (SP) over Tensor Parallelism (TP) is highly dependent on hardware interconnects. In environments with exceptionally fast inter-GPU communication (e.g., pure NVLink setups), applying only TP might be sufficient. How-ever, SP remains essential for scaling large models across diverse hardware configurations where com-munication latency is a bottleneck. 
+
+Acknowledgments 
+
+This work was supported by the New Faculty Startup Fund from Seoul National University, by the research fund of Hanyang University (HY-201700000002388), and by Automation and Sys-tem Research Institute at Seoul National University (No. 0418-20250030). This work was also sup-ported by Institute of Information & communica-tions Technology Planning & Evaluation (IITP) grant funded by the Korea government (MSIT) (No. RS-2025-02214497, RS-2025-02263167, RS-2024-00438729, RS-2021-II211343, IITP-2026-RS-2021-II211817), and by the Basic Science Re-search Program through the National Research Foundation of Korea (NRF) funded by the Min-istry of Education (RS-2026-25476387). We are grateful to VESSL AI for providing compute re-sources used in some of the early experiments in this work. Jiwon Seo is the corresponding author. 
+
+References 
+
+Amey Agrawal, Nitin Kedia, Ashish Panwar, Jayashree Mohan, Nipun Kwatra, Bhargav S. Gulavani, Alexey Tumanov, and Ramachandran Ramjee. 2024. Tam-ing throughput-latency tradeoff in llm inference with sarathi-serve. In Proceedings of the 18th USENIX Conference on Operating Systems Design and Imple-mentation , OSDI’24, USA. USENIX Association. Ning Ding, Yulin Chen, Bokai Xu, Yujia Qin, Shengding Hu, Zhiyuan Liu, Maosong Sun, and Bowen Zhou. 2023. Enhancing chat language mod-els by scaling high-quality instructional conversa-tions. In Proceedings of the 2023 Conference on Empirical Methods in Natural Language Processing ,pages 3029–3051, Singapore. Association for Com-putational Linguistics. Mostafa Elhoushi, Akshat Shrivastava, Diana Liskovich, Basil Hosmer, Bram Wasti, Liangzhen Lai, Anas Mahmoud, Bilge Acun, Saurabh Agarwal, Ahmed Roman, and 1 others. 2024. Layerskip: Enabling early exit inference and self-speculative decoding. In Proceedings of the 62nd Annual Meeting of the Association for Computational Linguistics (Volume 1: Long Papers) , pages 12622–12642. Yichao Fu, Siqi Zhu, Runlong Su, Aurick Qiao, Ion Sto-ica, and Hao Zhang. 2024. Efficient llm scheduling by learning to rank. Advances in Neural Information Processing Systems , 37:59006–59029. Yanping Huang, Youlong Cheng, Ankur Bapna, Orhan Firat, Dehao Chen, Mia Chen, HyoukJoong Lee, Ji-quan Ngiam, Quoc V Le, Yonghui Wu, and 1 others. 2019. Gpipe: Efficient training of giant neural net-works using pipeline parallelism. Advances in neural information processing systems , 32. Yunho Jin, Chun-Feng Wu, David Brooks, and Gu-Yeon Wei. 2023. S3: Increasing gpu utilization during generative inference for higher throughput. Advances in Neural Information Processing Systems , 36:18015– 18027. Woosuk Kwon, Zhuohan Li, Siyuan Zhuang, Ying Sheng, Lianmin Zheng, Cody Hao Yu, Joseph Gon-zalez, Hao Zhang, and Ion Stoica. 2023. Efficient memory management for large language model serv-ing with pagedattention. In Proceedings of the 29th symposium on operating systems principles , pages 611–626. Yaniv Leviathan, Matan Kalman, and Yossi Matias. 2023. Fast inference from transformers via spec-ulative decoding. In International Conference on Machine Learning , pages 19274–19286. PMLR. Yuhui Li, Fangyun Wei, Chao Zhang, and Hongyang Zhang. 2024a. Eagle-2: Faster inference of language models with dynamic draft trees. In Proceedings of the 2024 conference on empirical methods in natural language processing , pages 7421–7432. Yuhui Li, Fangyun Wei, Chao Zhang, and Hongyang Zhang. 2024b. Eagle: speculative sampling requires rethinking feature uncertainty. In Proceedings of the 41st International Conference on Machine Learning ,ICML’24. JMLR.org. Fangcheng Liu, Yehui Tang, Zhenhua Liu, Yunsheng Ni, Duyu Tang, Kai Han, and Yunhe Wang. 2024. Kangaroo: Lossless self-speculative decoding for accelerating llms via double early exiting. Advances in Neural Information Processing Systems , 37:11946– 11965. Meta AI. 2024. Llama-3.3-70B-Instruct Model Card. https://huggingface.co/meta-llama/ Llama-3.3-70B-Instruct/ .Qwen Team. 2025. Qwen3 technical report. Preprint ,arXiv:2505.09388. Runpod Inc. 2026. The AI developer cloud. https: //www.runpod.io/ . Accessed August 28, 2026. Rana Shahout, Eran Malach, Chunwei Liu, Weifan Jiang, Minlan Yu, and Michael Mitzenmacher. 2024. Don’t stop me now: Embedding based scheduling for llms. Preprint , arXiv:2410.01035. Mohammad Shoeybi, Mostofa Patwary, Raul Puri, Patrick LeGresley, Jared Casper, and Bryan Catan-zaro. 2020. Megatron-lm: Training multi-billion parameter language models using model parallelism. 
+
+Preprint , arXiv:1909.08053. vLLM Team. 2025. vllm documentation. 
+
+https://docs.vllm.ai/en/stable/serving/ parallelism_scaling/ . Accessed: 2026-03-17. Heming Xia, Zhe Yang, Qingxiu Dong, Peiyi Wang, Yongqi Li, Tao Ge, Tianyu Liu, Wenjie Li, and Zhi-fang Sui. 2024. Unlocking efficiency in large lan-guage model inference: A comprehensive survey of speculative decoding. In Findings of the Associa-tion for Computational Linguistics ACL 2024 , pages 7655–7671, Bangkok, Thailand and virtual meeting. Association for Computational Linguistics. Gyeong-In Yu, Joo Seong Jeong, Geon-Woo Kim, Soo-jeong Kim, and Byung-Gon Chun. 2022. Orca: A distributed serving system for Transformer-Based generative models. In 16th USENIX Symposium on Operating Systems Design and Implementation (OSDI 22) , pages 521–538, Carlsbad, CA. USENIX Association. Jun Zhang, Jue Wang, Huan Li, Lidan Shou, Ke Chen, Gang Chen, and Sharad Mehrotra. 2024. Draft& verify: Lossless large language model acceleration via self-speculative decoding. In Proceedings of the 62nd Annual Meeting of the Association for Compu-tational Linguistics (Volume 1: Long Papers) , pages 11263–11282. Lianmin Zheng, Wei-Lin Chiang, Ying Sheng, Tianle Li, Siyuan Zhuang, Zhanghao Wu, Yonghao Zhuang, Zhuohan Li, Zi Lin, Eric. P Xing, Joseph E. Gonza-lez, Ion Stoica, and Hao Zhang. 2023. Lmsys-chat-1m: A large-scale real-world llm conversation dataset. 
+
+Preprint , arXiv:2309.11998. 
+
+A Appendix 
+
+We will now show the derivations of the steady-state batch-size limits and the throughput gain of remaining-length-aware scheduling. 
+
+A.1. Saturated Limit of Equation (1) 
+
+Let the initial conditions be sa 
+
+> 0
+
+= 0 , sr 
+
+> 0
+
+= 0 , and 
+
+n0 = B, with sat = srt = nt = 0 for t < 0. Let 
+
+B⋆ 
+
+> eff
+
+= lim t→∞ (sat + nt) = sa + n be the steady-state effective bound. By the conservation of the total quantity in the system, sat + srt + nt = B for all t. Now: 
+
+B = B⋆ 
+
+> eff
+
++ sr
+
+Where, by taking the limit t → ∞ on the recur-rence relation for srt :
+
+sr = 
+
+> N−1
+
+X
+
+> i=1
+
+(sa + n)(1 − Θ) = ( N − 1) B⋆ 
+
+> eff
+
+(1 − Θ) 
+
+Overall: 
+
+B⋆ 
+
+> eff
+
++ ( N − 1) B⋆ 
+
+> eff
+
+(1 − Θ) = BB⋆ 
+
+> eff
+
+= BN − Θ( N − 1) 
+
+As desired. 
+
+A.2. Saturated Limit of Equation (3) 
+
+Let the initial conditions be Bi = B(1 − α)i for 
+
+0 ≤ i ≤ N − 1. Let B⋆α = lim t→∞ Bt. Rearrang-ing the recurrence relation yields Bt+1 − Bt =
+
+α(Bt+1 −N − Bt). Summing both sides from 
+
+t = N − 1 to T − 1 creates a telescoping sum. Now: 
+
+BT − BN −1 = α 
+
+> T−1
+
+X 
+
+> t=N−1
+
+Bt+1 −N − α 
+
+> T−1
+
+X 
+
+> t=N−1
+
+Bt
+
+Where, by shifting the index and canceling overlap-ping terms as T → ∞ :
+
+B⋆α − BN −1 = α 
+
+> N−2
+
+X
+
+> j=0
+
+Bj − α(N − 1) B⋆α
+
+And, using the initial condition for the geometric sum: 
+
+α 
+
+> N−2
+
+X
+
+> j=0
+
+B(1 −α)j = B−B(1 −α)N −1 = B−BN −1
+
+Overall: 
+
+B⋆α − BN −1 = ( B − BN −1) − α(N − 1) B⋆α
+
+B⋆α + α(N − 1) B⋆α = BB⋆α = B
+
+1 + α(N − 1) 
+
+As desired. 
+
+A.3. Derivation of Throughput Ratio G 
+
+We derive G over the period between two con-secutive request arrivals. Following the notation in Section 5.2, we further let Tok x and Tx denote the decoded-token count and execution time for 
+
+x ∈ { aggr , delay }, respectively. Tok aggr = ( bs + 1) I −
+
+> n
+
+X
+
+> k=1
+
+ik
+
+> wait
+
+,Taggr =  I − (n + 1) td + ( n + 1) tp,
+
+Thr aggr = Tok aggr 
+
+Taggr 
+
+,
+
+Tok delay = ( bs + 1) I − idelay ,Tdelay = ( I − 1) td + tp,
+
+Thr delay = Tok delay 
+
+Tdelay 
+
+,G = Thr delay 
+
+Thr aggr 
+
+.

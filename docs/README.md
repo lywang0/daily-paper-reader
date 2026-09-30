@@ -6,70 +6,49 @@
 </div>
 
 ## 每次日报
-- 最新运行日期：2026-09-29
-- 运行时间：2026-09-29 23:23:49 UTC
+- 最新运行日期：2026-09-30
+- 运行时间：2026-09-30 22:38:45 UTC
 - 运行状态：成功
-- 本次总论文数：16
-- 精读区：5
-- 速读区：11
+- 本次总论文数：9
+- 精读区：3
+- 速读区：6
 
 ### 今日简报（AI）
-2026-09-29 日报完成16篇论文筛选：精读5篇、速读11篇，主线落在NPU与LLM推理服务优化。  
-最值得看的是两项10分精读——NPU混合注意力模型加速，以及移动NPU上用KV Cache复用提升LLM服务效率；速读中KV Cache内存墙、多模态分拆服务与边缘模型并行也值得扫一眼。  
-普通读者建议先抓“KV Cache复用/内存墙”和“移动NPU推理”两条线，再回看满分精读的机制与实验。
-- 详情：[/202609/29/README](/202609/29/README)
+2026-09-30 日报：9篇推荐中精读3篇、速读6篇，NPU混合注意力与端侧Omni-LLM流式成为今日高光。  
+最值得看的是两项9.0精读：NPU上的混合注意力模型，以及OmniTide的端侧Omni-LLM流式算法-系统协同设计。  
+普通读者可优先读这两篇精读摘要，再按兴趣扫速读中的CUTLASS选核、嵌入式Conv3D缓存与随机计算量化。
+- 详情：[/202609/30/README](/202609/30/README)
 
 ### 精读区论文标签
-1. [Empowering Hybrid Attention Models on NPUs](/202609/29/2609.32114v1-empowering-hybrid-attention-models-on-npus)  
-   标签：评分：10.0/10、query:edge-llm
-   evidence：通过数据流重组在边缘NPU上实现高效混合注意力LLM推理
-2. [Dynamic Flow, Static Graph: KV Cache Reuse for Efficient LLM Serving on Mobile NPUs](/202609/29/2609.34727v1-dynamic-flow-static-graph-kv-cache-reuse-for-efficient-llm-serving-on-mobile-npus)  
-   标签：评分：10.0/10、query:edge-llm
-   evidence：面向移动NPU的LLM服务KV缓存复用
-3. [SPIMOE: Exploiting Hybrid Sparsity for Reasoning MoE Inference on Heterogeneous PIM Architectures](/202609/29/2609.34612v1-spimoe-exploiting-hybrid-sparsity-for-reasoning-moe-inference-on-heterogeneous-pim-architectures)  
+1. [Empowering Hybrid Attention Models on NPUs](/202609/30/2609.32114v1-empowering-hybrid-attention-models-on-npus)  
    标签：评分：9.0/10、query:edge-llm
-   evidence：面向高效MoE推理的异构计算协同设计
-4. [OmniTide: Co-Designing Algorithms and Systems for Efficient On-Device Omni-LLM Streaming](/202609/29/2609.34653v1-omnitide-co-designing-algorithms-and-systems-for-efficient-on-device-omni-llm-streaming)  
+   evidence：在边缘NPU上通过数据流重组实现混合注意力大模型高效推理
+2. [OmniTide: Co-Designing Algorithms and Systems for Efficient On-Device Omni-LLM Streaming](/202609/30/2609.34653v2-omnitide-co-designing-algorithms-and-systems-for-efficient-on-device-omni-llm-streaming)  
    标签：评分：9.0/10、query:edge-llm
-   evidence：面向端侧LLM推理的算法-系统协同设计
-5. [EdgeVLN: Runtime-Aware Deployment Ready Quantized Vision Language Navigation Model](/202609/29/2609.35570v1-edgevln-runtime-aware-deployment-ready-quantized-vision-language-navigation-model)  
+   evidence：面向端侧全能LLM流式推理的算法-系统协同设计
+3. [Spexis: Speculative Lookahead Scheduling for LLM Inference](/202609/30/2609.34370v1-spexis-speculative-lookahead-scheduling-for-llm-inference)  
    标签：评分：8.0/10、query:edge-llm
-   evidence：面向内存受限边缘设备的可部署量化VLN
+   evidence：基于vLLM、带前瞻调度的多GPU LLM服务框架
 
 ### 速读区论文标签
-1. [The KV Cache Is the New Memory Wall](/202609/29/2609.30854v1-the-kv-cache-is-the-new-memory-wall)  
+1. [Hardware-Aware Features for CUTLASS Kernel Selection](/202609/30/2609.35587v1-hardware-aware-features-for-cutlass-kernel-selection)  
    标签：评分：7.0/10、query:edge-llm
-   evidence：以硬件拓扑参数化KV缓存内存带宽墙的解析化综述
-2. [Predictive Rolling-Horizon Optimization for Commitment-Aware Model-Parallel Inference under Spatio-Temporal Edge Dynamics](/202609/29/2609.31018v1-predictive-rolling-horizon-optimization-for-commitment-aware-model-parallel-inference-under-spatio-temporal-edge-dynamics)  
-   标签：评分：7.0/10、query:edge-llm
-   evidence：边缘上承诺感知的模型并行推理调度
-3. [EAServe: Encode-Aware Disaggregated Serving for Multimodal Large Language Models](/202609/29/2609.31551v1-easerve-encode-aware-disaggregated-serving-for-multimodal-large-language-models)  
-   标签：评分：7.0/10、query:edge-llm
-   evidence：分离式编码-预填充-解码的LLM服务框架
-4. [MpFA: Hardware-Efficient Train-Free QK4V8 FlashAttention Kernels on Blackwell GPUs](/202609/29/2609.33135v1-mpfa-hardware-efficient-train-free-qk4v8-flashattention-kernels-on-blackwell-gpus)  
-   标签：评分：7.0/10、query:edge-llm
-   evidence：硬件表征引导的混合精度FlashAttention内核用于LLM推理
-5. [Approximating Softmax in Pretrained LLMs: Model Sensitivity and Kernel Acceleration](/202609/29/2609.33586v1-approximating-softmax-in-pretrained-llms-model-sensitivity-and-kernel-acceleration)  
-   标签：评分：7.0/10、query:edge-llm
-   evidence：在张量核上近似softmax以实现注意力内核加速
-6. [DPS: Dual-Mode Precision LLM Serving with Semi-Unified Memory](/202609/29/2609.34380v1-dps-dual-mode-precision-llm-serving-with-semi-unified-memory)  
-   标签：评分：7.0/10、query:edge-llm
-   evidence：双精度LLM服务系统，权重内存弹性化
-7. [Communication-Aware Model Distributed Inference via Latent Representation Compression](/202609/29/2609.30413v1-communication-aware-model-distributed-inference-via-latent-representation-compression)  
+   evidence：面向CUTLASS核选择的硬件感知表示以支持算子加速
+2. [Cache-Aware Conv3D Lowering Across Embedded World-Model Decoders](/202609/30/2609.31938v1-cache-aware-conv3d-lowering-across-embedded-world-model-decoders)  
    标签：评分：6.0/10、query:edge-llm
-   evidence：资源受限边缘上的分布式推理优化
-8. [ActKV: Efficient LLM Agents through Action-Guided KV Cache Management](/202609/29/2609.31395v1-actkv-efficient-llm-agents-through-action-guided-kv-cache-management)  
+   evidence：面向嵌入式边缘解码器的缓存感知算子降级
+3. [Precision As You Need: Stochastic Computing Is a Dense Adaptive Quantizer](/202609/30/2609.32922v1-precision-as-you-need-stochastic-computing-is-a-dense-adaptive-quantizer)  
    标签：评分：6.0/10、query:edge-llm
-   evidence：面向智能体LLM服务的KV缓存压缩提升吞吐
-9. [PackServe: SLO-Aware Request Scheduling for Agentic LLM Serving at Scale](/202609/29/2609.33224v1-packserve-slo-aware-request-scheduling-for-agentic-llm-serving-at-scale)  
+   evidence：面向矩阵乘的硬件友好自适应精度
+4. [OLED-MoE: Accelerating MoE-Based dLLM Inference via Inter-Iteration Locality-Aware Expert Offloading](/202609/30/2609.33385v1-oled-moe-accelerating-moe-based-dllm-inference-via-inter-iteration-locality-aware-expert-offloading)  
    标签：评分：6.0/10、query:edge-llm
-   evidence：面向LLM服务框架的SLO感知请求调度
-10. [QuantaSpike: Short-Window Spike-Driven Quantization for Large Language Models](/202609/29/2609.34259v1-quantaspike-short-window-spike-driven-quantization-for-large-language-models)  
+   evidence：面向显存受限GPU的MoE扩散大模型专家卸载推理加速
+5. [AgentPerfBench: A Benchmarking and Evaluation Suite for Inference Performance of Agentic LLMs](/202609/30/2609.34683v1-agentperfbench-a-benchmarking-and-evaluation-suite-for-inference-performance-of-agentic-llms)  
    标签：评分：6.0/10、query:edge-llm
-   evidence：面向低能耗LLM推理的脉冲驱动量化
-11. [PulseInfer: I/O-Centric Sparse KV Cache Offloading for Efficient Long-Context LLM Decoding](/202609/29/2609.34555v1-pulseinfer-io-centric-sparse-kv-cache-offloading-for-efficient-long-context-llm-decoding)  
+   evidence：面向LLM服务引擎、调度策略与硬件设计的基准
+6. [P4Q: Co-designing Token Pruning and Quantization for Vision-Language Model Acceleration](/202609/30/2609.34867v1-p4q-co-designing-token-pruning-and-quantization-for-vision-language-model-acceleration)  
    标签：评分：6.0/10、query:edge-llm
-   evidence：面向长上下文LLM解码的KV缓存卸载系统
+   evidence：面向模型推理加速的Token剪枝与量化协同设计
 
 
 <div class="dpr-home-promo-card">

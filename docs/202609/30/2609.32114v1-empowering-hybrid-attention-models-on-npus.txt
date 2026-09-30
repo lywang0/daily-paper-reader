@@ -1,0 +1,1010 @@
+Title: Empowering Hybrid Attention Models on NPUs
+
+URL Source: https://arxiv.org/pdf/2609.32114v1
+
+Published Time: Tue, 29 Sep 2026 00:28:43 GMT
+
+Number of Pages: 16
+
+Markdown Content:
+# Empowering Hybrid Attention Models on NPUs 
+
+## Yinyuan Zhang 1 Daliang Xu 2,* Xiaolong Huang 1 Wangsong Yin 1
+
+## Yun Ma 1 Mengwei Xu 2 Gang Huang 1
+
+> 1
+
+Peking University 2Beijing University of Posts and Telecommunications 
+
+{yinyuanzhang16,yws}@stu.pku.edu.cn {huangxiaolong,mayun,hg}@pku.edu.cn {xudaliang,mwx}@bupt.edu.cn 
+
+## Abstract 
+
+Hybrid attention models have emerged as a crucial architec-ture for Large Language Models (LLMs) (e.g., the Qwen3.5 and Kimi series). Their memory and computational efficiency make them highly attractive for on-device inference, form-ing a promising synergy with edge Neural Processing Units (NPUs). However, naive execution of these hybrid models on edge NPUs fails to deliver these benefits, often bottlenecking the prefill stage due to severe memory-system inefficiencies and architectural mismatches within the linear attention (LA) layers. We present HA-NPU, the first system to en-able efficient hybrid attention LLM inference on edge NPUs without modifying the underlying algorithms. HA-NPU en-hances execution efficiency by reorganizing the dataflow of the LA components across three levels: (1) At the core level, it partitions workloads by the head dimension and fuses dependent operators, eliminating cross-core global mem-ory accesses; (2) At the operator level, it reorders execution to consume intermediate tensors immediately, drastically minimizing local-buffer pressure; (3) At the tensor level, it employs dataflow-aware layout planning to minimize trans-formation overhead between matrix and vector processing units. Compared to competitive baselines, HA-NPU achieves up to 35.95 × LA kernel speedup and 36.14 × energy reduc-tion, delivering up to 2.03 × faster end-to-end request la-tency. The source code will be made publicly available at 
+
+https://github.com/yinyuanzhang/HA-NPU .
+
+## 1 Introduction 
+
+Linear attention (LA) is emerging as a crucial building block for open-source large language models (LLMs) by reduc-ing full attention’s quadratic complexity to linear and re-placing the growing key-value (KV) cache with a fixed-size recurrent state [28]. Recent LLMs, such as the Qwen3.5 se-ries (0.8B–397B), Qwen3.8-Flash-Next (e.g., 125B), and Kimi K3 (e.g., 2.8T), adopt delta-rule LA mechanisms such as Gated DeltaNet (GDN) and Kimi Delta Attention (KDA) in hybrid architectures [29, 30, 44, 49, 63]. LA’s memory and computational efficiency make it highly attractive for on-edge inference, where compute capability, memory capacity, and energy are stringently constrained. Such deployments typically rely on energy-efficient Neural Processing Units (NPUs) [16, 53, 58, 61]. Together, LA and edge NPUs form a promising algorithm-hardware synergy. 
+
+> ∗Corresponding author.
+
+Obstacles to LA Inference on Edge NPUs. Surprisingly, edge NPU execution fails to deliver these expected benefits. During prompt prefilling, LA is no faster than full attention (FA) and can even bottleneck end-to-end inference. Profiling Qwen3.5-2B on an Ascend 310P edge NPU reveals that, at 4,096 input tokens, a complete LA layer performs 8 .7× fewer multiply-accumulate operations than full attention, yet runs 3.02 × slower. Furthermore, LA consumes 75 .16%–76 .99% of the total prefill latency across Qwen3.5 models (Figure 3), with a dismal matrix-unit utilization of 0 .20%–0 .41%. This in-efficiency stems from excessive data movement caused by an architectural mismatch between LA execution patterns and edge NPUs. Specifically, we identify three major challenges across the two-level memory hierarchy: 
+
+• At the global memory (GM) level, fine-grained chunk-head mapping breaks NPU-preferred coarse-grained tensor locality. 
+
+LA involves chunk-independent preprocessing and output computation, and sequence-dependent state updating. To maximize GPU multithreading, frameworks like Flash Linear Attention (FLA) map preprocessing and output computation by chunks (without dependency) and state updating by heads (with sequence dependency) [66]. While this mapping boosts parallelism, it triggers frequent cross-core communication that GPUs can hide via massive multithreading. However, NPUs typically process coarse-grained tensor blocks without such mechanisms, resulting in severe data movement over-head where GM accesses account for 56.2% of LA latency on the Ascend 310P. 
+
+• At the on-core buffer level, limited cache capacity and conflict-ing tensor-layout preferences incur additional data movement. 
+
+(i) LA’s default execution order overloads local-buffer ca-pacity. Efficient execution requires keeping a tensor in the cache until all dependent operators consume it. However, LA generates intermediate tensors long before their final use. Because the on-core cache is too small for keeping all these long-lived tensors, the system repeatedly spills and reloads data. As a result, tensor spilling inflates logical GM traffic by 93 .4% for GDN and 63 .8% for KDA (Figure 4). (ii) Conflicting tensor-layout preferences between matrix and vector processing units. LA frequently alternates between ma-trix (preferring blocked layouts) and vector units (preferring contiguous layouts) for operations like matrix multiplication, scaling, masking, and normalization. While existing systems rely on layout transformations to bridge this gap, they incur substantial overhead [38], consuming 41.58% of cross-unit 
+
+> 1arXiv:2609.32114v1 [cs.DC] 26 Sep 2026 Yinyuan Zhang et al.
+
+execution time and increasing memory traffic by 16.7% in our profiling. Consequently, HA-NPU needs to optimally decide whether and where to perform these transformations—an NP-hard problem complicated by cross-chunk state propa-gation, branched dataflows, and long operator chains. 
+
+Our approach This paper presents HA-NPU, the first sys-tem to enable efficient linear-attention LLM inference on edge NPUs without modifying the underlying attention algo-rithms. We abstract the delta-rule-based LA operators (e.g., GDN and KDA) into a unified Map-Reduce-Map inference paradigm (§ 2.1). Building upon this paradigm, our core in-sight is that reorganizing the LA execution flow to match edge NPU architectural characteristics maximizes data reuse and minimizes data movement while strictly preserving re-current state dependencies. Specifically: (1) At the core level, we partition workloads by the head dimension and map the entire partition to a single core, avoiding the cross-core de-pendencies and global memory accesses. (2) At the operator level, we reorder execution so that intermediate tensors are consumed immediately, reducing the cache footprint. (3) At the tensor level, layout transformations are triggered only when they guarantee end-to-end performance gains, thereby minimizing transform overhead. The corresponding novel techniques are detailed as follows: 
+
+Head-level mapping with cross-operator fusion (§ 4) addresses the frequent GM accesses caused by chunk-head mapping. Our key insight is that since edge NPUs typically have fewer cores than attention heads, head-level parallelism alone saturates the hardware; chunk-level parallelism merely adds severe cross-core GM synchronization overhead. Thus, HA-NPU partitions workloads by head and fuses dependent operators onto a single core, keeping recurrent states and intermediates in on-core buffers to eliminate cross-core re-duction. However, rigid head mapping causes tail-phase load imbalance when the head count is not a multiple of the core count. To resolve this, HA-NPU proposes sub-head paral-lelism to the remainder. For instance, mapping a 16-head Qwen model onto a 10-core Ascend 310P leaves 6 tail heads. HA-NPU splits these remaining heads column-wise along the non-reduction dimension, fully utilizing all 10 cores in the tail phase. 
+
+Lifetime-aware operator reordering (§ 5) mitigates local-buffer pressure from long-lived intermediate tensors. Our key insight is that operators can execute once inputs are ready, safely bypassing LA’s default order. HA-NPU reorders execution to consume intermediates immediately in two scenarios: (i) Cross-chunk: To prevent two state versions from coexisting in the cache, HA-NPU shifts from a state-first 
+
+to a chunk-first order, delaying state commits to enable in-place updates. (ii) Intra-chunk: Default scheduling interleaves GEMMs and matrix inversions, temporarily idling operands and bloating cache. HA-NPU adopts a GEMM-first order, decoupling inversions and grouping shared-input operations for immediate on-core reuse. 
+
+Dataflow-aware layout transformation planning (§ 6) minimizes layout transformation overhead between matrix and vector units. While optimal layout selection is NP-hard, our key insight is that LA dataflows and NPU constraints offer three structural opportunities to drastically prune the search space: (i) decoupling cross-chunk decisions into iso-lated intra-chunk subproblems, since only the recurrent state crosses boundaries; (ii) using the strict blocked-layout mandate of matrix units as definitive anchors to simplify branched planning; and (iii) merging contiguous vector-operator chains to evaluate cumulative layout efficiency. Exploiting these properties, HA-NPU employs dynamic pro-gramming to generate an optimal offline layout plan. 
+
+Implementation and evaluation. HA-NPU is a general inference system targeting the universal matrix-vector com-pute paradigm and constrained memory hierarchies inherent to the architecture of modern edge NPUs [21, 23, 36, 50]. We select Ascend as our representative platform for its open-source stack and explicit hardware control [20, 21], instan-tiating the framework atop vLLM-Ascend with ∼13K lines of C/C++. We comprehensively evaluated HA-NPU’s GDN and KDA kernels on two representative edge NPUs, Ascend 310P and 310B. For end-to-end inference, we evaluated six GDN- and KDA-based LLMs (Qwen3.5-0.8B/2B/4B/9B, AFM-4.5B, and the MoE-based Ling-3.0-tiny) across diverse text and multimodal benchmarks. Compared with four compet-itive baselines—vLLM-Ascend [31, 55], FLA [63, 66], FLA + MegaKernel [13, 18], and FlashQLA [70]—HA-NPU achieves 1.69–35 .95 × kernel speedups and 1 .76–36 .14 × kernel energy reductions. End-to-end, it delivers up to 2 .03 × faster infer-ence and up to 48 .0% lower device energy per request. Fur-thermore, compared with FLA, HA-NPU reduces peak kernel memory by up to 54 .6% and improves GEMM-normalized Matrix-unit utilization by up to 5 .24 ×.
+
+Contributions are summarized as follows: 
+
+• Characterize linear-attention prefilling on edge NPUs and identify a data movement problem spanning frequent GM access, buffer capacity, and tensor layout transformation. 
+
+• Present HA-NPU, the first efficient NPU-oriented linear-attention inference system with three novel techniques: head-level mapping, lifetime-aware operator reordering, dataflow-aware layout transformation planning. 
+
+• Evaluate on representative GDN and KDA mechanisms, 2 Ascend NPUs, and 6 LLMs, showing consistent kernel, end-to-end latency, energy, and memory improvements. 
+
+## 2 Background and Motivation 
+
+2.1 Linear-Attention-based LLMs Rise of Linear-Attention Hybrids. Recent frontier open-weight models increasingly adopt hybrid architectures that replace most dense attention layers with linear attention for better efficiency. Notably, leading models such as the Qwen series (e.g., Qwen3.5, Qwen3.8) adopt GDN [44, 49], while       
+
+> 2Empowering Hybrid Attention Models on NPUs Linear attention Full attention FFN/ MOE FFN/MOE
+> ×3
+> ×1
+> x0
+> K0
+> V0
+> K1
+> V1
+> append Growing KV Cache Memory
+> x1
+> Fixed-size State Memory
+> S0S1
+> K0V0
+> Update
+> Qt
+> S2
+> K1V1
+> Update St
+> …
+> x0x1
+> K2
+> V2
+> x2
+> Qt
+> …
+> Vt
+> xt
+> Kt
+> Ot
+> KtVt
+> xt
+> Ot
+> Update
+> Independent K/V Retrieval Recurrent State Update
+> ×B
+> Token Sequence (Time step 𝑡 )LA adoption in LLMs GDN Qwen3.5 Qwen3.8
+> KDA Kimi K3 GLM-5.3-Flash
+
+(a) Hybrid linear-attention LLM architecture …𝑥 0 𝑥 c-1 … 𝑥 c 𝑥 2c-1 …        
+
+> Chunk 0 Chunk 1 Chunk 𝑁 $-1
+> 𝑥 !!"# $ 𝑥 !!$−1 …………
+> MAP (#1-#4): Intra-chunk pre-processing
+> S[1] S[0] S[𝑁 !]
+> Reduce (#5): Cross-chunk state recurrence MAP (#6): Intra-chunk output projection Parallel tokens
+
+(b) Map–Reduce–Map execution of chunkwise GDN 
+
+Figure 1. Architecture and chunkwise execution of the Qwen3.5 (GDN) hybrid linear-attention LLM. Kimi K3 and GLM-5.3-Flash utilize KDA [30, 56]. By replac-ing growing KV caches with fixed-size recurrent states, LA avoids the quadratic complexity of full attention, drastically reducing the computational and memory overheads during inference [29, 63]. Crucially, these architectural advantages are particularly indispensable for edge devices, where strict memory and compute constraints make linear attention es-sential for viable deployments. 
+
+Architecture of Linear-Attention Hybrids. Figure 1(a) illustrates a typical hybrid architecture that periodically in-terleaves linear and full attention blocks (e.g., a 3:1 ratio in Qwen3.5 and Kimi K3 [30, 49]). Unlike full attention, which stores a sequence-growing KV cache, linear attention main-tains a fixed-size recurrent state per head. At step 𝑡 , it up-dates the previous state 𝑆 𝑡 −1 using 𝐾 𝑡 and 𝑉 𝑡 , then computes the output with 𝑄 𝑡 and the updated 𝑆 𝑡 . For an input of 𝑇 
+
+tokens, this recurrent formulation reduces full attention’s 
+
+O( 𝑇 2) compute and O( 𝑇 ) memory costs to O( 𝑇 ) and O( 1),respectively [28]. However, this state propagation inherently introduces a strict serial dependency (𝑆 𝑡 −1 → 𝑆 𝑡 ), trading sequence-level parallelism for resource efficiency. 
+
+Chunkwise Map-Reduce-Map Execution. While token-by-token recurrence supports decoding, to mitigate its severe serialization bottlenecks during prefilling, modern imple-mentations partition inputs into chunks, casting execution AI Core       
+
+> ×1～10 Compute units L0 level L1 level Global memory GM
+> 95 GB/s
+> UB L1 L0A L0B L0C
+> 205 GB/s 256KB, 1MB 117 GB/s 64KB 82 GB/s 98 GB/s 314 GB/s 117 GB/s 116 GB/s 331 GB/s
+> Scalar Unit
+> Control Flow
+> Matrix Unit
+> Matrix Multiply
+> Vector Unit
+> Element-wise
+
+Figure 2. Representative Edge NPU architecture (Ascend 310 series). into a Map–Reduce–Map paradigm (Figure 1(b)). Using GDN as an example, an initial Map phase (operators #1–#4: Gate, KKT, Solve, and W/U) precomputes chunk-local transforma-tions to capture token-level dependencies. This enables the subsequent Reduce phase (operator #5: H) to perform state updates via chunk-level matrix operations rather than token-by-token recurrence, incorporating the incoming state 𝑆 𝑐 −1
+
+to yield the updated state 𝑆 𝑐 . Finally, a subsequent Map phase (operator #6: O) combines these resolved states with local causal interactions to compute the final token outputs. Con-sequently, both Map phases execute independently across chunks, successfully confining the sequence-dependent bot-tleneck exclusively to the Reduce phase. 
+
+2.2 Edge NPUs 
+
+On-device LLM inference commonly targets NPUs since their specialized data-parallel engines provide high throughput and energy efficiency under tight compute, memory, and power budgets [61]. 
+
+NPU Architecture and Memory Subsystem. A widely adopted NPU architecture relies on three specialized process-ing units: a Scalar unit for control flow, a Vector unit for gen-eral data-parallel operations (e.g., normalization), and a ded-icated Matrix unit for compute-intensive tensor operations (e.g., GEMM) (e.g., Huawei Ascend, Qualcomm Hexagon, AMD XDNA, and Intel NPUs) [21, 23, 36, 50]. To support these processing units, NPUs employ a memory hierarchy comprising a high-capacity Global Memory (GM) and fast, explicitly managed on-core buffers. Using Ascend as a rep-resentative example (Figure 2), each core features a Unified Buffer (UB) for Vector operations, L0 buffers for Matrix op-erations, and L1 for staging reusable tiles [21, 73]. Crucially, memory bandwidth varies significantly across these data paths; in our representative profiling on Ascend 310P, the di-rect on-core forwarding (UB → L1), GM-to-buffer (GM → L1), and cross-GM (UB → GM → L1) bandwidths are 205 GB/s, 95 GB/s, and 48 GB/s, respectively. 
+
+NPU Programming Model. Unlike GPU SIMT ( Single-Instruction, Multiple-Threads ) architectures that rely on dy-namic thread scheduling, NPUs expose parallelism primarily                          
+
+> 3Yinyuan Zhang et al. Linear Attn. Full Attn. 040 80 512 1K 2K 4K
+> 4.98 ×
+> 3.02 ×
+> Latency (ms) Prompt length Linear Attn. Full Attn. MLP LayerNorm 050 100 2B/512 77.9%
+> 2B/4K 75.2%
+> 4B/512 80.1%
+> 4B/4K 77.0%
+> Prefill time (%)
+> (a) Layer-level latency Linear Attn. Full Attn. 040 80 512 1K 2K 4K
+> 4.98 ×
+> 3.02 ×
+> Latency (ms) Prompt length Linear Attn. Full Attn. MLP LayerNorm 050 100 2B/512 77.9%
+> 2B/4K 75.2%
+> 4B/512 80.1%
+> 4B/4K 77.0%
+> Prefill time (%) (b) Model-level latency
+
+Figure 3. Prefill performance on Ascend 310P. through explicit data mapping and SIMD execution [16, 50]. This parallelism operates at two levels. Across AI Cores, the workload is parallelized by mapping distinct data partitions to available cores. Within each AI Core, massive data-level parallelism is achieved through single-instruction, multiple-data (SIMD) execution strictly within the Matrix and Vector processing units [21]. 
+
+2.3 Gaps between Linear Attention and Edge NPUs 
+
+Despite the theoretical efficiency of LA and the high through-put of NPUs, we surprisingly find that naive LA execution severely underperforms during the prefill stage, often bot-tlenecking end-to-end inference. Profiling Qwen3.5-2B/4B on an Ascend 310P shows LA is 3 .02–4 .98 × slower than full attention for 512–4K tokens (Figure 3(a)), dispropor-tionately consuming 75 .16%–80 .12% of the total prefill time (Figure 3(b)). We then dig into the underlying reasons and find that LA prefill suffers from a memory-system bottleneck dominated by data movement. We trace this bottleneck to architectural mismatches across three execution levels: the core level, the operator level, and the tensor level. 
+
+Core level: Chunk-head mapping breaks tensor lo-cality. To maximize GPU parallelism, existing chunkwise LA executions [63] parallelize chunk-independent Map phases while serializing head-dependent Reduce phases, trigger-ing frequent cross-core communication. While GPUs hide this GM access overhead via high bandwidth and massive multithreading, this fine-grained mapping severely clashes with NPU architectures, which process coarse-grained tensor blocks rather than fine-grained threads. Consequently, ten-sors must be repeatedly flushed to and reloaded from GM, in-flating GM accesses to 56 .2% of total LA latency for Qwen3.5-2B on Ascend 310P. Starved for data, effective Matrix-unit utilization plummets to a mere 0 .20%–0 .41%—a stark contrast to the 16 .8%–29 .0% achieved by full attention (Table 1). 
+
+Operator level: Default execution order overloads local buffers. Within an AI core, compute units heavily rely on limited-capacity local buffers (e.g., UB for Vector and L0 for Matrix units). However, LA’s default semantic execution order generates intermediate tensors long before their final consumption. Because these tensors remain live across multi-ple intervening operators, their overlapping lifetimes quickly 
+
+Table 1. Matrix processing unit execution and per-layer history memory of native Full- and Linear-Attention cores in Qwen3.5-2B prefill on one Ascend 310P.        
+
+> Full Attention Linear Attention Tokens MACs (GMAC) Cube util. K/V cache (MiB) MACs (GMAC) Cube util. State (MiB)
+
+512 1.08 16.8% 1.0 0.75 0.20% 1.0 1,024 4.33 22.0% 2.0 1.51 0.29% 1.0 2,048 17.31 26.7% 4.0 3.02 0.37% 1.0 4,096 69.25 29.0% 8.0 6.04 0.41% 1.0 Ideal resident Actual spill/reload 020 40 60 Traffic (MiB) 21 .41 41 .41    
+
+> +93 .4%
+> GDN 31 .33 51 .33
+> +63 .8%
+> KDA
+> (a) GM traffic 025 50 75 100 Traffic (MiB) 64 .53 84 .53
+> +31 .0%
+> GDN 74 .53 84 .53
+> +13 .4%
+> KDA (b) L1-to-L0 traffic
+
+Figure 4. Comparison of memory traffic between ideal tensor residency and actual spill/reload on Ascend 310P (𝑇 = 2048, 𝐻 = 10, 𝐶 = 64). ………… 
+
+> 128 cols 128 rows Row-major
+> (a) Dense layout
+
+…………
+
+> 16 cols 16 rows
+
+…………  
+
+> 8 tile cols 8 tile rows Intra-tile order (Row-major ) Inter-tile order (Column-major ) (b) Blocked layout
+
+Figure 5. Dense and Blocked memory layouts of a 128 × 128 FP16 matrix. Red arrows show element order in memory. exceed the strict capacity limits of the on-core cache [1]. Un-able to maintain tensor residency, the system triggers severe capacity-induced thrashing—repeatedly spilling and reload-ing intermediate data through the memory hierarchy [14, 24]. This redundant data movement imposes substantial memory overhead: our capacity ablation reveals that tensor spilling inflates logical GM traffic by 93 .4% for GDN and 63 .8% for KDA (Figure 4). 
+
+Tensor level: Conflicting layout preferences inflate transformation overhead. Within an AI core, the LA dataflow frequently alternates between Matrix processing units (e.g., for GEMMs) and Vector processing units (e.g., for normaliza-tion). However, these units impose fundamentally incompat-ible memory layouts: Matrix processing units mandate two-level blocked layouts to align with tiled multipliers, whereas Vector processing units strictly favor contiguous dense lay-outs for regular sequential access (Figure 5). Consequently,      
+
+> 4Empowering Hybrid Attention Models on NPUs Map operator ………Head 1 Head 2 …………Head m …n chunks n chunks Reduce operator Head 1 ……Head 2 ……Head m ……Head m ……Head m ……
+> Split
+> ……Reordered & Planned Compute Graph
+> LA core Input Proj. Output Proj. LA FFN FA …
+
+Online Offline               
+
+> 123413' 42TT
+> §6 Tensor-Layout Planning
+> 13' 42
+> §5 Operator Reordering Original Computation Graph
+> TDense layout Blocked layout Transform Prompt …Output
+> NPU Cores
+> §4 Head-level Mapping & Fusion
+> Operator
+
+Figure 6. Overview of HA-NPU. as tensors are continuously handed off between units, their physical layouts must be repeatedly transformed even when logical values remain unchanged [38]. LA’s highly inter-leaved operator chain severely amplifies this structural con-flict, turning logical tensor handoffs into pure data-movement overhead. In our profiling of Qwen3.5-2B, these redundant layout transformations consume 41 .58% of the cross-unit execution time and increase memory traffic by 16 .7%. 
+
+## 3 Design Overview 
+
+Design Goal HA-NPU is a general, memory-efficient LA in-ference system designed specifically for resource-constrained edge NPUs to significantly reduce prefill latency and energy consumption. It operates as a transparent, drop-in engine that integrates seamlessly into existing frameworks (e.g., vLLM-Ascend) without altering original attention semantics. It natively supports SOTA delta-rule architectures (e.g., GDN, KDA) and easily extends to others (e.g., RetNet, GLA). 
+
+Workflow. To alleviate the severe memory-system bottle-necks of LA prefilling on edge NPUs, HA-NPU shifts the execution paradigm from sequence-dimension parallelism to operator-dataflow locality. Abstracting the workload into a chunkwise Map–Reduce–Map paradigm, it systematically reconstructs the inference pipeline across three architectural levels: (1) At core level : It partitions workloads by head and fuses dependent operators onto a single core, eliminating cross-core GM accesses. (2) At operator level : It reorganizes operator execution order to consume intermediate tensors immediately, mitigating spill and reload traffic within limited on-core buffers. (3) At tensor level : It coordinates tensor lay-outs to resolve format conflicts between matrix and vector processing units, minimizing transformation overheads. 
+
+• Offline Stage (Operator & Tensor Levels) . Given an LA computation graph (Figure 6), HA-NPU generates a deter-ministic static execution plan, reordered & planned graph .It sequentially applies lifetime-aware operator reordering (§ 5) to determine a memory-efficient execution sequence, and dataflow-aware layout planning (§ 6) to assign exact physical formats and transformation sites for all tensors. 
+
+• Online Stage (Core Level) Taking the input projection’s 
+
+𝑄 /𝐾 /𝑉 tensors, gates, and initial state, HA-NPU executes this reordered and planned graph via head-level mapping with fusion (§ 4). This mapping pins each head to a dedi-cated AI Core and elastically splits the execution tail, max-imizing hardware saturation and preserving on-core local-ity, yielding the final attention outputs and updated states for downstream layers and subsequent decoding. 
+
+## 4 Head-Level Mapping with Cross-Operator Fusion 
+
+In chunkwise LA, the overall computation is organized across independent attention heads ( 𝐻 1, . . . , 𝐻 𝑚 ) and sequence chunks (𝐶 1, . . . , 𝐶 𝑛 ). The execution structurally alternates between Map and Reduce operators with fundamentally conflicting execution patterns: Map operators allow chunk-level concur-rent execution, whereas the Reduce operator enforces strict head-level sequential execution. To execute this interleaved workload, mainstream frame-works pursue maximum parallelism for massive GPU concur-rency, assembling these granularities into two predominant schemas (Figure 7(a,b)): 
+
+• Chunk-Head-Chunk Mapping: [31, 66] This schema completely decouples the operators to isolate the serial bottleneck. It executes both Map phases as parallel chunk-level workloads (e.g., 𝐶 1, . . . , 𝐶 𝑛 ), interrupted by a strictly sequential head-level Reduce workload (e.g., updating the recurrent state across 𝐶 1 → 𝐶 2 → · · · → 𝐶 𝑛 within 𝐻 1). 
+
+• Chunk-Seg-Seg Mapping: [70] In contrast, this schema pursues concurrency by parallelizing the bottleneck itself. It executes the first Map phase as parallel chunk-level work-loads (e.g., 𝐶 1, . . . , 𝐶 𝑛 ), followed by extra pre-computation that enables concurrent segment-level execution for Re-duce and final Map phases (e.g., splitting 𝐻 1’s chain into independent segments 𝑆 1 (𝐶 1 → 𝐶 2) and 𝑆 2 (𝐶 3 → 𝐶 4)). 
+
+Fractured Locality and the Memory Wall. Fundamen-tally, both mappings reflect a GPU-centric design philoso-phy that prioritizes massive thread concurrency—a strict necessity to hide memory latency and saturate massive GPU architectures (e.g., an NVIDIA RTX 4090 requires thousands of concurrent workloads to fully utilize its 128 SMs and 48 warps/SM). However, on edge NPUs, this execution model fractures data locality and creates a severe memory wall. Be-cause edge NPUs are strictly bottlenecked by constrained GM bandwidth, independently scheduling workloads of varying granularities severs on-core data dependencies, triggering 
+
+> 5
+
+Yinyuan Zhang et al. C1                      
+
+> GM
+> H1
+> …
+> GM GM Local Local Local
+> C2C3C4CnC1…C2C3C4Cn
+> C1C2C3C4Cn
+> S1S2St
+> ………
+> Extra Pre Comp.
+> Chunk-Head-Chunk mapping
+> S1S2St
+> Map Map
+> H1
+> H1
+> H1
+> Reduce
+> Chunk-Seg-Seg mapping Head-Head-Head mapping
+> n chunks …
+> C2C3CnC1
+> H1
+> H2
+> Hm
+> m heads ………… n chunks …
+> C2C3CnC1
+> H1
+> H2
+> Hm
+> m heads …………
+
+…   
+
+> Chunk-level mapping
+> NPU Cores
+> Head-level mapping Seg-level mapping
+> …
+> Whole head
+> ……Map-op1 …………Map-op2 Map-op6
+> C2CnC1
+> Reduce-op …
+
+(a) Memory access patterns across different mappings (b) Workload scheduling to NPU cores (c) Intra-head cross-operator execution 
+
+Figure 7. Illustration of Chunk-Head-Chunk, Chunk-Seg-Seg, and Head-Head-Head execution mappings of chunkwise LA. frequent cross-core synchronization that forces intermedi-ate tensors and recurrent states to be repeatedly material-ized to GM. This massive GM traffic drastically inflates data movement overhead, severely starving the high-throughput Matrix units (§ 2.3). To shatter this memory wall, HA-NPU shifts the execu-tion paradigm from pursuing parallelism along the sequence dimension to maximizing data locality along the operator dataflow . This shift is motivated by two key insights: 
+
+Insight 1: Head-Level Independence Across Operators. 
+
+Despite intra-head serialization during state updates, zero data dependencies exist across heads throughout all Map and Reduce operators, eliminating cross-head synchronization. 
+
+Insight 2: Redundant LA Parallelism on Edge NPUs. 
+
+Edge NPUs integrate very few compute units (e.g., 1–10 in Ascend 310, 1 in Qualcomm NPUs) [7, 16, 19], relative to the abundant attention heads in modern LLMs (e.g., 16–64 in Qwen3.5) [45–47]. Thus, when enough heads are available to occupy all cores, exposing fine-grained chunk-level work-loads offers no additional benefit to core-level concurrency. Leveraging these properties, HA-NPU adopts a head-centric execution paradigm that guarantees strict on-core tensor reuse while ensuring full NPU saturation. Specifically, it in-troduces two core mechanisms: (1) head-level mapping with cross-operator fusion , which vertically integrates a head’s het-erogeneous operators into a single workload pinned to a ded-icated core; and (2) computation splitting , which adaptively partitions tail-end execution to expose additional concurrent workloads when the remaining heads underfill the NPU. 
+
+Head-Level Mapping with Cross-Operator Fusion. To resolve the granularity mismatch, HA-NPU adopts the atten-tion head as its fundamental scheduling unit, mapping in-dependent heads to different dedicated cores for concurrent execution. Within each core, it fuses the entire Map–Reduce– Map pipeline into a single kernel. As illustrated in Figure 7(c), a core sequentially processes chunks ( 𝐶 1 → · · · → 𝐶 𝑛 ), exe-cuting all operators along the dataflow (Map-op1 → · · · → 
+
+Reduce-op → Map-op6) within each chunk 𝐶 𝑖 . This localized First 10 heads: heads 0-9 
+
+> 10/10 cores active
+> Remaining 6 tail heads: heads 10–15
+> 6/10 cores active
+> Unused cores
+
+NPU Cores 
+
+(a) Core underutilization at the execution tail NPU Cores  
+
+> Cross-core reduction No cross-core reduction
+
+………… 
+
+> 64 128 64 128 64
+
+× = + 64 128 64 
+
+×128 64 
+
+=     
+
+> 64 64 64 64 128 Q0Q1
+> S0
+> S1
+> O0
+> O1
+> OO0O1QRow-wise Workload Partitioning Column-wise Workload Partitioning partition S0S1
+> partition
+
+(b) Row versus column splitting of 𝑆 
+
+Figure 8. Comparison of workload partitioning strategies. ……Workload Partition 
+
+> NPU Cores
+
+… ……        
+
+> Chunk Split
+> Column Split
+> Step I: One-to-One Step II : Tile-to-One Step III :Chunk-to-One Head 0~9 Head 10~14 Head 15
+
+… … …
+
+Figure 9. Workflow of HA-NPU’s three-tiered scheduling. execution confines intermediate tensors and state 𝑆 𝑖 within on-core buffers, bypassing the GM memory wall. 
+
+Computation Splitting. While head-level mapping maxi-mizes data locality, it risks core underutilization at the ex-ecution tail (e.g., mapping 16 heads onto 10 cores leaves 6 residual heads, Figure 8(a)). To eliminate this, HA-NPU dy-namically partitions these residual heads to expose additional concurrent workloads. A row-wise split of the recurrent state 
+
+𝑆 mandates costly cross-core reductions. Instead, HA-NPU exploits the structural independence of state updates by em-ploying column-wise partitioning (Figure 8(b)). Assigning each column block to a distinct core inherently doubles the concurrent workloads for each selected head, preserving on-core locality without requiring cross-core reduction. 
+
+6Empowering Hybrid Attention Models on NPUs 
+
+Putting It Together. To preserve on-core tensor reuse and sufficient parallelism, HA-NPU orchestrates these mecha-nisms through a three-tiered scheduling pipeline (Figure 9): 
+
+• Step I (Sufficient Head Parallelism): Each head executes on one AI Core, preserving on-core tensor reuse across operators and chunks. 
+
+• Step II (Underfilled Tails): Partitions residual heads along the columns of 𝑆 to expose independent workloads. 
+
+• Step III (Extreme Tails): Reverts to chunk-head-chunk map-ping exclusively for boundary cases, injecting sequence-dimension concurrency to guarantee core saturation. 
+
+## 5 Lifetime-Aware Operator Reordering 
+
+While head-resident mapping (§ 4) localizes data, sustaining it requires buffering recurrent states, intermediate tensors, and I/O tensors with overlapping lifetimes. The default se-mantic execution order severely exacerbates this pressure by generating intermediate tensors long before their con-sumption, unnecessarily prolonging their lifetimes. For in-stance, adding a 64-KiB state to the 244-KiB kernel footprint pushes peak memory to 308 KiB, exceeding Ascend 310P’s 256-KB buffer. This capacity deficit triggers inevitable cache thrashing, forcing the NPU to repeatedly evict and reload still-needed tensors, negating on-core locality. 
+
+Lifetime-Aware Reordering. To eliminate this, our core insight is that operators with ready inputs are not bound by default semantic sequence. Inspired by out-of-order ex-ecution in modern processors, HA-NPU reorders operator execution to prioritize computations that consume intermedi-ate tensors immediately after generation. This tensor lifetime minimization strategy forces the early release of memory footprints, keeping peak memory within local buffer capaci-ties. Specifically, HA-NPU applies this operator reordering to two critical scenarios: (i) across chunks for recurrent state updates, and (ii) within a chunk for shared-input GEMMs. 
+
+• Cross-Chunk: State-First to Chunk-First Order via Operator Splitting. The default state-first order computes the new state 
+
+𝑆 𝑐 +1 (Operator 5) before the chunk output (Operator 6) fin-ishes consuming the old state 𝑆 𝑐 (Figure 10(a)). This lifetime overlap forces 𝑆 𝑐 and 𝑆 𝑐 +1 to co-reside in the on-core buffer, doubling the state memory footprint. To eliminate this over-head, HA-NPU exploits a critical partial dependency : while the default semantics treat Operator 5 as a monolithic step, Operator 6 actually requires only the incoming state 𝑆 𝑐 and an intermediate tensor 𝑣 𝑐 , completely bypassing the need for the final updated state 𝑆 𝑐 +1. HA-NPU thus decouples Opera-tor 5 and transitions to a chunk-first order ( Operator 5-read 
+
+→ Operator 6 → Operator 5-update , Figure 10(b)), deferring the state update until 𝑆 𝑐 is read for the last time. This enables an in-place overwrite, halving the state memory requirement while strictly preserving algorithmic recurrence. 
+
+• Intra-Chunk: Inversion-First to GEMM-First Order via Oper-ator Rewriting. The default inversion-first order schedules the Execution order              
+
+> Op 5 Chunk 0
+> Read Update
+> v
+> S0S2
+> S1
+> Old and new state tensor overlap
+> Buffer 0
+> S0S0
+> Op 6 Op 5 Chunk 1
+> Read Update
+> vS1S1
+> Buffer 1
+> 2x buffer memory
+> Op 6
+> S1S2
+> output O0output O1
+> State tensor SIntermediate tensor vOutput OData dependency
+
+(a) State-first: state update before output Chunk 0        
+
+> S0Buffer 0 Op 5
+> Read
+> Op 5
+> Update
+> Op 6
+> S0S0
+> v
+> S1
+> S1S2
+> Op 5
+> Read
+> Op 5
+> Update
+> Op 6
+> S1S1
+> v
+> S2
+> Chunk 1
+> 1x buffer memory No state tensor overlap output O0output O1
+
+(b) Chunk-first: output before state update 
+
+Figure 10. Operator (Op) decoupling and reordering for in-place state updates. matrix inversion ( 𝐴 −1) between GEMMs that share input ten-sors (e.g., 𝐾 , 𝑄 , 𝑆 , and 𝐾 T) (Figure 11(a)). Thus, these shared inputs (e.g., 𝐾 𝑇 ) remain temporarily idle across the inversion phase. To sustain efficient pipelining, the inversion exhausts L0 buffer with its intermediates, forcing redundant evictions and L1 reloads of idle inputs for subsequent GEMMs. HA-NPU eradicates these transfers through a methodical two-step optimization. First, it breaks the strict data depen-dency of 𝑊 = 𝐴 −1𝐾 via operator rewriting. By factoring out 
+
+𝐴 −1 (Figure 11(b)), the newly formulated GEMM operation directly consumes 𝐾 , effectively decoupling this computation from the costly matrix inversion. Second, with this depen-dency resolved, HA-NPU transitions to a GEMM-first order 
+
+by grouping all shared-input GEMM operators ( 𝐾𝑆 , 𝑄𝑆 , 𝐾𝐾 𝑇 ,
+
+𝑄𝐾 𝑇 ) before the inversion (Figure 11(c)). Executing them in a contiguous phase maintains these inputs within the L0 buffer for direct reuse, subsequently releasing them to free workspace for the inversion. 
+
+## 6 Dataflow-Aware Layout Transformation Planning 
+
+LA frequently alternates between Matrix and Vector compu-tations, triggering a fundamental layout conflict: Matrix pro-cessing units achieve high throughput with Blocked layouts, whereas Vector processing units favor contiguous Dense layouts (§ 2.3). This conflict introduces a strict trade-off (Figure 12(a)): transforming layouts incurs transformation overheads [38], while computing with mismatched formats suffers execution penalties—a balance dependent on specific operator types and tensor shapes. Consequently, HA-NPU formulates layout planning as a discrete cost minimization problem to find a plan 𝜋 ∗ that minimizes total inference la-tency: 𝜋 ∗ = arg min 𝜋 [𝑇 𝑒𝑥𝑒𝑐 (𝜋 ) + 𝑇 𝑡𝑟𝑎𝑛𝑠 𝑓 𝑜𝑟𝑚 (𝜋 )] , where 𝑇 𝑒𝑥𝑒𝑐            
+
+> 7Yinyuan Zhang et al. UB
+> L1 L0A L0B L0C
+> KKKKT
+> Cube
+> Eviction Left input tensors Right input tensors Dependency Execution order KT
+> KT
+> A
+> Matrix inversion
+> K
+> Cube
+> KKA−1
+> A−1
+> S
+> Cube
+> SS[W;Q] WWWQQ
+> occupies L0
+> Q
+> Cube
+> KTapply A
+> −1
+> reload
+> Original Graph W
+> 𝐴 #$ 𝑉 − 𝐴 #$ 𝐾 𝑆 WS depends on inversion through W
+> KT
+
+(a) Inversion-first order UB         
+
+> L1 L0A L0B L0C
+> KKKKT
+> Cube
+> KT
+> KT
+> A
+> Matrix inversion
+> S
+> Cube
+> SS[K;Q] KKQQ
+> occupies L0
+> Q
+> Cube
+> KTapply A
+> −1
+> reload
+> Rewritten Graph
+> 𝐴 #$ 𝑉 − 𝐾𝑆
+> KIndependent of inversion A−1
+> reload Eliminate GEMM
+> W=A−1 K
+> T
+
+(b) GEMM-first order — Step I: Remove inversion dependency UB     
+
+> L1 L0A L0B L0C
+> S
+> Cube
+> SS[K;Q] KKQQ
+> apply A
+> −1
+> Resident in L0A
+> [K;Q] KT
+> KT
+> KT
+> Cube A
+> Matrix inversion
+> occupies L0 Release input L0 buffers A−1
+> Reorder GEMMs before inversion Contiguous Cube phase Reuse shared input tensors across GEMMs
+
+(c) GEMM-first order — Step II: Reorder for input reuse 
+
+Figure 11. Operator rewriting and reordering enable GEMM-first execution for on-core tensor reuse. and 𝑇 𝑡𝑟𝑎𝑛𝑠 𝑓 𝑜𝑟𝑚 represent the layout-specific execution costs and transformation overheads, respectively. 
+
+Combinatorial Layout Search. Finding the global opti-mum 𝜋 ∗ is non-trivial because layout decisions are deeply coupled across the execution dataflow [32]. Specifically, these dependencies necessitate joint layout optimization across three structural dimensions: (i) sequence-level cross-chunk propagation (Figure 12(b)), (ii) shared tensors in multi-branch dataflows (Figure 12(c)), and (iii) cumulative overheads along long Vector chains (Figure 12(d)). Together, these deep cou-plings formulate the layout optimization as a Partitioned Boolean Quadratic Programming (PBQP) problem. General PBQP is NP-hard [38]. For an input partitioned into 𝑁 𝑐 
+
+chunks with up to 𝑚 layout choices per chunk, the search space explodes to 2 𝑚 ∗𝑁 𝑐 . As 𝑁 𝑐 scales linearly with the input sequence length, naive enumeration becomes intractable for long-context inference. 
+
+Pruning the search space. Fortunately, the regular LA dataflow and NPU hardware constraints provide three key opportunities to drastically prune the search space: 
+
+• Decoupling global planning into intra-chunk subproblems. 
+
+Because layout costs propagate strictly via tensor depen-dencies and only the recurrent state crosses chunk bound-aries, intra-chunk layout decisions remain perfectly iso-lated (Figure 12(b)). HA-NPU exploits this by retaining only the minimal intra-chunk cost for limited state-layout combinations, effectively breaking the cross-chunk cou-pling. 
+
+• Simplifying branch layout planning through fixed Matrix in-terfaces. We leverage a consistent dataflow characteristic of LA: branched shared tensors invariably serve as operands for downstream Matrix computation units. Since these units strictly mandate Blocked inputs, HA-NPU uses this terminal constraint as a definitive anchor, directly prun-ing the combinatorial branch search into a deterministic, one-time transformation evaluation (Figure 12(c)). 
+
+• Merging Vector chains into a single logical unit. For shape-preserving vector chains here, layout transform costs are independent of placement under our cost model. Since each vector operator executes no slower in Dense layout, an all-Dense chain with boundary transforms is no more expensive than any mixed-layout assignment. HA-NPU therefore evaluates only two candidates for each chain: all-Dense with boundary transforms, or all-Blocked (Fig-ure 12(d)). 
+
+Finding the optimal layout plan. With the search space rigorously bounded, the global optimization reduces to a straightforward dynamic programming (DP) recurrence: 𝐷 𝑖 (𝑠 ) =
+
+min 𝑝 [𝐷 𝑖 −1 (𝑝 ) + 𝑐 𝑖 (𝑝, 𝑠 )] , where 𝐷 𝑖 (𝑠 ) represents the mini-mum accumulated cost up to step 𝑖 under layout state 𝑠 , and 
+
+𝑐 𝑖 (𝑝, 𝑠 ) is the transition cost from predecessor state 𝑝 . HA-NPU evaluates this recurrence in a strict topological order. Crucially, at chunk boundaries, the layout state 𝑠 collapses to retain only the recurrent-state layout, ensuring the search complexity scales linearly ( 𝑂 (𝑁 𝑐 )) rather than exponentially. 
+
+Global Plan Generation. During the DP forward pass, HA-NPU records the optimal predecessor state for each lay-out transition. The planner then backtracks to assign exact physical layouts to all tensors and pinpoint transformation insertion sites. This offline generation yields a static, de-terministic execution plan, completely eliminating runtime layout-scheduling overhead. 
+
+## 7 Implementation and Evaluation 
+
+HA-NPU is a general inference system designed around the ubiquitous traits of modern edge NPUs: utilizing head-level mapping for limited compute cores, operator reordering for constrained memory hierarchies, and layout planning for the matrix-vector compute paradigm [21, 23, 36, 50]. We                         
+
+> 8Empowering Hybrid Attention Models on NPUs Transform overhead Lower Vector cost
+> TT
+> No transform overhead
+> Higher Vector cost
+> Chunk 0
+> ？……
+> Chunk 1
+> ？………
+> Longer sequences, more chunks
+> ？
+> Joint layout decisions across chunks
+> Chunk 0
+> ？……
+> Chunk 1
+> ？………S
+> Only state tensor remains alive
+> across chunks
+> ……Local lifetime
+> Intra-chunk plan Intra-chunk plan Joint layout decisions across branches
+> …？？？……
+> ？…………………T
+> If needed Fixed blocked layout at Matrix input
+> …？？？
+> Joint layout decisions along long chains
+> ？
+> …？
+> Merge layout decisions into one chain-level choice
+> T
+> If needed Uniform layout
+> Layout transform Matrix processing unit Vector processing unit Dense layout Blocked layout
+> T
+> ？Layout choice
+> (a) Trade-off between execution cost and transform overhead (b) Decomposing global layout planning (c) Simplifying branch layout planning (d) Merging layout decisions
+> Unit-preferred layout Keep Blocked layout Local lifetime
+
+Figure 12. Illustration of dataflow-aware layout planning. instantiate our prototype on the Ascend 310 series specifi-cally because its open-source, programmable stack affords the explicit hardware control necessary for these low-level optimizations [20, 21]. As a ∼13K-line C/C++ kernel-level drop-in replacement, HA-NPU uses a torch_npu binding [5] to integrate natively into vLLM-Ascend [31, 55] without modifying the high-level serving pipeline. Our implementa-tion further addresses two practical concerns: (1) Full-Layer Implementation: An LA layer comprises input/output pro-jections and the LA core. We accelerate these projections via operator fusion and convolution-metadata reuse (1 .62 ×
+
+speedup over native vLLM-Ascend), equipping all baselines with this identical backend to strictly isolate our core im-provements during end-to-end comparisons. (2) Minimized I-cache pressure: HA-NPU shares fixed-shape Cube routines across GEMMs, eliminating redundant scalar control code to reduce I-cache misses. 
+
+7.1 Experiment Setups Hardware Setup. We evaluate HA-NPU on two edge Ascend NPUs: Ascend 310P (10 AI Cores, 96 GB LPDDR4X, 8-core CPU) and Ascend 310B (one AI Core, 24 GB LPDDR4X, 4-core CPU) [7, 19, 39]. All experiments use the CANN toolkit [21] within vLLM-Ascend [55] for end-to-end evaluation. 
+
+Models and Datasets. We evaluate two SOTA linear atten-tion mechanisms—GDN [63] and KDA [29]—using four GDN-based multimodal models (Qwen3.5-0.8B/2B/4B/9B) [48, 49] and two KDA-based text-only models (AFM-4.5B [3] and Ling-3.0-tiny [22]). For end-to-end evaluation, we use text QA (TriviaQA [25], HotpotQA [67]) across all models, MMMU [69] for GDN-based multimodal evaluation, and MMLU-Pro [57] for text-only KDA models. 
+
+Baselines. We compare HA-NPU with four SOTA base-lines: (1) vLLM-Ascend [31, 55] (v0.19.1rc1), the native in-ference backend; (2) Flash Linear Attention (FLA) [63, 66], using chunkwise execution; (3) FLA + MegaKernel [13, 18], a single-kernel variant assessing kernel-launch overheads; and (4) FlashQLA [70], using its fused, segment-parallel ex-ecution. As official FLA and FlashQLA releases lack NPU support, we rigorously ported their computation flows to As-cend 310P/310B, strictly preserving their principal fusion and segmentation strategies. Because official FlashQLA release supports only GDN, we accurately extended its algorithmic logic to a KDA version. For a controlled comparison, all meth-ods share identical projection and decoding, a chunk size of 64, and mixed-precision dataflows (FP16 Q/K/V and FP32 gates/states). 
+
+Metrics. We report core forward latency, end-to-end re-quest latency, peak memory, energy (integrated from 100-ms power samples over a continuous 10-second execution via As-cend’s API, divided by total calls), memory traffic (aggregated via hardware counters), and Matrix utilization (hardware-recorded MACs divided by overhead-free device-event tim-ings, normalized to the device’s measured peak FP16 GEMM throughput). All experiments report the average of 3–5 runs. 
+
+7.2 Linear-Attention Kernel Performance 
+
+We evaluate the core performance of HA-NPU across a com-prehensive sweep of attention formulations, head counts, se-quence lengths, and devices. As shown in Figures 13 and 14, 
+
+HA-NPU consistently delivers superior execution effi-ciency and energy savings across all configurations. Forward Latency. Compared with vLLM-Ascend: HA-NPU achieves an 11 .60–19 .28 × speedup on Ascend 310P (4,096 to-kens) by replacing fragmented general-purpose torch_npu 
+
+operators with highly fused, NPU-aligned kernels. Compared with FLA: HA-NPU achieves a 4 .74–7 .02 × speedup (4,096 tokens) by replacing FLA’s GM-bound, stage-by-stage exe-cution with head-level on-core reuse. Compared with FLA-MegaKernel: HA-NPU maintains a 4 .74–7 .69 × speedup, con-firming that merely reducing kernel launches is futile with-out eliminating underlying GM bottlenecks. 
+
+Compared with FlashQLA: Although FlashQLA outper-forms FLA via partial operator fusion and segment-level 
+
+> 9Yinyuan Zhang et al.
+
+512 1K 2K 4K 040 80 120 
+
+> 1.9–35.9× 1.9–25.4× 1.8–20.7× 1.8–19.3×
+
+GDN (Heads=16) 512 1K 2K 4K 060 120 180 
+
+> 1.9–25.8× 2.0–21.0× 1.9–19.7× 1.9–18.1×
+
+GDN (Heads=32) 512 1K 2K 4K 080 160 240 
+
+> 1.9–19.0× 2.1–17.6× 1.9–15.9× 1.9–14.3×
+
+GDN (Heads=48) 
+
+512 1K 2K 4K 040 80 120 
+
+> 2.0–28.0× 2.1–21.4× 2.2–17.1× 2.2–16.4×
+
+KDA (Heads=16) 512 1K 2K 4K 060 120 180 
+
+> 2.1–21.2× 2.1–17.5× 2.1–16.3× 2.1–14.6×
+
+KDA (Heads=32) 512 1K 2K 4K 080 160 240 
+
+> 2.0–16.1× 2.1–13.7× 2.0–12.5× 2.1–11.6×
+
+KDA (Heads=48) 
+
+> Forward latency (ms)
+
+vLLM-Ascend Flash Linear Attention Flash Linear Attention + MegaKernel FlashQLA 
+
+HA-NPU 
+
+(a) Ascend 310P (X-axis: Sequence length 𝑇 (tokens)) 512 1K 2K 4K 0200 400 600 
+
+> 2.2–7.0× 2.0–6.6× 1.7–6.0× 1.9–6.7×
+
+GDN (Heads=16) 512 1K 2K 4K 0400 800 1200 
+
+> 2.0–6.4× 2.2–6.5× 1.7–6.5× 1.9–6.6×
+
+GDN (Heads=32) 512 1K 2K 4K 0600 1200 1800 
+
+> 2.0–6.5× 2.0–6.0× 1.7–6.1× 2.1–7.7×
+
+GDN (Heads=48) 
+
+512 1K 2K 4K 0200 400 600 
+
+> 2.4–5.7× 2.5–6.3× 2.4–6.5× 2.4–6.6×
+
+KDA (Heads=16) 512 1K 2K 4K 0400 800 1200 
+
+> 2.3–5.8× 2.3–5.9× 2.2–6.0× 2.3–6.3×
+
+KDA (Heads=32) 512 1K 2K 4K 0600 1200 1800 
+
+> 2.3–5.5× 2.3–5.8× 2.1–5.6× 2.2–5.9×
+
+KDA (Heads=48) 
+
+> Forward latency (ms)
+
+(b) Ascend 310B (X-axis: Sequence length 𝑇 (tokens); vLLM-Ascend is unsupported on 310B )
+
+Figure 13. Forward latency of GDN and KDA under different sequence lengths and head counts on Ascend 310P and 310B. Green annotations show the range of speedups achieved by HA-NPU over the baselines for each configuration. 512 1K 2K 4K 0369
+
+> 2.1–36.1× 2.0–24.2× 1.8–19.8× 1.8–18.5×
+
+GDN (Heads=16) 512 1K 2K 4K 0612 18 
+
+> 2.0–25.3× 2.0–20.6× 1.8–19.2× 1.8–17.7×
+
+GDN (Heads=32) 512 1K 2K 4K 0816 24 
+
+> 2.0–19.1× 2.0–16.8× 1.9–15.6× 1.9–14.3×
+
+GDN (Heads=48) 
+
+512 1K 2K 4K 0369
+
+> 2.1–27.7× 2.0–20.1× 2.1–16.6× 2.1–15.3×
+
+KDA (Heads=16) 512 1K 2K 4K 0612 18 
+
+> 2.1–20.7× 2.1–17.0× 2.1–16.0× 2.1–14.6×
+
+KDA (Heads=32) 512 1K 2K 4K 0816 24 
+
+> 2.0–15.7× 2.0–13.8× 2.0–12.7× 2.0–11.9×
+
+KDA (Heads=48) 
+
+> Energy per forward (J)
+
+Sequence length, T (tokens) vLLM-Ascend Flash Linear Attention Flash Linear Attention + MegaKernel FlashQLA 
+
+HA-NPU 
+
+Figure 14. Energy consumption of GDN and KDA under different sequence lengths and head counts on Ascend 310P. parallelism, its inter-kernel execution still materializes in-termediate tensors, leaving data locality fundamentally un-resolved. Tailored strictly for memory-bound edge NPUs, HA-NPU directly targets these pain points via full fusion for data locality, operator reordering for buffer efficiency, and layout planning for minimal transform overheads. These memory-centric optimizations yield direct hardware benefits: compared with FlashQLA, HA-NPU reduces GM traffic by 21 .2%–40 .8% and L1-to-L0 transfers by 39 .2%–58 .4% (§ 7.6), which unblocks the compute unit to boost Matrix-unit uti-lization by up to 1 .74 × (§ 7.6), ultimately translating into a 1.79–2 .41 × latency speedup for 4,096-token inputs. 
+
+Energy Consumption. On Ascend 310P for 4,096-token sequences, HA-NPU achieves energy reductions of 11 .92– 18 .50 × over vLLM-Ascend, 4 .48–4 .95 × over FLA, 4 .47–5 .01 ×
+
+over FLA-MegaKernel, and 1 .76–2 .11 × over FlashQLA. By confining states on-core, maximizing tensor reuse, and avoid-ing unnecessary layout transforms, HA-NPU reduces the energy-intensive GM traffic that dominates baselines. 
+
+> 10 Empowering Hybrid Attention Models on NPUs
+
+TriviaQA HotpotQA MMMU 02.5 57.5 1.12–2.03× 1.11–2.01× 1.09–1.82× Qwen3.5-0.8B (GDN-based) 
+
+TriviaQA HotpotQA MMMU 02.5 57.5 1.09–1.77× 1.09–1.80× 1.07–1.68× Qwen3.5-2B (GDN-based) 
+
+TriviaQA HotpotQA MMMU 0612 18 1.09–1.87× 1.09–1.85× 1.08–1.74× Qwen3.5-4B (GDN-based) 
+
+TriviaQA HotpotQA MMMU 0816 24 1.06–1.60× 1.08–1.71× 1.08–1.61× Qwen3.5-9B (GDN-based) 
+
+TriviaQA HotpotQA MMLU-Pro 0612 18 1.24–1.98× 1.25–2.02× 1.23–2.03× AFM-4.5B (KDA-based) 
+
+TriviaQA HotpotQA MMLU-Pro 04812 1.17–1.82× 1.17–1.84× 1.15–1.79× Ling-3.0-tiny (KDA-based)    
+
+> End-to-end request latency (s)  vLLM-Ascend Flash Linear Attention Flash Linear Attention + MegaKernel FlashQLA
+> HA-NPU
+
+TriviaQA HotpotQA MMMU 0250 500 750 1.12–1.92× 1.11–1.92× 1.10–1.79× Qwen3.5-0.8B (GDN-based) 
+
+TriviaQA HotpotQA MMMU 0250 500 750 1.09–1.66× 1.09–1.70× 1.07–1.63× Qwen3.5-2B (GDN-based) 
+
+TriviaQA HotpotQA MMMU 0600 1200 1800 1.10–1.73× 1.10–1.72× 1.08–1.68× Qwen3.5-4B (GDN-based) 
+
+TriviaQA HotpotQA MMMU 0800 1600 2400 1.07–1.49× 1.08–1.56× 1.08–1.51× Qwen3.5-9B (GDN-based) 
+
+TriviaQA HotpotQA MMLU-Pro 0600 1200 1800 1.18–1.81× 1.18–1.83× 1.18–1.88× AFM-4.5B (KDA-based) 
+
+TriviaQA HotpotQA MMLU-Pro 0400 800 1200 1.14–1.75× 1.15–1.78× 1.13–1.74× Ling-3.0-tiny (KDA-based) 
+
+> Device energy per request (J)
+
+Figure 15. End-to-end request latency and measured device energy per request on Ascend 310P. 
+
+7.3 End-to-End Performance 
+
+HA-NPU targets only the LA prefill stage, relying on the native backend for all decoding. Our evaluated workloads include TriviaQA (9,813–13,717 input vs. 7–9 output tokens), HotpotQA (11,003–13,407 input vs. 5–9 output tokens), MMLU-Pro (2,099–2,267 input vs. 1–2 output tokens), and the mul-timodal MMMU (2,138–5,621 input vs. 2–7 output tokens). Specifically, for Qwen3.5-2B on HotpotQA via vLLM-Ascend, prefill consumes 97.1% of total latency (5.983 s prefill vs. 0.163 s decode), making it end-to-end bottleneck here. 
+
+End-to-end Latency. HA-NPU consistently achieves the lowest latency across all 18 model-dataset config-urations (Figure 15). Compared with vLLM-Ascend, FLA, FLA-MegaKernel, and FlashQLA, it delivers speedups of 1.60–2.03x, 1.22–1.39x, 1.22–1.36x, and 1.06–1.12x across the Qwen3.5 series. This superiority extends to KDA-based models: yielding up to 2.03x and 1.27x speedups over vLLM-Ascend and FlashQLA for AFM-4.5B, and up to 1.84x and 1.21x for MoE-augmented Ling-3.0-tiny. With identical pe-ripheral operators and decoding backends across baselines, these system-level speedups validate HA-NPU’s core opti-mizations. 
+
+End-to-End Energy. System-wide, HA-NPU reduces to-tal device energy per request by 32 .8–48 .0%, 11 .8–24 .1%, 11 .6–23 .1%, and 6 .3–17 .1% against the four respective base-lines. Thus, HA-NPU’s kernel-level GM optimizations di-rectly translate into on-device energy savings. 
+
+Table 2. Model output quality on Ascend 310P (F1 ↑). 
+
+Qwen3.5-2B Qwen3.5-4B Method HotpotQA TriviaQA HotpotQA TriviaQA vLLM-Ascend 48.90 83.70 65.39 89.17 
+
+HA-NPU 49.06 83.53 65.14 89.17 128 256 512 1K 2K 4K 8K 16K 32K 64K 01234
+
+> GDN
+> T=64K: −52.6% / −6.0% vs. FLA / FlashQLA
+> 128 256 512 1K 2K 4K 8K 16K 32K 64K 0246
+> KDA
+> T=64K: −54.6% / −22.8% vs. FLA / FlashQLA
+> Peak memory (GiB)
+
+Sequence length, T (tokens)  
+
+> Flash Linear Attention FlashQLA
+> HA-NPU
+
+Figure 16. Peak memory consumption of GDN and KDA on Ascend 310P ( 𝐻 = 32). 
+
+7.4 Accuracy 
+
+Evaluated against a CPU FP64 reference across 360 GDN instances, HA-NPU achieves maximum NMSEs of 5 .23 ×10 −8
+
+for outputs and 9 .38 × 10 −12 for final states, corresponding strictly to inherent hardware rounding limits. Further, HA-NPU preserves end-to-end model quality, yielding negligible F1 score deviations ( ≤ 0.25) on both HotpotQA and TriviaQA compared with NPU-native vLLM-Ascend (Table 2).    
+
+> 11 Yinyuan Zhang et al. Flash Linear Attention FlashQLA
+> HA-NPU 02.5K 5K 7.5K 10K
+> GM traffic (MiB)  T=8K: −81.7% / −21.2% vs. FLA / FlashQLA T=8K: −84.8% / −40.8% vs. FLA / FlashQLA
+> 128 256 512 1K 2K 4K 8K 0500 1K 1.5K
+> L1-to-L0 traffic (MiB)  T=8K: −46.4% / −39.2% vs. FLA / FlashQLA
+> 128 256 512 1K 2K 4K 8K
+> T=8K: −30.5% / −44.0% vs. FLA / FlashQLA
+> GDN KDA
+> Sequence length, T (tokens)
+
+(a) Memory Traffic 128 256 512 1K 2K 4K 8K 02.5 57.5  
+
+> Matrix utilization (%)
+> T=8K: 4.2× FLA 1.7× FlashQLA
+> 128 256 512 1K 2K 4K 8K
+> T=8K: 4.9× FLA 1.5× FlashQLA
+> GDN KDA
+> Sequence length, T (tokens)
+
+(b) Matrix Utilization 
+
+Figure 17. Memory traffic and Matrix utilization of GDN and KDA on Ascend 310P ( 𝐻 = 32). 
+
+7.5 Peak Device Memory 
+
+Figure 16 evaluates the kernel-level peak device memory footprint during forward execution. By maximizing on-core residency and eliminating transient GM intermediates, HA-NPU’s head-level fusion bounds the peak memory strictly below all baselines. Specifically, compared with FLA, HA-NPU reduces peak memory by 31 .7–52 .6% for GDN and 38 .7–54 .6% for KDA. Compared with FlashQLA at 65,536 tokens, it saves 6.0% (GDN) and 22.8% (KDA). The larger KDA savings stem from FlashQLA’s GDN-centric design: its extra context-parallelism stage materializes a cumulative-gate tensor, which for KDA is 128 × larger than for GDN. HA-NPU naturally avoids this materialization via head-level fusion. 
+
+7.6 Memory Traffic and Matrix Utilization Memory Traffic. HA-NPU drastically curtails both global and on-core data movement (Figure 17(a)). Compared with FLA, it reduces GM traffic by 65 .5–84 .8% and L1-to-L0 trans-fers by 30 .5–46 .4%. Against FlashQLA, it cuts GM traffic by 21 .2–40 .8% and L1-to-L0 transfers by 39 .2–58 .4%. These dual savings stem directly from our co-design: head-level mapping keeps cross-stage intermediates on-core to slash GM traffic, while operator reordering eliminates redundant L1-to-L0 reloads via inter-GEMM operand reuse. The wider GM gap against FlashQLA on KDA reconfirms the structural overhead of its inter-kernel tensor materialization. 
+
+Matrix Utilization. HA-NPU eliminates redundant compu-tations through operator rewriting, reducing Matrix MACs 0246    
+
+> GDN
+> 5.46 1.91 1.45 1.23
+> KDA
+> 6.38 2.02 1.63 1.44
+> Latency (ms)  FLA FLA + Mapping FLA + Mapping + Reordering FLA + Mapping + Reordering + Layout
+
+Figure 18. Ablation study of HA-NPU on Ascend 310P ( 𝑇 =
+
+1,024; 𝐻 = 16). (e.g., by 17 .5% and 12 .9% versus FLA and FlashQLA for 4,096-token GDN). Despite executing fewer MACs, it achieves 5.33–7 .27% Matrix utilization for GDN and 4 .27–6 .38% for KDA, outperforming FLA by up to 5 .24 × and FlashQLA by up to 1 .74 × (Figure 17(b)). This dual advantage indicates that our localized execution and optimized layouts reduce data-movement overhead and improve Matrix-unit utilization. 
+
+7.7 Ablation Study 
+
+We conduct a breakdown analysis of HA-NPU’s techniques (Figure 18). Three techniques are represented by Mapping (§ 4), Reordering (§ 5), and Layout (§ 6). We observe that all three techniques contribute significantly and cu-mulatively to overall performance. Specifically, starting from FLA, we progressively enable each optimization: First, 
+
+head-level mapping yields the largest initial speedups (2 .86 ×
+
+for GDN and 3 .15 × for KDA) by minimizing cross-operator global memory transfers while utilizing compute cores. Next, 
+
+lifetime-aware operator reordering further cuts latency by 23.8% and 19.7% by shortening tensor lifetimes to maximize on-core reuse. Finally, dataflow layout planning trims the remaining latency by 15.1% and 11.2% by balancing layout efficiency against transformation overheads. 
+
+## 8 Related Work 
+
+LLM Inference on Edge NPUs. Leveraging NPU efficiency [10, 11, 26, 27], recent studies actively optimize on-device LLM/VLM inference [9, 12, 15, 16, 34, 35, 37, 40, 41, 59– 62, 68, 71]. Key optimizations include llm.npu ’s fixed-size chunking for static graphs [61], PowerInfer-2 ’s CPU-NPU pipelining to overlap weight loading [62], ShadowNPU ’s sparsity-guided token selection [68], and T-MAN ’s table-lookup low-bit inference [59]. While these works target stan-dard dense or sparse architectures, HA-NPU bridges this gap by co-designing the emerging LA dataflow specifically for edge NPUs. 
+
+Linear Attention in LLMs. Recent works optimize linear attention’s memory mechanisms, boosting accuracy while re-taining linear complexity through fixed-size recurrent states [2, 4, 17, 28, 29, 43, 51, 54, 63–65, 72]. Specifically, while 
+
+RetNet and GLA introduce temporal decay to control mem-ory retention [54, 64], DeltaNet , GDN , and KDA enhance 
+
+> 12
+
+Empowering Hybrid Attention Models on NPUs 
+
+state updates through error-correcting delta rules and fine-grained gating [29, 51, 63, 65]. These LA variants, particu-larly GDN and KDA, underpin practical hybrid LLMs such as Qwen3.5 [46], Kimi K3 [30], and GLM-5.3-Flash [56]. 
+
+Linear Attention on GPU/NPU. Recent works make LA practical via optimized kernels and runtime support [6, 8, 42]. On GPUs, frameworks like llama.cpp [33], FLA [64, 66], and FlashQLA [70] accelerate LA via chunkwise parallelism, enhanced concurrency, and warp specialization. For NPUs, basic execution paths in vLLM-Ascend [55] and SGLang [52] or ported GPU designs fail to exploit memory-constrained edge devices. HA-NPU unlocks this potential by co-designing LA execution with edge NPU hardware. 
+
+## 9 Conclusion 
+
+This paper presents HA-NPU, a memory-efficient LA in-ference system for edge NPUs that reduces prefill latency and energy consumption. HA-NPU integrates head-level mapping, lifetime-aware operator reordering, and layout planning to improve data locality. Extensive experiments on GDN and KDA demonstrate its effectiveness, achieving up to 2.03 × end-to-end speedup and 48 .0% lower device energy. 
+
+## References 
+
+[1] Byung Hoon Ahn, Jinwon Lee, Jamie Menjay Lin, Hsin-Pai Cheng, Jilei Hou, and Hadi Esmaeilzadeh. 2020. Ordering Chaos: Memory-Aware Scheduling of Irregularly Wired Neural Networks for Edge Devices. In Proceedings of Machine Learning and Sys-tems , I. Dhillon, D. Papailiopoulos, and V. Sze (Eds.), Vol. 2. 44–57. https://proceedings.mlsys.org/paper_files/paper/2020/file/ 79c36fe64e04b80fc44845bb9fe73242-Paper.pdf 
+
+[2] Yaroslav Aksenov, Nikita Balagansky, Sofia Lo Cicero Vaina, Boris Shaposhnikov, Alexey Gorbatovski, and Daniil Gavrilov. 2024. Linear Transformers with Learnable Kernel Functions are Better In-Context Models. In Proceedings of the 62nd Annual Meeting of the Association for Computational Linguistics (Volume 1: Long Papers) . Association for Computational Linguistics, Bangkok, Thailand, 9584–9597. https: //doi.org/10.18653/v1/2024.acl-long.518 
+
+[3] Arcee AI. 2025. AFM-4.5B-Base-KDA-NoPE. Hugging Face model card. Retrieved September 25, 2026 from https://huggingface.co/arcee-ai/AFM-4.5B-Base-KDA-NoPE 
+
+[4] Simran Arora, Sabri Eyuboglu, Michael Zhang, Aman Timalsina, Silas Alberti, James Zou, Atri Rudra, and Christopher Ré. 2024. Simple Linear Attention Language Models Balance the Recall-Throughput Tradeoff. In Proceedings of the 41st International Conference on Machine Learning (Proceedings of Machine Learning Research, Vol. 235) . PMLR, 1763–1840. https://proceedings.mlr.press/v235/arora24a.html 
+
+[5] Ascend Community. 2026. TorchNPU: PyTorch Adapter Plugin for Ascend NPU. Software. Retrieved September 24, 2026 from https: //github.com/Ascend/pytorch 
+
+[6] Maximilian Beck, Korbinian Pöppel, Phillip Lippe, and Sepp Hochreiter. 2025. Tiled Flash Linear Attention: More Efficient Linear RNN and xLSTM Kernels. In Advances in Neural Information Processing Systems ,Vol. 38. 83630–83685. https://doi.org/10.52202/085713-2522 
+
+[7] Beijing Tsingetech Co., Ltd. 2025. HD300I-DK Ascend 310P De-velopment Kit Datasheet. Product datasheet. Retrieved Septem-ber 25, 2026 from https://www.tsingetech.com/Public/upload/image/ 20251119/1763549712.pdf 
+
+[8] Feiyang Chen, Yu Cheng, Lei Wang, Yuqing Xia, Ziming Miao, Lingx-iao Ma, Fan Yang, Jilong Xue, Zhi Yang, Mao Yang, Xingda Wei, and Haibo Chen. 2026. MetaAttention: A Unified and Performant Atten-tion Framework across Hardware Backends. In Proceedings of the 31st ACM SIGPLAN Annual Symposium on Principles and Practice of Parallel Programming (PPoPP ’26) . Association for Computing Machinery, New York, NY, USA, 635–647. https://doi.org/10.1145/3774934.3786444 
+
+[9] Le Chen, Dahu Feng, Erhu Feng, Yingrui Wang, Rong Zhao, Yubin Xia, Pinjie Xu, and Haibo Chen. 2025. Characterizing Mobile SoC for Accelerating Heterogeneous LLM Inference. In Proceedings of the ACM SIGOPS 31st Symposium on Operating Systems Principles (SOSP ’25) . Association for Computing Machinery, 359–374. https://doi.org/ 10.1145/3731569.3764808 
+
+[10] Tianshi Chen, Zidong Du, Ninghui Sun, Jia Wang, Chengyong Wu, Yunji Chen, and Olivier Temam. 2014. DianNao: A Small-Footprint High-Throughput Accelerator for Ubiquitous Machine-Learning. In 
+
+Proceedings of the 19th International Conference on Architectural Sup-port for Programming Languages and Operating Systems (ASPLOS ’14) .Association for Computing Machinery, New York, NY, USA, 269–284. 
+
+https://doi.org/10.1145/2541940.2541967 
+
+[11] Yunji Chen, Tao Luo, Shaoli Liu, Shijin Zhang, Liqiang He, Jia Wang, Ling Li, Tianshi Chen, Zhiwei Xu, Ninghui Sun, and Olivier Temam. 2014. DaDianNao: A Machine-Learning Supercomputer. In 2014 47th Annual IEEE/ACM International Symposium on Microarchitecture (MI-CRO ’14) . IEEE, Piscataway, NJ, USA, 609–622. https://doi.org/10.1109/ MICRO.2014.58 
+
+[12] Zhiyang Chen, Daliang Xu, Haiyang Shen, Chiheng Lou, Mengwei Xu, Shangguang Wang, Xin Jin, and Yun Ma. 2025. Accelerating Mobile Language Model via Speculative Decoding and NPU-Coordinated Execution. arXiv preprint arXiv:2510.15312 (2025). https://doi.org/10. 48550/arXiv.2510.15312 
+
+[13] Xinhao Cheng, Zhihao Zhang, Yu Zhou, Jianan Ji, Jinchen Jiang, Zepeng Zhao, Ziruo Xiao, Zihao Ye, Yingyi Huang, Ruihang Lai, Hongyi Jin, Bohan Hou, Mengdi Wu, Yixin Dong, Anthony Yip, Zihao Ye, Songting Wang, Wenqin Yang, Xupeng Miao, Tianqi Chen, and Zhihao Jia. 2026. MPK: A Compiler and Runtime for Mega-Kernelizing Tensor Programs. In 20th USENIX Symposium on Operating Systems De-sign and Implementation (OSDI ’26) . USENIX Association, Seattle, WA, 1909–1926. https://www.usenix.org/conference/osdi26/presentation/ cheng 
+
+[14] Tri Dao, Daniel Y. Fu, Stefano Ermon, Atri Rudra, and Christopher Ré. 2022. FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness. In Advances in Neural Information Processing Systems ,Vol. 35. 16344–16359. [15] Google AI Edge Team. 2026. LiteRT-LM. Software. Retrieved Septem-ber 17, 2026 from https://github.com/google-ai-edge/LiteRT-LM 
+
+[16] Zixu Hao, Jianyu Wei, Tuowei Wang, Minxing Huang, Huiqiang Jiang, Shiqi Jiang, Ting Cao, and Ju Ren. 2026. Scaling LLM Test-Time Compute with Mobile NPU on Smartphones. In Proceedings of the Twenty-First European Conference on Computer Systems (EuroSys ’26) .Association for Computing Machinery, 2157–2172. https://doi.org/10. 1145/3767295.3769382 
+
+[17] Ali Hatamizadeh, Yejin Choi, and Jan Kautz. 2026. Gated DeltaNet-2: Decoupling Erase and Write in Linear Attention. arXiv preprint arXiv:2605.22791 (2026). https://doi.org/10.48550/arXiv.2605.22791 
+
+[18] Hazy Research. 2025. Megakernels. Software. Retrieved September 25, 2026 from https://github.com/HazyResearch/Megakernels 
+
+[19] Huawei Technologies Co., Ltd. 2025. Atlas 200I A2 Ac-celeration Module Specifications. Ascend product doc-umentation. Retrieved September 25, 2026 from https: //www.hiascend.com/document/detail/zh/Atlas%20200I%20A2/ 2520/intro/userguide/topic_0000002449785465.html 
+
+[20] Huawei Technologies Co., Ltd. 2025. CANN Opens Up: Unlocking Innovation Paradigms and Defining an Intelligent Future. Official 13 Yinyuan Zhang et al. 
+
+technical article (in Chinese). Retrieved September 25, 2026 from 
+
+https://www.hiascend.com/developer/techArticles/20250527-1 
+
+[21] Huawei Technologies Co., Ltd. 2026. Ascend C Operator Development Guide (CANN Community Edition 8.5.0, Document 01 ed.). Huawei Technologies Co., Ltd. [22] inclusionAI. 2026. Ling-3.0-tiny. Hugging Face model card. Retrieved September 25, 2026 from https://huggingface.co/inclusionAI/Ling-3.0-tiny 
+
+[23] Intel Corporation. 2024. Intel NPU Acceleration Library. Retrieved September 25, 2026 from https://intel.github.io/intel-npu-acceleration-library/npu.html 
+
+[24] Andrei Ivanov, Nikoli Dryden, Tal Ben-Nun, Shigang Li, and Torsten Hoefler. 2021. Data Movement Is All You Need: A Case Study on Optimizing Transformers. In Proceedings of Machine Learning and Systems , Alex Smola, Alex Dimakis, and Ion Stoica (Eds.), Vol. 3. 711–732. https://proceedings.mlsys.org/paper_files/paper/2021/file/ bc86e95606a6392f51f95a8de106728d-Paper.pdf 
+
+[25] Mandar Joshi, Eunsol Choi, Daniel Weld, and Luke Zettlemoyer. 2017. TriviaQA: A Large Scale Distantly Supervised Challenge Dataset for Reading Comprehension. In Proceedings of the 55th Annual Meeting of the Association for Computational Linguistics (Volume 1: Long Papers) .Association for Computational Linguistics, Vancouver, Canada, 1601– 1611. https://doi.org/10.18653/v1/P17-1147 
+
+[26] Norm Jouppi, George Kurian, Sheng Li, Peter Ma, Rahul Nagarajan, Lifeng Nai, Nishant Patil, Suvinay Subramanian, Andy Swing, Brian Towles, Clifford Young, Xiang Zhou, Zongwei Zhou, and David A. Patterson. 2023. TPU v4: An Optically Reconfigurable Supercomputer for Machine Learning with Hardware Support for Embeddings. In 
+
+Proceedings of the 50th Annual International Symposium on Computer Architecture (ISCA ’23) . Association for Computing Machinery, New York, NY, USA, 1–14. https://doi.org/10.1145/3579371.3589350 
+
+[27] Norman P. Jouppi, Cliff Young, Nishant Patil, David Patterson, Gau-rav Agrawal, Raminder Bajwa, Sarah Bates, Suresh Bhatia, Nan Bo-den, Al Borchers, Rick Boyle, Pierre-luc Cantin, Clifford Chao, Chris Clark, Jeremy Coriell, Mike Daley, Matt Dau, Jeffrey Dean, Ben Gelb, Tara Vazir Ghaemmaghami, Rajendra Gottipati, William Gulland, Robert Hagmann, C. Richard Ho, Doug Hogberg, John Hu, Robert Hundt, Dan Hurt, Julian Ibarz, Aaron Jaffey, Alek Jaworski, Alexan-der Kaplan, Harshit Khaitan, Daniel Killebrew, Andy Koch, Naveen Kumar, Steve Lacy, James Laudon, James Law, Diemthu Le, Chris Leary, Zhuyuan Liu, Kyle Lucke, Alan Lundin, Gordon MacKean, Adri-ana Maggiore, Maire Mahony, Kieran Miller, Rahul Nagarajan, Ravi Narayanaswami, Ray Ni, Kathy Nix, Thomas Norrie, Mark Omer-nick, Narayana Penukonda, Andy Phelps, Jonathan Ross, Matt Ross, Amir Salek, Emad Samadiani, Chris Severn, Gregory Sizikov, Matthew Snelham, Jed Souter, Dan Steinberg, Andy Swing, Mercedes Tan, Gre-gory Thorson, Bo Tian, Horia Toma, Erick Tuttle, Vijay Vasudevan, Richard Walter, Walter Wang, Eric Wilcox, and Doe Hyun Yoon. 2017. In-Datacenter Performance Analysis of a Tensor Processing Unit. In 
+
+Proceedings of the 44th Annual International Symposium on Computer Architecture (ISCA ’17) . Association for Computing Machinery, New York, NY, USA, 1–12. https://doi.org/10.1145/3079856.3080246 
+
+[28] Angelos Katharopoulos, Apoorv Vyas, Nikolaos Pappas, and François Fleuret. 2020. Transformers are RNNs: Fast Autoregressive Trans-formers with Linear Attention. In Proceedings of the 37th International Conference on Machine Learning (Proceedings of Machine Learning Re-search, Vol. 119) . PMLR, 5156–5165. https://proceedings.mlr.press/ v119/katharopoulos20a.html 
+
+[29] Kimi Team. 2025. Kimi Linear: An Expressive, Efficient Attention Architecture. arXiv preprint arXiv:2510.26692 (2025). https://doi.org/ 10.48550/arXiv.2510.26692 
+
+[30] Kimi Team. 2026. Kimi K3: Open Frontier Intelligence. arXiv preprint arXiv:2607.24653 (2026). https://arxiv.org/abs/2607.24653 
+
+[31] Woosuk Kwon, Zhuohan Li, Siyuan Zhuang, Ying Sheng, Lianmin Zheng, Cody Hao Yu, Joseph E. Gonzalez, Hao Zhang, and Ion Stoica. 2023. Efficient Memory Management for Large Language Model Serving with PagedAttention. In Proceedings of the 29th Symposium on Operating Systems Principles (SOSP ’23) . Association for Computing Machinery, 611–626. https://doi.org/10.1145/3600006.3613165 
+
+[32] Yizhi Liu, Yao Wang, Ruofei Yu, Mu Li, Vin Sharma, and Yida Wang. 2019. Optimizing CNN Model Inference on CPUs. In 2019 USENIX An-nual Technical Conference (ATC ’19) . USENIX Association, Renton, WA, 1025–1040. https://www.usenix.org/conference/atc19/presentation/ liu-yizhi 
+
+[33] llama.cpp Contributors. 2026. llama.cpp: Gated DeltaNet Execution. Source code. Retrieved September 25, 2026 from https://github.com/ ggml-org/llama.cpp/blob/master/src/models/delta-net-base.cpp 
+
+[34] Xudong Lu, Yinghao Chen, Cheng Chen, Hui Tan, Boheng Chen, Yina Xie, Rui Hu, Guanxin Tan, Renshou Wu, Yan Hu, Yi Zeng, Lei Wu, Liuyang Bian, Zhaoxiong Wang, Long Liu, Yanzhou Yang, Han Xiao, Aojun Zhou, Yafei Wen, Xiaoxin Chen, Shuai Ren, and Hongsheng Li. 2025. BlueLM-V-3B: Algorithm and System Co-Design for Multimodal Large Language Models on Mobile Devices. In Proceedings of the Computer Vision and Pattern Recognition Conference (CVPR) .4145–4155. https://openaccess.thecvf.com/content/CVPR2025/ html/Lu_BlueLM-V-3B_Algorithm_and_System_Co-Design_for_ Multimodal_Large_Language_Models_CVPR_2025_paper.html 
+
+[35] Xudong Lu, Yinghao Chen, Renshou Wu, Haohao Gao, Xi Chen, Xue Yang, Xiangyu Zhao, Aojun Zhou, Fangyuan Li, Yafei Wen, Xiaoxin Chen, Shuai Ren, and Hongsheng Li. 2025. GenieBlue: Integrating both Linguistic and Multimodal Capabilities for Large Language Models on Mobile Devices. In Proceedings of the IEEE/CVF International Conference on Computer Vision (ICCV) .4198–4210. https://openaccess.thecvf.com/content/ICCV2025/html/ Lu_GenieBlue_Integrating_both_Linguistic_and_Multimodal_ Capabilities_for_Large_Language_ICCV_2025_paper.html 
+
+[36] Eric Mahurin. 2023. Qualcomm Hexagon NPU. In 2023 IEEE Hot Chips 35 Symposium (HCS) . IEEE, 1–19. https: //www.hc2023.hotchips.org/assets/program/conference/day2/ ML%20Inference/HC2023%20Qualcomm%20Hexagon%20NPU.pdf 
+
+[37] mllm Contributors. 2026. mllm: Fast Multimodal LLM on Mobile Devices. Software. Retrieved September 17, 2026 from https://github. com/UbiquitousLearning/mllm 
+
+[38] Wei Niu, Md Musfiqur Rahman Sanim, Zhihao Shu, Jiexiong Guan, Xipeng Shen, Miao Yin, Gagan Agrawal, and Bin Ren. 2024. SmartMem: Layout Transformation Elimination and Adaptation for Efficient DNN Execution on Mobile. In Proceedings of the 29th ACM International Conference on Architectural Support for Programming Languages and Operating Systems, Volume 3 (ASPLOS ’24) . Association for Computing Machinery, 916–931. https://doi.org/10.1145/3620666.3651384 
+
+[39] Orange Pi. 2024. OrangePi AIpro (20T) Hardware Specifications. Product documentation. Retrieved September 25, 2026 from https: //www.orangepi.org/html/hardWare/computerAndMicrocontrollers/ details/Orange-Pi-AIpro%2820t%29.html 
+
+[40] PowerServe Contributors. 2026. PowerServe: High-Speed and Easy-Use LLM Serving Framework for Local Deployment. Software. Retrieved September 17, 2026 from https://github.com/powerserve-project/PowerServe 
+
+[41] PyTorch Team. 2026. ExecuTorch. Software. Retrieved September 17, 2026 from https://github.com/pytorch/executorch 
+
+[42] Zhen Qin, Weigao Sun, Dong Li, Xuyang Shen, Weixuan Sun, and Yiran Zhong. 2024. Various Lengths, Constant Speed: Efficient Lan-guage Modeling with Lightning Attention. In Proceedings of the 41st International Conference on Machine Learning (Proceedings of Machine Learning Research, Vol. 235) . PMLR, 41517–41535. https: //proceedings.mlr.press/v235/qin24c.html 
+
+14 Empowering Hybrid Attention Models on NPUs 
+
+[43] Zhen Qin, Songlin Yang, Weixuan Sun, Xuyang Shen, Dong Li, Weigao Sun, and Yiran Zhong. 2024. HGRN2: Gated Linear RNNs with State Expansion. In First Conference on Language Modeling . https: //openreview.net/forum?id=y6SqbJfCSk 
+
+[44] Qwen Team. 2026. On the Design of Qwen3.8-Next Architecture: Eval-uation, Efficiency, and Training Stability . Technical Report. Alibaba Group. https://arxiv.org/abs/2608.30320 
+
+[45] Qwen Team. 2026. Qwen3.5-0.8B. Hugging Face model documen-tation. Retrieved September 25, 2026 from https://huggingface.co/ Qwen/Qwen3.5-0.8B 
+
+[46] Qwen Team. 2026. Qwen3.5-397B-A17B. Hugging Face model card. Re-trieved September 25, 2026 from https://huggingface.co/Qwen/Qwen3. 5-397B-A17B 
+
+[47] Qwen Team. 2026. Qwen3.5-4B. Hugging Face model documenta-tion. Retrieved September 25, 2026 from https://huggingface.co/ Qwen/Qwen3.5-4B 
+
+[48] Qwen Team. 2026. Qwen3.5 Model Collection. Hugging Face model collection. Retrieved September 25, 2026 from https://huggingface. co/collections/Qwen/qwen35 
+
+[49] Qwen Team. 2026. Qwen3.5: Towards Native Multimodal Agents. Retrieved September 25, 2026 from https://qwen.ai/blog?id=qwen3.5 
+
+[50] Alejandro Rico, Satyaprakash Pareek, Javier Cabezas, David Clarke, Baris Ozgul, Francisco Barat, Yao Fu, Stephan Münz, Dylan Stuart, Patrick Schlangen, Pedro Duarte, Sneha Date, Indrani Paul, Jian Weng, Sonal Santan, Vinod Kathail, Ashish Sirasao, and Juanjo Noguera. 2024. AMD XDNA NPU in Ryzen AI Processors. IEEE Micro 44, 6 (2024), 73–82. https://doi.org/10.1109/MM.2024.3423692 
+
+[51] Imanol Schlag, Kazuki Irie, and Jürgen Schmidhuber. 2021. Linear Transformers Are Secretly Fast Weight Programmers. In Proceedings of the 38th International Conference on Machine Learning (Proceedings of Machine Learning Research, Vol. 139) . PMLR, 9355–9366. https: //proceedings.mlr.press/v139/schlag21a.html 
+
+[52] SGLang Team. 2026. SGLang: Gated DeltaNet Kernels for Linear Attention. Source code. Retrieved September 25, 2026 from https://github.com/sgl-project/sglang/blob/main/python/ sglang/srt/layers/attention/linear/kernels/gdn_triton.py 
+
+[53] Yixin Song, Zeyu Mi, Haotong Xie, and Haibo Chen. 2024. PowerInfer: Fast Large Language Model Serving with a Consumer-grade GPU. In 
+
+Proceedings of the ACM SIGOPS 30th Symposium on Operating Systems Principles (SOSP ’24) . Association for Computing Machinery, New York, NY, USA, 590–606. https://doi.org/10.1145/3694715.3695964 
+
+[54] Yutao Sun, Li Dong, Shaohan Huang, Shuming Ma, Yuqing Xia, Jilong Xue, Jianyong Wang, and Furu Wei. 2023. Retentive Network: A Successor to Transformer for Large Language Models. arXiv preprint arXiv:2307.08621 (2023). https://arxiv.org/abs/2307.08621 
+
+[55] vLLM-Ascend Team. 2025. vLLM Ascend Plugin. Software. Retrieved September 25, 2026 from https://github.com/vllm-project/vllm-ascend 
+
+[56] vLLM Team. 2026. GLM-5.3-Flash: Architecture and Deployment. vLLM Recipes. Retrieved September 25, 2026 from https://recipes. vllm.ai/zai-org/GLM-5.3-Flash 
+
+[57] Yubo Wang, Xueguang Ma, Ge Zhang, Yuansheng Ni, Abhranil Chan-dra, Shiguang Guo, Weiming Ren, Aaran Arulraj, Xuan He, Ziyan Jiang, Tianle Li, Max Ku, Kai Wang, Alex Zhuang, Rongqi Fan, Xi-ang Yue, and Wenhu Chen. 2024. MMLU-Pro: A More Robust and Challenging Multi-Task Language Understanding Benchmark. In Ad-vances in Neural Information Processing Systems , Vol. 37. 95266–95290. 
+
+https://doi.org/10.52202/079017-3018 
+
+[58] Jianyu Wei, Shijie Cao, Ting Cao, Lingxiao Ma, Lei Wang, Yanyong Zhang, and Mao Yang. 2025. T-MAC: CPU Renaissance via Table Lookup for Low-Bit LLM Deployment on Edge. In Proceedings of the Twentieth European Conference on Computer Systems (EuroSys ’25) .Association for Computing Machinery, New York, NY, USA, 278–292. 
+
+https://doi.org/10.1145/3689031.3696099 
+
+[59] Jianyu Wei, Qingtao Li, Shijie Cao, Lingxiao Ma, Zixu Hao, Yanyong Zhang, Xiaoyan Hu, and Ting Cao. 2025. T-MAN: Enabling End-to-End Low-Bit LLM Inference on NPUs via Unified Table Lookup. arXiv preprint arXiv:2511.11248 (2025). https://doi.org/10.48550/arXiv.2511. 11248 
+
+[60] Xinming Wei, Jiahao Zhang, Haoran Li, Jiayu Chen, Haoning Guan, Rui Qu, Maoliang Li, Xiang Chen, and Guojie Luo. 2026. Agent.xpu: Efficient Scheduling of Agentic LLM Workloads on Heterogeneous SoC. arXiv preprint arXiv:2506.24045 (2026). https://doi.org/10.48550/ arXiv.2506.24045 
+
+[61] Daliang Xu, Hao Zhang, Liming Yang, Ruiqi Liu, Gang Huang, Meng-wei Xu, and Xuanzhe Liu. 2025. Fast On-device LLM Inference with NPUs. In Proceedings of the 30th ACM International Conference on Architectural Support for Programming Languages and Operating Sys-tems, Volume 1 (ASPLOS ’25) . Association for Computing Machinery, 445–462. https://doi.org/10.1145/3669940.3707239 
+
+[62] Zhenliang Xue, Yixin Song, Zeyu Mi, Xinrui Zheng, Yubin Xia, and Haibo Chen. 2024. PowerInfer-2: Fast Large Language Model Inference on a Smartphone. arXiv preprint arXiv:2406.06282 (2024). https: //doi.org/10.48550/arXiv.2406.06282 
+
+[63] Songlin Yang, Jan Kautz, and Ali Hatamizadeh. 2025. Gated Delta Networks: Improving Mamba2 with Delta Rule. In The Thirteenth In-ternational Conference on Learning Representations . https://openreview. net/forum?id=r8H7xhYPwz 
+
+[64] Songlin Yang, Bailin Wang, Yikang Shen, Rameswar Panda, and Yoon Kim. 2024. Gated Linear Attention Transformers with Hardware-Efficient Training. In Proceedings of the 41st International Conference on Machine Learning (Proceedings of Machine Learning Research, Vol. 235) .PMLR, Vienna, Austria, 56501–56523. https://proceedings.mlr.press/ v235/yang24ab.html 
+
+[65] Songlin Yang, Bailin Wang, Yu Zhang, Yikang Shen, and Yoon Kim. 2024. Parallelizing Linear Transformers with the Delta Rule over Se-quence Length. In Advances in Neural Information Processing Systems ,Vol. 37. 115491–115522. https://arxiv.org/abs/2406.06484 
+
+[66] Songlin Yang and Yu Zhang. 2024. FLA: A Triton-Based Library for Hardware-Efficient Implementations of Linear Attention Mechanism. Software. Retrieved September 25, 2026 from https://github.com/fla-org/flash-linear-attention 
+
+[67] Zhilin Yang, Peng Qi, Saizheng Zhang, Yoshua Bengio, William Cohen, Ruslan Salakhutdinov, and Christopher D. Manning. 2018. HotpotQA: A Dataset for Diverse, Explainable Multi-hop Question Answering. In Proceedings of the 2018 Conference on Empirical Methods in Natu-ral Language Processing . Association for Computational Linguistics, Brussels, Belgium, 2369–2380. https://doi.org/10.18653/v1/D18-1259 
+
+[68] Wangsong Yin, Daliang Xu, Mengwei Xu, Gang Huang, and Xuanzhe Liu. 2026. ShadowNPU: System and Algorithm Co-design for NPU-Centric On-Device LLM Inference. In Proceedings of the 24th Annual International Conference on Mobile Systems, Applications and Services (MobiSys ’26) . Association for Computing Machinery, 294–308. https: //doi.org/10.1145/3745756.3809205 
+
+[69] Xiang Yue, Yuansheng Ni, Kai Zhang, Tianyu Zheng, Ruoqi Liu, Ge Zhang, Samuel Stevens, Dongfu Jiang, Weiming Ren, Yuxuan Sun, Cong Wei, Botao Yu, Ruibin Yuan, Renliang Sun, Ming Yin, Boyuan Zheng, Zhenzhu Yang, Yibo Liu, Wenhao Huang, Huan Sun, Yu Su, and Wenhu Chen. 2024. MMMU: A Massive Multi-discipline Multimodal Understanding and Reason-ing Benchmark for Expert AGI. In Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition . 9556–9567. 
+
+https://openaccess.thecvf.com/content/CVPR2024/html/Yue_ MMMU_A_Massive_Multi-discipline_Multimodal_Understanding_ and_Reasoning_Benchmark_for_CVPR_2024_paper.html 
+
+[70] Chengruidong Zhang, Xi Lin, Huiqiang Jiang, Zekun Wang, Xiao Li, Yizhong Cao, Bohan Zhuang, Rui Men, Jianwei Zhang, Bo Zheng, Junyang Lin, Dayiheng Liu, and Jingren Zhou. 2026. FlashQLA: Flash 15 Yinyuan Zhang et al. 
+
+Qwen Linear Attention. Software. Retrieved September 25, 2026 from 
+
+https://github.com/QwenLM/FlashQLA 
+
+[71] Yinyuan Zhang, Daliang Xu, Zhiyang Chen, Chenghua Wang, Ying Zhang, Mengwei Xu, and Gang Huang. 2026. VLMCache: Efficient On-Device Vision-Language Model Inference. In Proceedings of the 24th Annual International Conference on Mobile Systems, Applications and Services (MobiSys ’26) . Association for Computing Machinery, 854–867. https://doi.org/10.1145/3745756.3809243 
+
+[72] Yu Zhang, Songlin Yang, Ruijie Zhu, Yue Zhang, Leyang Cui, Yiqiao Wang, Bolun Wang, Freda Shi, Bailin Wang, Wei Bi, Peng Zhou, and Guohong Fu. 2024. Gated Slot Attention for Efficient Linear-Time Sequence Modeling. In Advances in Neural Information Processing Systems , Vol. 37. Curran Associates, Inc., 116870–116898. https://doi. org/10.52202/079017-3710 
+
+[73] Yuhang Zhou, Zhibin Wang, Guyue Liu, Shipeng Li, Xi Lin, Zibo Wang, Yongzhong Wang, Fuchun Wei, Jingyi Zhang, Zhiheng Hu, Yanlin Liu, Chunsheng Li, Ziyang Zhang, Yaoyuan Wang, Bin Zhou, Wanchun Dou, Guihai Chen, and Chen Tian. 2025. Squeezing Operator Performance Potential for the Ascend Architecture. In Proceedings of the 30th ACM International Conference on Architectural Support for Programming Languages and Operating Systems, Volume 2 (ASPLOS ’25) . Association for Computing Machinery, 1156–1171. https://doi. org/10.1145/3676641.3716243 
+
+16

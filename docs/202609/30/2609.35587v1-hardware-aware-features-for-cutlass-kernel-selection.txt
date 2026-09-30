@@ -1,0 +1,1320 @@
+Title: Hardware-Aware Features for CUTLASS Kernel Selection
+
+URL Source: https://arxiv.org/pdf/2609.35587v1
+
+Published Time: Tue, 29 Sep 2026 03:56:50 GMT
+
+Number of Pages: 20
+
+Markdown Content:
+# Hardware-Aware Features for CUTLASS Kernel Selection 
+
+# Shriram Chandran ∗† 
+
+ETH Zurich Zurich, Switzerland 
+
+# Dominic Rinderer †
+
+ETH Zurich Zurich, Switzerland 
+
+# Yakup Budanaz 
+
+ETH Zurich Zurich, Switzerland 
+
+# Alexandru Calotoiu 
+
+ETH Zurich Zurich, Switzerland 
+
+# Marcin Copik 
+
+ETH Zurich Zurich, Switzerland 
+
+# Torsten Hoefler 
+
+ETH Zurich Zurich, Switzerland 
+
+## Abstract 
+
+GPU libraries such as CUTLASS expose tens of thousands of seman-tically equivalent kernels for a single operation, making exhaustive autotuning expensive and execution-free selection difficult. Exist-ing analytical selectors require hand-designed performance rules, while learned selectors operate on raw configuration parameters and must infer hardware consequences from data. We introduce a hardware-aware representation for CUTLASS kernel selection that augments candidate configurations with statically computable estimates of induced hardware behavior. We construct a dataset of 4.9 million CUTLASS kernels and train gradient-boosted and neural learning-to-rank models to rank candidates within each prob-lem. On held-out exhaustive evaluation problems, hardware-aware representations reduce selection regret by up to 40% relative to structural baselines and 64 .2% relative to NVIDIA’s matrix-multiply heuristics. We further evaluate data-efficient cross-precision and epilogue-fusion transfer within CUTLASS GEMM, showing that explicitly representing candidate-induced hardware behavior pro-vides a useful inductive bias for learned kernel selection. 
+
+## 1 Introduction 
+
+Modern GPU libraries expose increasingly large spaces of imple-mentations for a single operation. CUTLASS [21] is a particularly expressive instance of this problem – a CUTLASS GEMM may be implemented in over sixty thousand ways using different tile shapes, instruction shapes, pipeline depths, schedules, cluster configura-tions, tile schedulers, and epilogue implementations, interacting non-trivially with the problem dimensions, layouts, data types, accumulation types, and target architecture [20]. The best configu-ration is determined by the interaction of these effects rather than by any one parameter in isolation. This flexibility is valuable to kernel developers, but it also creates a very large configuration space. Selecting an efficient implementation is therefore a central requirement for achieving near-peak performance on contemporary accelerators [4]. Empirical autotuning, by compiling and bench-marking candidate kernels, is expensive [1, 3, 19]. Compilation and measurement must be repeated for each target GPU, datatype, epi-logue, and problem shape. Empirical selection becomes impossible when a library requires several different GEMM shapes or must make selections dynamically. This motivates selectors that can rank candidates without executing them [3]. Existing execution-free selectors follow two main approaches. Analytical methods encode manually designed performance rules,    
+
+> †Equal contribution. ∗Corresponding author.
+
+such as preferences for tile sizes, occupancy limits, or wave quanti-zation based on the problem instance [19, 26]. These methods are fast but brittle, require substantial architecture-specific knowledge for development, and must be updated as hardware and kernel libraries evolve. Learned autotuners [16, 25] reduce the need for manual rules, but typically represent candidates using raw problem dimensions and template parameters, leaving the model to then infer how those parameters affect hardware behaviour. Thus, raw parameters are a poor description of these effects. We propose hardware-aware representations for kernel selec-tion. Each candidate is represented using its structural configuration together with inexpensive estimates of its induced hardware be-haviour. We construct a 4.9M-kernel training corpus, train ranking models, score the entire valid catalogue at inference, and obtain 6.2% mean selection regret, compared with 17% for nvMMH (nvMat-mulHeuristics, NVIDIA’s matrix multiply heuristics library), and 71.5% for random selection – a 64.2% and 91.3% relative reduction in selection regret, respectively. Our approach combines the strengths of analytical selectors and measurement-driven learning: hardware behavior is exposed ex-plicitly through static, mechanistic features, while the model learns how these effects interact from measured data rather than relying on a hand-written performance model. This gives the selector the best of both worlds: strong architectural inductive bias without brittle decision rules, and data-driven adaptability without forcing the model to rediscover hardware behavior from raw parameters. As a result, the same representation supports accurate selection, improved data efficiency, and transfer across related kernel spaces, establishing hardware-aware feature design as a practical founda-tion for learned performance modeling on modern accelerators. 
+
+## 2 Background 2.1 GPU Execution Model 
+
+An NVIDIA GPU consists of many streaming multiprocessors (SMs), each containing the compute units and on-chip storage used for execution. A kernel launches a grid of thread blocks, and each block is assigned to an SM independently. Threads within a block execute in groups of 32 called warps. Warps can cooperate through on-chip shared memory and synchronization, while registers are private to individual threads. The output of a kernel is therefore determined not only by the arithmetic performed, but also by how work, data, and synchronization are distributed across threads, warps, blocks, and the memory hierarchy. For GEMM, the main data movement path is from global mem-ory through shared memory to registers. A thread block typically loads tiles of the input matrices into shared memory, computes on 
+
+> 1arXiv:2609.35587v1 [cs.LG] 28 Sep 2026 Shriram Chandran ∗† , Dominic Rinderer †, Yakup Budanaz, Alexandru Calotoiu, Marcin Copik, and Torsten Hoefler
+
+those tiles using registers as accumulators, and eventually stores its output tile back to global memory. Shared memory provides lower-latency reuse within a block, while the L2 cache and device memory serve data shared across blocks and data that does not fit on chip. The amount of work and data assigned to a block de-termines its arithmetic intensity, memory traffic, shared-memory footprint, register usage, and ability to keep the SM occupied. Only a limited number of blocks can reside on an SM at once. This limit is determined by the block’s register and shared-memory requirements, its thread count, and architectural limits on blocks and warps. Higher residency can help hide memory and instruction latency, but increasing the amount of work assigned to a block often increases resource usage and can reduce the number of simultane-ously resident blocks. Consequently, the best GEMM configuration must balance reuse and computational efficiency against resource pressure. 
+
+## 2.2 Hopper Execution Mechanisms 
+
+Our primary evaluation targets NVIDIA Hopper GPUs, whose SM90a architecture introduces several mechanisms that substan-tially affect GEMM performance [12]. Hopper tensor-core oper-ations are issued using warpgroup matrix multiply-accumulate (WGMMA) instructions, comprising four consecutive warps, or 128 threads, cooperating to issue an asynchronous matrix opera-tion. The instruction shape and warpgroup organization impose further constraints on the tile shapes that a kernel can use. Hop-per also provides the Tensor Memory Accelerator (TMA), which asynchronously transfers multidimensional tensor regions between global memory and shared memory, saving several individual thread address computations and data loads. TMA and WGMMA enable warp-specialized pipelines [18], where different warps assume different duties. Producer warps issue asyn-chronous TMA transfers, while consumer warpgroups perform WGMMA on previously loaded tiles. The shared-memory buffer is divided into a multi-stage pipeline, allowing memory movement to run ahead of computation. Increasing the number of stages can hide transfer latency but increase shared-memory consumption. Hopper additionally supports thread-block clusters, which can cooperate through distributed shared memory, or through TMA multicast which can deliver the same data to multiple blocks. Clus-ters can reduce memory traffic but impose scheduling and residency constraints. Whether clustering is beneficial therefore depends on the problem shape, tile decomposition, and resource requirements of the candidate kernel. These mechanisms make the relationship between a CUTLASS configuration and hardware performance highly indirect. A config-uration parameter such as pipeline depth, schedule, or cluster shape changes several hardware-level properties simultaneously. The re-sulting effects cannot generally be inferred from the parameter value alone. 
+
+## 2.3 GEMM Tiling and CUTLASS 
+
+We consider the general matrix multiplication 𝐶 = 𝛼𝐴𝐵 +𝛽𝐶, where 
+
+𝐴 ∈ R𝑀 ×𝐾 , 𝐵 ∈ R𝐾 ×𝑁 , and 𝐶 ∈ R𝑀 ×𝑁 . The operation performs HBM Global Memory 
+
+Tensor Memory Accelerator 
+
+Thread Block 
+
+Cluster 
+
+Thread Block 1 
+
+> (SM 1)
+
+Thread Block 0 
+
+> (SM 0)
+
+Consumer 
+
+Warp Group 0  
+
+> 4 warps · 128 threads
+> Tensor
+> Cores Registers
+
+Consumer 
+
+Warp Group 1  
+
+> 4 warps · 128 threads
+> Tensor
+> Cores Registers
+
+Shared Memory 
+
+> warp-group
+> matrix multiply
+> warp-group
+> matrix multiply
+
+Producer Warp 
+
+> 32 threads
+> distributed
+> shared memory
+> multicast
+
+Figure 1: H100 Programming Model 
+
+(2 𝑀𝑁 𝐾 ) floating-point operations. A GPU implementation parti-tions 𝐶 into output tiles. A thread block computes one or more such tiles by iterating over the reduction dimension in chunks. A candidate configuration is characterized primarily by a tile shape (𝑇 𝑀 ,𝑇 𝑁 ,𝑇 𝐾 ). The first two dimensions determine the tile computed by a block, while 𝑇 𝐾 determines the amount of the re-duction processed in one mainloop iteration. Each iteration loads an 𝑇 𝑀 × 𝑇 𝐾 tile of 𝐴 and a 𝑇 𝐾 × 𝑇 𝑁 tile of 𝐵 , performs a matrix multiply-accumulate, and advances to the next 𝐾 -tile. The number of iterations is thus ⌈𝐾 /𝑇 𝐾 ⌉. The tile shape therefore affects the number of output tiles, boundary tile waste, effective arithmetic intensity, memory traffic, shared-memory and register usage, and the number of mainloop iterations. For one shape, our BF16 enumer-ator exposes 534 ,600 raw combinations per layout before validity filtering, and 2 ,138 ,400 kernels throughout. CUTLASS builds GEMM kernels by composing reusable main-loop and epilogue components. The mainloop loads input tiles and performs the matrix multiplication, while the epilogue applies op-erations such as scaling, bias addition, activation, residual addition, type conversion, and the final store. CUTLASS exposes all aforemen-tioned configurations as template parameters, and these choices are coupled – for e.g., a larger tile may increase data reuse but increase register and shared-memory usage. More pipeline stages can make 
+
+> 2
+
+Hardware-Aware Features for CUTLASS Kernel Selection 
+
+the pipeline more efficient, but consume additional resources and re-duce occupancy. A schedule may require a particular tile divisibility or warpgroup arrangement. Clusters may reduce redundant loads while limiting which blocks can be resident together. Epilogues add their own computation, memory traffic, and resource require-ments, and can change which mainloop configuration is best. Not every combination of choices produces a valid kernel. CUTLASS implicitly imposes architectural and implementation constraints on several of the parameters. The valid candidate set is therefore a tiny constrained subset of the cartesian product of the parameters. Static CUTLASS legality and shared-memory checks retain around 11 .36%, leaving a catalogue of around 61 ,000 per layout (243 ,000 throughout), on the basis of which the selector must therefore rank candidates. The configuration does not directly specify performance – mak-ing selecting an efficient candidate from this valid set highly non-trivial. On a GH200, measured CUTLASS throughputs on BF16 GEMMs in our sweep span 0 .01–763 Tflop/s depending on prob-lem size and configuration. For one given GEMM shape and data layout, the empirical best and worst valid kernels can differ by a factor of 1 ,070 × in throughput (median across 68 evaluated groups; 3.9 million measured pairs), a uniform random pick achieves only 28 .5% of the in-group oracle on average, and choosing a static best configuration only 71%. Less than 2 .4% of configurations get per-formance within 5% of the best kernel on average. Mis-selection is therefore not a rounding error; it can waste most of the hard-ware budget on every GEMM in a compiled program. Exhaustively compiling and benchmarking the full catalogue is impractical at scale: our evaluation set contains only 17 shapes, yet requires a benchmarking sweep over the 3 .9 million distinct (kernel, shape) GPU measurements (68 unique groups, up to 61 ,000 candidates per group). Compiling the heavily templated configuration catalogue once alone costs on the order of hours of CPU time even before any GPU benchmarking begins. 
+
+## 2.4 A Generated Kernel                                                                                                                                                                           
+
+> 1// ... unrelated generated boilerplate omitted ( includes , CUDA / CUTLASS checks ) ...
+> 23// Config : cutlass3x_sm90_tensorop_bf16_bf16_f32_bf16_bf16_
+> 4// 128 x128x64_1x1x1_4_tnn_align64_warpspecialized_epi_tma
+> 56namespace Kernel_0 {
+> 78using ElementA =cutlass :: bfloat16_t ;
+> 9using LayoutATag =cutlass :: layout :: RowMajor ;
+> 10 constexpr int AlignmentA =64;
+> 11 12 using ElementB =cutlass :: bfloat16_t ;
+> 13 using LayoutBTag =cutlass :: layout :: ColumnMajor ;
+> 14 constexpr int AlignmentB =64;
+> 15 16 using ElementD =cutlass :: bfloat16_t ;
+> 17 using ElementC =cutlass :: bfloat16_t ;
+> 18 using LayoutCTag =cutlass :: layout :: ColumnMajor ;
+> 19 using LayoutDTag =cutlass :: layout :: ColumnMajor ;
+> 20 constexpr int AlignmentD =64;
+> 21 constexpr int AlignmentC =64;
+> 22 23 using ElementAccumulator =float ;
+> 24 using ElementCompute =float ;
+> 25 using ArchTag =cutlass :: arch :: Sm90 ;
+> 26 using OperatorClass =cutlass :: arch :: OpClassTensorOp ;
+> 27 28 using MmaTileShape =Shape < _128 , _128 , _64 >;
+> 29 using ClusterShape =Shape <_1 , _1 , _1 >;
+> 30 using StageCount =cutlass :: gemm :: collective :: StageCount <4 >;
+> 31 using TileSchedulerType =cutlass :: gemm :: PersistentScheduler ;
+> 32 33 using MainloopScheduleType =cutlass :: gemm :: KernelTmaWarpSpecialized ;
+> 34 using EpilogueScheduleType =cutlass :: epilogue :: TmaWarpSpecialized ;
+> 35 using EpilogueTile =cutlass :: epilogue :: collective :: EpilogueTileAuto ;
+> 36 37 using CollectiveEpilogue =typename cutlass :: epilogue :: collective :: CollectiveBuilder <
+> 38 ArchTag , OperatorClass ,
+> 39 MmaTileShape , ClusterShape ,
+> 40 EpilogueTile ,
+> 41 ElementAccumulator , ElementAccumulator ,
+> 42 ElementC , LayoutCTag , AlignmentC ,
+> 43 ElementD , LayoutDTag , AlignmentD ,
+> 44 EpilogueScheduleType
+> 45 >:: CollectiveOp ;
+> 46 47 using CollectiveMainloop =typename cutlass :: gemm :: collective :: CollectiveBuilder <
+> 48 ArchTag , OperatorClass ,
+> 49 ElementA , LayoutATag , AlignmentA ,
+> 50 ElementB , LayoutBTag , AlignmentB ,
+> 51 ElementAccumulator ,
+> 52 MmaTileShape , ClusterShape ,
+> 53 StageCount ,
+> 54 MainloopScheduleType
+> 55 >:: CollectiveOp ;
+> 56 57 using GemmKernel =cutlass :: gemm :: kernel :: GemmUniversal <
+> 58 Shape < int , int , int , int >,
+> 59 CollectiveMainloop ,
+> 60 CollectiveEpilogue ,
+> 61 TileSchedulerType >;
+> 62 63 using Gemm =cutlass :: gemm :: device :: GemmUniversalAdapter < GemmKernel >;
+> 64 }
+
+The snippet above is a representative CUTLASS kernel: BF16 operands with FP32 accumulation, tile 128 × 128 × 64, a 1 × 1 cluster, four mainloop pipeline stages, the plain TMA warp-specialized mainloop, a TMA warp-specialized epilogue, persistent tile schedul-ing, and the TN operand layout (A row-major, B column-major). The configuration name is recorded in the generated comment header. Reading top to bottom: ElementA/B/C and 
+
+ElementAccumulator fix the operand and accumulation types; LayoutA/B are the searched operand layouts while 
+
+LayoutC/D are always column-major in our generator (row-major 𝐶 is obtained offline via the transpose–swap identity 
+
+𝐶 ⊤ = 𝐵 ⊤𝐴 ⊤). AlignmentA/B/C are derived as 128 /sizeof(element) bytes of vectorization. ArchTag and OperatorClass pin the kernel to SM90 tensor-core WGMMA. MmaTileShape and 
+
+ClusterShape are the thread-block tile 𝑇 𝑀 × 𝑇 𝑁 × 𝑇 𝐾 and cluster 
+
+𝐶 𝑀 × 𝐶 𝑁 × 𝐶 𝐾 ; StageCount sets the software-pipelined mainloop depth. MainloopScheduleType , EpilogueScheduleType , and 
+
+TileSchedulerType select the Hopper TMA warp-specialized mainloop variant, epilogue implementation, and persistent vs. Stream-K tile scheduling. The two CollectiveBuilder aliases materialize epilogue and mainloop collectives; GemmKernel and 
+
+Gemm wrap them into a universal device GEMM. The setup excerpt shows the runtime path our benchmark uses: packed CuTe 
+
+3Shriram Chandran ∗† , Dominic Rinderer †, Yakup Budanaz, Alexandru Calotoiu, Marcin Copik, and Torsten Hoefler 
+
+Table 1: Configuration knobs exposed by the BF16 SM90 generator ( generate_search_space ).    
+
+> Knob Values / domain Meaning
+> tile_m
+
+{64 , 128 , 192 , 256 } Thread-block 𝑀 tile extent  
+
+> tile_n
+
+{16 , 32 , 48 , 64 , 80 , 96 , 128 , 192 , 256 } Thread-block 𝑁 tile extent  
+
+> tile_k
+
+{32 , 64 , 128 , 256 , 512 } Thread-block 𝐾 tile / pipeline atom  
+
+> stages
+
+{2, . . . , 12 } Mainloop pipeline stage count   
+
+> cluster_m ,cluster_n
+
+{1, 2, 4, 8, 16 }, 𝐶 𝑀 𝐶 𝑁 ≤ 16 CTA cluster shape in 𝑀 and 𝑁   
+
+> cluster_k fixed
+
+1 𝐾 -clustering not searched          
+
+> kernel_schedule WS / Pingpong / Cooperative TMA warp-specialized mainloop policy
+> epilogue_schedule NoSmem / TMA / TMA-Cooperative Epilogue store path
+> scheduler Persistent / Stream-K Tile scheduling across the output grid
+> layout TN, TT, NN, NT Operand layouts for
+
+𝐴 and 𝐵    
+
+> Fixed (not searched independently)
+> Operand / acc. types BF16 in, FP32 acc. (BF16 sweep) CUTLASS element aliases
+> alignment_*
+
+128 bit / element size TMA vectorization requirement 
+
+𝐶 /𝐷 layout ColumnMajor Row-major output via transpose trick       
+
+> ArchTag /OpClass Sm90 / TensorOp Target architecture
+> EpilogueTile EpilogueTileAuto Sub-tile shape chosen by CUTLASS
+
+Table 2: Static validity constraints for BF16 SM90 GEMM configurations.   
+
+> Constraint Reason Stream-K
+
+⇒ cooperative mainloop CUTLASS Stream-K scheduler requires the cooperative TMA mainloop. Cooperative mainloop ⇒ 𝑇 𝑀 ≡ 0 (mod 128 ) Two consumer warpgroups split the 𝑀 tile; each half must stay 64-row WGMMA aligned. 
+
+𝑆 mainloop + 𝑆 epi + 2 KiB ≤ 227 KiB Hopper shared-memory capacity per CTA; 𝑆 epi depends on epilogue schedule and tile via estimate_epilogue_smem_bytes .If 𝐴 is column-major: 𝑇 𝐾 ≤ 256 𝐶 𝑁 TMA smem box 𝐾 extent is multicast-split across the 𝑁 cluster dimension. If 𝐵 is row-major: 𝑇 𝐾 ≤ 256 𝐶 𝑀 Symmetric 𝐾 -box limit along the 𝑀 cluster dimension for the transposed operand. 
+
+strides, GemmUniversalMode::kGemm , alpha/beta epilogue scalars, a hardware-info struct, then can_implement and initialize 
+
+before timed run . Every generated source has essentially the same structure; the search space is formed by varying a small set of template/configuration choices while leaving the GEMM semantics unchanged. Table 1 lists the configuration space. 
+
+## 2.5 Configuration Space 
+
+For a fixed GEMM problem shape, BF16 precision, and operand-layout tag, the generator varies tile geometry, cluster shape, pipeline depth, mainloop and epilogue schedules, and the tile scheduler. Operand element types, accumulator type, architecture tag, opera-tor class, 𝐶 /𝐷 layout, alignments, and epilogue-tile sizing are not independent search axes: they are fixed by the precision tuple or left to CUTLASS defaults ( EpilogueTileAuto ). Rasterization or-der, swizzle patterns, and classic split-𝐾 are likewise not exposed by our API; Stream-K is the only searched alternative to persis-tent scheduling, and CUTLASS resolves remaining lowering details internally. The raw Cartesian product over the searched axes alone contains 2,138 ,400 combinations. Static validity filtering leaves 242 ,971 BF16 configurations. 
+
+## 2.6 Validity Constraints 
+
+The Cartesian product contains many combinations that cannot instantiate as valid SM90 kernels. Enumeration is therefore followed by our set of static predicates; we also statically remove wasteful candidates with 𝑇 𝑁 > 2𝑀 or 𝑇 𝑁 > 2𝑁 . Table 2 lists the constraints active for BF16. 
+
+## 3 From CUTLASS Candidates to Hardware-Aware Features 
+
+For each candidate configuration, we compute a feature map en-tirely from the problem description, configuration parameters, and hardware constants. This constraint is essential for an execution-free selector. To decide which execution effects are worth repre-senting, we first profile kernels. 
+
+## 3.1 Profiling Analysis for Feature Construction 
+
+The purpose of profiling is to identify execution effects that distin-guish fast and slow CUTLASS configurations and can subsequently be approximated statically. 
+
+3.1.1 Profiling setup. We collected 408 Nsight Compute profiles of BF16 CUTLASS GEMM kernels on GH200 across 17 problem shapes. Profiles are associated with fixed (𝑀, 𝑁 , 𝐾, layout ) groups, within which only the CUTLASS candidate configuration changes. For every profiled candidate, we pair the collected hardware counters with the throughput measured by our benchmark harness. Because many hardware counters scale strongly with the amount of work in the GEMM, correlations computed over all profiles can be misleading. For example, larger problems can simultaneously execute more tensor-core instructions, generate more memory traf-fic, and achieve higher sustained throughput. To separate these 
+
+> 4Hardware-Aware Features for CUTLASS Kernel Selection
+
+## ML Selector 
+
+Top-K 
+
+Ranking 
+
+## CUTLASS 
+
+## Problem 
+
+## Space  Layout 
+
+# .00 
+
+Size  DType 
+
+> 0
+
+Epilogue  GPU 
+
+> Get Problem Instance
+> Construct CUTLASS Catalogue
+> Compute Feature Matrix
+> runs in milliseconds
+> Epi. Schedule (3)
+> Cluster Sizes (15)
+> Pipeline
+> Depth (11)
+> Tile Scheduler (2)
+
+## List CUTLASS Catalogue  (534600) 
+
+> Tile Sizes (180)
+
+128x256x64 
+
+64x128x32 
+
+... 
+
+> Schedule (3)
+
+Persistent 
+
+Warp Specialized 
+
+Ping-Pong 
+
+through static heuristics 
+
+## Hardware-Aware  Feature  Map 
+
+Structural Core 
+
+> Problem Size, Layout, Data Type, Tile Sizes, Pipeline Depth, Schedule
+
+Work Decomposition 
+
+> Tile waste, wave balance, SM waste, cluster fit
+
+Memory Behaviour 
+
+> Epilogue flops, arithmetic intensity, problem size vs cache size
+
+Resource Pressure 
+
+> Register usage, shared memory usage, occupancy
+
+Pipeline Behaviour 
+
+> Pipeline depth, cache arithmetic intensity, stage amortization
+
+## Problem 
+
+## Instance 
+
+## Best 
+
+## Kernel 
+
+## Chosen  Execution free, near-
+
+oracle performance 
+
+Performance: 
+
+673.9 Tflop/s 
+
+nvMMH: 
+
+383.5 Tflop/s 
+
+(1.76x faster) 
+
+Figure 2: Overview of our execution-free CUTLASS kernel selector, which maps each problem and candidate catalogue to hardware-aware features and ranks kernels without benchmarking. 
+
+problem-size effects from candidate quality, for each metric 𝑥 we compute 
+
+𝜌 𝑔 (𝑥 ) = Spearman 
+
+
+
+{𝑥 (𝑐 )} 𝑐 ∈𝐶 𝑔 , {𝑇 (𝑐 )} 𝑐 ∈𝐶 𝑔 
+
+
+
+,
+
+where 𝑔 is a fixed shape–layout group, 𝐶 𝑔 is the set of profiled can-didates in that group, and 𝑇 (𝑐 ) is measured benchmark throughput. Table 3 reports the complete set of counters used in this analysis. 
+
+3.1.2 Global correlation is often a problem-size effect. Several met-rics appear to be excellent performance predictors when all profiles are pooled, yet lose almost all ranking power once the problem is fixed. For example, sm_active_pct has global 𝜌 = +0.910 but mean within-group 𝜌 𝑔 = −0.001. Likewise, l2_read_sectors drops from 
+
++0.942 globally to −0.102 within groups, and dram_read_bytes 
+
+drops from +0.903 to −0.055. These quantities primarily distin-guish different amounts of work rather than good candidates from bad candidates for the same GEMM. Two execution quantities remain substantially correlated with candidate quality after fixing the problem. dram_throughput_pct 
+
+has mean within-group 𝜌 𝑔 = +0.408, and tensor_active_pct 
+
+has mean 𝜌 𝑔 = +0.392; both have positive correlation in 83 .7% of computable groups. These measurements suggest that successful candidates simultaneously sustain the memory system and keep the tensor-core pipeline active. Since both quantities require executing the kernel, we instead construct static proxies for the mechanisms that produce them: data reuse, traffic, cache-relative working sets, feed–compute balance, pipeline fill, and pipeline amortization. 
+
+3.1.3 Measured symptoms versus controllable causes. Several coun-ters are useful diagnostically but unsuitable as direct selector fea-tures. Barrier stalls, for example, have global 𝜌 = +0.894 but only mean within-group 𝜌 𝑔 = +0.156. Long-scoreboard stalls even change apparent interpretation: their global correlation is −0.679, while the mean within-group correlation is +0.193. Such coun-ters describe the state of an asynchronous execution pipeline after scheduling, resource allocation, and overlap have already taken effect. This distinction is also visible when relating configuration param-eters to measured counters. Pipeline depth has mean within-group correlation −0.357 with long-scoreboard stalls (median −0.439), con-sistent with additional stages being associated with fewer exposed memory dependencies. However, stage count itself has only weak correlation with throughput. We therefore represent the quantities that determine the consequences of staging, such as bytes per stage, 
+
+> 5Shriram Chandran ∗† , Dominic Rinderer †, Yakup Budanaz, Alexandru Calotoiu, Marcin Copik, and Torsten Hoefler
+
+Table 3: Spearman correlation between profiled execution metrics and measured benchmark throughput.                                                                               
+
+> Metric Global 𝜌 Mean 𝜌 𝑔 Median 𝜌 𝑔
+> Throughput and pipeline activity
+> tensor_active_pct +0.992 +0.392 +0.492
+> dram_throughput_pct +0.817 +0.408 +0.500
+> compute_throughput_pct +0.977 +0.235 +0.382
+> tma_active_pct +0.792 +0.181 +0.289
+> sm_active_pct +0.910 −0.001 +0.024
+> Memory traffic and hierarchy
+> dram_read_bytes +0.903 −0.055 −0.093
+> dram_write_bytes +0.817 +0.000 +0.086
+> l2_read_sectors +0.942 −0.102 −0.238
+> l2_write_sectors +0.908 −0.151 −0.184
+> l2_throughput_pct +0.868 +0.142 +0.314
+> l2_hit_rate −0.393 −0.058 −0.087
+> l2_read_hit_rate +0.003 −0.086 −0.194
+> l2_write_hit_rate +0.243 +0.110 +0.000
+> Occupancy and resource use
+> achieved_occupancy_pct +0.388 +0.140 +0.128
+> registers_per_thread +0.736 −0.151 −0.315
+> warps_active +0.388 +0.112 +0.145
+> eligible_warps_per_cycle +0.337 −0.148 −0.191
+> Warp stalls
+> stall_barrier_pct +0.894 +0.156 +0.143
+> stall_long_scoreboard_pct −0.679 +0.193 +0.267
+> stall_short_scoreboard_pct −0.863 +0.029 +0.029
+> stall_gmma_pct +0.540 −0.158 −0.217
+> stall_mio_pct −0.100 +0.217 +0.227
+> stall_wait_pct −0.519 −0.113 −0.143
+> stall_not_selected_pct +0.054 −0.224 −0.238
+
+total shared-memory demand, residency, pipeline fill, and stage amortization, rather than treating the stall counter or stage count as a complete performance signal. 
+
+3.1.4 Static Configuration Effects. We additionally apply the same within-group analysis to candidate parameters and statically de-rived quantities. Table 4 summarizes the strongest effects. 
+
+Table 4: Correlation between selected static candidate quan-tities and measured throughput.                                     
+
+> Feature Global 𝜌 Mean 𝜌 𝑔 Median 𝜌 𝑔
+> tile_m +0.626 −0.261 −0.409
+> tile_n +0.827 +0.080 +0.091
+> tile_k −0.415 +0.257 +0.272
+> k_iters +0.826 −0.260 −0.289
+> reg_pressure_proxy +0.827 −0.222 −0.319
+> cluster_size −0.337 −0.247 −0.223
+> stages −0.001 −0.111 −0.145
+> bytes_per_stage +0.396 +0.054 +0.092
+> pipeline_fill_frac +0.721 +0.233 +0.171
+> restream_factor +0.399 +0.115 +0.258
+
+These results illustrate why raw template parameters alone are insufficient. For example, stages has almost zero global correlation and only weak negative within-group correlation with throughput, even though stage depth directly affects the asynchronous main-loop. Its performance effect depends on how much storage each stage requires, how many 𝐾 -iterations are available to amortize pipeline startup, and whether the resulting resource footprint re-duces residency. The representation therefore includes both the raw stage count and derived quantities describing these interactions. Similarly, 𝑇 𝐾 has positive mean within-group correlation with throughput ( +0.257), while the corresponding number of reduc-tion iterations has correlation −0.260. However, 𝑇 𝐾 is not itself an arithmetic-intensity proxy: in the tile-level ratio 
+
+𝐼 tile = 2𝑇 𝑀 𝑇 𝑁 𝑇 𝐾 
+
+𝑏 𝐴 𝑇 𝑀 𝑇 𝐾 + 𝑏 𝐵 𝑇 𝑁 𝑇 𝐾 
+
+= 2𝑇 𝑀 𝑇 𝑁 
+
+𝑏 𝐴 𝑇 𝑀 + 𝑏 𝐵 𝑇 𝑁 
+
+,𝑇 𝐾 cancels. Instead, changing 𝑇 𝐾 modifies reduction granularity, the number of mainloop iterations, per-stage storage, and the amount of computation available between pipeline synchronization points. 
+
+3.1.5 Regime Dependence. The effect of a configuration parameter need not be uniform over the shape space. To test this, we repeat the within-group analysis after partitioning the held-out problems by size, geometry, and arithmetic-intensity regime. The strongest example is 𝑇 𝐾 . Its effect remains positive across coarse size regimes, with mean within-group correlations of +0.217, 
+
++0.307, and +0.245 for small, medium, and large problems respec-tively, and +0.265 for compute-heavy problems. The magnitude changes substantially with geometry: the mean correlation is +0.549 for wide GEMMs, +0.116 for square GEMMs, and +0.021 for tall GEMMs. Skinny-𝐾 problems yield +0.268. 
+
+Table 5: Within-group correlation between 𝑇 𝐾 and through-put under selected problem regimes.                       
+
+> Regime Mean 𝜌 𝑔 Median 𝜌 𝑔
+> Small +0.217 +0.262
+> Medium +0.307 +0.412
+> Large +0.245 +0.273
+> Compute-heavy +0.265 +0.289
+> Memory-heavy +0.238 +0.262
+> Wide +0.549 +0.577
+> Square +0.116 +0.237
+> Tall +0.021 −0.010
+> Skinny-𝐾 +0.268 +0.268
+
+These results show that the strength of its effect depends strongly on problem geometry and execution regime. More generally, this motivates exposing both candidate choices and the problem quan-tities that determine how those choices should be interpreted. The same principle guides the complete feature map: a feature is retained when it is available before execution, distinguishes con-figurations or identifies the regime in which they operate, and has a plausible connection to an execution mechanism. 
+
+## 3.2 Feature Map 
+
+Table 6 summarizes our chosen feature set. The structural core iden-tifies the problem and candidate. The remaining groups estimate the hardware behavior. For each problem 𝑝 , candidate 𝑐 , and target 
+
+ℎ, this procedure produces the feature vector 𝑥 = 𝜙 (𝑝, 𝑐, ℎ ); the feature matrix of the candidate catalogue is the sole input to the selector described in Section 4. 
+
+3.2.1 Structural Core. The structural core contains the quantities required to identify a candidate: problem dimensions, operand lay-outs and types, threadblock and instruction tile shapes, stage count, mainloop and epilogue schedules, cluster shape, tile scheduler, and operator and compute-engine identifiers. Architecture descriptors 
+
+> 6Hardware-Aware Features for CUTLASS Kernel Selection
+
+Table 6: Feature groups.            
+
+> Group Features and purpose Structural core log 2𝑀, log 2𝑁 , log 2𝐾 ; operand layouts; input, accumulation, and output types; tile and in-struction shapes; pipeline stages; mainloop and epilogue schedules; cluster shape; tile sched-uler; and architecture identifiers. Work decomposition Output-tile counts, reduction iterations, edge-tile waste, SM subscription, final-wave efficiency, Stream-K applicability, and cluster fit. Memory behavior Problem and tile arithmetic intensity, operand re-streaming, working-set and resident-panel size relative to L2, and input, data/epilogue/conversion traffic. Resource pressure Bytes per pipeline stage, total mainloop and epilogue shared-memory storage, register-pressure proxy, and shared-memory- and register-limited occupancy. Pipeline behavior Estimated TMA load time, WGMMA compute time, producer–consumer ratio, pipeline-fill fraction, stage amortization, and interactions between tile depth, stage count, and occupancy.
+
+provide the capacities and rates used by the derived features, includ-ing the number of SMs, shared-memory and register-file capacity per SM, LLC capacity, HBM bandwidth, and the peak throughput of the selected compute engine. These features are necessary but insufficient. A stage count of four does not itself state whether four stages are enough to overlap TMA and WGMMA, whether the associated buffers fit in shared memory, or whether the problem has enough 𝐾 -iterations to amor-tize pipeline fill. The derived groups make these consequences explicit. 
+
+3.2.2 Work Decomposition and Wave Quantization. Let 
+
+(𝑇 𝑀 ,𝑇 𝑁 ,𝑇 𝐾 ) be the candidate tile shape. The output grid and number of mainloop iterations are 
+
+𝑛 𝑀 =
+
+ 𝑀 𝑇 𝑀 
+
+
+
+, 𝑛 𝑁 =
+
+ 𝑁 𝑇 𝑁 
+
+
+
+, 𝑛 𝐾 =
+
+ 𝐾 𝑇 𝐾 
+
+
+
+.
+
+The candidate computes 𝑛 𝑀 𝑛 𝑁 output tiles. The edge tiles may execute masked work that is discarded; we encode this separately along each output dimension: 
+
+𝑤 𝑀 = 𝑛 𝑀 𝑇 𝑀 − 𝑀 𝑀 , 𝑤 𝑁 = 𝑛 𝑁 𝑇 𝑁 − 𝑁 𝑁 .
+
+To estimate wave quantization, we divide the number of output tiles by the number of concurrently resident blocks across the GPU. If 𝑆 SM is the SM count and 𝑏 res the estimated resident blocks per SM, then 
+
+𝑞 SM =
+
+ 𝑛 𝑀 𝑛 𝑁 
+
+𝑆 SM 𝑏 res 
+
+
+
+is the number of passes that the resident blocks make over the tile list. The corresponding wave efficiency is 
+
+𝜂 last = 𝑛 𝑀 𝑛 𝑁 
+
+𝑞 SM 𝑆 SM 𝑏 res 
+
+.
+
+A value near one indicates that there are several waves and/or the final wave fills the GPU, while a small value indicates a ragged tail. This directly motivates the Stream-K proxy: 
+
+streamK_applicability = max (0, 1 − 𝜂 last ),
+
+together with a feature indicating whether the candidate actu-ally uses Stream-K. Cluster features similarly encode the cluster dimensions, number of tiles available to fill each cluster dimension, and whether the cluster overshoots the grid. 
+
+3.2.3 Memory Behavior. We estimate problem arithmetic intensity using the bytes required by the input matrices and the complete epilogue: 
+
+𝐼 problem = 2𝑀𝑁 𝐾 𝑏 𝐴 𝑀𝐾 + 𝑏 𝐵 𝐾𝑁 + 𝑄 epilogue 
+
+,
+
+where 𝑏 𝐴 and 𝑏 𝐵 are input element sizes and 𝑄 epilogue includes output stores and any reads or writes induced by the output type, 
+
+𝛽𝐶 , residual, bias, activation, or conversion operations. A complementary tile-level feature captures the amount of tensor-core work obtained from a loaded operand footprint: 
+
+𝐼 mainloop = 2𝑇 𝑀 𝑇 𝑁 
+
+𝑇 𝑀 𝑏 𝐴 + 𝑇 𝑁 𝑏 𝐵 
+
+.
+
+Here 𝑇 𝐾 cancels. This is useful: 𝑇 𝐾 affects per-stage storage and pipeline depth, whereas 𝑇 𝑀 and 𝑇 𝑁 determine how much reuse the tile geometry obtains from each loaded operand row or column. We estimate the re-streaming incurred if operand panels cannot remain resident in LLC: 
+
+𝑟 stream = 𝑛 𝑁 𝑏 𝐴 𝑀𝐾 + 𝑛 𝑀 𝑏 𝐵 𝐾𝑁 𝑏 𝐴 𝑀𝐾 + 𝑏 𝐵 𝐾𝑁 .
+
+The remaining cache features compare the complete operand working set and a single resident operand panel with LLC capacity. Together, these features distinguish a problem whose repeated operand reads are absorbed by LLC from one that must repeatedly fetch them from HBM. 
+
+3.2.4 Resource Pressure and Occupancy. The shared-memory buffer required for one mainloop stage is 
+
+𝐵 stage = 𝑇 𝑀 𝑇 𝐾 𝑏 𝐴 + 𝑇 𝑁 𝑇 𝐾 𝑏 𝐵 .
+
+For 𝑆 pipeline stages, the mainloop requires 𝑆𝐵 stage bytes. The epilogue additionally requires schedule-dependent storage 𝐵 epi ,including output fragments and any fused epilogue state. For a warp-specialized schedule, mainloop and epilogue storage may overlap; cooperative and ping-pong schedules may require both simultaneously. We therefore compute the corresponding schedule-specific total shared-memory requirement 𝐵 smem and its fraction of per-SM capacity: 
+
+> 7Shriram Chandran ∗† , Dominic Rinderer †, Yakup Budanaz, Alexandru Calotoiu, Marcin Copik, and Torsten Hoefler
+
+𝑓 smem = 𝐵 smem 
+
+𝐶 smem 
+
+.
+
+This bounds shared-memory-limited residency: 
+
+𝑏 smem =
+
+𝐶 smem 
+
+𝐵 smem 
+
+
+
+.
+
+We approximate register pressure from the output elements accumulated per thread, 
+
+𝑟 proxy = 𝑇 𝑀 𝑇 𝑁 
+
+𝑇 block 
+
+,
+
+and use the register-file capacity 𝐶 reg to derive an independent residency bound 𝑏 reg . The estimated resident-block count is 
+
+𝑏 res = min (𝑏 smem , 𝑏 reg , 𝑏 arch ).
+
+Keeping the separate bounds matters, because increasing the stage count tightens the shared-memory bound but does not directly alter accumulator pressure. The model can therefore distinguish a kernel limited by registers from one that falls off a shared-memory size limitation. 
+
+3.2.5 Pipeline Balance. Hopper warp-specialized kernels overlap TMA loads from HBM to shared memory with WGMMA execution from shared memory. We estimate the producer and consumer times for one stage as 
+
+𝑡 producer = 𝑛 𝑆𝑀 𝐵 stage 
+
+d𝐵𝑊 TMA 
+
+𝑡 consumer = 2𝑇 𝑀 𝑇 𝑁 𝑇 𝐾 
+
+𝑛 consumer b𝑃 WGMMA 
+
+where 𝑛 consumer is the number of consumer warpgroups actively executing the mainloop for the selected schedule, d𝐵𝑊 TMA is the bandwidth of the TMA operation, and b𝑃 WGMMA is the throughput of the WGMMA operation. The producer-consumer ratio 
+
+𝑟 pc = 𝑡 consumer 
+
+𝑡 producer 
+
+is a static proxy for whether TMA can supply WGMMA at the required rate. Values far below one indicate that consumers are likely to wait for data; values far above one indicate that loads are completed faster than arithmetic consumes them. Two additional features describe whether the pipeline depth is useful for the problem: 
+
+𝑓 fill = min (𝑆, 𝑛 𝐾 )
+
+𝑆 , 𝑎 stage = 𝑛 𝐾 
+
+𝑆 .
+
+The first falls below one when the contraction is too shallow to prime a deep pipeline. The second measures how often the pipeline fill cost is amortized. Finally, 𝑆 · 𝑓 smem exposes the interaction be-tween stage count and shared-memory pressure. This interaction captures both the stage-count cliff and the regime in which a larger 
+
+𝑇 𝐾 becomes harmful because its enlarged stage buffers force a shal-lower pipeline. 
+
+## 4 Training the Selector 
+
+Given an input configuration, we list the valid CUTLASS kernel catalogue, and use a machine learning model to rank the catalogue and choose the best kernel. In this section, we explain the data collection process for training and the model design. 
+
+## 4.1 Constructing The Training Dataset 
+
+The CUTLASS configuration space is too large to measure exhaus-tively for every problem shape. Even after validity filtering, a single BF16 GEMM layout exposes over sixty thousand candidate configu-rations. Exhaustively sweeping this space over thousands of shapes would require thousands of compiles and hundreds of millions of benchmarks. We therefore separate the collection into two tasks. Our training dataset covers a broad range of GEMM shapes while also sampling candidates within each shape-layout group. The held-out evaluation dataset covers fewer shapes, but sweeps their valid candidates exhaustively to establish a trustworthy in-space oracle. This section describes the training GEMM collection; the same collection design is used when extending the dataset to additional types, epilogues, and operator families. 
+
+4.1.1 Shape Selection. A GEMM problem shape is a triple 
+
+(𝑀, 𝑁 , 𝐾 ). We define our structured anchor grid in 3 dimensions as [32,16384] 3 with each dimension snapped to a multiple of 32 – roughly 134 million lattice points. The preferred CUTLASS ker-nel changes with problem geometry (square, tall, wide, skinny-𝐾 ), reduction depth ( ⌈𝐾 /𝑇 𝐾 ⌉), and cache residency; a single random draw over this box would leave boundary (extreme large/small values of one/more dimensions) and hardware transition points se-verely underrepresented. We therefore use two complementary (but non-disjoint) construction axes: a geometry class (interior versus boundary/extreme) and, where needed, targeted supplements (an-chor neighbours and transition points). The final dataset contains 593 base shapes ( × 4 layouts = 2372 unique groups): 
+
+• Primary random coverage (469 shapes). 297 interior 
+
+shapes: log-uniform draws from the anchor grid. 172 bound-ary shapes: deliberate hull extremes; very tall, wide, skinny-
+
+𝐾 , and corner cases up to 16384 on an axis. 
+
+• Targeted supplements (124 shapes). 92 anchor shapes: Neighbours formed by ablating shapes. For every data point, the training set includes shapes that vary one di-mension at a time where the domain permits it. This helps the model learn how changing different dimensions of the input shape changes performance and behaviour. This adds 47 interior and 45 boundary shapes. 32 transition shapes: points near the roofline ridge (BF16 arithmetic intensity 
+
+≈ 247 .3 flop/byte on GH200) and the 50 MiB LLC-residency boundary. This adds 14 interior and 18 boundary shapes. 
+
+4.1.2 Candidate Sampling. For a shape-layout group, we measure only a budgeted subset of the full catalogue during training. The default budget is 2000 candidates per group. It is reduced to 1000 for the largest shapes, where each benchmark is substantially more expensive, and increased to 3000 for atypical or transition shapes, where the configuration ranking changes more sharply. 
+
+> 8Hardware-Aware Features for CUTLASS Kernel Selection
+
+Table 7: Fraction of valid kernels close to the exhaustive oracle.             
+
+> Threshold Mean fraction Median fraction Minimum fraction Within 1% 0.43% 0.17% 0.17% Within 5% 2.41% 1.00% 0.33% Within 10% 10.91% 4.42% 1.17%
+
+Exhaustive measurement is impractical for training. Therefore we study how the measurement budget should be allocated across candidates. The goal of this experiment is to quantify how effec-tively a sampling policy exposes high-performing kernels within a fixed measurement budget. We use the exhaustively measured BF16 evaluation groups as ground truth. For each group 𝑔 , let 𝐶 𝑔 denote the complete valid candidate catalogue, 𝑇 (𝑐 ) the measured throughput of candidate 𝑐 ,and 
+
+𝑇 ★ 
+
+> 𝑔
+
+= max  
+
+> 𝑐 ∈𝐶 𝑔
+
+𝑇 (𝑐 )
+
+the exhaustive oracle throughput. Given a sampling policy that selects a subset 𝑆 𝐵 (𝑔 ) ⊆ 𝐶 𝑔 of 𝐵 candidates, we define the sampling regret 
+
+𝑅 𝐵 (𝑔 ) = 1 − max 𝑐 ∈𝑆 𝐵 (𝑔 ) 𝑇 (𝑐 )
+
+𝑇 ★
+
+> 𝑔
+
+.
+
+This measures the quality lost purely because the measurement subset failed to contain the best available kernels. For stochastic policies, we repeat each sampling experiment 100 times per group and report mean results. 
+
+4.1.3 Sparsity of the High-Performance Tail. We first quantify how many kernels in the valid catalogue are actually competitive. For each group, we compute the fraction of candidates whose through-put lies within 𝜖 of the exhaustive oracle: 
+
+𝑞 𝜖 (𝑔 ) =
+
+𝑐 ∈ 𝐶 𝑔 : 𝑇 (𝑐 ) ≥ ( 1 − 𝜖 )𝑇 ★
+
+> 𝑔
+
+|𝐶 𝑔 | .
+
+Across the evaluation groups, only 0.43% of candidates are within 1% of the oracle on average, 2.4% are within 5%, and 10.9% are within 10%. The corresponding median fractions are 0.17%, 1.0%, and 4.4%, respectively. In the most selective groups, fewer than 0.33% of valid kernels lie within 5% of the optimum. These results show that high-performing kernels occupy a sparse tail of the catalogue. A uniformly sampled training subset can therefore contain thousands of measured candidates while still failing to observe any configuration close to the true optimum. 
+
+4.1.4 Sampling Policies. We compare the following candidate-selection policies. 
+
+Uniform. Candidates are sampled uniformly at random from the complete valid catalogue. 
+
+Static top-𝐵 . Candidates are ranked by the final static sampling score from Section 4.1.8, and the highest-ranked 𝐵 candidates are selected deterministically. 
+
+Figure 3: Sampling regret versus candidate measurement budget on the exhaustive BF16 evaluation groups. 10 2 10 3 10 4
+
+> Measurement Budget ( B)
+> 0510 15 20 25
+> Sampling Regret (%)
+> Uniform 75/25 Proxy Static Top-B
+
+Biased-diverse sampling. This is the policy used to construct the training set. A fraction 75% of the budget is sampled from the high-ranked portion of the static score, while the remaining 25% is sampled uniformly from the rest of the catalogue. The exploratory quarter is not overhead for oracle discovery alone: the throughput predictor must also observe poorly ranked configurations during training, so a purely heuristic-biased corpus would under-represent the long tail of bad kernels. We evaluate budgets 
+
+𝐵 ∈ { 100 , 250 , 500 , 1000 , 2000 , 3000 , 5000 , 10000 }.
+
+The values 1000, 2000, and 3000 correspond directly to the candidate budgets used in our training collection. 
+
+4.1.5 Sampling Efficiency. Figure 3 reports sampling regret as a function of measurement budget. Uniform sampling improves steadily with larger budgets, but converges slowly because the near-optimal tail is sparse. At a budget of 1000 candidates, uniform sampling leaves 11.3% mean regret; at 2000 candidates the regret is 8.5%, and at 3000 candidates it remains 7.1%. The static top-𝐵 policy improves over uniform sampling at small budgets, reaching 0.6% regret at 𝐵 = 2000. However, its determinis-tic bias can exclude competitive kernels that receive a poor heuristic score. The biased-diverse policy combines both effects and achieves 1.5%, 0.9%, and 0.5% mean regret at budgets of 1000, 2000, and 3000, respectively. At the default training budget of 2000 candidates, biased-diverse sampling reduces sampling regret by 89.4% relative to uniform sam-pling (from 8.5% to 0.9%). Static top-𝐵 attains marginally lower regret (0.6%) at this budget, but it is unsuitable as a training policy because it never deliberately measures configurations the heuristic ranks poorly. Oracle-discovery metrics and training-corpus con-struction therefore pull in opposite directions under a fixed budget. 
+
+4.1.6 Probability of Observing a Near-Optimal Kernel. Sampling regret summarizes the quality of the best observed configuration, but it is also useful to ask how often a sampling policy discovers at 
+
+> 9Shriram Chandran ∗† , Dominic Rinderer †, Yakup Budanaz, Alexandru Calotoiu, Marcin Copik, and Torsten Hoefler
+
+Figure 4: Probability that the sampled candidate pool con-tains a near-optimal kernel. 10 2 10 3 10 4
+
+> Measurement Budget ( B)
+> 020 40 60 80 100
+> Groups With Kernel Within 5% of Oracle (%)
+> Uniform 75/25 Proxy Static Top-B
+
+least one near-optimal kernel. We therefore measure 
+
+𝑃 𝜖 (𝐵 ) = Pr 
+
+
+
+max    
+
+> 𝑐 ∈𝑆 𝐵 (𝑔 )
+
+𝑇 (𝑐 ) ≥ ( 1 − 𝜖 )𝑇 ★
+
+> 𝑔
+
+
+
+for 𝜖 ∈ { 0.01 , 0.05 , 0.10 }.Figure 4 reports 𝑃 0.05 (𝐵 ) as a function of measurement budget. At 𝐵 = 2000, uniform sampling observes at least one kernel within 5% of the oracle in 25.6% of groups, compared with 97.1% for static top-𝐵 and 91.3% for biased-diverse sampling. At 𝐵 = 3000, the cor-responding fractions are 35.3%, 97.1%, and 97.3%. Uniform sampling improves with budget but remains far below the heuristic-biased policies until 𝐵 ≥ 3000, where biased-diverse sampling essentially matches static top-𝐵 .
+
+Table 8: Ablation of the exploitation fraction at 𝐵 = 2000 .             
+
+> Heuristic-biased fraction 𝛼 Mean sampling regret Groups within 5% of oracle 0.00 8.5% 25.6% 0.25 1.4% 87.0% 0.50 1.1% 88.9% 0.75 0.9% 91.3% 1.00 0.6% 97.1%
+
+4.1.7 Effect of the Exploration Fraction. The biased-diverse policy trades off exploitation of the static score against broader exploration of the remaining catalogue. We ablate this mixture at a fixed budget of 𝐵 = 2000. Let 𝛼 denote the fraction of the budget drawn from the heuristic-preferred region. We test 
+
+𝛼 ∈ { 0, 0.25 , 0.50 , 0.75 , 1.0}.
+
+Pure exploration ( 𝛼 = 0) reduces to broad random sampling and yields 8.5% mean regret. Pure exploitation ( 𝛼 = 1) achieves 0.6% regret and 97.1% within-5% coverage, the best values for oracle dis-covery on this evaluation set. Increasing 𝛼 monotonically improves both metrics, yet 𝛼 = 1 is not a viable training policy: the model would rarely see measured examples of low-throughput kernels and could not learn to discriminate bad configurations from good ones. This retrospective analysis validates the 𝛼 = 0.75 policy used for corpus construction. At 𝐵 = 2000 this yields 0.9% mean regret and 91.3% within-5% coverage—a modest cost relative to 𝛼 = 1— while guaranteeing that one quarter of every measurement budget samples outside the heuristic-preferred region. 
+
+4.1.8 Summary. The exhaustive study confirms that the candidate-selection problem is dominated by a sparse high-performance tail: only 2.4% of valid kernels lie within 5% of the oracle on average. Consequently, uniform sampling requires substantially larger mea-surement budgets to expose competitive configurations. At the default budget of 2000 candidates per shape–layout group, our biased-diverse policy reduces sampling regret from 8.5% to 0.9% and increases the probability of observing a kernel within 5% of the oracle from 25.6% to 91.3%. These results retroactively validate the candidate-sampling strat-egy used for the training corpus. Most measurements are directed toward configurations with favorable static efficiency estimates, while the fixed 25% exploratory fraction ensures the predictor is trained on bad as well as good kernels—a requirement that pure top-
+
+𝐵 or 𝛼 = 1 sampling cannot satisfy under the same budget. Instead, we rank the valid candidates using a cheap, static efficiency score that ranks kernels likely to give better performance. Let 𝑐 𝑀 , 𝑐 𝑁 be the thead-block cluster shape, 𝑆 SM the number of SM clusters, 𝑆 the pipeline stage count, and 
+
+𝑛 𝑐 =
+
+ 𝑀 𝑐 𝑀 𝑇 𝑀 
+
+  𝑁 𝑐 𝑁 𝑇 𝑁 
+
+
+
+be the number of clusters required by the launch. The number of cluster waves is thus 𝑊 = ⌈ 𝑛 𝑐  
+
+> 𝑆 SM
+
+⌉. We use the following sampling score to rank kernels: 
+
+𝑠 sample = 𝑛 𝑐 
+
+𝑊 𝑆 SM 𝑐 𝑀 𝑐 𝑁 
+
+· 𝑆 ·√︁ 𝑇 𝑀 𝑇 𝑁 𝑇 𝐾 
+
+The first term favours efficient wave filling, penalizing oversized clusters that are too wasteful. The remaining terms favour config-urations with deeper pipelines and sufficiently large tiles, which are likely to have higher reuse and provide better throughput. For a group budget, three quarters of the sampled configurations are drawn from the top of this ranking, while the remaining quar-ter is sampled across the rest of the ranked space. This preserves examples of poor and mediocre configurations. If the number of valid candidates is below the assigned budget, we collect the entire valid pool. The final training collection contains approximately 4.9 million measured kernels. 
+
+4.1.9 Collection Pipeline. We perform data collection on a GH200 node of the Daint supercomputer on CSCS Alps, equipped with 4 GH200 GPUs. We compile CUTLASS SM90a kernels from the commit 3476ddb7 using CUDA 13.1. Each measurement records the behavior of one candidate on one shape-layout group. Each suc-cessful benchmark consists of five warm-up iterations followed by five rounds of three timed iterations. Every attempted measurement is recorded, including successful executions, compilation failures, launch failures, crashes, and timeouts. To make the dataset practical to collect, we implement the following optimizations: 
+
+> 10 Hardware-Aware Features for CUTLASS Kernel Selection
+
+(1) Batched compilation. Kernels that share a subset of con-figurations are compiled together into one shared library. A single exported entry point dispatches by kernel index in-side the batch, amortizing template instantiation and nvcc 
+
+startup cost across many configurations. (2) Executable caching. Each batch library is stored under a name derived from a hash of its member configurations, and kernels are reused instead of recompilation. (3) Buffer caching. Each GPU worker pre-allocates a fixed device memory pool and serves all kernels from slices of that pool rather than allocating fresh tensors per kernel. We replicate the matrices enough times from this pool until the working set exceeds L2 capacity. (4) Node-local database storage. Benchmark results and com-pile metadata are written to a registry database kept in node-local memory for the duration of the job, and checkpointed periodically to scratch and to durable home storage. (5) Parallel compilation and benchmarking. Compilation and GPU benchmarking run concurrently: a pool of CPU workers builds shared libraries while one persistent process per GPU consumes a queue of newly compiled kernels. A monitor recovers from worker crashes and hung kernels by attributing the failure to the active measurement, record-ing it, and respawning the worker to continue with the remainder of the queue. 
+
+## 4.2 Evaluation Dataset 
+
+Unlike the training corpus, where each problem is measured on a proxy shortlist of ≈ 2,000 configurations, the evaluation corpus is exhaustively enumerated: for every held-out shape (𝑀, 𝑁 , 𝐾 ) in Table 9 and every layout tag ℓ ∈ { TN , TT , NN , NT }, the candidate set C( 𝑀, 𝑁 , 𝐾, ℓ ) is the full catalogue after static validity filtering (Section 2) and shape-aware plan guards. No further proxy pruning is applied. The 17 shapes are listed exhaustively; together with four layouts they define 68 evaluation groups and 3 ,922 ,067 distinct (kernel, shape) benchmark tasks. 
+
+## 4.3 Learning to Rank Candidates 
+
+We study two model families for mapping the hardware-aware representation 𝜙 (𝑝, 𝑐, ℎ ) to a scalar candidate score. In both cases, candidates are grouped by GEMM problem 𝑝 and supervision is derived from measured kernel throughput within that group. 
+
+4.3.1 Problem and Candidate Sets. A GEMM instance is a tuple 
+
+𝑝 = (𝑀, 𝑁 , 𝐾, ℓ ), where ℓ denotes the operand layout tag. ℎ be a hardware descriptor. For each 𝑝 we maintain a finite candidate set 
+
+C( 𝑝 ) ⊂ K , where K is the statically valid CUTLASS configuration catalogue (Section 2). Every 𝑐 ∈ C( 𝑝 ) is described by a feature vector x(𝑝, 𝑐 ) = 𝜙 (𝑝, 𝑐 ) ∈ R𝑑 computed from problem geometry, tile and cluster parameters, schedule choices, and the analytical hardware proxies of Section 3; no feature depends on measured runtime counters. A learned selector is a scoring function 𝑓 𝜃 : R𝑑 →
+
+R. The deployed decision rule is always ˆ𝑐 (𝑝 ) = arg max    
+
+> 𝑐 ∈ C ( 𝑝 )
+
+𝑓 𝜃 
+
+ x(𝑝, 𝑐, ℎ ), (1) i.e. we reduce selection to within-problem ranking and do not use a predicted throughput value directly at inference time. 
+
+Table 9: Held-out evaluation shapes and valid kernel counts per layout.                                                                                                                                     
+
+> Shape Kernel count
+> 𝑀 𝑁 𝐾 TN TT NN NT Total 2048 2048 2048 60,795 60,740 60,740 60,696 242,971 4096 4096 4096 60,795 60,740 60,740 60,696 242,971 64 64 64 32,190 32,135 32,135 32,091 128,551 128 128 128 60,795 60,740 60,740 60,696 242,971 256 256 256 60,795 60,740 60,740 60,696 242,971 512 512 512 60,795 60,740 60,740 60,696 242,971 32 128 4096 60,795 60,740 60,740 60,696 242,971 2048 128 4096 60,795 60,740 60,740 60,696 242,971 4096 128 4096 60,795 60,740 60,740 60,696 242,971 12,288 128 4096 60,795 60,740 60,740 60,696 242,971 256 4096 4096 60,795 60,740 60,740 60,696 242,971 256 12,288 4096 60,795 60,740 60,740 60,696 242,971 64 12,288 4096 37,290 37,235 37,235 37,191 148,951 2048 2048 128 60,795 60,740 60,740 60,696 242,971 4096 11,008 4096 60,795 60,740 60,740 60,696 242,971 256 256 8192 60,795 60,740 60,740 60,696 242,971 512 3072 768 60,795 60,740 60,740 60,696 242,971 Sum (68 groups) 981,405 980,470 980,470 979,722 3,922,067
+
+4.3.2 Measured Labels. For each successfully benchmarked pair 
+
+(𝑝, 𝑐 ) the autotuner records a mean throughput estimate b𝑇 (𝑝, 𝑐 )
+
+and an empirical standard deviation b𝜎 (𝑝, 𝑐 ) over repeated timed rounds. Group all rows that share the same 𝑝 and index such a group by 𝑔 . The empirical group maximum is 
+
+𝑇 ★ 
+
+> 𝑔
+
+= max  
+
+> 𝑐 ∈ C ( 𝑔 )
+
+b𝑇 (𝑔, 𝑐 ), 𝑦 (𝑔, 𝑐 ) = b𝑇 (𝑔, 𝑐 )
+
+𝑇 ★
+
+> 𝑔
+
+∈ ( 0, 1], (2) so that 𝑦 (𝑔, 𝑐 ) = 1 for at least one measured candidate in the group and 𝑦 (𝑔, 𝑐 ) < 1 otherwise. On training problems C( 𝑔 ) is a proxy shortlist (Section 4.1); on evaluation problems it is a near-exhaustive sweep over the catalogue, so 𝑇 ★ 
+
+> 𝑔
+
+approximates the in-space empiri-cal oracle for that shape–layout. 
+
+4.3.3 Relevance grades (ranking supervision). Ranking objectives do not use raw b𝑇 directly; they use discrete grades derived from it. Within group 𝑔 , sort candidates by decreasing b𝑇 (𝑔, 𝑐 ) and partition the sorted list into contiguous bands by merging adjacent entries 𝑖 
+
+and 𝑖 +1 whenever their throughput gap is smaller than twice the pooled measurement uncertainty, 
+
+b𝑇 𝑖 − b𝑇 𝑖 +1 < 2√︃ b𝜎 2 
+
+> 𝑖
+
++ b𝜎 2
+
+> 𝑖 +1
+
+. (3) Let 𝑏 (𝑐 ) ∈ { 0, 1, . . . } be the band index of 𝑐 (0 for the top band). We assign integer grades 𝛾 (𝑔, 𝑐 ) = 𝐺 max − 𝑏 (𝑐 ) with 𝐺 max = 31. For listwise tree training we further compress grades to a top-focused relevance scale with 𝐵 bands ( 𝐵 =2 by default): rel (𝑔, 𝑐 ) = clip  𝛾 (𝑔, 𝑐 ) − ( 𝐺 max − 𝐵 ), 0, 𝐵 . (4) Thus only the highest-throughput band(s) carry non-zero relevance, concentrating learning on near-optimal orderings. 
+
+4.3.4 Model A (gradient-boosted ranker). Model A is an additive ensemble of regression trees 𝑓 𝜃 = Í𝑚 ℎ𝑚 fitted with XGBoost. Nu-meric features enter splits directly; categorical schedule and layout fields use native categorical handling with a fixed level ordering shared across train, validation, and deployment. Let Gtr denote the 
+
+> 11 Shriram Chandran ∗† , Dominic Rinderer †, Yakup Budanaz, Alexandru Calotoiu, Marcin Copik, and Torsten Hoefler
+
+set of training groups and list all rows in a group-contiguous order with group-id vector g. We train with one of three objectives: 
+
+• Listwise ranking (default): minimise a surrogate for NDCG at cut-off |C( 𝑔 )| using targets rel (𝑔, 𝑐 ) and the stan-dard rank : ndcg objective; 
+
+• Pairwise ranking : rank : pairwise on the same relevance labels; 
+
+• Pointwise regression (ablation): minimise Í𝑖 
+
+ 𝑓 𝜃 (x𝑖 )− 𝑦 𝑖 
+
+2
+
+with reg : squarederror, treating 𝑦 𝑖 as a continuous target independent of group structure. Only the first two objectives align the training loss with the argmax decision rule in (1); the regression ablation tests whether accurate throughput prediction implies good selection. 
+
+4.3.5 Model B (feed-forward ranker). Model B is a multilayer per-ceptron 𝑓 𝜃 : R𝑑 ′
+
+→ R applied to a transformed feature matrix. Let xnum denote numeric columns and xcat categorical indicators obtained by one-hot encoding with the same frozen level sets as in Model A. Training applies per-column standardisation to xnum 
+
+(zero mean, unit variance, with NaN /±∞ mapped to zero before scaling); categoricals are left unscaled. We consider three training losses: 
+
+LMSE (𝜃 ) = 1
+
+𝑁 
+
+> 𝑁
+
+∑︁ 
+
+> 𝑖 =1
+
+ 𝑓 𝜃 (x′ 
+
+> 𝑖
+
+) − 𝑦 𝑖 
+
+2, (5) 
+
+LRankNet (𝜃 ) = 1
+
+|P | ∑︁ (𝑖,𝑗 ) ∈ P 
+
+log  1 + exp  𝑓 𝜃 (x′ 
+
+> 𝑗
+
+) − 𝑓 𝜃 (x′ 
+
+> 𝑖
+
+) , (6) 
+
+LLambdaRank (𝜃 ) = 1
+
+|P | ∑︁ (𝑖,𝑗 ) ∈ P 
+
+ΔNDCG 𝑖 𝑗 log  1 + exp  𝑓 𝜃 (x′ 
+
+> 𝑗
+
+) − 𝑓 𝜃 (x′ 
+
+> 𝑖
+
+) ,
+
+(7) where x′ 
+
+> 𝑖
+
+is the scaled/encoded feature vector, and P is a set of ordered pairs within a group such that 𝑦 𝑖 > 𝑦 𝑗 (higher-throughput index 𝑖 , lower 𝑗 ). For LambdaRank we use gain values 𝑔 𝑖 = 𝑦 𝑖 
+
+(linear mode) or 𝑔 𝑖 = 2𝑦 𝑖 − 1 (exponential mode), ideal discounted cumulative gain IDCG = Í𝑛 𝑟 =1 𝑔 𝜋 (𝑟 ) /log 2 (1+𝑟 ) for the throughput-sorted permutation 𝜋 , and pair weights 
+
+ΔNDCG 𝑖 𝑗 = 𝑔 𝑖 − 𝑔 𝑗 𝐷 (𝑟 𝑖 ) − 𝐷 (𝑟 𝑗 )
+
+IDCG , 𝐷 (𝑟 ) = 1log 2 (1 + 𝑟 ) ,
+
+(8) with ranks 𝑟 𝑖 , 𝑟 𝑗 computed from the current model scores (detached from the gradient graph when evaluating 𝐷 ). Pairs are sampled per group with a hard cap; pairs touching any of the top eight 𝑦 -values are always retained ( needle guarantee ) before random subsampling of the remainder. At deployment, numeric standardisation is folded into the exported inference graph so that (1) can be evaluated on raw feature rows. 
+
+4.3.6 Linear Ridge Baseline. The ridge baseline tests how much of the learned selectors’ advantage comes from the hardware-aware representation and globally linear feature combinations, without tree splits or hidden layers. It uses the same candidate feature matrix as Models A and B: numeric columns from 𝜙 (𝑝, 𝑐, ℎ ) are standardised with training-set mean and variance (with non-finite values mapped to zero before scaling), and categorical schedule and layout fields are one-hot encoded with the same frozen level sets. Let x′ 
+
+> 𝑖
+
+denote the resulting vector for row 𝑖 .The scorer is ordinary least squares with optional ℓ2 shrinkage: 
+
+𝑓 w,𝑏 (x′) = w⊤x′ +𝑏, min 
+
+> w,𝑏
+
+∑︁ 𝑖 ∈ P tr 
+
+ 𝑦 𝑖 − 𝑓 w,𝑏 (x′ 
+
+> 𝑖
+
+)2 + 𝛼 ∥w∥22. (9) We solve (9) in closed form after centring x′ and 𝑦 (intercept handled separately); at inference the deployed rule is still the argmax in (1). Unlike the ranking objectives above, training optimises squared error on 𝑦 directly; validation and test nonetheless score the selected 
+
+kernel through regret (11). 
+
+4.3.7 Selection Regret (The Target Metric). For any scorer 𝑓 𝜃 the 
+
+regret of group 𝑔 is 
+
+𝑅 (𝑔 ; 𝑓 𝜃 ) = 1 − 𝑦  𝑔, ˆ𝑐 (𝑔 ) = 1 − b𝑇  𝑔, ˆ𝑐 (𝑔 )
+
+𝑇 ★
+
+> 𝑔
+
+, (10) ˆ𝑐 (𝑔 ) = arg max   
+
+> 𝑐 ∈ C ( 𝑔 )
+
+𝑓 𝜃 
+
+ x(𝑔, 𝑐 ). (11) 
+
+𝑅 (𝑔 ) ∈ [0, 1) with 𝑅 (𝑔 ) = 0 iff the selector picks a measured maximiser in C( 𝑔 ). Aggregate reports include the mean ¯𝑅 =
+
+> 1
+> | G |
+
+Í𝑔 𝑅 (𝑔 ), median, 95th percentile, and maximum across groups, as well as Top1 (𝑓 𝜃 ) = 1
+
+|G| ∑︁ 𝑔 
+
+1rank ( ˆ𝑐 (𝑔 )) = 1, (12) Top5 (𝑓 𝜃 ) = 1
+
+|G| ∑︁ 𝑔 
+
+1rank ( ˆ𝑐 (𝑔 )) ≤ 5, (13) Within5% (𝑓 𝜃 ) = 1
+
+|G| ∑︁ 𝑔 
+
+1𝑅 (𝑔 ; 𝑓 𝜃 ) ≤ 0.05 , (14) where rank (·) is the rank by measured b𝑇 within the group (minimum-rank tie breaking). Regret is the quantity we minimise during hyperparameter search and of which we maximise inter-pretability. 
+
+4.3.8 Hyperparameter Search. We tune 𝜃 with Optuna’s Tree-structured Parzen Estimator (TPE), minimising CV in (15). Unless an objective is pinned for an ablation arm, each trial also selects the training loss (ranking versus pointwise regression) as a categorical hyperparameter so TPE can allocate budget to the better-surrogate family. Trials are executed in parallel on multiple GPUs against a shared SQLite study so workers contribute to one global search. Table 10 and Table 11 list the searched ranges; conditional knobs apply only when the trial’s loss is a ranking objective. For Model B the search budget is deliberately lighter per trial (3-fold × two seeds); the winning configuration is re-validated offline at 5-fold cross-validation with three independent initialisation seeds before the final production fit. After search completes, the best trial’s hyperparameters are locked and the model is refit once on all of Ptr .
+
+4.3.9 Shape-Grouped Cross-Validation. Hyperparameters are cho-sen by 𝐾 -fold cross-validation on Ptr only. Folds partition base shapes (𝑀, 𝑁 , 𝐾 ): all four layouts of a shape belong to the same fold, so validation never sees a training shape under any layout. Let 
+
+S be the set of distinct base shapes in Ptr and {S (𝑘 ) }𝐾 𝑘 =1 a partition of S. For fold 𝑘 , train 𝑓 (𝑘 ) 
+
+> 𝜃
+
+on all groups whose base shape lies in S \ S (𝑘 ) using the chosen training objective ( LMSE , LRankNet ,
+
+> 12 Hardware-Aware Features for CUTLASS Kernel Selection
+
+Table 10: Hyperparameter search space for Model A (gradient-boosted trees).   
+
+> Knob Range / values Notes
+
+𝜂 (learning rate) [5 × 10 −3, 0.3] log-uniform max_depth {4, . . . , 12 } 
+
+> min_child_weight
+
+[1, 30 ] log-uniform subsample [0.5, 1.0] row subsampling colsample_bytree [0.5, 1.0] column subsampling 
+
+𝜆 (L2) [0.01 , 20 ] log-uniform 
+
+𝛼 (L1) [10 −4, 10 ] log-uniform 
+
+𝛾 (min split loss) [0, 5]
+
+𝑛 estimators {300 , . . . , 1200 } boosting rounds loss {ndcg , pairwise , mse } optional categorical rel_top_bands {2, . . . , 5} ranking losses only CV folds 𝐾 5 shape-grouped 
+
+Table 11: Hyperparameter search space for Model B (MLP).    
+
+> Knob Range / values Notes loss
+
+{LambdaRank , RankNet ,
+
+mse } 
+
+> optional categorical learning rate
+
+[10 −4, 5 × 10 −3 ] log-uniform Adam hidden topology 10 preset tuples depths 2–4, widths 32 –
+
+1024  
+
+> dropout
+
+[0, 0.4] after each ReLU weight decay {0, 10 −7, 10 −6, 10 −5, 10 −4,
+
+10 −3 } 
+
+> epochs
+
+{20 , . . . , 150 } 
+
+> batch size
+
+{1024 , 2048 , 4096 , 8192 } MSE only groups per batch {32 , 64 , 128 , 256 } ranking only gradient clip (max norm) {0, 0.5, 1, 5, 10 } ranking only max pairs per group {2k , . . . , 64k } ranking only gain transform {linear , exp } LambdaRank only CV folds 𝐾 3 during search shape-grouped train seeds 2 per fold averaged before reporting 
+
+CV   
+
+> pruner median, 10 startup trials early-stops weak MLP tri-als
+
+LLambdaRank , or the tree ranker analogue), then evaluate on valida-tion groups G (𝑘 ) by computing (11) via (1). The CV score is CV (𝑓 𝜃 ) = 1
+
+𝐾 
+
+> 𝐾
+
+∑︁ 
+
+> 𝑘 =1
+
+1
+
+|G (𝑘 ) |∑︁ 𝑔 ∈ G (𝑘 )
+
+𝑅  𝑔 ; 𝑓 (𝑘 )
+
+> 𝜃
+
+. (15) Bayesian optimisation (Optuna TPE) minimises CV over tree depth, learning rate, regularisation, ensemble size, hidden widths, dropout, pair caps, and—when not fixed—the choice among ranking versus regression objectives. Pev is never used in (15). 
+
+4.3.10 Final Fit and Test Protocol. After hyperparameters are fixed, we refit 𝑓 𝜃 once on all training groups in Ptr (no held-out fold). The reported generalisation result is the evaluation of (11)–(1) on the 68 oracle groups in Pev , with breakdowns by problem regime (square, tall, wide, skinny-𝐾 , large). Baselines computed on the same measured data include uniform random selection, whose expected regret is E𝑔 [1 − ¯𝑦 (𝑔 )] with ¯ 𝑦 (𝑔 ) = 1
+
+> | C ( 𝑔 ) |
+
+Í𝑐 𝑦 (𝑔, 𝑐 ), and a single fixed configuration chosen by best mean 𝑦 over groups where it appears in at least 80% of evaluation groups. 0 20 40 60 80 100 120 140 
+
+> Epoch
+> 0.75 0.80 0.85 0.90 0.95
+> Validation NDCG@10
+> MLP (full, lambdarank) MLP (structural, lambdarank) MLP (full, mse) MLP (structural, mse) MLP (full, ranknet) MLP (structural, ranknet)
+
+Figure 5: MLP validation NDCG@10. 
+
+4.3.11 Relation between Training Loss and Validation Metric. Mea-sured throughput always defines the supervision signal ( 𝑦 and 𝛾 ), but the default training objectives are ranking losses that penalise incorrect orderings within C( 𝑔 ) rather than absolute error in b𝑇 .Cross-validation and final testing, by contrast, always score the 
+
+deployed rule (1) through regret (11). This deliberate mismatch— optimise surrogate ranking loss, validate selection regret—matches the compiler use case: only the identity of the argmax matters, and mis-ordering among top candidates is far more costly than mis-predicting throughput on clearly suboptimal tiles. 
+
+## 5 Evaluation 
+
+We run our experiments on a gh200 node of the Daint supercom-puter on CSCS Alps, equipped with 4 GH200 GPUs running SUSE Linux Enterprise Server 15 SP6. We compile CUTLASS from the commit 3476ddb7 using CUDA 13.1. The environment runs Python 3.12.3 with nvidia-matmul-heuristics-0.1.0.27 as the baseline; we are unable to compare against other related baselines [19, 24] since they are not implemented for the Hopper architecture. 
+
+## 5.1 Training 
+
+We train two model families, an MLP and XGBoost, under both the full hardware-aware representation and a structural-only abla-tion. For the MLP, we compare MSE, RankNet, and LambdaRank objectives; for XGBoost, we compare squared-error regression, pair-wise ranking, and NDCG listwise ranking. We monitor validation NDCG@10 during training. Figure 5 and Figure 6 show the validation trajectories. All objec-tives converge stably. With the full feature set, MSE achieves the highest validation NDCG@10 for both MLP (0.968) and XGBoost (0.960). On structural features, MSE again performs best, reaching 0.969 for MLP and 0.929 for XGBoost. Validation NDCG is not perfectly aligned with held-out selection regret. In particular, MLP RankNet attains slightly lower validation NDCG than MSE but achieves the lowest held-out regret among the MLP variants. We therefore report the best held-out configuration for each model family and retain the objective-level comparison as a training analysis rather than treating validation NDCG as a direct proxy for final selection quality. 
+
+> 13
+
+Shriram Chandran ∗† , Dominic Rinderer †, Yakup Budanaz, Alexandru Calotoiu, Marcin Copik, and Torsten Hoefler 0 200 400 600 800 
+
+> Boosting Round
+> 0.5 0.6 0.7 0.8 0.9
+> Validation NDCG@10
+> XGBoost (full, mse) XGBoost (structural, mse) XGBoost (full, ndcg) XGBoost (structural, ndcg) XGBoost (full, pairwise) XGBoost (structural, pairwise)
+
+Figure 6: XGBoost validation NDCG@10. lambdarank mse ranknet 0246810   
+
+> Regret (%)
+> MLP MLP(s) mse ndcg pairwise 0.0 0.2 0.4 0.6 0.8 1.0
+> Val NDCG@10
+> XGB XGB(s)
+
+Figure 7: Full and structural features across training objec-tives. 0 20 40 60 
+
+Selection Regret (%) 
+
+MLP XGB MLP(s) XGB(s) nvMMH Ridge Ridge(s) random 
+
+Figure 8: Mean selection regret. 
+
+Hardware-aware features improve held-out selection consis-tently across objectives. The gain is modest for the MLP and larger for XGBoost, suggesting that tree models benefit more strongly from exposing the derived hardware behavior explicitly. Figure 7 compares full and structural features across all objec-tives. 0 10 20 30 40 50 
+
+Per-Group Regret (%) 
+
+0.0 0.2 0.4 0.6 0.8 1.0 
+
+> CDF
+
+MLP MLP(s) XGB XGB(s) nvMMH Ridge Ridge(s) 
+
+Figure 9: CDF of per-group selection regret. Table 12: Selection quality on 68 exhaustively measured shape–layout groups. 
+
+Method Mean Median Within 1% Within 5% Top-1 MLP (full) 6.2% 2.6% 36.8% 63.2% 27.9% MLP (structural) 7.4% 3.1% 32.4% 55.9% 26.5% XGBoost (full) 6.4% 4.9% 25.0% 52.9% 19.1% XGBoost (structural) 10.7% 8.3% 17.6% 39.7% 13.2% nvMMH (best-of-𝐾 ) 12.0% 10.2% 0.0% 25.0% 0.0% nvMMH (top-1) 17.3% 14.6% 0.0% 10.3% 0.0% Ridge (full) 23.7% 20.0% 4.4% 16.2% 1.5% Ridge (structural) 60.8% 63.6% 0.0% 0.0% 0.0% Analytical score 63.7% 63.8% 0.0% 0.0% 0.0% Random 71.5% — — — —
+
+## 5.2 Evaluation on the Exhaustive Dataset 
+
+We consider an MLP with 1 .76 M trainable parameters and an XG-Boost ensemble of 916 trees with maximum depth 7. Table 12 summarizes the main results. On the held out evaluation dataset (Figure 8), the best hardware-aware MLP reduces mean re-gret to 6 .2%, compared with 17 .3% for the top-1 nvMMH recommen-dation and 71 .5% for a random valid candidate. Hardware-aware XGBoost MSE follows closely at 6 .4%. Hardware-aware features reduce mean regret on the best MLP from 7 .4% to 6 .2%; for XGBoost, they reduce it from 10 .7% to 6 .4%. The larger XGBoost gain indi-cates that the derived features substantially simplify the mapping from configuration parameters to performance. The learned selectors are also substantially more likely to return near-oracle kernels. MLP RankNet selects a kernel within 5% of the oracle on 63 .2% of groups, and XGBoost MSE does so on 52 .9%. In comparison, nvMMH top-1 reaches this threshold on only 10 .3% of groups. Even an oracle choice among nvMMH’s top-𝐾 recom-mendations reaches it on only 25 .0%, showing that much of the remaining gap arises from the candidate ranking itself rather than from the final choice within the shortlist. We next ask whether the hardware-aware representation could support strong kernel selection without a nonlinear learned model. We compare against two simpler alternatives: a validation-selected 
+
+14 Hardware-Aware Features for CUTLASS Kernel Selection MLP MLP(s) XGB XGB(s) nvMMH 010 20 30 40 50 60 70 
+
+> Groups Within 5% of Oracle (%)
+
+Figure 10: Fraction of evaluation groups selected within 5% 
+
+of oracle throughput. 
+
+analytical score that combines a small set of mechanistic hardware terms, and a ridge regressor that linearly scores candidates using the same feature representation as our learned selectors (Table 12). The analytical score performs poorly, reaching 63 .7% mean re-gret and never selecting a configuration within 5% of the oracle across the 68 exhaustive evaluation groups. Individual hardware features correlate with throughput in training, yet this compact composition of them fails to rank the performance tail: knowing which mechanisms matter is not the same as knowing how they in-teract. Under the same linear model family, structural features alone yield 60 .8% regret, while adding the hardware-aware representation reduces this to 23 .7%. Thus the proposed features expose substantial selection signal even without a large nonlinear model. However, this global linear combination remains worse than nvMMH (17 .3%) and far behind the nonlinear MLP and XGBoost selectors (6 .2% and 6.4%). These results separate representation from model expressivity. Hardware-aware features make the problem considerably easier to learn, but a single global linear mapping is insufficient for strong performance in this setting. The nonlinear learned models are there-fore important for translating mechanistic features into accurate kernel rankings. Figure 9 shows that MLP and XGBoost place most of their mass at low regret: hardware-aware MLP and XGBoost have medians of 2.6% and 4 .9%, compared with 14 .6% for nvMMH, and hardware-aware models sit above their structural counterparts throughout the curve. Figure 10 reports the fraction of groups within 5% of oracle throughput. 
+
+Regime breakdown. Selection quality varies by problem geome-try. MLP RankNet achieves mean regret of 0 .9% on wide GEMMs and 3 .3% on tall GEMMs, while square and skinny-𝐾 problems re-main more difficult. The same trend appears for XGBoost and the structural ablations. nvMMH performs worse across all regimes, with mean regret between approximately 12% and 19%. skinny-K square tall wide 
+
+> Shape Regime
+> 0510 15 20
+> Mean Regret (%)
+> MLP (full) MLP (structural) XGBoost (full) XGBoost (structural) nvMMH
+
+Figure 11: Mean regret by GEMM shape regime. skinny-K square tall wide    
+
+> Shape Regime
+> 0246810 12 14
+> Regret (%)
+> MLP MLP(s) XGB XGB(s) skinny-K square tall wide
+> Shape Regime
+> 020 40 60 80
+> Within 5% of Oracle (%)
+> MLP MLP(s) XGB XGB(s)
+
+Figure 12: Regret and within-5% rate by regime for the best full and structural variants. 10 3 10 4 10 5 10 6
+
+MLP Params 510 15 20 Regret (%) 
+
+Full Structural 
+
+Figure 13: MLP of different parameter counts. 
+
+## 5.3 Model Size Ablations 
+
+We next ask whether the benefit of hardware-aware features persists as model capacity changes. We fix the MSE objective and sweep MLP widths from 16 ×8 to 1024 ×1024 ×512 ×256, and XGBoost max_-depth over {2, 3, 4, 6, 8, 11 , 14 }, using three seeds per configuration and both feature sets. Figure 13 and Figure 14 report held-out mean selection regret. Hardware-aware features substantially reduce the model capac-ity required for accurate kernel selection. At the smallest MLP sizes, the structural model incurs up to 14% higher regret, whereas 
+
+15 Shriram Chandran ∗† , Dominic Rinderer †, Yakup Budanaz, Alexandru Calotoiu, Marcin Copik, and Torsten Hoefler 2 3 4 6 8 11 14 XGBoost Maximum Depth 10 15 20 25 Regret (%) 
+
+Full Structural 
+
+Figure 14: XGB of different depths. 
+
+the hardware-aware representation already captures much of the performance structure of the search space. As capacity increases, structural models gradually recover this gap, and only the largest MLP ( ∼1.7 M parameters) matches the full representation. This ef-fect is even more pronounced for tree models. XGBoost benefits from the hardware-aware representation throughout the entire depth sweep and retains an advantage even at the largest tested depth. In this sense, the hardware-aware features do not merely improve final accuracy; they make kernel-selection itself easier to learn. 
+
+## 5.4 Generalization and Broad GEMM Evaluation 
+
+The exhaustive evaluation measures selection quality against a true in-space oracle, but necessarily covers only a small number of prob-lems. We therefore evaluate whether the same selectors generalize at scale to 8 ,000 previously unseen BF16 GEMMs. Half of the shapes are 32-aligned, while the remainder are only 8-aligned, introducing off-grid dimensions that are sparsely represented in the training sweep. The broad evaluation uses 2 ,000 (𝑀, 𝑁 , 𝐾 ) triples held out from the production BF16 autotuning databases and evaluates each under all four operand layouts (TN, TT, NN, NT), yielding 8 ,000 problems. Half of the shapes are fully 32-aligned; the remainder are 8-aligned but not 32-aligned. The latter set tests generalization to off-grid dimensions that are largely absent from the regular training sweep. The performance results are in Table 13. We compare four learned selectors—MLP and XGBoost MSE, each with the full hardware-aware representation and the structural-only ablation—against nvMMH. Each learned model returns a sin-gle rank-1 CUTLASS configuration. nvMMH emits a rank-1 tile and cluster recommendation but does not completely specify the CUTLASS mainloop, epilogue, and scheduler configuration. We therefore materialize all valid variants consistent with the nvMMH recommendation and report the best measured variant. This gives nvMMH an optimistic comparison relative to the learned selectors, which each receive only one selected kernel. 
+
+Table 13: Broad GEMM evaluation on 8,000 held-out problems.                          
+
+> Model Features Geo-mean % roof vs. nvMMH Win % MLP MSE Full 11.9% 1.14 ×79.6% MLP MSE Structural only 11.5% 1.10 ×73.9% XGBoost MSE Full 11.8% 1.13 ×77.4% XGBoost MSE Structural only 11.4% 1.09 ×70.1% nvMMH —37.6 10.5% ——
+
+All candidates are compiled and benchmarked on the same GH200 node using the same warmup, iteration-count, and operand-rotation protocol as the training measurements. To isolate kernel ranking from tile-scheduler choices, every method uses the same rank-1 rasterization, swizzle, and split-𝐾 settings during bench-marking. nvMMH retains its recommended tile geometry, while the learned selectors retain their independently selected tile, schedule, cluster, and pipeline configuration. Figure 15a places the selected kernels against the GH200 roofline. For the roofline analysis, we use a GH200 peak BF16 tensor-core throughput of 989 .5 Tflop /s and memory bandwidth of 4 TB /s. Arithmetic intensity is computed from the mathematical GEMM work and minimum operand traffic. Each light point corresponds to one measured GEMM, while the bold curves show binned me-dian throughput. The hardware-aware MLP and XGBoost selectors produce nearly identical performance envelopes despite their very different model architectures, and both consistently outperform nvMMH across the full arithmetic-intensity range. The improve-ment persists from memory-bound GEMMs through the transi-tion region and into compute-bound problems, indicating that the learned representation captures performance effects beyond any single bottleneck regime. All methods achieve 100% execution coverage on the 8 ,000 prob-lems. The hardware-aware MLP reaches 42 .9 Tflop /s geometric-mean throughput compared with 37 .6 Tflop /s for nvMMH, cor-responding to a 1 .14 × improvement. Hardware-aware XGBoost reaches 42 .4 Tflop /s, or 1 .13 × nvMMH. The structural variants re-main competitive at 41 .2 and 41 .0 Tflop /s, but both are consistently below their hardware-aware counterparts. Measured per problem, the full-feature MLP outperforms nvMMH on 79 .6% of cases and full-feature XGBoost on 77 .4%. Even the structural variants win on 73 .9% and 70 .1%, respectively. To-gether with the exhaustive-oracle evaluation, this shows that the learned selectors’ lower selection regret translates directly into higher realized throughput over a substantially broader problem distribution. 
+
+## 5.5 Transfer Learning Experiments 
+
+We evaluate whether a selector trained on BF16 can be adapted efficiently to new precisions. We transfer the BF16 models to FP32 and FP8 E4M3 GEMMs using nested subsets of the corresponding target-dtype training corpus, and evaluate on held-out problems against nvMMH. Figures 15b and 15c show that only modest target-dtype su-pervision is required to recover strong performance. On FP32, hardware-aware selectors already reach approximately 1 .20 ×–1.22 × geometric-mean speedup over nvMMH using only 5% of 
+
+> 16 Hardware-Aware Features for CUTLASS Kernel Selection
+
+10 2 10 3
+
+Arithmetic Intensity [flop/byte] 10 2
+
+10 1
+
+10 0
+
+10 1
+
+10 2
+
+10 3
+
+> Throughput [Tflop/s]
+
+MLP XGBoost nvMMH 
+
+> (a) GEMM evaluation against GH200 roofline.
+
+1 510 25 50 100 Training data fraction (%) 1.0 1.1 1.2 Speedup vs nvMMH 
+
+MLP (full) MLP (structural) XGBoost (full) XGBoost (structural) (b) Cross-precision transfer to FP32. 1 510 25 50 100 Training data fraction (%) 1.0 1.1 1.2 1.3 Speedup vs nvMMH 
+
+MLP (full) MLP (structural) XGBoost (full) XGBoost (structural) 
+
+> (c) Cross-precision transfer to FP8.
+
+1 510 25 50 100 Training data fraction (%) 0.75 0.80 0.85 0.90 0.95 1.00 Speedup vs nvMMH 
+
+MLP (full) MLP (structural) XGBoost (full) XGBoost (structural) (d) Cross-epilogue transfer. 
+
+Figure 15: Model Generalization and Transfer experiments. 
+
+the available target shapes, and improve to approximately 1 .24 ×
+
+with the full target corpus. The corresponding structural models generally trail the hardware-aware representation, particularly in the low-data regime. FP8 E4M3 presents a noisier, more difficult transfer setting, but the same trend persists. Hardware-aware MLPs reach 1 .12 × speedup with 5% of the target shapes and 1 .19 × with the full corpus, while XGBoost remains around 1 .15 ×–1 .17 × across the sweep. Together, these results show that the selectors retain useful structure across changes in numerical precision, and that ex-posing candidate-induced hardware behavior improves adaptation when target-domain measurements are limited. We repeat the same finetuning protocol for FP16 epilogue-fusion GEMMs, fusing ReLU, GeLU, and/or bias, warm-starting from the unfused BF16 checkpoints. Figure 15d summarizes the results on held-out fusion GEMMs. With only 10% of the fusion corpus, hardware-aware MLP and XGBoost already match nvMMH (1 .00 ×
+
+and 1 .00 × geometric-mean speedup, respectively) and outperform the structural ablation (0 .93 ×). 
+
+5.5.1 Transfer Learning Details. For each target dtype, FP32 TN and FP8 E4M3 TN, we construct nested subsets containing 
+
+{1, 5, 10 , 25 , 50 , 100 }% of the 593 target-dtype base training shapes. The same (𝑀, 𝑁 , 𝐾 ) subsets are used for FP32 and FP8, while the measured candidate kernels differ according to dtype-specific va-lidity and compilation behavior. The fractions therefore measure target-domain shape coverage rather than equal numbers of kernel measurements. We fix the MSE objective and reuse the model architectures selected for the BF16 study. MLP transfer initializes from the corre-sponding BF16 checkpoint, while XGBoost is warm-started from the BF16 model by adding 200 trees. We evaluate both the complete 
+
+> 17 Shriram Chandran ∗† , Dominic Rinderer †, Yakup Budanaz, Alexandru Calotoiu, Marcin Copik, and Torsten Hoefler
+
+Table 14: Cross-precision transfer at 100% of the target TN training shapes.                                     
+
+> Dtype Method Coverage Speedup Win % FP32 MLP (full) 89.5% 1.24 ×74.6% FP32 XGBoost (full) 96.7% 1.24 ×78.4% FP32 MLP (structural) 96.1% 1.18 ×71.8% FP32 XGBoost (structural) 91.7% 1.20 ×68.6% FP8 E4M3 MLP (full) 65.4% 1.19 ×47.4% FP8 E4M3 XGBoost (full) 73.0% 1.17 ×51.2% FP8 E4M3 MLP (structural) 87.5% 1.18 ×64.6% FP8 E4M3 XGBoost (structural) 66.0% 1.15 ×43.6%
+
+hardware-aware representation and the structural ablation. Evalu-ation uses a disjoint held-out TN set and the same benchmarking protocol as Section 5.4. Learned selectors emit one rank-1 kernel, while nvMMH is evaluated using its best valid schedule realization. At full target-dtype coverage, FP32 transfer reaches 1 .24 ×
+
+geometric-mean speedup for both hardware-aware MLP and XG-Boost, with win rates of 74 .6% and 78 .4%, respectively. Structural variants remain strong but consistently lower, reaching 1 .18 × and 1.20 ×. FP8 remains more challenging, particularly in execution coverage, but the hardware-aware MLP and XGBoost still achieve 1.19 × and 1 .17 × geometric-mean speedup over nvMMH. The low-data regime is particularly informative. At 5% of the target shape pool, the hardware-aware FP32 models already exceed nvMMH by roughly 20%–22%, despite observing only 30 target-dtype GEMM geometries. The corresponding FP8 models also ex-ceed nvMMH, demonstrating that much of the useful structure learned from BF16 survives the precision change and can be adapted with comparatively little target-domain data. We apply the same finetuning protocol to the FP16 epilogue-fusion GEMMs. Selectors are warm-started from the unfused BF16 checkpoints and finetuned on nested subsets of the 593-shape fusion training corpus, using the same {1, 5, 10 , 25 , 50 , 100 }% fractions as the precision-transfer study. We evaluate 1 ,000 held-out problems with in-vocabulary fusion kinds assigned at evaluation time. At full fusion training coverage, hardware-aware XGBoost matches nvMMH (1 .00 × geometric-mean speedup), while the hardware-aware MLP reaches 0 .97 ×. Structural variants remain below at 0 .94 ×–0 .94 ×. All configurations achieve 100% execution coverage. The low-data fusion regime mirrors the precision-transfer trend. With only 10% of the fusion corpus (59 shapes), hardware-aware MLP and XGBoost already reach 1 .00 × geometric-mean speedup over nvMMH, while structural models remain lower. The hardware-aware MLP peaks at 1 .01 × with 25% coverage before settling near parity. 
+
+## 5.6 DeepBench Case Study 
+
+To test whether the same selectors generalize to an externally de-fined workload, we evaluate on dense GEMMs from DeepBench [2], a public catalogue of speech-recognition and language-modeling kernels compiled for 2016-era training and inference stacks. Our cat-alogue contains 151 unique (𝑀, 𝑁 , 𝐾, layout ) problems after dedu-plication. The evaluation set contains 107 training, 39 inference-server, and 5 inference-device problems. MLP MLP(s) XGB XGB(s) Ridge Ridge(s) Random 0.0 0.2 0.4 0.6 0.8 1.0 1.2 
+
+> Speedup vs nvMMH
+
+Figure 16: Speedup vs. nvMMH. Table 15: DeepBench throughput generalization on 151 prob-lems. Speedup is geometric-mean throughput relative to nvMMH.                            
+
+> Model Features vs. nvMMH Win % MLP MSE Full 1.12 ×96.0% MLP MSE Structural only 1.13 ×92.7% XGBoost MSE Full 1.12 ×84.8% XGBoost MSE Structural only 1.05 ×59.6% Ridge Full 0.83 ×40.4% Ridge Structural only 0.27 ×0.0% Random —0.22 ×0.0% nvMMH ———
+
+Table 16: DeepBench speedup vs. nvMMH by catalogue split.                 
+
+> Split 𝑛 MLP (full) MLP (struct.) XGBoost (full) Training 107 1.09 ×1.09 ×1.07 ×
+> Inference server 39 1.25 ×1.28 ×1.29 ×
+> Inference device 51.08 ×1.00 ×1.04 ×
+
+Table 15 and Figure 16 summarize the results. All learned se-lectors achieve 100% execution coverage on the retained prob-lems. Hardware-aware MLP and XGBoost improve geometric-mean throughput by 12%–13% over nvMMH and win on 85%–96% of prob-lems. The structural MLP matches the full model (1 .13 ×), consistent with the observation that structural features extrapolate more ro-bustly when problem geometry departs from the training grid. Ridge and random baselines remain well below nvMMH, confirming that the gains require learned nonlinear ranking rather than a linear surrogate or chance. The improvement is largest on inference-server GEMMs (1 .24 ×–1.29 × for MLP and XGBoost over nvMMH), which contain the batched speech and language-modeling layers DeepBench was de-signed to stress. Training-split problems show a smaller but still positive margin ( ≈ 1.07 ×–1 .09 ×). 
+
+> 18 Hardware-Aware Features for CUTLASS Kernel Selection
+
+## 6 Related Work 
+
+Learned cost models guide iterative search over tensor-program spaces [1, 6, 10, 26, 28] in frameworks like AutoTVM [5, 23] and An-sor [28]. While corpora like TenSet [29] and optimization methods like AdaTune [10] or TLP [25] improve search efficiency, our model scores the entire valid CUTLASS configuration catalogue in a single batch to directly select the optimal implementation. While device-transfer frameworks [1, 16, 25] rely on complex learned program representations, instead we show that explicit, mechanism-level hardware features provide a strong inductive bias that improves transfer accuracy with fewer target-domain measurements. While predictive models like ISAAC [22], CUTLASS-tailor [24], and related low-bit selectors [7, 8] show that GEMM execution cost is learnable from configuration descriptors [11], our model uses analytical hardware-behavior features to directly rank and select optimal configurations. Manual analytical models [9, 15] and heuristics [3, 13, 19, 27] avoid training data by hardcoding hardware-mapping rules, but we learn these complex interactions from behavioral features instead. Architectural innovations like Stream-K [14] and FlashAttention-3 [17] demonstrate that GPU efficiency relies on work partitioning and pipeline coordination rather than just raw computation. We model these underlying mechanisms as compile-time features to select optimal configurations from the vast spaces exposed by CUT-LASS. 
+
+## 7 Conclusion 
+
+We presented a hardware-aware approach to learned CUTLASS kernel selection. Rather than asking a model to infer GPU behavior from raw configuration parameters, we augment each candidate with statically computable estimates of induced execution behavior. Using 4.9 million measured CUTLASS kernels, the resulting repre-sentation achieves mean selection regret of 6 .2% with an MLP and 6.4% with XGBoost, compared with 17 .3% for the top-1 nvMMH recommendation. Its benefit across both model families indicates that the improvement comes from the representation rather than a particular predictor architecture. More broadly, our results suggest that learned performance mod-els benefit from representing what a configuration does to the hardware, rather than only what the configuration is. Raw param-eters often hide effects whose meaning changes with workload and execution regime, while fully analytical models require brittle architecture-specific rules. Hardware-aware representations pro-vide an intermediate abstraction: architectural knowledge exposes the relevant mechanisms, while data learns their interactions. As accelerator configuration spaces grow, such behavioral representa-tions may provide a reusable basis for performance models across precisions, operators, and architectures. The central implication is that better performance models may come less from larger models than from better representations aligned with hardware execution. 
+
+## AI Acknowledgment 
+
+In this work, we used generative AI tools to assist with the im-plementation and debugging of benchmarking and analysis code, interpret intermediate experimental results, and assist with lan-guage editing of the manuscript. We did not use generative AI tools to generate synthetic experimental data, formulate or prove mathe-matical claims, or fabricate experimental measurements or results. Tasks involving surveys, interviews, transcription of research ma-terial, and qualitative or thematic data analysis were not applicable to this work. All AI-assisted research ideas, methodological suggestions, code, analyses, and manuscript text were reviewed by the authors. AI-assisted code was inspected and validated through compilation, testing, and comparison against measured data before being used in the experimental pipeline. Literature suggestions and technical claims were checked against the corresponding papers or documen-tation. Experimental results were obtained from the authors’ own measurement infrastructure, and their interpretation and the final scientific conclusions were determined by the authors. We take responsibility for the final content of this work, including all text, claims, code, and artifacts produced with the aid of generative AI. 
+
+## Code 
+
+Our code is available online at https://github.com/spcl/cutlass-selector. 
+
+## Acknowledgments 
+
+This project received support by the ERC PSAP project (Grant Agreement No. 101002047). The research was conducted as part of the FastTrackAI project at the Singapore-ETH Centre, which was established collaboratively between ETH Zurich and the Na-tional Research Foundation, Singapore. Additionally, this research is supported by the National Research Foundation, Singapore (NRF), and the Ministry of Digital Development and Information (MDDI) under the AI Visiting Professorship (Award No. AIVP-2025-005). We also thank the Swiss National Supercomputing Center (CSCS) for providing the computational resources used in this work. 
+
+## References                      
+
+> [1] Yang Bai, Mingjun Li, Wendong Xu, and Bei Yu. 2025. A learned performance model with transfer learning across GPUs on tensorized instructions. IEEE Transactions on Parallel and Distributed Systems 36, 9 (2025), 1904–1919. [2] Baidu. 2016. DeepBench: Benchmarking deep learning operations on different hardware. https://github.com/baidu-research/DeepBench. [3] Harrison Barclay, Ian Tramble, Michał Kukuła, Michel Migdal, Nicholai Tukanov, and Leopold Cambier. 2025. Improving GEMM Kernel Auto-Tuning Efficiency on NVIDIA GPUs with Heuristics and CUTLASS 4.2 | NVIDIA Technical Blog. https://developer.nvidia.com/blog/improving-gemm-kernel-auto-tuning-efficiency-on-nvidia-gpus-wi\th-heuristics-and-cutlass-4-2/ [4] Ganesh Bikshandi and Jay Shah. 2023. Developing CUDA Kernels for Accelerated Matrix Multiplication on NVIDIA Hopper Architecture using the CUTLASS Library. Colfax Research (2023). [5] Tianqi Chen, Lianmin Zheng, Eddie Yan, Ziheng Jiang, Thierry Moreau, Luis Ceze, Carlos Guestrin, and Arvind Krishnamurthy. 2018. Learning to optimize tensor programs. In Proceedings of the 32nd International Conference on Neural Information Processing Systems (Montréal, Canada) (NIPS’18) . Curran Associates Inc., Red Hook, NY, USA, 3393–3404. [6] Junkyeong Choi, Hyucksung Kwon, Woongkyu Lee, Jungwook Choi, and Jieun Lim. 2022. Learning from distinctive candidates to optimize reduced-precision convolution program on tensor cores. arXiv preprint arXiv:2202.06819 (2022). [7] Hong Guo, Nianhui Guo, Christoph Meinel, and Haojin Yang. 2024. Low-bit CUTLASS GEMM Template Auto-tuning using Neural Network. In 2024 IEEE International Symposium on Parallel and Distributed Processing with Applications (ISPA) . 394–401. doi:10.1109/ISPA63168.2024.00057 [8] Hong Guo, Nianhui Guo, Christoph Meinel, and Haojin Yang. 2026. Leveraging Large-Scale Data for Efficient Low-Bit CUTLASS GEMM Optimization via Neural Networks. Big Data Mining and Analytics 9, 2 (2026), 632–652. doi:10.26599/ BDMA.2025.9020065 19
+
+Shriram Chandran ∗† , Dominic Rinderer †, Yakup Budanaz, Alexandru Calotoiu, Marcin Copik, and Torsten Hoefler 
+
+[9] Aaron Jarmusch and Sunita Chandrasekaran. 2026. Microbenchmark-Driven Analytical Performance Modeling Across Modern GPU Architectures. arXiv:2605.04178 [cs.DC] https://arxiv.org/abs/2605.04178 [10] Menghao Li, Minjia Zhang, Chi Wang, and Mingqin Li. 2020. AdaTune: adaptive tensor program compilation made efficient. In Proceedings of the 34th International Conference on Neural Information Processing Systems (Vancouver, BC, Canada) 
+
+(NIPS ’20) . Curran Associates Inc., Red Hook, NY, USA, Article 1241, 13 pages. [11] Xiaoteng Liu and Pavly Halim. 2024. Understanding GEMM Performance and En-ergy on NVIDIA Ada Lovelace: A Machine Learning-Based Analytical Approach. arXiv:2411.16954 [cs.DC] https://arxiv.org/abs/2411.16954 [12] Weile Luo, Ruibo Fan, Zeyu Li, Dayou Du, Qiang Wang, and Xiaowen Chu. 2024. Benchmarking and Dissecting the Nvidia Hopper GPU Architecture. In 2024 IEEE International Parallel and Distributed Processing Symposium (IPDPS) . 656–667. doi:10.1109/IPDPS57955.2024.00064 [13] NVIDIA. 2025. NVIDIA Matmul Heuristics — nvMatmulHeuristics. https: //docs.nvidia.com/cuda/nvidia-matmul-heuristics/ [14] Muhammad Osama, Duane Merrill, Cris Cecka, Michael Garland, and John D. Owens. 2023. Stream-K: Work-Centric Parallel Decomposition for Dense Matrix-Matrix Multiplication on the GPU. In Proceedings of the 28th ACM SIGPLAN Annual Symposium on Principles and Practice of Parallel Programming (Montreal, QC, Canada) (PPoPP ’23) . Association for Computing Machinery, New York, NY, USA, 429–431. doi:10.1145/3572848.3577479 [15] Dezhi Ran, Shuxiao Xie, Mingfang Ji, Anmin Liu, Mengzhou Wu, Yuan Cao, Yuzhe Guo, Hao Yu, Linyi Li, Yitao Hu, Wei Yang, and Tao Xie. 2026. KernelBand: Steering LLM-based Kernel Optimization via Hardware-Aware Multi-Armed Bandits. arXiv:2511.18868 [cs.LG] https://arxiv.org/abs/2511.18868 [16] Jaehun Ryu and Hyojin Sung. 2021. Metatune: Meta-learning based cost model for fast and efficient auto-tuning frameworks. arXiv preprint arXiv:2102.04199 
+
+(2021). [17] Jay Shah, Ganesh Bikshandi, Ying Zhang, Vijay Thakkar, Pradeep Ramani, and Tri Dao. 2024. FlashAttention-3: fast and accurate attention with asynchrony and low-precision. In Proceedings of the 38th International Conference on Neu-ral Information Processing Systems (Vancouver, BC, Canada) (NIPS ’24) . Curran Associates Inc., Red Hook, NY, USA, Article 2193, 28 pages. [18] Rupanshu Soi, Rohan Yadav, Fredrik Kjolstad, Alex Aiken, Maryam Mehri Dehnavi, Michael Garland, and Michael Bauer. 2025. Optimal Software Pipelin-ing and Warp Specialization for Tensor Core GPUs. arXiv:2512.18134 [cs.PL] https://arxiv.org/abs/2512.18134 [19] Ryan Swann, Muhammad Osama, Xiaohu Guo, Bryant Nelson, Lixun Zhang, Alex Brown, Yen Ong, Ali Yazdani, Sean Siddens, Ganesh Dasika, et al. 2025. tritonblas: Triton-based analytical approach for gemm kernel parameter selection. arXiv preprint arXiv:2512.04226 (2025). [20] Vijay Thakkar, Cris Cecka, Tejash Shah, Jay Shah, Paul VanKough-nett, and Ryo Asai. 2025. CUTLASS 3.x: Orthogonal, Reusable, and Composable Abstractions for GEMM Kernel Design | NVIDIA Technical Blog. https://developer.nvidia.com/blog/cutlass-3-x-orthogonal-reusable-and-composable-abstractions-\for-gemm-kernel-design/ [21] Vijay Thakkar, Pradeep Ramani, Cris Cecka, Aniket Shivam, Honghao Lu, Ethan Yan, Jack Kosaian, Mark Hoemmen, Haicheng Wu, Andrew Kerr, Matt Nicely, Duane Merrill, Dustyn Blasig, Aditya Atluri, Fengqi Qiao, Piotr Majcher, Paul Springer, Markus Hohnerbach, Jin Wang, and Manish Gupta. 2023. CUTLASS. https://github.com/NVIDIA/cutlass/tree/v3.0.0 [22] Philippe Tillet and David Cox. 2017. Input-aware auto-tuning of compute-bound HPC kernels. In Proceedings of the International Conference for High Performance Computing, Networking, Storage and Analysis (Denver, Colorado) (SC ’17) . As-sociation for Computing Machinery, New York, NY, USA, Article 43, 12 pages. doi:10.1145/3126908.3126939 [23] Xingfu Wu, Praveen Paramasivam, and Valerie Taylor. 2023. Autotuning Apache TVM-based Scientific Applications Using Bayesian Optimization. In 
+
+Proceedings of the SC ’23 Workshops of the International Conference on High Per-formance Computing, Network, Storage, and Analysis (Denver, CO, USA) (SC-W ’23) . Association for Computing Machinery, New York, NY, USA, 29–35. doi:10.1145/3624062.3626079 [24] Yongseung Yu, Donghyun Son, Younghyun Lee, Sunghyun Park, Giha Ryu, Myeongjin Cho, Jiwon Seo, and Yongjun Park. 2023. Tailoring CUTLASS GEMM using Supervised Learning. In 2023 IEEE 41st International Conference on Computer Design (ICCD) . 465–474. doi:10.1109/ICCD58817.2023.00077 [25] Yi Zhai, Yu Zhang, Shuo Liu, Xiaomeng Chu, Jie Peng, Jianmin Ji, and Yanyong Zhang. 2023. TLP: A Deep Learning-Based Cost Model for Tensor Program Tuning. In Proceedings of the 28th ACM International Conference on Architectural Support for Programming Languages and Operating Systems, Volume 2 (Vancouver, BC, Canada) (ASPLOS 2023) . Association for Computing Machinery, New York, NY, USA, 833–845. doi:10.1145/3575693.3575737 [26] Kaixuan Zhang, Chutong Ding, Shiyou Qian, Luping Wang, Jian Cao, Guangtao Xue, Cheng Huang, Guodong Yang, and Liping Zhang. 2026. WaveTune: Wave-aware Bilinear Modeling for Efficient GPU Kernel Auto-tuning. arXiv preprint arXiv:2604.10187 (2026). [27] Xiao Zhang, Yaoyao Ding, Bolin Sun, Yang Hu, Tatiana Shpeisman, and Gennady Pekhimenko. 2026. Hexcute: A Compiler Framework for Automating Layout Synthesis in GPU Programs. arXiv:2504.16214 [cs.LG] https://arxiv.org/abs/2504. 16214 [28] Lianmin Zheng, Chengfan Jia, Minmin Sun, Zhao Wu, Cody Hao Yu, Ameer Haj-Ali, Yida Wang, Jun Yang, Danyang Zhuo, Koushik Sen, Joseph E. Gonzalez, and Ion Stoica. 2020. Ansor: generating high-performance tensor programs for deep learning. In Proceedings of the 14th USENIX Conference on Operating Systems Design and Implementation (OSDI’20) . USENIX Association, USA, Article 49, 17 pages. [29] Lianmin Zheng, Ruochen Liu, Junru Shao, Tianqi Chen, Joseph E Gonzalez, Ion Stoica, and Ameer Haj Ali. 2021. Tenset: A large-scale program performance dataset for learned tensor compilers. In Thirty-fifth Conference on Neural Infor-mation Processing Systems Datasets and Benchmarks Track (Round 1) .20

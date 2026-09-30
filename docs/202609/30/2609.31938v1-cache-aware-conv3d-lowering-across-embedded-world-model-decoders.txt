@@ -1,0 +1,323 @@
+Title: Cache-Aware Conv3D Lowering Across Embedded World-Model Decoders
+
+URL Source: https://arxiv.org/pdf/2609.31938v1
+
+Published Time: Tue, 29 Sep 2026 00:16:36 GMT
+
+Number of Pages: 16
+
+Markdown Content:
+# Cache-Aware Conv3D Lowering Across Embedded World-Model Decoders 
+
+Jiaming Zhang 1,2, Wu Yang 2, Shuai Tao 2, and Wulong Liu 2 
+
+> 1
+
+University of Wisconsin–Madison, Madison, WI, USA  
+
+> 2
+
+Beta Infinity, Beijing, China 
+
+Abstract. Generative world models can provide visual rollouts for em-bodied planning, yet their feasibility on edge devices depends not only on the learned model but also on how the execution runtime repre-sents its operations. We introduce a cache-aware lowering that expresses supported causal Conv3D calls as batched spatial Conv2D operations while preserving pretrained weights, temporal-cache semantics, convo-lution parameters, bias placement, and output layout. Across the com-plete Cosmos3-Edge image-to-video pipeline on a 64-GB NVIDIA Jetson AGX Orin, the proposed route accelerates VAE decoding by approxi-mately 7× and reduces complete-generation latency by more than 2×,while repeated decoder evaluations maintain complete fast-path coverage without fallbacks. The unchanged lowering also improves Cosmos3-Nano and transfers to LingBot-World’s architecturally distinct Wan2.1 VAE. A clean-device comparison against fully specialized TensorRT shows that TensorRT provides a further 1.36 × steady-state improvement, but re-quires substantially greater per-module and per-runtime-state AOT spe-cialization. Same-latent BF16 and FP32 evaluations characterize the finite-precision differences introduced by the alternative execution order. Together, these results position cache-aware lowering as a lightweight runtime optimization that recovers most of the available decoder accel-eration without modifying the learned models themselves. 
+
+Keywords: World models · Video VAE · Edge inference · Runtime sys-tems · GPU optimization 
+
+## 1 Introduction 
+
+Learned world models support control by enabling an agent to reason through imagined observations or latent trajectories before acting [2–5]. Foundation-scale systems extend this concept toward general-purpose video generation and Physical AI models [7, 8, 12]. Because a planner may need to evaluate several possible futures before selecting an action, rollout latency directly limits both deliberation speed and the number of alternatives that can be considered. This systems-level concern is separate from whether the generated video is sufficiently accurate for closed-loop control. We study local execution on a 64-GB NVIDIA Jetson AGX Orin, whose unified-memory architecture provides substantially less compute capacity and arXiv:2609.31938v1 [cs.LG] 25 Sep 2026 2 J. Zhang et al. 
+
+memory bandwidth than datacenter GPUs. Robotic systems may alternatively rely on cloud or fog offloading [6, 11], but such approaches introduce additional networking, availability, and latency considerations. The central question of this work is whether a fixed pretrained causal video decoder can be executed more efficiently through a runtime-only transforma-tion. We do not retrain, quantize, prune, distill, replace, or otherwise modify the learned model. A Cosmos3-Nano profile attributes 139.91 of 145.82 VAE-decode GPU seconds, or 95.95%, to baseline Conv3D, with the largest costs concen-trated in calls with short temporal extents and large spatial feature maps. To address this pattern, we lower each supported temporal kernel tap to batched spatial Conv2D while preserving the pretrained weights, causal-cache ordering, convolution parameters, bias placement, and output layout. Unsupported calls return to the original Conv3D implementation, while route counters expose un-supported cases and fallbacks. We evaluate Cosmos3-Edge as the primary deployment case through its com-plete Diffusers-native image-to-video pipeline. Edge uses the same byte-identical Wan2.2 VAE checkpoint as Cosmos3-Nano but exercises it through a different conditioning and generation path. We separately measure image-conditioning VAE encoding, denoising and other pipeline operations, and final VAE decod-ing, while retaining the Nano profile and complete text-to-video sweep. Finally, we apply the unchanged lowering to LingBot-World [10], whose distinct Wan2.1 VAE provides evidence of transfer across decoder architectures. This evaluation design distinguishes isolated decoder acceleration from improvements that re-main visible at the complete-generation boundary across different workloads, frame lengths, and VAE configurations. 
+
+Our Contributions (1) Edge deployment characterization. We connect the reconciled Cosmos3-Nano Conv3D profile to a controlled Cosmos3-Edge deployment using the byte-identical Wan2.2 VAE. We separate complete I2V latency into encoder, decoder, and unchanged transformer-and-other work. 
+
+(2) Cache-aware lowering. We express supported cached causal Conv3D calls as batched Conv2D operations while preserving temporal indexing and model semantics. The route includes guarded fallback, reversible installation, derived-weight caching, and explicit route accounting. 
+
+(3) Cross-boundary and cross-decoder evaluation. We report repeated Edge generation and decoder measurements, retain the Cosmos3-Nano genera-tion sweep, and test decoder-only transfer on LingBot-World’s distinct Wan2.1 VAE. We additionally report numerical agreement, route coverage, completion, and memory behavior. 
+
+(4) Production-runtime comparison. We construct a full-coverage Ten-sorRT baseline for the 17-frame Edge decoder. TensorRT achieves the lowest steady-state latency under aggressive fixed-model AOT specialization, while our generic runtime lowering captures 95.55% of the absolute eager-to-TensorRT la-tency reduction without per-module or per-state engine construction. Cache-Aware Conv3D Lowering Across Embedded World-Model Decoders 3
+
+## 2 Related Work 
+
+World Models and Video Generation. World models learn predictive dynamics that allow an agent to reason through imagined observations or latent trajec-tories [3–5]. Visual foresight makes this connection more explicit by combin-ing action-conditioned video prediction with model-predictive control [2]. More recent systems extend predictive modeling toward general-purpose video gen-eration and Physical AI. Cosmos provides pretrained world foundation models [7, 8], while Wan introduces an open family of large-scale video generators [12]. LingBot-World further develops an interactive world model using the Wan video stack [10]. These systems motivate the need for efficient rollout generation. However, our study does not compare predictive accuracy, interaction quality, or policy performance. Instead, we examine whether the execution of fixed pre-trained video VAEs can be accelerated through a runtime transformation alone. This distinction allows the learned behavior of the model to remain unchanged while isolating the effect of the underlying execution strategy. 
+
+Spatiotemporal Computation and Decoder Acceleration. Previous work has re-structured 3D convolution by separating its spatial and temporal computation. P3D and R(2+1)D replace or factorize 3D kernels into combinations of spatial and temporal operations for network design and optimization [9, 14]. Our ap-proach similarly exposes the spatial computation within Conv3D, but it does not introduce a learned factorization or alter the architecture. Instead, each temporal tap of an existing causal Conv3D is evaluated as spatial Conv2D over the valid cached frames, while the original weights and temporal indexing are maintained. Unlike video-VAE approaches that redesign, prune, replace, or distill decoder components [17, 18], our lowering changes only the runtime representa-tion of supported calls inside fixed pretrained decoders. Therefore, the method targets execution efficiency without requiring additional training data, parame-ter updates, or changes to the decoder’s learned function. 
+
+Embedded Runtimes, Compilation, and Serving. Embedded robotic systems op-erate under strict compute, memory, and latency constraints [6, 11]. TVM and Ansor provide graph-, operator-, and hardware-aware tensor transformations [1, 16], while Triton enables developers to construct programmable GPU ker-nels [13]. vLLM-Omni provides stage-oriented execution for multimodal and diffusion pipelines [15]. Our work addresses a complementary operator-level problem inside the decoder stage: preserving temporal-cache semantics while selecting a guarded runtime route. For this reason, we evaluate support condi-tions, fallback behavior, route coverage, numerical agreement, memory use, and complete-generation latency together. We additionally compare against a full-coverage TensorRT deployment as a production-runtime reference. TensorRT achieves higher throughput on the evaluated 17-frame workload. We therefore do not claim universal superiority over optimized Conv3D or global optimality across runtimes and hardware. 4 J. Zhang et al. 
+
+## 3 Deployment Characterization 
+
+3.1 Cosmos3-Nano Profile and Edge Checkpoint Identity 
+
+We profile a 17-frame, five-step, 1280 × 720 Cosmos3-Nano request using Nsight Systems 2026.3.1. Conv3D contributes 139.91 of 145.82 s of VAE GPU time, corresponding to 95.95%. In addition, one implicit BF16 3D-convolution kernel family accounts for 75.6% of the captured kernel time. Within the measured 17-frame decoder boundary, the target workload contains 169 causal Conv3D invocations. The highest-cost signatures are summarized in Tab. 1; the most expensive calls combine short temporal extents with large spatial feature maps, motivating the temporal-tap lowering introduced in Sec. 4. The Cosmos3-Edge VAE is byte-identical to the Nano Wan2.2 VAE. Both the checkpoint bytes and all 196 parameter tensors match exactly. Therefore, the Nano profile identifies the same operator family targeted in the Edge de-ployment. However, the 95.95% attribution belongs specifically to the profiled Nano execution and should not be interpreted as an independently measured Edge-specific profile. 
+
+Table 1: Highest-cost causal Conv3D signatures. Cosmos3-Nano uses Nsight GPU time at 1280 × 720 ; LingBot-World uses CUDA events at 480 × 832 . Edge uses the byte-identical Wan2.2 VAE but is not independently profiled.                                                       
+
+> Model Rank Cin →Cout Tin →Tout H×WTcCalls Time / VAE share Nano 1256 →256 4→4360 ×640 215 26.08 s / 17.88% Nano 2512 →512 4→4180 ×320 215 25.59 s / 17.55% Nano 31024 →1024 2→290 ×160 215 12.76 s / 8.75% LingBot 196 →96 4→4480 ×832 218 12.620 s / 27.0% LingBot 2192 →192 4→4240 ×416 218 12.343 s / 26.4% LingBot 3192 →192 4→4240 ×416 165.115 s / 10.9%
+
+3.2 Distinct Wan2.1 Transfer Profile 
+
+At 17 frames, LingBot executes 164 Conv3D calls across 28 signatures. The summed CUDA-event time for these calls is 45.801 s, or 97.8% of the 46.812 s clean VAE-decode time. The instrumented decode takes 48.786 s, including ap-proximately 1.97 s of measurement overhead. A separate decode with synchro-nization after every call takes 46.54 s under exclusive GPU access. All observed calls use five-dimensional tensors, unit temporal stride, one con-volution group, and a temporal kernel size of three. The two highest-cost signa-tures contribute 53.4% of the attributed Conv3D time. Computation is therefore again concentrated in calls with short temporal kernels and large spatial feature maps. Although LingBot-World uses a distinct Wan2.1 VAE, its dominant calls satisfy the same execution contract targeted by the proposed lowering. Cache-Aware Conv3D Lowering Across Embedded World-Model Decoders 5
+
+## 4 Cache-Aware Runtime Lowering 
+
+4.1 Temporal-Tap Conv2D Formulation 
+
+Let Z represent the cache-augmented input and let W represent the unchanged Conv3D weights: 
+
+Z ∈ RN ×Cin ×Tin ×Hin ×Win ,W ∈ RCout ×Cin ×Kt×Kh×Kw .
+
+For unit temporal stride and one convolution group, temporal tap k selects the following source time: 
+
+qk(t) = t + kd t − pl, (1) where temporal positions outside the valid input range contribute zero. With 
+
+Wk = W [: , :, k, :, :] , PyTorch’s cross-correlation convention gives 
+
+Yn, :,t, :,: = b +
+
+> Kt−1
+
+X
+
+> k=0
+
+Conv2D  Zn, :,q k (t),:,:, W k; s, p, d , (2) where s = ( sh, s w), p = ( ph, p w), and d = ( dh, d w) denote the original spatial stride, padding, and dilation parameters, respectively. Therefore, the unchanged Conv3D kernel can be reconstructed by summing the spatial response from each temporal tap and adding the bias exactly once. 
+
+4.2 Temporal Intervals 
+
+Let C denote the cache, X denote the current input, and Z = [ C; X]T denote their concatenation along the temporal dimension. The effective left padding is 
+
+pl = pbase  
+
+> l
+
+− | C|T , which produces 
+
+To =
+
+ |Z|T + pl + pr − dt(Kt − 1) − 1
+
+st
+
+
+
++ 1 . (3) For the supported calls, st = 1 . Defining δk = kd t − pl, the intersection of the constraints 0 ≤ o < T o and 0 ≤ o + δk < |Z|T gives 
+
+ol = max(0 , −δk), oh = min( To, |Z|T − δk). (4) The corresponding source interval is 
+
+[zl, z h) = [ ol + δk, o h + δk).
+
+Both intervals have an equal length of oh − ol. This equality enables the valid temporal range to be folded into the batch dimension and evaluated with one Conv2D call for each active temporal tap. As a result, the implementation avoids evaluating temporally invalid frames and preserves the same causal alignment produced by the original cached Conv3D operation. The interval construction also remains valid for temporal dilation because dt is already included in the tap offset δk.6 J. Zhang et al. 
+
+4.3 Guarded Runtime Procedure 
+
+Figure 1 summarizes the temporal-tap data flow, while Algorithm 1 specifies the corresponding validation, fallback, and accumulation procedure. Unsupported calls return to the original Conv3D route, and strict mode terminates validation when an unsupported case or execution error occurs. 
+
+Concatenate causal cache and input Find valid output interval for tap k
+
+Fold interval time into batch One batched Conv2D with Wk
+
+Restore time, accumulate taps, add bias once temporal-tap loop 
+
+Fig. 1: Cache-aware lowering of each temporal tap to one batched Conv2D. 
+
+Algorithm 1 Cache-aware Conv3D-to-Conv2D lowering 
+
+Require: X, C, W, b, p, s, d, g 
+
+State: strict flag and route counters ρ
+
+▷ Validate and prepare 
+
+1: increment ρ. calls 
+
+2: if X or W is not a 5-D tensor, st̸ = 1 , or g̸ = 1 : return Fallback 
+
+3: Z ← [C; X]T if cached, else X; compute pl, p r , T o
+
+4: if pr < 0 or To < 1: return Fallback 
+
+5: A ← ∅
+
+▷ Lower temporal taps 
+
+6: for k = 0 , . . . , K t − 1 do 
+
+7: compute ol, o h, z l, z h using Eq. (4) 8: if ol ≥ oh: continue 
+
+9: Wk ← cached _contiguous( W [: , :, k, :, :]) 
+
+10: U2 ← fold N T (Z[: , :, z l : zh, :, :]) 
+
+11: R ← unfold T (Conv2D( U2, W k ; s, p, d)) 
+
+12: if A = ∅: A ← zeros( N, T o, C out , H o, W o)
+
+13: A[: , o l : oh, :, :, :] += R
+
+14: end for 
+
+▷ Finalize 
+
+15: if A = ∅: return Fallback 
+
+16: add b once; restore layout; increment ρ. fast 
+
+17: return contiguous output 
+
+Exception: re-raise if strict; otherwise fallback Cache-Aware Conv3D Lowering Across Embedded World-Model Decoders 7
+
+## 5 Experimental Methodology 
+
+5.1 Systems, Boundaries, and Provenance 
+
+Table 2 summarizes the evaluated systems. Cosmos3-Edge is the primary deploy-ment case, Cosmos3-Nano provides the detailed profile and text-to-video sweep, and LingBot-World provides the cross-architecture transfer evaluation. 
+
+Table 2: Evaluated systems. Compression lists spatial/temporal factors.                           
+
+> Association VAE zCompression Relation Boundary Cosmos3-Edge Wan2.2 TI2V 48 16 ×/4×Primary deployment Full I2V + decoder Cosmos3-Nano Wan2.2 TI2V 48 16 ×/4×Byte-identical VAE Full T2V + decoder LingBot-World Wan2.1 16 8×/4×Distinct architecture Decoder only
+
+Model artifacts are loaded offline from recorded repository snapshots, with identifiers, revisions, configurations, source dtypes, and checkpoint SHA-256 val-ues recorded for provenance. All experiments run on one 64-GB NVIDIA Jetson AGX Orin with Python 3.12.13, PyTorch 2.11.0+cu130, CUDA 13.0, and cuDNN 9.19.0. Cosmos3-Nano uses Diffusers 0.38.0, while the frozen Cosmos3-Edge environment uses Diffusers 0.40.0.dev0 at commit b48d49d8 . The production-runtime comparison adds TensorRT 10.16.2.10 while retaining the same Py-Torch, CUDA, cuDNN, and Diffusers stack. Primary latency measurements use BF16, with FP32 reserved for numerical validation. The proposed route uses Py-Torch Conv2D; TensorRT is evaluated separately as a production-runtime base-line. Quantization, pruning, decoder replacement, and model parallelism are not used. 
+
+5.2 Complete-Pipeline Workloads 
+
+Cosmos3-Edge is evaluated through the Diffusers-native image-to-video path using a fixed conditioning image and prompt at 480 × 832 , 50 denoising steps, guidance 5.0, seed 0, and BF16 execution. We evaluate 25 frames as the primary deployment workload and five frames as the minimum runtime-accepted request producing a nondegenerate temporal sequence. With 4× temporal compression, requests below five frames produce only one output frame. The two configurations place different fractions of complete-generation time inside the VAE and test the expected workload-share dependence. Frame-length scaling is evaluated separately through the decoder-only sweep at 5, 9, 17, 33, and 49 frames. Each complete-pipeline route uses three fresh-container repetitions under the same warm-up procedure, and we report the median. We synchronize execution and measure Te2e , image-conditioning Tencode , final Tdecode , and 
+
+Tdit+other = Te2e − Tencode − Tdecode .8 J. Zhang et al. 
+
+Calls are attributed by the active vae.encode or vae.decode runtime scope. The retained Nano sweep requests {5, 9, 17 , 33 , 49 } frames at 1280 ×720 , using five denoising steps, 24 FPS, seed 123, guidance 6.0, flow shift 10.0, and text-to-video mode. Its synchronized omni.generate timer includes tokenization, text encoding, denoising, and VAE decoding but excludes host conversion, MP4 en-coding, and file writing. Each frame-count/route pair contains one fresh-process measurement after one excluded warm-up. 
+
+5.3 Decoder Sweeps and Acceptance 
+
+For the Edge decoder evaluation, deterministic BF16 latents are generated for each frame count and shared between baseline and optimized routes. We de-code 5, 9, 17, 33, and 49 output frames using three fresh-process repetitions per route and frame count, each with one untimed warm-up followed by one CUDA-synchronized timed decode. For the tested 4k + 1 frame counts, the latent shape is [1 , 48 , (F − 1) /4 + 1 , 30 , 52] .LingBot uses synthetic decoder-compatible BF16 latents with batch size 1, 16 channels, temporal extent T , and spatial size 60 × 104 . We use one fresh-process measurement per route and frame count. These tests establish decoder arith-metic and runtime transfer rather than complete LingBot generation speedup or perceptual quality. A point is accepted only if execution succeeds, returns a fresh nonempty tensor of the expected shape, introduces no unexpected NaN or Inf values, and reports consistent route counters. Baselines must contain no fast-path hits, while optimized runs must use the intended route without unexplained fallbacks. 
+
+5.4 Clean Production-Runtime Comparison 
+
+We separately compare native PyTorch, our lowering, and full-coverage Ten-sorRT on the 17-frame Cosmos3-Edge decoder. The otherwise idle Jetson AGX Orin runs in MAXN mode with jetson_clocks enabled and GPU/EMC fre-quencies fixed at 1300.5/3199 MHz. We collect six measurements per route in balanced order. Each runs in a fresh route-specific process with one excluded warm-up, cleared VAE temporal state, and one CUDA-synchronized timed de-code. TensorRT uses 99 fixed-shape learned-weight engines spanning 33 runtime signatures and covers all 169 WanCausalConv3d invocations without eager fall-back. Engine construction, deserialization, and context creation occur outside steady-state timing and are reported separately. Fresh processes also prevent TensorRT residency from affecting eager or lowering memory measurements. Device telemetry records temperature, GPU and EMC frequencies, and avail-able power rails. The hottest sensor reaches 71.1 ◦C, with no observed load-time GPU or EMC frequency reduction. Kernel logs nevertheless record hot-surface cooling-state transitions, so we do not claim thermal throttling is absent. Be-cause no reliable whole-board VDD_IN rail is exposed, available power rails are reported independently rather than summed. Cache-Aware Conv3D Lowering Across Embedded World-Model Decoders 9
+
+5.5 Numerical Validation and Memory Accounting 
+
+Same-latent evaluations reconstruct the VAE, clear temporal state, and verify identical latent hashes between routes. The baseline uses the original Wan causal Conv3D implementation, while strict mode terminates the lowering evaluation on any unsupported route or exception. We report maximum and mean abso-lute differences, RMSE, cosine similarity, and NaN/Inf mismatches in BF16 and FP32, with FP64 accumulation for cosine similarity. A paired Edge generation uses the same checkpoint, image, prompt, seed, scheduler, step count, and precision while capturing the encoder output, pre-decode latent, and decoded tensor. This measures finite-precision propagation through 50 unchanged denoising steps rather than isolated decoder equivalence. Peak anonymous RSS comes from /proc/self/status , while peak CUDA allocated and reserved memory come from PyTorch’s caching allocator. Because the Jetson AGX Orin uses unified memory, these are overlapping views and are not summed. 
+
+## 6 Results 
+
+6.1 Cosmos3-Edge Deployment 
+
+Table 3 presents the complete-pipeline timing decomposition. At 25 frames, the lowering reduces median VAE-decoder latency from 90.05 to 13.03 s, cor-responding to a 6.91 × speedup. Complete image-to-video generation decreases from 180.68 to 81.94 s, producing a 2.21 × end-to-end speedup. The five-frame workload exhibits the same pattern, with 7.92 × decoder acceleration and 1.85 ×
+
+complete-generation acceleration. 
+
+Table 3: Cosmos3-Edge complete image-to-video latency decomposition. Values are medians over three fresh-container runs per route. Tdit+other = Te2e − Tencode − Tdecode .                                      
+
+> Frames Phase Baseline (s) Lowered (s) Speedup 5VAE encode 5.325 0.728 7.32 ×
+> 5Transformer + other 21.516 21.581 ≈1.00 ×
+> 5VAE decode 18.798 2.374 7.92 ×
+> 5Complete generation 45.639 24.681 1.85 ×
+> 25 VAE encode 25.561 4.024 6.35 ×
+> 25 Transformer + other 65.072 65.142 ≈1.00 ×
+> 25 VAE decode 90.046 13.027 6.91 ×
+> 25 Complete generation 180.682 81.935 2.21 ×
+
+The patched Wan causal Conv3D class accelerates supported calls in both VAE encoding and decoding, while transformer-and-other latency remains es-sentially unchanged. At 25 frames, all 237 decoder calls use the fast path; the encoder records 169 fast-path calls and 12 guarded fallbacks from two stride-two temporal downsampling modules outside the unit-stride support contract. 10 J. Zhang et al. 
+
+6.2 Decoder Sweeps and Architecture Transfer 
+
+Table 4 compares VAE-decoder latency across the three evaluated systems. The repeated Cosmos3-Edge sweep achieves 6.92 ×–7.93 × acceleration over 5–49 frames, with run-to-run standard deviation below 0.1 s. Cosmos3-Nano achieves 
+
+4.74 ×–6.65 × decoder acceleration, while LingBot-World achieves 2.70 ×–5.75 ×
+
+using the unchanged lowering. Across the measured decoder boundaries, all op-timized WanCausalConv3d calls use the fast path for all three systems, with no decoder fallbacks. 
+
+Table 4: VAE-decoder BF16 latency. Cosmos3-Edge values are medians of n = 3 runs per route; Cosmos3-Nano and LingBot-World values have n = 1 . Coverage reports fast-path hits over WanCausalConv3d invocations within the measured decoder boundary, excluding pre-target activity. Cosmos3-Nano records 1,083/1,083 fast-path executions across the sweep.                                                                                 
+
+> Model Frames C3D (s) C2D (s) Speedup Coverage Cosmos3-Edge 518.749 2.365 7.93 ×67/67 Cosmos3-Edge 933.095 4.458 7.42 ×101/101 Cosmos3-Edge 17 61.573 8.623 7.14 ×169/169 Cosmos3-Edge 33 118.519 16.976 6.98 ×305/305 Cosmos3-Edge 49 175.569 25.379 6.92 ×441/441 Cosmos3-Nano 520.52 3.78 5.43 ×67/67 Cosmos3-Nano 933.44 7.05 4.74 ×101/101 Cosmos3-Nano 17 106.45 18.30 5.82 ×169/169 Cosmos3-Nano 33 253.26 38.08 6.65 ×305/305 Cosmos3-Nano 49 363.83 58.36 6.23 ×441/441 LingBot-World 514.21 5.27 2.70 ×65/65 LingBot-World 926.74 5.29 5.05 ×98/98 LingBot-World 17 47.11 9.90 4.76 ×164/164 LingBot-World 33 102.24 17.77 5.75 ×296/296 LingBot-World 49 132.84 27.76 4.79 ×428/428
+
+All optimized Cosmos3-Edge and LingBot-World decoder calls use the fast path, with no fallbacks, unsupported cases, or execution exceptions. Cosmos3-Nano similarly records complete measured-decoder coverage, with 1,083/1,083 
+
+WanCausalConv3d invocations taking the fast path and no fallback, unsupported, or exception increments across the sweep. Its complete-generation acceleration ranges from 2.58 × to 3.30 ×.The evaluations provide two complementary forms of evidence. Cosmos3-Edge and Cosmos3-Nano use the byte-identical Wan2.2 VAE, but exercise it through different generation modes and pipeline boundaries. LingBot-World in-stead changes latent channels, decoder width, compression factors, feature-map sizes, module count, and runtime shapes. Its acceleration therefore provides the distinct-architecture transfer result. Cache-Aware Conv3D Lowering Across Embedded World-Model Decoders 11 
+
+6.3 Numerical Agreement 
+
+Table 5 presents same-latent BF16 agreement at 17 output frames. Additional Cosmos3-Edge measurements across the complete frame sweep remain stable: cosine similarity is at least 0.99998, maximum absolute difference is at most 0.045, and RMSE ranges from 2.6×10 −3 to 3.1×10 −3. No NaN or Inf mismatches are observed.                       
+
+> Table 5: Same-latent BF16 agreement at 17 output frames. Cosmos3-Edge and LingBot-World use synthetic decoder-compatible latents; Cosmos3-Nano uses a saved generated latent. Model Full max Mean abs. RMSE Cosine NaN/Inf Cosmos3-Edge 4.49e −21.84e −32.75e −30.99998334 0/0 Cosmos3-Nano 3.3203e −21.8781e −32.8215e −30.99998309 0/0 LingBot-World 2.3440e −21.5640e −32.3230e −30.99998402 0/0
+
+FP32 reduces the discrepancy further: Cosmos3-Edge reaches cosine similar-ity 0.99999999 with maximum absolute difference 1.2 × 10 −3, while Cosmos3-Nano and LingBot-World reach 0.99999998, consistent with finite-precision exe-cution rather than a cache-indexing error. TensorRT also agrees closely with eager BF16 execution: maximum absolute difference 0.1016, RMSE 4.63 × 10 −3, cosine similarity 0.999953, and no NaN or Inf values. Neither route is bit-exact. In complete Edge generation, encoder, pre-decode, and decoded tensors reach cosine similarities of 0.999977, 0.998841, and 0.999331. This captures finite-precision propagation through 50 unchanged denoising steps rather than isolated decoder equivalence. 
+
+6.4 Memory Behavior and Completion 
+
+The lowering trades memory for latency through folded inputs, accumulation, and cached spatial weight slices. Across the Nano and LingBot sweeps, the largest observed increases are 1.70/3.30/1.60 GiB and 7.66/4.60/7.62 GiB in anonymous RSS/CUDA allocated/CUDA reserved memory, respectively. The optimized 25-frame Edge route reaches approximately 12.6 GB peak CUDA allocation without out-of-memory failure. In the clean 17-frame Edge comparison, eager execution and our lowering use 5.37 and 7.31 GiB peak CUDA allocation, with process VmHWM of 8.23 and 9.75 GiB. Cached tap slices occupy 1.06 GB; major temporary buffers include approximately 0.41 GB folded input, 0.20 GB accumulation, and 0.61 GB cache concatenation. Their lifetimes overlap and therefore do not form an additive peak decomposition. 12 J. Zhang et al. 
+
+Full TensorRT reaches 14.57 GiB peak CUDA allocation and 34.19 GiB pro-cess VmHWM; its 99 execution contexts report 13.87 GB of context memory and the serialized engines occupy 3.16 GB. All routes fit on the evaluated 64-GB Orin, and Edge and LingBot also complete the 49-frame decoder configuration. Because Jetson uses unified memory, process and CUDA memory metrics are overlapping views and are not summed. 
+
+6.5 Production-Runtime Comparison 
+
+We compare against a fully specialized BF16 TensorRT deployment on the same 17-frame Cosmos3-Edge decoder. Table 6 summarizes the clean-device results.                
+
+> Table 6: Clean-device 17-frame decoder comparison on Jetson AGX Orin. Latency is the median over six runs; coverage denotes accelerated WanCausalConv3d calls. Method Latency (s) Speedup Coverage PyTorch eager 61.72 1.00 ×native Ours 9.23 6.69 ×169/169 TensorRT 6.78 9.10 ×169/169
+
+TensorRT is 1.36 × faster than our lowering but requires 99 fixed-shape en-gine specializations across 33 runtime signatures, 1637.6 s of AOT compilation, 3.16 GB of serialized engines, and 7.58 s of cold setup. Using the clean-device medians, the fraction of the eager-to-TensorRT latency reduction captured by our lowering is 
+
+61 .7179 − 9.2289 61 .7179 − 6.7848 = 95 .55% .
+
+Thus, our lowering achieves most of the steady-state gain without per-module or per-state AOT engine construction. 
+
+## 7 Discussion 
+
+7.1 What Edge Establishes and What Transfers 
+
+Cosmos3-Edge provides the strongest deployment evidence because the low-ering remains effective inside a complete 50-step image-to-video pipeline. The transformer-and-other portion remains essentially unchanged, so the complete-generation improvement follows the accelerated VAE phases. The larger end-to-end gain at 25 frames likewise reflects the greater baseline latency spent inside the VAE. Cosmos3-Edge and Cosmos3-Nano use the same byte-identical Wan2.2 VAE and therefore demonstrate different execution boundaries rather than architec-tural transfer. LingBot-World provides that transfer evidence through a Wan2.1 Cache-Aware Conv3D Lowering Across Embedded World-Model Decoders 13 
+
+VAE with different latent channels, compression, decoder width, feature hier-archy, module count, and runtime shapes. The claim remains limited to the evaluated Wan family and Diffusers causal-convolution implementation, where the shared opportunity is short-temporal, large-spatial calls whose valid frames form contiguous intervals suitable for batched Conv2D execution. 
+
+7.2 Performance, Memory, and Numerical Implications 
+
+The production-runtime comparison clarifies the deployment point targeted by our method. Under aggressive fixed-model AOT specialization, TensorRT reaches 6.78 s versus 9.23 s for our lowering. However, our route captures 95.55% of the absolute eager-to-TensorRT latency reduction without constructing 99 module-and state-specific engines. The distinction is therefore not whether specialized Conv3D can achieve higher steady-state throughput, but how much specializa-tion and memory residency are required to reach that operating point. This distinction is particularly relevant for embodied deployment, where de-coder latency is only one resource constraint. Perception, planning, control, and other co-resident components must share the same device memory. In the clean 17-frame comparison, our lowering uses 7.31 GiB peak CUDA allocation and 9.75 GiB process VmHWM, compared with 14.57 GiB and 34.19 GiB for the full-residency TensorRT deployment. TensorRT therefore provides the lowest measured decoder latency but leaves substantially less memory headroom for the rest of an embodied-AI stack. Reducing this residency could require addi-tional engine management, such as selective loading or eviction, which we do not evaluate. Our lowering instead occupies a lighter runtime point while retaining most of the measured steady-state acceleration. The remaining memory overhead is also potentially reducible. Cached spa-tial weight slices account for approximately 1.06 GB, while folded inputs, cache concatenation, and accumulation constitute the main temporary buffers. Their overlapping lifetimes prevent an additive peak decomposition but suggest op-portunities for selective weight caching, buffer reuse, or streamed accumulation. We also retain the custom-kernel result as a systems-level caution. Selected Triton kernels [13] improve individual operations in isolation, yet an integrated 17-frame experiment increases VAE-decoding latency from 16.01 to 66.81 s de-spite no route misses or emergency Conv3D fallbacks. Without an integrated kernel-time breakdown, we do not attribute the regression to a specific mech-anism; instead, it reinforces that operator-level gains must be validated at the complete execution boundary. Finally, BF16 and FP32 results support numerical agreement for the tested inputs but do not establish perceptual equivalence or invariance in downstream control. The complete Edge comparison captures propagation of small BF16 differences through unchanged denoising. The smaller FP32 discrepancy is con-sistent with finite-precision execution and accumulation order rather than an observed cache-indexing error. 14 J. Zhang et al. 
+
+7.3 Limitations 
+
+Cosmos3-Edge complete-generation and decoder sweeps use three fresh-container repetitions per route, while the clean 17-frame runtime comparison uses six bal-anced repetitions. Cosmos3-Nano and LingBot-World sweep points use one fresh-process measurement and are reported without variance or statistical-significance claims. All experiments use one 64-GB NVIDIA Jetson AGX Orin, and fresh-process execution does not represent sustained or concurrent serving. Complete generation is evaluated for Edge and Nano, whereas LingBot-World uses synthetic decoder-compatible latents. Edge and Nano also share a byte-identical Wan2.2 VAE, so architectural transfer is established only through the evaluated Wan2.1 LingBot decoder. Other cache APIs, Conv3D classes, hardware platforms, resolutions, schedulers, and software stacks remain untested. TensorRT is 1.36 × faster on the clean 17-frame workload, demonstrating that our representation is not globally optimal. We do not exhaustively evaluate other compiler-generated, vendor-specific, or manually optimized Conv3D implemen-tations, and relative performance may differ across workloads and hardware. The complete Edge numerical evaluation uses one image, prompt, seed, and scheduler and does not establish perceptual equivalence, downstream-control in-variance, or closed-loop task performance. The runtime comparison also records hot-surface cooling-state transitions despite no observed GPU or EMC frequency reduction, so we do not claim thermal throttling is absent; no reliable whole-board input-power rail was available for system-level energy measurement. Finally, the lowering remains restricted to supported cases including five-dimensional inputs, unit temporal stride, and one convolution group. Twelve stride-two encoder calls in the 25-frame Edge pipeline therefore remain on native Conv3D, so zero-fallback claims apply to the decoder rather than the complete pipeline. 
+
+## 8 Conclusion 
+
+We presented a cache-aware runtime lowering that evaluates supported causal Conv3D calls as batched Conv2D operations without changing pretrained model weights or temporal-cache semantics. Across the evaluated Wan-family decoders, it provides substantial decoder acceleration and complete fast-path coverage, in-cluding a 6.91 × decoder speedup and 2.21 × complete-generation speedup on the primary 25-frame Cosmos3-Edge workload. A full-coverage TensorRT compar-ison shows that aggressive fixed-model AOT specialization can achieve higher steady-state throughput, while our lowering provides a lighter-weight runtime operating point without per-module or per-state engine construction. The same lowering also transfers to a distinct Wan2.1 VAE, indicating that the optimiza-tion is not specific to a single decoder instance. Numerical and route validation further show that the observed gains preserve the intended cache behavior while maintaining strong finite-precision agreement. Together, these results highlight runtime operator representation as a practical lever for accelerating pretrained video world-model decoders on embedded GPUs. Cache-Aware Conv3D Lowering Across Embedded World-Model Decoders 15 
+
+## References 
+
+1. Chen, T., Moreau, T., Jiang, Z., Zheng, L., Yan, E., Shen, H., Cowan, M., Wang, L., Hu, Y., Ceze, L., Guestrin, C., Krishnamurthy, A.: TVM: An automated End-to-End optimizing compiler for deep learning. In: 13th USENIX Symposium on Operating Systems Design and Implementation (OSDI 18). pp. 578–594. USENIX Association, Carlsbad, CA (Oct 2018), https://www.usenix.org/conference/ osdi18/presentation/chen 
+
+2. Finn, C., Levine, S.: Deep visual foresight for planning robot motion. In: 2017 IEEE International Conference on Robotics and Automation (ICRA). pp. 2786– 2793 (2017). https://doi.org/10.1109/ICRA.2017.7989324 
+
+3. Ha, D., Schmidhuber, J.: World models (2018). https://doi.org/10.48550/ arXiv.1803.10122 
+
+4. Hafner, D., Lillicrap, T., Ba, J., Norouzi, M.: Dream to control: Learning behaviors by latent imagination. In: International Conference on Learning Representations (2020), https://openreview.net/forum?id=S1lOTC4tDS 
+
+5. Hafner, D., Lillicrap, T., Fischer, I., Villegas, R., Ha, D., Lee, H., Davidson, J.: Learning latent dynamics for planning from pixels. In: Chaudhuri, K., Salakhutdi-nov, R. (eds.) Proceedings of the 36th International Conference on Machine Learn-ing. Proceedings of Machine Learning Research, vol. 97, pp. 2555–2565. PMLR (09–15 Jun 2019), https://proceedings.mlr.press/v97/hafner19a.html 
+
+6. Ichnowski, J., Chen, K., Dharmarajan, K., Adebola, S., Danielczuk, M., Mayoral-Vilches, V., Jha, N., Zhan, H., Llontop, E., Xu, D., Buscaron, C., Kubiatow-icz, J., Stoica, I., Gonzalez, J., Goldberg, K.: Fogros2: An adaptive platform for cloud and fog robotics using ros 2. In: 2023 IEEE International Conference on Robotics and Automation (ICRA). pp. 5493–5500 (2023). https://doi.org/10. 1109/ICRA48891.2023.10161307 
+
+7. NVIDIA, et al.: Cosmos world foundation model platform for physical AI (2025). 
+
+https://doi.org/10.48550/arXiv.2501.03575 
+
+8. NVIDIA, et al.: Cosmos 3: Omnimodal world models for physical AI (2026). https: //doi.org/10.48550/arXiv.2606.02800 
+
+9. Qiu, Z., Yao, T., Mei, T.: Learning spatio-temporal representation with pseudo-3d residual networks. In: 2017 IEEE International Conference on Computer Vision (ICCV). pp. 5534–5542 (2017). https://doi.org/10.1109/ICCV.2017.590 
+
+10. Robbyant Team, Gao, Z., Wang, Q., Zeng, Y., Zhu, J., Cheng, K.L., Li, Y., Wang, H., Xu, Y., Ma, S., Chen, Y., Liu, J., Cheng, Y., Yao, Y., Zhu, J., Meng, Y., Zheng, K., Bai, Q., Chen, J., Shen, Z., Yu, Y., Zhu, X., Shen, Y., Ouyang, H.: Advancing open-source world models (2026). https://doi.org/10.48550/arXiv.2601.20540 
+
+11. Tahir, N., Parasuraman, R.: Edge computing and its application in robotics: A survey (2025). https://doi.org/10.48550/arXiv.2507.00523 
+
+12. Team Wan, et al.: Wan: Open and advanced large-scale video generative models (2025). https://doi.org/10.48550/arXiv.2503.20314 
+
+13. Tillet, P., Kung, H.T., Cox, D.: Triton: an intermediate language and compiler for tiled neural network computations. In: Proceedings of the 3rd ACM SIGPLAN International Workshop on Machine Learning and Programming Languages. p. 10–19. MAPL 2019, Association for Computing Machinery, New York, NY, USA (2019). https://doi.org/10.1145/3315508.3329973 
+
+14. Tran, D., Wang, H., Torresani, L., Ray, J., LeCun, Y., Paluri, M.: A Closer Look at Spatiotemporal Convolutions for Action Recognition. In: 2018 IEEE/CVF Confer-ence on Computer Vision and Pattern Recognition (CVPR). pp. 6450–6459. IEEE 16 J. Zhang et al. Computer Society, Los Alamitos, CA, USA (Jun 2018). https://doi.org/10. 1109/CVPR.2018.00675 
+
+15. Yin, P., Zhu, J., Gao, H., Zheng, C., Huang, Y., Zhou, T., Yang, R., Liu, W., Chen, W., Guo, C., Deng, D., Mo, Z., Wang, C., Cheng, J., Wang, R., Liu, H.: vllm-omni: Fully disaggregated serving for any-to-any multimodal models (2026). 
+
+https://doi.org/10.48550/arXiv.2602.02204 
+
+16. Zheng, L., Jia, C., Sun, M., Wu, Z., Yu, C.H., Haj-Ali, A., Wang, Y., Yang, J., Zhuo, D., Sen, K., Gonzalez, J.E., Stoica, I.: Ansor: generating high-performance tensor programs for deep learning. In: Proceedings of the 14th USENIX Conference on Operating Systems Design and Implementation. OSDI’20, USENIX Association, USA (2020) 17. Zhu, L., Huang, Y., Ge, X., Xue, Y., Liu, Z., Zhang, Y., Lin, Z., Zhang, J.: Flash-VAED: Plug-and-play VAE decoders for efficient video generation. In: Forty-third International Conference on Machine Learning (2026), https://openreview.net/ forum?id=PDBLtVDb0d 
+
+18. Zou, Y., Yao, J., Yu, S., Zhang, S., Liu, W., Wang, X.: Turbo-vaed: Fast and stable transfer of video-vaes to mobile devices. Proceedings of the AAAI Conference on Artificial Intelligence 40 (16), 14086–14094 (Mar 2026). https://doi.org/10. 1609/aaai.v40i16.38420
