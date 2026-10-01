@@ -6,49 +6,38 @@
 </div>
 
 ## 每次日报
-- 最新运行日期：2026-09-30
-- 运行时间：2026-09-30 22:38:45 UTC
+- 最新运行日期：2026-10-01
+- 运行时间：2026-10-01 23:14:04 UTC
 - 运行状态：成功
-- 本次总论文数：9
-- 精读区：3
-- 速读区：6
+- 本次总论文数：5
+- 精读区：4
+- 速读区：1
 
 ### 今日简报（AI）
-2026-09-30 日报：9篇推荐中精读3篇、速读6篇，NPU混合注意力与端侧Omni-LLM流式成为今日高光。  
-最值得看的是两项9.0精读：NPU上的混合注意力模型，以及OmniTide的端侧Omni-LLM流式算法-系统协同设计。  
-普通读者可优先读这两篇精读摘要，再按兴趣扫速读中的CUTLASS选核、嵌入式Conv3D缓存与随机计算量化。
-- 详情：[/202609/30/README](/202609/30/README)
+- 今日共生成 5 篇推荐（精读 4 篇，速读 1 篇）
+- 精读：《OmniTide: Co-Designing Algorithms and Systems for Efficient On-Device Omni-LLM Streaming》（9.0/10）, 《PastForward: Faster On-Device GUI Agents via Computational Experience Reuse》（8.0/10）
+- 速读：《Beneath the Tokens: A Performance Engineering Study of Multi-Token Prediction in GPU-Accelerated LLM Inference》（6.0/10）
+- 这些结果覆盖了当下较热的方向，建议先看精读区论文的关键问题与方法。
+- 详情：[/202610/01/README](/202610/01/README)
 
 ### 精读区论文标签
-1. [Empowering Hybrid Attention Models on NPUs](/202609/30/2609.32114v1-empowering-hybrid-attention-models-on-npus)  
+1. [OmniTide: Co-Designing Algorithms and Systems for Efficient On-Device Omni-LLM Streaming](/202610/01/2609.34653v2-omnitide-co-designing-algorithms-and-systems-for-efficient-on-device-omni-llm-streaming)  
    标签：评分：9.0/10、query:edge-llm
-   evidence：在边缘NPU上通过数据流重组实现混合注意力大模型高效推理
-2. [OmniTide: Co-Designing Algorithms and Systems for Efficient On-Device Omni-LLM Streaming](/202609/30/2609.34653v2-omnitide-co-designing-algorithms-and-systems-for-efficient-on-device-omni-llm-streaming)  
-   标签：评分：9.0/10、query:edge-llm
-   evidence：面向端侧全能LLM流式推理的算法-系统协同设计
-3. [Spexis: Speculative Lookahead Scheduling for LLM Inference](/202609/30/2609.34370v1-spexis-speculative-lookahead-scheduling-for-llm-inference)  
+   evidence：面向端侧流式全模态LLM的算法-系统协同设计
+2. [PastForward: Faster On-Device GUI Agents via Computational Experience Reuse](/202610/01/2609.32166v1-pastforward-faster-on-device-gui-agents-via-computational-experience-reuse)  
    标签：评分：8.0/10、query:edge-llm
-   evidence：基于vLLM、带前瞻调度的多GPU LLM服务框架
+   evidence：面向端侧设备的GUI智能体推理加速
+3. [Sol-H3: Recursive Self-Improvement for MiniMax-H3 Inference Acceleration on Sol-Engine across Cloud and Edge](/202610/01/2609.35110v1-sol-h3-recursive-self-improvement-for-minimax-h3-inference-acceleration-on-sol-engine-across-cloud-and-edge)  
+   标签：评分：8.0/10、query:edge-llm
+   evidence：面向云与边缘的视频扩散模型全栈推理加速管线
+4. [From Experience to Expertise: Adoption-Aware Memory Learning for Data-Scarce NPU Kernel Synthesis](/202610/01/2609.35568v1-from-experience-to-expertise-adoption-aware-memory-learning-for-data-scarce-npu-kernel-synthesis)  
+   标签：评分：8.0/10、query:edge-llm
+   evidence：面向数据稀缺NPU内核合成的记忆学习智能体
 
 ### 速读区论文标签
-1. [Hardware-Aware Features for CUTLASS Kernel Selection](/202609/30/2609.35587v1-hardware-aware-features-for-cutlass-kernel-selection)  
-   标签：评分：7.0/10、query:edge-llm
-   evidence：面向CUTLASS核选择的硬件感知表示以支持算子加速
-2. [Cache-Aware Conv3D Lowering Across Embedded World-Model Decoders](/202609/30/2609.31938v1-cache-aware-conv3d-lowering-across-embedded-world-model-decoders)  
+1. [Beneath the Tokens: A Performance Engineering Study of Multi-Token Prediction in GPU-Accelerated LLM Inference](/202610/01/2609.35188v1-beneath-the-tokens-a-performance-engineering-study-of-multi-token-prediction-in-gpu-accelerated-llm-inference)  
    标签：评分：6.0/10、query:edge-llm
-   evidence：面向嵌入式边缘解码器的缓存感知算子降级
-3. [Precision As You Need: Stochastic Computing Is a Dense Adaptive Quantizer](/202609/30/2609.32922v1-precision-as-you-need-stochastic-computing-is-a-dense-adaptive-quantizer)  
-   标签：评分：6.0/10、query:edge-llm
-   evidence：面向矩阵乘的硬件友好自适应精度
-4. [OLED-MoE: Accelerating MoE-Based dLLM Inference via Inter-Iteration Locality-Aware Expert Offloading](/202609/30/2609.33385v1-oled-moe-accelerating-moe-based-dllm-inference-via-inter-iteration-locality-aware-expert-offloading)  
-   标签：评分：6.0/10、query:edge-llm
-   evidence：面向显存受限GPU的MoE扩散大模型专家卸载推理加速
-5. [AgentPerfBench: A Benchmarking and Evaluation Suite for Inference Performance of Agentic LLMs](/202609/30/2609.34683v1-agentperfbench-a-benchmarking-and-evaluation-suite-for-inference-performance-of-agentic-llms)  
-   标签：评分：6.0/10、query:edge-llm
-   evidence：面向LLM服务引擎、调度策略与硬件设计的基准
-6. [P4Q: Co-designing Token Pruning and Quantization for Vision-Language Model Acceleration](/202609/30/2609.34867v1-p4q-co-designing-token-pruning-and-quantization-for-vision-language-model-acceleration)  
-   标签：评分：6.0/10、query:edge-llm
-   evidence：面向模型推理加速的Token剪枝与量化协同设计
+   evidence：GPU加速LLM推理中多Token预测的性能研究
 
 
 <div class="dpr-home-promo-card">
