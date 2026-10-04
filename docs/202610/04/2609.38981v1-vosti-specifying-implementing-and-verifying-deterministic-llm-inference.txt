@@ -1,0 +1,702 @@
+Title: Vosti: Specifying, Implementing, and Verifying Deterministic LLM Inference
+
+URL Source: https://arxiv.org/pdf/2609.38981v1
+
+Published Time: Thu, 01 Oct 2026 01:06:26 GMT
+
+Number of Pages: 14
+
+Markdown Content:
+# Vosti: Specifying, Implementing, and Verifying Deterministic LLM Inference 
+
+## Jianxing Qin 
+
+Duke University Durham, NC, United States 
+
+## Alexander Du 
+
+Duke University Durham, NC, United States 
+
+## Danfeng Zhang 
+
+Duke University Durham, NC, United States 
+
+## Matthew Lentz 
+
+Duke University Durham, NC, United States 
+
+## Danyang Zhuo 
+
+Duke University Durham, NC, United States 
+
+## Abstract 
+
+LLM inference systems may vary batch composition, prompt chunking, prefill/decode execution, and KV-cache reuse, evic-tion, or recomputation. These optimizations should not affect system outputs. Production systems, including vLLM’s batch-invariant mode and SGLang’s deterministic mode, target this goal but lack a formal system-level specification. We formalize deterministic LLM inference: under a fixed model and deployment configuration, requests with the same prompt and initial sampler state produce bitwise-identical logits at corresponding output positions across executions. Our tests find that these production modes produce differ-ent logits under some execution variations. To address this limitation, we present Vosti, an inference engine designed and verified against this specification. Vosti chooses kernels independently of runtime engine state and ties cached KV values to their logical token prefixes. Its proof decomposes at the engine/GPU kernel boundary: a Verus inductive proof establishes that scheduling and the paged, prefix-sharing KV-cache preserve output logits, while a Triton analyzer proves bitwise-equal selected kernel outputs across batches, query lengths, and paged KV-cache layouts. Vosti produces bitwise-identical logits across every tested execution varia-tion and achieves performance comparable to vLLM’s batch-invariant mode on decode-heavy workloads, while providing a stronger, formally verified determinism guarantee. 
+
+## 1 Introduction 
+
+LLM inference frameworks rarely execute a request in one fixed way. As load and GPU memory pressure change, the server may co-batch the request with different compan-ions [30], split its prompt into prefill chunks of different sizes [1], compute a multi-token prefill or a single-token de-code through speculative decoding [6, 19], and evict, relocate, share, or recompute its KV-cache state [17]. These choices may affect performance but should not affect model results: for a fixed model, prompt, and sampler state, the logits at a logical token position should not depend on how the server computes it. Yet they can produce different logits. GPU ker-nels select tilings and reduction orders based on execution shapes, and floating-point results depend on the resulting operation order [16]. The scheduler and paged cache also determine the tokens and KV state supplied to those kernels, so different executions can change kernel inputs. Recent work addresses one source of these differences: batch-dependent kernels. In under a year, batch-invariant kernels went from a blog post [16] to production modes: vLLM ships a batch-invariant mode [25, 27] and SGLang ships a deterministic mode [24]; DeepSeek-V4 builds end-to-end batch-invariant kernels into its training stack [11]. But batch composition is only one way a server varies execution, and no formal definition states what deterministic inference requires from the system as a whole. 
+
+Specification. Our first contribution is a system-level def-inition of deterministic LLM inference. An LLM inference system is deterministic if, for a fixed model, deployment configuration, prompt, and sampler state, every observed execution produces bitwise-identical logits at each output position; equal sampler states then yield prefix-comparable output traces. The definition constrains observable outputs only; it does not assume batching, prompt chunking, or a KV-cache. We vary batch sizes, chunked-prefill budgets, prefill versus decode, and prefix reuse in production LLM inference systems. Both vLLM’s batch-invariant mode and SGLang’s deterministic mode produce logit mismatches. Representa-tive mismatches arise from shape-dependent kernel special-ization and different attention reduction arithmetic across ex-ecution paths. These results expose scope limits rather than necessarily indicating bugs: one kernel configuration’s batch invariance does not establish determinism across chunking, prefill/decode transitions, or cache reuse. 
+
+Vosti. Our second contribution is the design and imple-mentation of Vosti, an LLM inference system designed and verified to provide deterministic inference. Vosti’s engine is implemented and formally verified using Verus [18]. It con-tinuously batches prefill chunks and decode tokens, where each may carry arbitrary KV-cache pages. We prove in Verus that each engine step produces logits determined solely by the request’s token history. The proof maintains a central KV-cache invariant alongside request, layout, and write-isolation invariants. The KV-cache invari-ant ensures that every live or retained reusable KV entry equals the value obtained by recomputing its token prefix 
+
+> 1arXiv:2609.38981v1 [cs.DC] 30 Sep 2026 Jianxing Qin, Alexander Du, Danfeng Zhang, Matthew Lentz, and Danyang Zhuo
+
+Table 1. Motivating determinism tests of Vosti and produc-tion inference engines. Each cell reports bitwise-matched logit pairs divided by total compared pairs. Green denotes full agreement; red denotes at least one mismatch.                                                                                           
+
+> Engine Attn. Model Batch Chunk P–D Prefix
+> vLLM FA3 Llama3.1-8B 177/296 49/90 53/384 3/14 vLLM Inv. FA3 Llama3.1-8B 296/296 90/90 384/384 14/14 vLLM Inv. Triton Llama3.1-8B 296/296 90/90 384/384 14/14 SGLang FA3 Llama3.1-8B 156/296 50/90 59/384 4/14 SGLang Det. FA3 Llama3.1-8B 296/296 90/90 384/384 14/14 SGLang Det. Triton Llama3.1-8B 296/296 90/90 3/384 13/14 Vosti Triton Llama3.1-8B 296/296 90/90 384/384 14/14 vLLM FA3 Gemma3-4B 70/296 0/90 5/384 3/14 vLLM Inv. FA3 Gemma3-4B 193/296 0/90 5/384 11/14 vLLM Inv. Triton Gemma3-4B 242/296 0/90 192/384 13/14 SGLang FA3 Gemma3-4B 81/296 42/90 5/384 2/14 SGLang Det. FA3 Gemma3-4B 206/296 70/90 5/384 10/14 SGLang Det. Triton Gemma3-4B 256/296 70/90 3/384 9/14 Vosti Triton Gemma3-4B 296/296 90/90 384/384 14/14
+
+without cache. Induction over engine steps then establishes request determinism. Vosti preserves engine optimizations such as continuous batching, chunked prefill, and KV-cache reuse, while con-straining kernel choices that could change floating-point results. It uses fixed, runtime-independent kernel configura-tions, retaining tiling and independent parallelism. Dispatch among bitwise-equivalent kernels remains a future exten-sion. Our analyzer translates annotated Triton [26] into a tile-level IR and uses Z3 [10] to prove bitwise equality of se-lected kernel outputs across kernel invocations. At runtime, Vosti rejects a missing configuration rather than autotuning. 
+
+Evaluation. Vosti passes all 5,488 bitwise comparisons across seven Llama and Gemma models, covering batch-ing, chunked prefill, prefill–decode equivalence, and prefix reuse. Its performance is comparable to production inference engines on decode-heavy workloads. On an H200 GPU, Vosti achieves 1 .36–3 .19 × the decode throughput of vLLM’s batch-invariant modes and completes sessions 1 .14–2 .20 × faster in a synthetic agentic workload, while remaining slower than both default modes and SGLang’s deterministic modes. 
+
+## 2 Specifying Deterministic LLM Inference 
+
+2.1 Why Deterministic Inference? 
+
+An LLM server can realize one output token sequence through many executions. Continuous batching changes a request’s companions as requests arrive and finish; chunked prefill partitions a prompt according to a token budget; speculative decoding computes several candidate positions in an extend step; and a paged KV-cache may share, relocate, evict, or re-compute a logical prefix [6, 17, 19, 30]. These choices should change performance, not model results. Both GPU kernels and the inference engine can change these results. GPU kernels select tilings, reduction orders, and sometimes entire implementations based on tensor shapes. As floating-point addition is not associative, changing the re-duction order can change the resulting bit pattern [16]. The scheduler and cache determine the tokens, positions, cached prefix, and metadata supplied to those kernels. Determin-ism must therefore hold across the whole system: invariant kernels cannot compensate for an engine that supplies a different input, and correct engine state is insufficient if a kernel changes its value-relevant operation order. Different logits can change stochastic draft acceptance [6, 19] and violate the prefill–decode equivalence expected by speculative verification [33]. They can also create a mismatch between rollout and training log-probabilities in reinforce-ment learning [27], make a continuation depend on whether KV state was retained or recomputed, and prevent an opera-tor from reproducing one request independently of the load and cache history under which it originally ran. 
+
+2.2 Measuring Production Deterministic Modes 
+
+We measure whether production inference engines and Vosti preserve bitwise logit equality under different execution vari-ations. We run vLLM 0.28.0 in its default and batch-invariant modes, and SGLang [37] 0.5.19 in its default and determin-istic modes. For both production deterministic modes, we test FlashAttention 3 (FA3) [22] and Triton attention back-ends. Default modes select their backends automatically; both select FA3 for both models. We also run Vosti using its verified Triton kernels. All experiments use Llama3.1-8B and text-only Gemma3-4B in BF16 on one NVIDIA H200. Each comparison checks bitwise equality of the complete raw next-token logit vectors. Table 1 reports matched pairs over total compared pairs. 
+
+Test construction. Batch composition runs the same prompts individually and in batches of different sizes and orders. We compare each prompt’s last logits. Chunked prefill prefills the same prompt under different chunk budgets, including an unchunked reference, and compares the last logits. Prefill– decode generates a fixed-length response, then prefills the original prompt plus successive prefixes of that response in a separate engine. We compare the logits at corresponding prediction positions, ensuring identical token histories. Pre-fix reuse compares cold-prefill logits against those obtained after another request populates the cache in the same engine as the warm request. Cases cover full and partial prefix reuse; recorded cache-hit counts validate reuse where required. 
+
+Results. Vosti matches all pairs per model. On Llama3.1-8B, both vLLM batch-invariant backends and SGLang deter-ministic FA3 match every pair. SGLang deterministic Triton matches all batch and chunk comparisons, but only 3/384 prefill–decode pairs and 13/14 prefix pairs. On Gemma3-4B, all four production deterministic configurations exhibit 
+
+> 2Vosti : Specifying, Implementing, and Verifying Deterministic LLM Inference
+
+mismatches in every category. These modes usually reduce mismatches relative to defaults, but bitwise logit agreement still depends on model, backend, and execution variation. These tests are not exhaustive verification: passing does not establish determinism beyond the tested cases. Con-versely, a mismatch demonstrates numerical variation, not necessarily a bug for the intended use case. 
+
+2.3 A System-Level Formulation 
+
+Fix an inference configuration 𝑊 , comprising the model weights, numerical dtypes, and all value-relevant aspects of the platform and implementation. An output record is a pair 
+
+(ℓ, 𝑦 ) ∈ Logits × Token ,
+
+where ℓ is the logit bit pattern and 𝑦 is the emitted token. Let Id be the set of request identifiers. At each engine step, the observable output is a finite partial map 
+
+𝑂 𝑖 : Id ⇀ (Logits × Token ).
+
+Thus, an engine step may emit one output record for each of zero or more requests, without imposing an order among requests processed in the same step. For a request 𝑟 , let 𝑠 0 be any engine state reachable under 
+
+𝑊 immediately after 𝑟 is admitted and before it produces any output. This state may contain other requests and retained cache state. A finite execution starting from 𝑠 0 has the form 
+
+𝑠 0
+
+> 𝑂 1
+
+−−→ 𝑠 1
+
+> 𝑂 2
+
+−−→ · · · 𝑂 𝑛 
+
+−−→ 𝑠 𝑛 .
+
+We identify its observable trace with the finite sequence 
+
+𝑇 = (𝑂 1, 𝑂 2, . . . , 𝑂 𝑛 ).
+
+Define the per-request view of 𝑟 by 
+
+view 𝑟 (𝑇 ) =  𝑂 𝑖 (𝑟 . id ) 1 ≤ 𝑖 ≤ 𝑛 ∧ 𝑟 . id ∈ dom (𝑂 𝑖 ),
+
+where the records are ordered by increasing 𝑖 . This view retains the observable history of 𝑟 , but does not retain its identifier, its batch position, steps in which it produced no output, or outputs belonging to other requests. 
+
+Definition 2.1 (Deterministic LLM inference) . An inference system is deterministic if, for every pair of finite executions 
+
+𝑇 1,𝑇 2 that share configuration 𝑊 , and every pair of requests 
+
+𝑟 1, 𝑟 2 newly admitted in their respective initial states as above, whenever their prompts and initial sampler states are the same: 
+
+𝑟 1.prompt = 𝑟 2.prompt and 𝑟 1.sampler 0 = 𝑟 2.sampler 0,
+
+their per-request views are prefix-comparable: 
+
+view 𝑟 1 (𝑇 1) ⪯ view 𝑟 2 (𝑇 2) ∨ view 𝑟 2 (𝑇 2) ⪯ view 𝑟 1 (𝑇 1).
+
+Here, ⪯ denotes the prefix relation. Equality of logit compo-nents means equality of their bit patterns. Intuitively, a global execution may interleave many re-quests and may batch them differently at each engine step. The operation view 𝑟 removes these scheduling details and retains only the observable history of request 𝑟 . It also erases the request identifier: identifiers distinguish request instances but must not affect corresponding outputs. Because the executions are finite and may schedule re-quests differently, their per-request views need not have equal lengths. Prefix comparability requires the shorter view to agree exactly with the beginning of the longer one. Equiv-alently, corresponding requests produce identical logit bits and tokens at every output index reached by both executions. This definition is not a liveness property. It constrains outputs whenever both executions produce the correspond-ing records, but does not require an admitted request to be scheduled, to make progress, or to complete. It is also not a functional-correctness specification: a system may satisfy de-terminism while producing logits or tokens that differ from those prescribed by the intended model semantics. 
+
+## 3 Overview 
+
+Vosti is a deterministic LLM inference system that produces bitwise-identical logits for a request across the system’s ex-ecution variations. Figure 1 shows Vosti’s implementation and proof composition; brackets mark each verifier’s scope. The inference engine schedules and batches tokens, manages cached prefixes, and invokes GPU kernels. Vosti follows one design rule: for a fixed model and de-ployment configuration, the runtime may vary token batching, state storage, or state access, while preserving each position’s floating-point operation sequence . This rule does not intrinsi-cally require a unique kernel or tiling. However, rather than proving bitwise equivalence across alternative implementa-tions, Vosti pins kernels and launch configurations selected solely based on the fixed model and environment. Machine-checked engine proofs and the kernel verifier then establish that runtime variation (e.g., batch size, KV-cache hit length, and request scheduling) changes neither a position’s logical inputs nor its floating-point operation sequence. For exam-ple, matmul block sizes may vary with the layer’s weight dimensions while remaining fixed across runtime batch sizes. We verify Vosti in two layers. At the engine layer, each GPU operation 𝐾 is represented by an uninterpreted func-tion 𝑓 𝐾 that gives the operation’s single-request result. Verus checks that engine steps preserve request and cache invari-ants and that each emitted logit vector depends only on the request’s token history, assuming that the result selected for request 𝑟 is 𝑓 𝐾 (𝑥 𝑟 ) for its logical input 𝑥 𝑟 . The proof reasons about request states, page tables, and cache sharing and up-dates without modeling Triton or floating-point arithmetic. Assuming the kernel contracts, Verus also checks the induc-tion over engine steps: requests with the same prompt and initial sampler state produce per-request views that agree on their common prefix, as illustrated at the top of Figure 1. Our kernel verifier proves the contracts in Figure 1 un-der the stated assumptions. For each kernel, it proves that  
+
+> 3Jianxing Qin, Alexander Du, Danfeng Zhang, Matthew Lentz, and Danyang Zhuo
+> Request determinism § 2
+> 𝑟 1, 𝑟 2: same prompt + initial sampler state; fixed model/deployment
+> 𝑇 1
+> 𝑇 2
+
+𝑜 0 𝑜 1 𝑜 2
+
+𝑜 0 𝑜 1view 𝑟 1view 𝑟 2
+
+𝑜 0 𝑜 1
+
+𝑜 0 𝑜 1
+
+𝑜 2 Same logit bits and tokens on common prefix Output: 𝑜 𝑖 = (ℓ𝑖 , 𝑦 𝑖 )            
+
+> Inference engine § 4 Scheduler KV-cache manager Model executor
+> Engine proof
+> Preserves invariants
+> ℓ=Forward (𝑊 , ℎ )
+> Inductive proof
+> External APIs Kernel launch code Compiled kernel Triton compiler
+> invokes
+> Kernel contracts
+> Bitwise equality of selected outputs Imported
+> GPU kernels § 5
+> Triton source + annotations
+> Fixed configuration Batched Alone
+> 𝑥𝑟 𝑧𝑟 𝑥𝑟 𝑧𝑟 𝐾 𝑓 𝐾
+> Bitwise equal
+> Verus + Z3
+> Uses contracts as assumptions
+> Our kernel verifier + Z3
+> Checks kernels satisfy contracts Trusted component Code / proof artifact Selected request data Other request data Data / execution Projection / correspondence Proof composition Tool check / scope
+
+Figure 1. Vosti’s inference system and two-layer verification. Brackets show each verifier’s scope; Verus assumes the shared kernel contracts, while our kernel verifier proves them. the selected output of invocation 𝐾 (𝑋 ) equals 𝑓 𝐾 (𝑥 𝑟 ) when 
+
+𝑥 𝑟 denotes the same logical input. The linear-projection ex-ample at the bottom of Figure 1 illustrates this relation for batched and singleton invocations. The two invocations may differ in batch layout, query length, whether the position is computed during prefill or decode, and physical page ta-bles. The proof establishes that both invocations perform the same operations, in the same order, on the selected input. Configuration checks then bind the proved launch parame-ters to the runtime invocation. The trusted Triton compiler compiles the source into the GPU kernel that Vosti invokes. The two proofs meet at 𝑓 𝐾 . The engine proof establishes the logical input 𝑥 𝑟 and uses 𝑓 𝐾 (𝑥 𝑟 ) without interpreting its arithmetic; the kernel proof establishes that the deployed GPU invocation returns that result. Verus checks each call’s preconditions and assumes its postconditions through a trusted import. It does not recheck the kernel proofs; con-tract translation and tensor-representation correspondence remain trusted (§5.1). Composing the proofs yields the main invariant in §4.2. §4 describes the engine implementation and proof, while §5 describes the kernel verifier. 
+
+## 4 Engine Implementation and Verification 
+
+We design our engine and structure our proofs around the intermediate goal of demonstrating that each engine step produces logits determined solely by the token history for any request. To build up to this, we refer to an engine step as 𝐸 𝑂 
+
+−→ 𝐸 ′, with the finite partial output map 𝑂 defined in §2.3, and write 𝑜 𝑢 = 𝑂 (𝑢 ) with components 𝑜 𝑢 .logits and 
+
+𝑜 𝑢 .token . For any engine state 𝐸 , we let 𝐸. requests map live request identifiers to records, and write 𝑟 𝑢 = 𝐸. requests [𝑢 ].Given this, we want to show that for any engine step 𝐸 𝑂 
+
+−→ 𝐸 ′,all request IDs 𝑢 ∈ dom (𝑂 ) must have their logits ( 𝑜 𝑢 .logits )equal to the result of a deterministic function Forward, which depends only on the configuration ( 𝑊 ) and the history of the request ( 𝑟 𝑢 .history using the pre-step state 𝐸 , which is equal to the prompt followed by emitted tokens). Forward outputs the last-position logits based on a cold forward (i.e., from an empty KV-cache). To prove this inductively, we need to introduce several invariants whose conjunction forms Inv (𝐸,𝑊 ). Therefore, our goal is to prove the following theorem: 
+
+Theorem 4.1 (Engine-step preservation) . Under the fixed deployment assumptions and imported kernel contracts, 
+
+Inv (𝐸,𝑊 ) ∧ 𝐸 𝑂 
+
+−→ 𝐸 ′
+
+=⇒
+
+
+
+Inv (𝐸 ′,𝑊 )∧ ∀ 𝑢 ∈ dom (𝑂 ),𝑜 𝑢 .logits = Forward (𝑊 , 𝑟 𝑢 .history )
+
+
+
+.
+
+To prove our engine meets Definition 2.1, we subsequently need to account for the token sampled from the logits (which Forward says nothing about). Sampling is a deterministic 
+
+> 4Vosti : Specifying, Implementing, and Verifying Deterministic LLM Inference
+
+function of logits and explicit per-request sampler state. Two requests with the same prompt and initial sampler state begin with equal histories and sampler states; whenever both reach their next output, Theorem 4.1 gives equal logits; in turn, sampling gives equal tokens and successor sampler states, so appending those tokens preserves history equality. Steps without an output do not advance this per-request sequence. Verus checks the induction over finite executions: corresponding requests agree at every output index reached by both, regardless of their interleaving with other requests. Their views are therefore prefix-comparable. In the rest of the section, we will first discuss three de-sign choices that support the verification of determinism, followed by the invariants that form Inv (𝐸,𝑊 ) and how they are preserved. 
+
+4.1 Engine Implementation 
+
+Vosti follows vLLM’s architecture [17], with continuous batching, paged KV storage, and prefix caching. We im-plement the engine in Rust with Verus annotations and in-voke Triton kernels through Python. Three implementation choices support determinism and its verification. 
+
+Fixed kernel choices. At initialization, the engine binds the model to an immutable runtime configuration contain-ing the selected kernel specializations and tile parameters. These choices depend on the fixed model and deployment configuration, not the current batch size, prefill chunk size, or whether a request is prefilling or decoding. The inference path performs no runtime autotuning and does not fall back to configurations outside the verified set. §5 describes the kernels and their numerical guarantees. 
+
+Exact prefix matching. A cached page is reusable only for the token prefix that produced it. The cache manager uses rolling hashes to find candidate pages, then checks their exact tokens, depth in the prefix, and physical parent page. A hash collision therefore cannot justify reuse. Under memory pressure, the manager evicts only unreferenced leaves of this parent chain, so a parent identifier cannot be recycled while a retained child still refers to it. 
+
+Separate cache reuse from generation. The scheduler resolves all prefix-cache hits before registering any pages that the current step will produce. Those pages can be reused only in later steps, after their KV values have been computed. Previously computed shared or registered prefix pages re-main immutable; new KV values are written to private suffix slots. This discipline separates the cache contents a step may reuse from the values it must compute. These choices do not require identical scheduling deci-sions across executions. Batch composition, scheduling or-der, and physical page allocation may vary. The proof must establish that these choices do not change a request’s logits.                                                        
+
+> 1Share
+> A, B live
+> 𝑃 7:[𝑎, 𝑏 ]
+> refs = 2
+> 𝑃 2:[𝑐, 𝑑 ]
+> refs = 1
+> 𝑃 9:[𝑒, 𝑓 ]
+> refs = 1 AB
+> 2Retain
+> A, B finished
+> 𝑃 7:[𝑎, 𝑏 ]
+> refs = 0
+> 𝑃 2:[𝑐, 𝑑 ]
+> refs = 0
+> 𝑃 9:[𝑒, 𝑓 ]
+> refs = 0
+> 3Evict
+> 𝑃 7:[𝑎, 𝑏 ]
+> refs = 0
+> 𝑃 2free
+> 𝑃 9:[𝑒, 𝑓 ]
+> refs = 0
+> 4Reuse + recompute
+> C: [𝑎, 𝑏, 𝑐, 𝑑 ]
+> 𝑃 7:[𝑎, 𝑏 ]
+> refs = 1
+> 𝑃 2:[𝑐, 𝑑 ]
+> refs = 1
+> 𝑃 9:[𝑒, 𝑓 ]
+> refs = 0 CInitial KV state Final KV state Cold Reuse
+> 𝑃 7
+> ∅
+> KV 𝑎 KV 𝑏
+> KV 𝑎 KV 𝑏 KV 𝑐 KV 𝑑
+> KV 𝑎 KV 𝑏 KV 𝑐 KV 𝑑
+> [𝑎, 𝑏, 𝑐, 𝑑 ][𝑐, 𝑑 ]
+> Final KV states: bitwise equal at every layer Stored parent Prefill refs: live references Prefix Suffix Other branch Other pages omitted
+
+Figure 2. The KV-cache invariant across sharing, retention, eviction, and recomputation: every initialized live or retained entry equals the KV value from a cold forward on its corre-sponding causal prefix. 𝑃 𝑖 denotes physical KV-cache page 𝑖 ;each page holds KV values for two tokens in this example. 
+
+4.2 Engine Invariants 
+
+To establish request determinism across batching, schedul-ing, and cache reuse, we maintain a central KV-cache invari-ant alongside request, layout, and write-isolation invariants. The KV-cache invariant ensures that every live or retained reusable KV entry equals the value obtained by recomputing its token prefix without cache. Our mechanized proof uses ghost state representing logical request histories and cache provenance; this state does not affect runtime. 
+
+Logical values and notation. Forward (𝑊 , ℎ ), for a non-empty request history ℎ, composes the fixed single-request uninterpreted kernel functions 𝑓 𝐾 introduced in §3. For 0 ≤
+
+𝑝 < |ℎ|, define 𝑓 KV (𝑊 , ℎ, 𝑝 ) as the collection of KV pairs across all decoder layers produced at position 𝑝 by a cold for-ward on the first 𝑝 + 1 tokens of ℎ. We call this the canonical 
+
+KV value. It depends only on the causal prefix ending at 𝑝 ; the kernel contracts establish that processing later tokens does not change this value. The fields 𝑟 𝑢 .sampler and 𝑟 𝑢 .cached 
+
+hold the request’s current sampler state and initialized-cache length, respectively. The lookup 𝑟 𝑢 .slot (𝑝 ) maps logical po-sition 𝑝 to a physical slot through its page table, and 𝐸. kv [𝑠 ]
+
+denotes the collection of KV pairs across all layers at slot 𝑠 .
+
+> 5Jianxing Qin, Alexander Du, Danfeng Zhang, Matthew Lentz, and Danyang Zhuo
+
+This notation groups values logically, without requiring con-tiguous storage across layers. Equality of KV values means bitwise equality at every layer; logit equality is also bitwise. 
+
+Request and layout consistency. Queues and request maps agree on live identifiers, and request records track their histories, sampler states, and stopping states consistently. Ini-tialized cache lengths satisfy 0 ≤ 𝑟 𝑢 .cached ≤ | 𝑟 𝑢 .history |,and page tables map these prefixes to allocated, in-range slots. Tensor shapes, permissions, capacity, and the fixed runtime configuration satisfy the engine’s readiness con-ditions. Planning establishes the corresponding kernel-call premises, including the mapping from each packed row to its request and logical token position. 
+
+KV-value consistency. Let 𝐸. prefixes collect initialized live-request prefixes (including private tails) and retained reusable prefixes. Each prefix record 𝑞 has a token sequence 
+
+𝑞. tokens and an equally long sequence 𝑞. slots of physical slots in token order. These records are ghost views of request and page metadata. Write ℎ[0 : 𝑐 ] for the first 𝑐 tokens of a history ℎ. For every live request identifier 𝑢 , the collection contains a record 𝑞 𝑢 
+
+satisfying 
+
+𝑞 𝑢 .tokens = 𝑟 𝑢 .history [0 : 𝑟 𝑢 .cached ],𝑞 𝑢 .slots [𝑝 ] = 𝑟 𝑢 .slot (𝑝 ) (0 ≤ 𝑝 < 𝑟 𝑢 .cached ).
+
+The collection also contains a record for every resident chain with published prefix provenance: its tokens and slots are reconstructed from exact token blocks, logical depths, and parent links. This coverage includes chains with no live ref-erences and those not currently selected by the hash index. For every 𝑞 ∈ 𝐸. prefixes and 0 ≤ 𝑝 < |𝑞. tokens |, the KV-value invariant requires 
+
+𝐸. kv [𝑞. slots [𝑝 ]] = 𝑓 KV (𝑊 , 𝑞. tokens , 𝑝 ).
+
+The coverage conditions and this equality are part of Inv. Together they give canonical values for every initialized request position and every retained prefix, independently of whether its creating request is still live. Uninitialized slots are not readable and carry no KV-value obligation. Figure 2 illustrates this persistence. Requests A and B share 𝑃 7 and retain separate suffix pages 𝑃 2 and 𝑃 9. Their KV-value obligations survive request completion. Evicting leaf 𝑃 2
+
+removes its obligation without affecting 𝑃 7 or 𝑃 9; 𝑃 7 cannot be evicted while 𝑃 9 refers to it. A later request reuses 𝑃 7 and recomputes the suffix, re-establishing the same canonical values in newly allocated storage. 
+
+Sharing and write isolation. Shared and registered prefix pages are immutable, and writable suffix slots are private. Each execution plan assigns in-range, mutually disjoint write slots that do not overlap other requests’ initialized prefixes or retained values. Consequently, extending one request’s cache preserves the values available to other requests. 
+
+4.3 Invariant Preservation Initialization and admission. Initialization establishes Inv: request records contain their initial histories and sam-pler states. Initialized-cache lengths are zero and no prefixes are retained, so the KV-value invariant holds vacuously. Ad-mission adds a request in this state at a stable engine bound-ary, preserving existing cache values and the invariant. 
+
+Planning and forward execution. Planning may com-bine cold prefill, cached partial prefill, and decode work. It resolves prefix hits, allocates private suffix storage, and evicts only unreferenced leaves. Row mappings and write-slot checks establish the kernel-contract premises (§5). For a cache hit, let 𝑞 ∈ 𝐸. prefixes represent the retained chain being reused, and let 𝑐 = |𝑞. tokens |. Exact prefix match-ing establishes 
+
+𝑟 𝑢 .history [0 : 𝑐 ] = 𝑞. tokens .
+
+Let 𝐸 + denote the intermediate state after attaching the pre-fix, and let 𝑟 + = 𝐸 +.requests [𝑢 ]. Attachment preserves the request’s history and the reused values, and maps each posi-tion 𝑝 < 𝑐 to 𝑞. slots [𝑝 ]. Consequently, for every 0 ≤ 𝑝 < 𝑐 ,
+
+𝐸 +.kv [𝑟 +.slot (𝑝 )] = 𝐸. kv [𝑞. slots [𝑝 ]] 
+
+= 𝑓 KV (𝑊 , 𝑞. tokens , 𝑝 )
+
+= 𝑓 KV (𝑊 , 𝑟 +.history , 𝑝 ).
+
+The KV-value invariant gives the second equality; depen-dence only on the causal prefix gives the third. Thus, adding the reused prefix to the request’s initialized cache preserves consistency, even if no earlier request remains live. The forward proof proceeds by decoder layer and sched-uled token position. The kernel contracts establish cold-forward equality for cold prefill. For cached work, the KV invariant supplies a canonical prefix, and a continuation lemma establishes that every processed position yields the same logits and new KV values that a cold forward would. Layout mappings connect these logical values to packed tensors and physical cache slots. When a request emits an output, its selected row corresponds to the last position of its pre-step history, yielding the output equality in Theorem 4.1. 
+
+State updates. Newly written KV values are canonical; write isolation preserves the values of other requests and retained pages. Extending a request’s initialized prefix ex-tends its record in the prefix collection. Publishing a newly computed full page also establishes a retained-prefix record for these canonical values, so their KV-value obligation sur-vives the creating request’s completion. Leaf-only eviction preserves the obligations of surviving pages. After sampling for request 𝑢 , the engine appends the emitted token, updates its sampler state and cache length, then adjusts queues and reference counts. Finished requests may be removed without discarding retained pages’ KV-value obligations. Steps with-out an output for a request preserve its history and sampler 
+
+> 6Vosti : Specifying, Implementing, and Verifying Deterministic LLM Inference
+
+state but may extend its initialized cache. Together, these updates re-establish Inv at the next engine-step boundary. 
+
+## 5 Kernel Implementation and Verification 
+
+Kernel contracts require equal logical inputs and guarantee bitwise-equal selected outputs despite changes in batch size, query length, or KV cache hits. Equal inputs alone do not ensure this property: changes in the operation sequence can affect floating-point rounding. Our verifier establishes two facts: corresponding computations apply matching value-relevant operations in the same order, and those operations receive equal inputs. We develop the structural analysis using matmul, then extend it with value analysis for attention causality, under the verification assumptions stated below. 
+
+5.1 Relational Kernel Contracts 
+
+Each contract relates input and output regions of two kernel invocations. Regions select tensor cells by logical indices; specified equality is bitwise and other inputs need not agree. For example, consider matmul with 𝑀 × 𝐾 activations 
+
+𝑎 , 𝐾 × 𝑁 weights 𝑏 , and 𝑀 × 𝑁 output 𝑐 . Each row in 𝑎 
+
+represents one token; a request may contribute multiple rows. The contract compares any selected token row with its singleton run, requiring equal inputs for that row and the weights. All other token rows remain unconstrained. Kernel annotations are comments and do not affect ex-ecution. @params declares tensor shapes, strides, element kinds, and typed scalars; @grid declares the launch grid; and 
+
+@verif states a relation between invocations. The verifier treats @params and @grid as the invocation model and same 
+
+and pre as premises, and proves the output equality specified by post . Figure 3 combines the annotation, tile IR, and de-pendency analysis, with callouts identifying the obligations checked by Z3. We abbreviate strides and use mathemati-cal notation. With fixed tile dimensions 𝐵 𝑀 , 𝐵 𝑁 , 𝐵 𝐾 , ceiling division covers the output with 𝐵 𝑀 × 𝐵 𝑁 tiles. Here, subscripts 𝐿 and 𝑅 denote the packed-token and singleton runs. The free integer variable 𝑥 is automatically universally quantified: the contract holds for every selected row satisfying 0 ≤ 𝑥 < 𝑀 𝐿 whenever the remaining premises hold. Both invocations share weight dimensions and tile constants. This row-level guarantee supports request-level batch invariance and independence from how tokens are grouped into matmul invocations. The engine proof establishes kernel-call preconditions and imports kernel contracts as trusted assumptions in Verus. Contract translation and the correspondence between tensor representations remain trusted. 
+
+5.2 Relational Structural Analysis Tile representation. Our kernels use a restricted subset of Triton, compiled by the unmodified Triton compiler. The                                                                                                                                                              
+
+> Kernel runs: 𝐿 : arbitrary 𝑀 >0;𝑅 :𝑀 =1.Compare row 𝑥 (0≤𝑥 <𝑀 ) in 𝐿 with row 0in 𝑅 .
+> @params( tensor( 𝑎 , float, shape( 𝑀, 𝐾 ), strides(...)), tensor( 𝑏 , float, shape( 𝐾, 𝑁 ), strides(...)), tensor( 𝑐 , float, shape( 𝑀, 𝑁 ), strides(...))) @grid( ⌈𝑀 /𝐵 𝑀 ⌉,⌈𝑁 /𝐵 𝑁 ⌉)@verif(batch_invariance, same( 𝑁 , 𝐾 ), pre( 0≤𝑥 <𝑀 𝐿 , 𝑀 𝑅 =1,
+> 𝑎 𝐿 [𝑥 :𝑥 +1,0 : 𝐾 ]=𝑎 𝑅 [0 : 1 ,0 : 𝐾 ],
+> 𝑏 𝐿 [0 : 𝐾, 0 : 𝑁 ]=𝑏 𝑅 [0 : 𝐾, 0 : 𝑁 ]), post( 𝑐 𝐿 [𝑥 :𝑥 +1,0 : 𝑁 ]=𝑐 𝑅 [0 : 1 ,0 : 𝑁 ]))
+> Z3: pairing and bounds
+> parfor 𝑖 in range( ⌈𝑀 /𝐵 𝑀 ⌉): parfor 𝑗 in range( ⌈𝑁 /𝐵 𝑁 ⌉):
+> 𝑚 ←𝑖𝐵 𝑀 ,𝑛 ←𝑗𝐵 𝑁 𝑆 ←zeros (𝐵 𝑀 , 𝐵 𝑁 )
+> for 𝑘 in range( ⌈𝐾 /𝐵 𝐾 ⌉):
+> 𝑡 ←𝑘𝐵 𝐾 𝐴 ←𝑎 [𝑚 :𝑚 +𝐵 𝑀 , 𝑡 :𝑡 +𝐵 𝐾 ]
+> 𝐵 ←𝑏 [𝑡 :𝑡 +𝐵 𝐾 , 𝑛 :𝑛 +𝐵 𝑁 ]
+> 𝑆 ←mma (𝐴, 𝐵, 𝑆 )
+> 𝑐 [𝑚 :𝑚 +𝐵 𝑀 , 𝑛 :𝑛 +𝐵 𝑁 ] ← 𝑆
+> 1234
+> 𝑖 𝐿 =⌊𝑥 /𝐵 𝑀 ⌋ ↔ 𝑖 𝑅 =0
+> 𝑗 𝐿 =𝑗 𝑅 𝑘 𝐿 =𝑘 𝑅 in order Rows within tiles: 𝑟 𝐿 =𝑥 mod 𝐵 𝑀 ;𝑟 𝑅 =0.
+> 𝐴 𝐵 𝑆 𝑎 [𝑚 +𝑟, . . . ]
+> 𝑏 [. . . , . . . ]
+> 𝑐 [𝑚 +𝑟, . . . ]
+> 12334
+> Z3: stores cover
+> post pre : input equalities Z3: input-region coverage and matching load masks
+
+Figure 3. Matmul contract, tile IR, and Z3 checks. Numbers link statements to backward dependencies. Slices are half-open; loads are zero-padded and stores bounds-masked. mma denotes tl.dot ; parfor denotes independent grid iterations. verifier specializes tile constants and translates block point-ers, masked accesses, tile operations, structured loops, and scalar branches into a typed tile IR. Block-pointer geometry and scalar metadata identify tensor regions. Unsupported constructs and unresolved shapes are rejected. For matmul (Figure 3), each program starts with a zero FP32 accumulator of shape 𝐵 𝑀 × 𝐵 𝑁 . It loads activation and weight tiles, accumulates their products over ⌈𝐾 /𝐵 𝐾 ⌉ itera-tions, then stores the output tile. Tile-size selection depends on fixed 𝑁 and 𝐾 , not runtime 𝑀 .
+
+Relational control-flow alignment. The verifier seeks a control-flow isomorphism pairing program instances and operations relevant to the selected outputs. Straight-line operations pair in source order with matching operators, 
+
+> 7Jianxing Qin, Alexander Du, Danfeng Zhang, Matthew Lentz, and Danyang Zhuo
+
+types, static parameters, and operand order. Branches require equal value-relevant guards and recursively aligned paths. Reduction loops pair iterations in the same order, requiring equal ranges, related initial state, and corresponding state updates. Parallel grid loops ( parfor in Figure 3) may instead pair only the independent iterations producing the selected regions. Z3 checks the scalar, guard, and range obligations under the contract premises. In matmul, the verifier pairs the program containing left token row 𝑥 with the singleton program containing right row zero, for each output-column tile. Shared 𝐾 and 𝐵 𝐾 give equal loop ranges. The zero initializations, accumulation operations, and stores align, while the selected rows may have different offsets within their tiles. 
+
+Backward rules. Along this correspondence, backward rules determine which operand regions must agree given output regions. Elementwise operations require correspond-ing regions; broadcasts map them to source coordinates; reductions extend them over the reduced axis. For a matrix-product tile 𝐷 = tl.dot (𝐴, 𝐵 ), let 𝐼 and 𝐽 select output rows and columns, and let 𝐻 be the complete contracted index range. Writing 𝐴 [𝐼, 𝐻 ] for the subregion selected by these indices, the rule is 𝐷 [𝐼, 𝐽 ] ← 𝐴 [𝐼, 𝐻 ], 𝐵 [𝐻, 𝐽 ]. The arrow maps a selected output region to its required input regions; rows of 𝐴 outside 𝐼 remain unconstrained. For mma, the re-quired inputs additionally include the corresponding region of the incoming accumulator. Z3 checks that annotated in-put equalities cover these dependencies, relevant load masks agree, and stores cover the declared outputs. Applying these rules to matmul, the selected output row re-quires the corresponding final accumulator row. As Figure 3 illustrates, each accumulation step requires its preceding ac-cumulator row, the selected activation-row segment, and the corresponding weight tile. The annotated input equalities cover those segments and tiles. Starting from equal zero ac-cumulators, induction over the aligned iterations gives equal accumulator rows; the paired stores then give the contract’s output equality under the trusted tile-operation rules. 
+
+5.3 Value-Aware Regional Analysis 
+
+Structural analysis alone cannot establish attention causal-ity: it conservatively retains dependencies on masked KV cells and requires matching loop ranges. Value analysis can remove these dependencies and establish that extra key-tile iterations preserve the selected state. 
+
+The causal contract. Let 𝑞 len and 𝑘 len be an invocation’s query and key lengths, with 0 < 𝑞 len ≤ 𝑘 len . Query row 𝑖 ,where 0 ≤ 𝑖 < 𝑞 len , has logical position 
+
+𝑝 = 𝑘 len − 𝑞 len + 𝑖.                                       
+
+> Prefill: 𝑖 =3,𝑞 len =𝑘 len =6
+> Decode: 𝑖 =0,𝑞 len =1,𝑘 len =4
+> 𝑞 0𝑞 1𝑞 2𝑞 4𝑞 5𝑞 3
+> 𝑞 3
+> 𝑞 :
+> 𝑞 :Attention Attention
+> KV 0
+> KV 0
+> KV 1
+> KV 1
+> KV 2
+> KV 2
+> KV 3
+> KV 3
+> KV 4KV 5
+> 𝑃 7𝑃 2𝑃 9
+> 𝑃 4𝑃 8KV: KV: Masked
+> 𝑜 3
+> 𝑜 3Output Bitwise equal
+> 𝑝 =𝑘 len −𝑞 len +𝑖 =3in both invocations Selected input/output Equal KV prefix Other data Data flow 𝑃 𝑗 : physical KV page
+
+Figure 4. Prefill and decode use equal queries and KV pre-fixes despite different query indices and physical pages, yield-ing bitwise-equal outputs. Here, 𝑞 𝑝 , KV 𝑝 , and 𝑜 𝑝 are indexed by logical position. Future KV positions are causally masked. The contract requires equal selected queries at equal 𝑝 and equal logical KV values through 𝑝 , with shared head geom-etry, scale, page size, and tile constants (Figure 4). Lengths, row indices, and physical page mappings may differ. 
+
+Forward value analysis. The kernel verifier uses conserva-tive abstract interpretation [8] to track regions known to con-tain zero, one, or negative infinity, Boolean mask values, and unchanged state. Unknown positions remain unconstrained. This information refines the backward dependencies: a false mask selects its false branch; masked scores become negative infinity; subsequent numerical rules identify zeroed tensor regions and restrict the following matrix product’s value dependencies. Rules may carry explicit side conditions, such as finiteness of affected values. 
+
+From value analysis to causal equivalence. Shared key-tile iterations align in order, with selected KV dependencies confined to the causal prefix. Extra iterations have all-false masks for the selected row, for which the kernel explicitly retains its incoming state. The value analysis establishes this exact identity transition. We relax §5.2’s equal-range re-quirement only for iterations proved to preserve the selected state bitwise, extending control-flow alignment up to iden-tity steps . Equal initial states and aligned updates then give equal outputs without cancellation or reassociation. Appen-dix A develops the attention contract, tile IR, and relational argument in more detail. 
+
+Verification assumptions. The verifier checks IR-level rule applications and relational obligations. It assumes that compiled Triton operations preserve the stated regional de-pendencies, operation correspondences, and numerical trans-fer rules; tests support these assumptions on the evaluated                 
+
+> 8Vosti : Specifying, Implementing, and Verifying Deterministic LLM Inference 025 50
+> Prefill (K tok/s)  Gemma3-4B
+> 015 30
+> Llama3.1-8B
+> 048
+> Gemma3-27B
+> 048
+> Gemma4-31B
+> 04812 16 0400 800
+> Decode (tok/s)
+> 04812 16 0300 600
+> 04812 16 0100 200
+> 04812 16 080 160
+> Cached context length (K tokens)
+> Vosti
+> vLLM Default vLLM Inv. FA3 vLLM Inv. Triton SGLang Default SGLang Det. FA3 SGLang Det. Triton
+
+Figure 5. Prefill (top) and decode (bottom) throughput (higher is better) versus cached context length. configurations. The translator, solver encoding, structural-to-value argument, engine/kernel interface, and compiler/GPU execution remain trusted. Attention assumes input-dependent finiteness, unchecked at runtime. Full numerical correctness against a reference semantics remains outside our scope. 
+
+## 6 Evaluation 
+
+6.1 Determinism and Numerical Variation 
+
+We detail the tests in §2.2, extend Vosti’s model coverage, and investigate selected production-engine mismatches. 
+
+Test coverage. Prompts are random token sequences with lengths chosen near batching, chunking, and attention-window boundaries. Batch tests use 32 prompts of 17–8,193 tokens and batch sizes 2, 4, and 8, yielding 296 comparisons includ-ing order variations. Chunk tests use 18 prompts of 63–32,768 tokens and budgets of 64, 128, 256, 512, and 1,024 tokens against an unchunked reference with a 32,768-token bud-get, yielding 90 comparisons. Prefill–decode tests start from prompts of 257, 8,192, and 32,768 tokens and compare 128 prediction positions each, yielding 384 pairs. The 14 prefix-reuse comparisons cover full and partial reuse, divergent continuations, and generated-prefix reuse. Together, these give 784 comparisons per model and configuration. Using the criteria of §2.2, Vosti passes all 784 compar-isons for each of seven models: Llama3.1-8B, Llama3.2-3B, Gemma3-4B, Gemma3-12B, Gemma3-27B, Gemma4-12B, and Gemma4-31B, totaling 5,488 bitwise-matched pairs. 
+
+Metadata-dependent specialization. In both vLLM and SGLang, FA3 uses a batch-wide K-length bound to determine whether local-window masking is needed. This choice also affects kernel specialization and tiling, so batch composition can change attention outputs. SGLang’s decode graphs ex-pose a related dependence on storage metadata: their wider KV page tables affect a similar specialization decision, even when the valid keys are unchanged. These behaviors ac-count for selected batch and prefill–decode differences in the Gemma3-4B measurements. 
+
+Path-dependent numerical behavior. SGLang’s Triton prefill and decode paths use different numerical algorithms; fixing the decode split-KV count does not make their atten-tion outputs bitwise identical. In vLLM’s invariant Triton path, query partitioning changes which fully masked softmax tiles are visited. Processing such a tile can also replace a run-ning maximum of −∞ with zero, affecting subsequent round-ing. Thus, numerical variation can arise within an attention implementation as well as from specialization choices. 
+
+Scope. Controlled tests support these explanations, which cover some mismatches in Table 1. The differences charac-terize numerical behavior under tested execution variations and need not indicate engine bugs. 
+
+6.2 Performance 
+
+For Gemma4-31B, the vLLM invariant FA3 configuration uses FA3 for local attention and Triton for global attention because FA3 does not support its 512-dimensional heads. SGLang’s deterministic FA3 configuration is unsupported for this model (shown as N/A or omitted). 
+
+Throughput. To separate prefill and decode costs, we vary cached context length from 0 to 16K tokens on a single H200 NVL GPU, holding the batch size at 4 and the per-sequence query/decode length fixed. Figure 5 shows engines’ prefill and decode throughput at different cached context lengths. Timing excludes cache warmup. Vosti achieves 1 .36–3 .19 ×
+
+the decode throughput of vLLM’s invariant configurations, while prefill throughput remains lower than that of both engines.   
+
+> 9Jianxing Qin, Alexander Du, Danfeng Zhang, Matthew Lentz, and Danyang Zhuo 050 100
+> Vosti
+> Default Inv. FA3 Inv. Triton Default Det. FA3 Det. Triton
+> 54
+> 23 82 99 30 43 35
+
+Gemma3-4B   
+
+> 0150 300
+> 108
+> 37 122 233 38 67 56
+
+Llama3.1-8B   
+
+> 0150 300
+> 143
+> 90 277 315 106 114 119
+
+Gemma3-27B   
+
+> 0200 400
+> 238
+> 106 373 377 128 N/A 136
+
+Gemma4-31B 
+
+Mean session completion time (s)     
+
+> Vosti vLLM SGLang Decode Prefill + others
+
+Figure 6. End-to-end session time (lower is better). Solid segments show decode time, from first output token to response completion; hatched segments combine initial-turn and follow-up prefill (request submission to first output token) with inter-turn user delay and client/scheduling gaps. N/A indicates an unsupported engine configuration. These trends are consistent with the engines’ kernel choices. SGLang benefits from DeepGEMM [36] and efficient atten-tion, including FA3 and split-KV in its Triton decode path. Both Vosti and vLLM’s invariant modes use Triton matmul, but vLLM’s larger tiles favor prefill, whereas Vosti’s smaller tiles favor decode. This trade-off helps explain Vosti’s lower prefill throughput and its decode advantage over vLLM’s invariant modes despite comparable or slower attention. 
+
+Session completion time. Coding agents and document-analysis sessions [2, 23] reuse long-lived reference mate-rial or project context across calls, while new messages and tool results extend the history. With effective cache reten-tion, such agentic workloads can be decode-dominated [32]. We capture this pattern with a synthetic LLM-serving trace of four concurrent sessions of six turns each on an H200 NVL GPU. Initial-turn prefill processes a 16K-token prompt, reusing an 8K shared prefix already cached. Follow-up prefill adds 256 input tokens to the retained conversation. Each turn produces 768 output tokens. Each session issues its next turn after the preceding response completes and a 0.5 s inter-turn user delay. Initial requests are randomly staggered. Figure 6 reports mean session completion time, broken down into decode and combined prefill and other delays. Decode accounts for 91–93% of Vosti’s session time, lim-iting the impact of prefill overhead in this decode-heavy workload. Vosti completes sessions 1 .14–2 .20 × faster than vLLM’s invariant modes, while remaining slower than the default modes and SGLang’s deterministic modes. 
+
+6.3 Implementation and Verification Effort 
+
+Table 2 reports implementation, specification, and proof lines of code for Vosti’s core components, together with verifi-cation time. The engine specification comprises two parts. The abstract specification defines request correspondence, 
+
+Table 2. Core implementation and verification effort (lines of code), and wall-clock verification time of Vosti. Kernel times are per configuration.                                  
+
+> Component Impl. Spec Proof Time
+> Engine and model execution 14,043 876 64,952 52.9s Triton kernels 3,028 500 017.3s Attention (Full & SWA) 1,189 213 015.8s Linear 387 45 00.4s Normalization 665 99 00.5s Activation & others 787 143 00.6s Kernel verifier 17,182 00-
+> Engine specification breakdown: Abstract specification: 168; runtime contracts: 708 LoC.
+
+execution traces, and observable output agreement. Run-time contracts express the assumptions at external-operation boundaries, including Verus counterparts of the kernel con-tracts and assumptions about certain CUDA calls used at runtime. We measure wall-clock verification time with two AMD EPYC 9355 32-core CPUs (128 hyperthreads). Verus uses 127 workers; the kernel verifier runs on a single core, with mean times per kernel configuration reported. 
+
+## 7 Discussion 
+
+Determinism and functional correctness. A consistently incorrect implementation can still be deterministic. As an extreme example, an engine that always returns all-zero logits and token ID zero produces identical outputs across executions while failing to implement the intended model. Vosti’s verification establishes determinism but not func-tional correctness. Our guarantee also fixes the model and 
+
+> 10 Vosti : Specifying, Implementing, and Verifying Deterministic LLM Inference
+
+value-relevant deployment configuration. It does not estab-lish bitwise agreement across numerical dtypes, kernel con-figurations, compiler versions, or hardware platforms. 
+
+Cross-kernel relational verification. Fixing kernel and launch choices simplifies verification, but a single implemen-tation may be suboptimal across workload regimes. DeepSeek-V4 uses two decoding-attention kernels: one assigns a single SM per sequence for full waves, while the other uses multiple SMs to reduce latency in partially filled waves. Both preserve the same accumulation order for bitwise identity [11]. Ex-tending our relational analysis to verify bitwise equivalence across distinct kernels could enable workload-dependent dispatch while preserving deterministic outputs. 
+
+Additional model architectures. Linear-attention archi-tectures such as Gated DeltaNet summarize token history in a recurrent state [29]. Supporting them would require ex-tending our cache invariant to associate retained states with token prefixes and establishing bitwise agreement across chunked prefill and recurrent decode, whose mathematically equivalent formulations may group floating-point operations differently. Mixture-of-experts (MoE) models introduce data-dependent routing and token regrouping; expert-capacity limits in some designs can also make computation depend on co-batched tokens [14]. Extending Vosti to MoE would require batch-independent routing policies, invariants pre-serving token identity through regrouping, and relational contracts for expert computation and output accumulation. 
+
+Multi-GPU inference. Vosti currently supports single-GPU execution. Extending determinism to parallel inference introduces both numerical and distributed-state obligations. Tensor parallelism requires preserving value-relevant accu-mulation order across local kernels and collective reductions, while pipeline execution and distributed KV storage require tracking request and token provenance across devices. Our approach could extend through relational contracts for dis-tributed operations and invariants for communication and state ownership. An initial target is determinism within a fixed parallel configuration; bitwise agreement across GPU counts or partitionings requires additional constraints [35]. 
+
+## 8 Related Work 
+
+Deterministic LLM inference. Thinking Machines Lab introduced batch-invariant kernels, and vLLM, SGLang, and DeepSeek have brought related modes into production in-ference stacks [11, 16, 24, 25, 27]. Yuan et al. empirically characterize numerical variation across batch sizes, GPU types, and parallel configurations [31], while Zhang et al. study invariance across tensor-parallel sizes [35]. These ef-forts control numerical variation through kernel design and empirical validation. Vosti combines engine invariants with relational kernel contracts to establish per-request determin-ism across batching, chunking, prefill–decode transitions, and cache reuse under its stated assumptions. LLM-42 [15] uses fixed-shape verification and rollback to recover deterministic decoding. MarginGate [7] selectively verifies low-margin steps and repairs the current KV col-umn, with thresholds calibrated for sequence-level agree-ment. Vosti verifies the implementation ahead of execution, avoiding per-request replay. 
+
+Reproducible floating-point computation. The HPC community has developed bitwise-reproducible reductions whose results are independent of data partitioning or summa-tion order [12]. Vosti targets a fixed deployment, preserving each position’s logical inputs and value-relevant operation sequence across execution variations. This requires engine invariants alongside kernel-level guarantees. 
+
+KV-cache sharing security. HijackKV [34] shows that position-independent reuse can carry attacker-controlled context into another request through cached KV values. This motivates tracking the full causal prefix, as captured by Vosti’s cache-provenance invariant. PromptPeek [28] re-constructs other users’ prompts through serving-order side channels induced by shared prefix caches. Vosti constrains output values across cache reuse; confidentiality of timing and serving order remains outside its guarantee. 
+
+GPU kernel verification. GPUVerify proves race freedom and barrier safety for CUDA and OpenCL kernels [4]. Volta checks optimized ML kernels against reference implemen-tations at the PTX level using real-number arithmetic [13], and ProofWright verifies memory, thread, and functional properties of generated CUDA kernels [5]. Product programs reduce relational verification to verification of a combined program [3]. Vosti relates two invocations of the same Triton kernel with different packed-row indices, query lengths, and physical page tables. Its tile-level analysis aligns the selected computations and establishes equal dependencies. Like trans-lation validation [21] and Alive2 [20], it checks concrete pro-grams’ relational obligations; our translator, cross-language bridge, and compiler remain trusted. 
+
+## 9 Conclusion 
+
+We presented Vosti, an LLM inference system designed and verified against a system-level specification of determinism. For a fixed model and deployment, its proof combines engine invariants checked in Verus with relational Triton kernel contracts. The engine preserves each position’s logical in-puts across scheduling and KV-cache reuse, while the kernel verifier establishes equal selected outputs by aligning value-relevant operations and their dependencies. Together, they establish per-request bitwise determinism under the stated assumptions and trusted computing base. 
+
+> 11
+
+Jianxing Qin, Alexander Du, Danfeng Zhang, Matthew Lentz, and Danyang Zhuo 
+
+Vosti passes all 5,488 bitwise comparisons across seven Llama and Gemma models. On the evaluated decode-heavy serving workload, it completes sessions 1 .14–2 .20 × faster than vLLM’s batch-invariant modes, while remaining slower than the default configurations and SGLang’s deterministic modes. These results demonstrate how engine invariants and relational kernel verification can support deterministic inference with practical performance. Vosti’s source code is publicly available at https://github.com/QDelta/Vosti .
+
+## Acknowledgments 
+
+This work was supported in part by National Science Foun-dation grants CNS-2625580, CNS-2238665, CNS-2402696, and OAC-2503010, as well as by gifts from Amazon, Google, and Meta. This research was also supported by the National Sci-ence Foundation through the ACCESS program and AWS through the CloudBank project, which is supported by Na-tional Science Foundation grant 1925001. 
+
+## References 
+
+[1] Amey Agrawal, Nitin Kedia, Ashish Panwar, Jayashree Mohan, Nipun Kwatra, Bhargav Gulavani, Alexey Tumanov, and Ramachandran Ram-jee. 2024. Taming Throughput-Latency Tradeoff in LLM Inference with Sarathi-Serve. In Symposium on Operating Systems Design and Implementation (OSDI) . 117–134. https://www.usenix.org/conference/ osdi24/presentation/agrawal 
+
+[2] Anthropic. 2025. Prompt caching with Claude. https://claude.com/ blog/prompt-caching .[3] Gilles Barthe, Juan Manuel Crespo, and César Kunz. 2011. Relational Verification Using Product Programs. In International Symposium on Formal Methods (FM) . 200–214. doi: 10.1007/978-3-642-21437-0_17 
+
+[4] Adam Betts, Nathan Chong, Alastair Donaldson, Shaz Qadeer, and Paul Thomson. 2012. GPUVerify: a verifier for GPU kernels. In ACM SIG-PLAN Conference on Object-Oriented Programming, Systems, Languages, and Applications (OOPSLA) . 113–132. doi: 10.1145/2384616.2384625 
+
+[5] Bodhisatwa Chatterjee, Drew Zagieboylo, Sana Damani, Siva Hari, and Christos Kozyrakis. 2025. ProofWright: Towards Agentic Formal Verification of CUDA. arXiv:2511.12294 [cs.SE] https://arxiv.org/abs/ 2511.12294 
+
+[6] Charlie Chen, Sebastian Borgeaud, Geoffrey Irving, Jean-Baptiste Lespiau, Laurent Sifre, and John Jumper. 2023. Accelerat-ing Large Language Model Decoding with Speculative Sampling. arXiv:2302.01318 [cs.CL] https://arxiv.org/abs/2302.01318 
+
+[7] Kexin Chu, Yang Zhou, and Wei Zhang. 2026. MarginGate: Sparse Margin-Triggered Verification for Batch-Invariant LLM Inference. arXiv:2605.30218 [cs.LG] https://arxiv.org/abs/2605.30218 
+
+[8] Patrick Cousot and Radhia Cousot. 1977. Abstract interpretation: a unified lattice model for static analysis of programs by construction or approximation of fixpoints. In ACM SIGPLAN-SIGACT Symposium on Principles of Programming Languages (POPL) . 238–252. doi: 10.1145/ 512950.512973 
+
+[9] Tri Dao, Dan Fu, Stefano Ermon, Atri Rudra, and Christopher Ré. 2022. FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness. In Conference on Neural Information Processing Systems (NeurIPS) . 16344–16359. doi: 10.52202/068431-1189 
+
+[10] Leonardo de Moura and Nikolaj Bjørner. 2008. Z3: An Efficient SMT Solver. In International Conference on Tools and Algorithms for the Construction and Analysis of Systems (TACAS) . 337–340. doi: 10.1007/ 978-3-540-78800-3_24 
+
+[11] DeepSeek-AI et al. 2026. DeepSeek-V4: Towards Highly Efficient Million-Token Context Intelligence. arXiv:2606.19348 [cs.CL] https: //arxiv.org/abs/2606.19348 
+
+[12] James Demmel and Hong Diep Nguyen. 2013. Fast Reproducible Floating-Point Summation. In IEEE Symposium on Computer Arithmetic (ARITH) . 163–172. doi: 10.1109/ARITH.2013.9 
+
+[13] Benjamin Driscoll, Kshitij Dubey, Anjiang Wei, Neeraj Kayal, Rahul Sharma, and Alex Aiken. 2026. Equivalence Checking of ML GPU Kernels. In ACM SIGPLAN Conference on Object-Oriented Programming, Systems, Languages, and Applications (OOPSLA) . https://arxiv.org/abs/ 2511.12638 To appear. [14] William Fedus, Barret Zoph, and Noam Shazeer. 2022. Switch Trans-formers: Scaling to Trillion Parameter Models with Simple and Effi-cient Sparsity. Journal of Machine Learning Research 23, 120 (2022), 1–39. https://jmlr.org/papers/v23/21-0998.html 
+
+[15] Raja Gond, Aditya K Kamath, Ramachandran Ramjee, and Ashish Panwar. 2026. LLM-42: Enabling Determinism in LLM Inference with Verified Speculation. In ACM Symposium on Oper-ating Systems Principles (SOSP) . https://www.microsoft.com/en-us/research/publication/llm-42-enabling-determinism-in-llm-inference-with-verified-speculation/ To appear. [16] Horace He and Thinking Machines Lab. 2025. Defeating Nondetermin-ism in LLM Inference. https://thinkingmachines.ai/blog/defeating-nondeterminism-in-llm-inference/ . doi: 10.64434/tml.20250910 
+
+[17] Woosuk Kwon, Zhuohan Li, Siyuan Zhuang, Ying Sheng, Lianmin Zheng, Cody Hao Yu, Joseph Gonzalez, Hao Zhang, and Ion Stoica. 2023. Efficient Memory Management for Large Language Model Serv-ing with PagedAttention. In ACM Symposium on Operating Systems Principles (SOSP) . 611–626. doi: 10.1145/3600006.3613165 
+
+[18] Andrea Lattuada, Travis Hance, Jay Bosamiya, Matthias Brun, Chan-hee Cho, Hayley LeBlanc, Pranav Srinivasan, Reto Achermann, Tej Chajed, Chris Hawblitzel, Jon Howell, Jacob R. Lorch, Oded Padon, and Bryan Parno. 2024. Verus: A Practical Foundation for Systems Ver-ification. In ACM Symposium on Operating Systems Principles (SOSP) .438–454. doi: 10.1145/3694715.3695952 
+
+[19] Yaniv Leviathan, Matan Kalman, and Yossi Matias. 2023. Fast In-ference from Transformers via Speculative Decoding. In Interna-tional Conference on Machine Learning (ICML) . 19274–19286. https: //proceedings.mlr.press/v202/leviathan23a.html 
+
+[20] Nuno P. Lopes, Juneyoung Lee, Chung-Kil Hur, Zhengyang Liu, and John Regehr. 2021. Alive2: bounded translation validation for LLVM. In ACM SIGPLAN Conference on Programming Language Design and Implementation (PLDI) . 65–79. doi: 10.1145/3453483.3454030 
+
+[21] Amir Pnueli, Michael Siegel, and Eli Singerman. 1998. Translation Validation. In International Conference on Tools and Algorithms for the Construction and Analysis of Systems (TACAS) . 151–166. doi: 10.1007/ BFb0054170 
+
+[22] Jay Shah, Ganesh Bikshandi, Ying Zhang, Vijay Thakkar, Pradeep Ramani, and Tri Dao. 2024. FlashAttention-3: Fast and Accurate At-tention with Asynchrony and Low-precision. In Conference on Neural Information Processing Systems (NeurIPS) . 68658–68685. doi: 10.52202/ 079017-2193 
+
+[23] Thariq Shihipar. 2026. Lessons from building Claude Code: Prompt caching is everything. https://claude.com/blog/lessons-from-building-claude-code-prompt-caching-is-everything .[24] The SGLang Team. 2025. Towards Deterministic Inference in SGLang and Reproducible RL Training. https://www.lmsys.org/blog/2025-09-22-sglang-deterministic/ .[25] The vLLM Team. 2026. Batch Invariance. https://docs.vllm.ai/en/ latest/features/batch_invariance/ . Accessed on 2026-09-08. [26] Philippe Tillet, H. T. Kung, and David Cox. 2019. Triton: an interme-diate language and compiler for tiled neural network computations. In ACM SIGPLAN International Workshop on Machine Learning and Programming Languages (MAPL) . 10–19. doi: 10.1145/3315508.3329973 
+
+12 Vosti : Specifying, Implementing, and Verifying Deterministic LLM Inference 
+
+[27] vLLM and TorchTitan Teams. 2025. No More Train-Inference Mismatch: Bitwise Consistent On-Policy Reinforcement Learning with vLLM and TorchTitan. https://vllm.ai/blog/2025-11-10-bitwise-consistent-train-inference .[28] Guanlong Wu, Zheng Zhang, Yao Zhang, Weili Wang, Jianyu Niu, Ye Wu, and Yinqian Zhang. 2025. I Know What You Asked: Prompt Leak-age via KV-Cache Sharing in Multi-Tenant LLM Serving. In Network and Distributed System Security Symposium (NDSS) . doi: 10.14722/ndss. 2025.241772 
+
+[29] Songlin Yang, Jan Kautz, and Ali Hatamizadeh. 2025. Gated Delta Networks: Improving Mamba2 with Delta Rule. In In-ternational Conference on Learning Representations (ICLR) .
+
+https://proceedings.iclr.cc/paper_files/paper/2025/hash/ 4904fad153f6434a7bcf04465d4be2cc-Abstract-Conference.html 
+
+[30] Gyeong-In Yu, Joo Seong Jeong, Geon-Woo Kim, Soojeong Kim, and Byung-Gon Chun. 2022. Orca: A Distributed Serving System for Transformer-Based Generative Models. In Symposium on Operating Systems Design and Implementation (OSDI) . 521–538. https://www. usenix.org/conference/osdi22/presentation/yu 
+
+[31] Jiayi Yuan, Hao Li, Xinheng Ding, Wenya Xie, Yu-Jhe Li, Wentian Zhao, Kun Wan, Jing Shi, Xia Hu, and Zirui Liu. 2025. Understanding and Mitigating Numerical Sources of Nondeterminism in LLM Inference. In 
+
+Conference on Neural Information Processing Systems (NeurIPS) . 169819– 169851. doi: 10.52202/085713-5653 
+
+[32] Yichao Yuan, Ankita Nayak, Souvik Kundu, and Nishil Talati. 2026. Agentic AI Workload Characteristics. arXiv:2605.26297 [cs.DC] https: //arxiv.org/abs/2605.26297 
+
+[33] Ranran Haoran Zhang, Soumik Dey, Ashirbad Mishra, Hansi Wu, Binbin Li, and Rui Zhang. 2026. Correctness Forensics for Batch Speculative Decoding: Diagnosing the Ragged Tensor Problem. In 
+
+Findings of the Association for Computational Linguistics: EMNLP . https: //arxiv.org/abs/2510.22876 To appear. [34] Yichi Zhang, Zhiqi Wang, Huan Zhang, and Yuchen Yang. 2026. Hi-jackKV: New Threat in Position-Independent KV Cache Reuse. In 
+
+USENIX Security Symposium . https://www.usenix.org/conference/ usenixsecurity26/presentation/zhang-yichi 
+
+[35] Ziyang Zhang, Xinheng Ding, Jiayi Yuan, Rixin Liu, Huizi Mao, Jiarong Xing, and Zirui Liu. 2026. Deterministic Inference across Tensor Parallel Sizes That Eliminates Training-Inference Mismatch. In International Conference on Machine Learning (ICML) . https: //openreview.net/forum?id=5eZmlUyFpl 
+
+[36] Chenggang Zhao, Zhean Xu, Liang Zhao, Jiashi Li, Chenhao Xu, Anyi Xu, Shengyu Liu, Kexing Zhou, and Kuai Yu. 2025. DeepGEMM: Clean and Efficient BLAS Kernel Library on GPU. https://github.com/ deepseek-ai/DeepGEMM .[37] Lianmin Zheng, Liangsheng Yin, Zhiqiang Xie, Chuyue Sun, Jeff Huang, Cody Hao Yu, Shiyi Cao, Christos Kozyrakis, Ion Stoica, Joseph E. Gonzalez, Clark Barrett, and Ying Sheng. 2024. SGLang: Efficient Execution of Structured Language Model Programs. In Confer-ence on Neural Information Processing Systems (NeurIPS) . 62557–62583. doi: 10.52202/079017-2000 
+
+## A Verifying Paged Attention 
+
+We expand §5.3 using a mathematical presentation of the attention tile IR. 
+
+A.1 Properties and Logical Inputs 
+
+Fix the element types, head geometry, scale, page size 𝑃 , and tile sizes 𝐵 𝑀 , 𝐵 𝑁 , with 𝐵 𝑁 | 𝑃 . Consider one query head of dimension 𝑑 and its KV head. Invocation 𝑋 has query/key lengths 0 < 𝑠 𝑋 ≤ 𝑛 𝑋 ; query row 0 ≤ 𝑖 𝑋 < 𝑠 𝑋 represents position 𝑝 𝑋 = 𝑛 𝑋 − 𝑠 𝑋 + 𝑖 𝑋 .Let 𝑄 𝑋 , 𝑂 𝑋 denote queries and outputs. Logical cache ma-trices 𝐾 𝑋 , 𝑉 𝑋 use page table 𝜋 𝑋 : for key position 𝑗 ,
+
+𝐾 𝑋 [ 𝑗, :] = 𝐾 phys  
+
+> 𝑋
+
+[𝜋 𝑋 (⌊ 𝑗 /𝑃 ⌋) , 𝑗 mod 𝑃, :],
+
+and similarly for 𝑉 𝑋 . The engine supplies valid lengths and layouts; physical addresses may differ. 
+
+Batch invariance relates a packed request to its singleton run with equal queries and logical cache. A second contract requires equal output rows at the same logical token position across singleton runs with different query/key lengths and row indices. Writing ≡𝑏 for bitwise equality, this contract requires 
+
+𝑝 𝐿 = 𝑝 𝑅 = 𝑝, 𝑄 𝐿 [𝑖 𝐿 , :] ≡ 𝑏 𝑄 𝑅 [𝑖 𝑅 , :],𝐾 𝐿 [0 : 𝑝 + 1, :] ≡ 𝑏 𝐾 𝑅 [0 : 𝑝 + 1, :],𝑉 𝐿 [0 : 𝑝 + 1, :] ≡ 𝑏 𝑉 𝑅 [0 : 𝑝 + 1, :]
+
+=⇒ 𝑂 𝐿 [𝑖 𝐿 , :] ≡ 𝑏 𝑂 𝑅 [𝑖 𝑅 , :].
+
+This implication uses the assumptions below; concrete an-notations conservatively require equality of whole pages intersecting the prefix. The two properties together relate packed prefill to decode. 
+
+A.2 A Simplified Tile IR 
+
+Omitting 𝑋 , the selected query tile starts at 𝑎 = 𝐵 𝑀 ⌊𝑖 /𝐵 𝑀 ⌋.Its 𝐵 𝑀 ×𝑑 query matrix 𝑄 𝑡 processes key tiles 𝑡 = 0, . . . , 𝑁 −1, where 
+
+𝑁 =
+
+𝑛 − 𝑠 + min (𝑠, 𝑎 + 𝐵 𝑀 )
+
+𝐵 𝑁 
+
+
+
+.
+
+Page lookups supply 𝐵 𝑁 × 𝑑 tiles 𝐾 𝑡 , 𝑉 𝑡 , with zero-padded out-of-range loads. For lanes 0 ≤ 𝑟 < 𝐵 𝑀 , 0 ≤ 𝑏 < 𝐵 𝑁 , and 
+
+𝑗 = 𝑡𝐵 𝑁 + 𝑏 , the mask is 
+
+𝑀 𝑡 [𝑟, 𝑏 ] = (𝑎 + 𝑟 < 𝑠 ) ∧ ( 𝑗 < 𝑛 ) ∧ ( 𝑗 ≤ 𝑛 − 𝑠 + 𝑎 + 𝑟 ).
+
+Following FlashAttention’s tiled online-softmax compu-tation [9], the FP32 state holds row maxima 𝑚 , normaliza-tion sums 𝑧 , and weighted values 𝑈 , of shapes 𝐵 𝑀 , 𝐵 𝑀 , and 
+
+𝐵 𝑀 × 𝑑 , initialized to (−∞ , 0, 0). With shared base-two scale 
+
+𝑐 , each iteration proceeds as follows. Operations retain fixed floating-point types, parameters, and value-relevant order; reductions run over key lanes and row scalars broadcast over columns. 
+
+𝐺 ← dot (𝑄 𝑡 , 𝐾 T 
+
+> 𝑡
+
+) 𝑐, 
+
+b𝐺 ← select (𝑀 𝑡 , 𝐺, −∞) ,ℎ ← any 𝑏 𝑀 𝑡 ,
+
+b𝑚 ← max (𝑚, max 𝑏 b𝐺 ),𝛼 ← exp 2 (𝑚 − b𝑚 ),𝐴 ← select (𝑀 𝑡 , exp 2 (𝐺 − b𝑚 ), 0),
+
+b𝑧 ← 𝑧𝛼 + sum 𝑏 𝐴, 
+
+b𝑈 ← dot (cast 𝑉 (𝐴 ), 𝑉 𝑡 , 𝑈 𝛼 ),
+
+(𝑚, 𝑧, 𝑈 ) ← select (ℎ, ( b𝑚, b𝑧, b𝑈 ), (𝑚, 𝑧, 𝑈 )) .
+
+13 Jianxing Qin, Alexander Du, Danfeng Zhang, Matthew Lentz, and Danyang Zhuo 
+
+Here dot is the fixed tile product, its optional third operand is an accumulator, and select chooses componentwise. The weights are cast to the cache element type before the second dot; the normalization sum uses the uncast weights. The stored output is 
+
+𝑂 𝑡 = cast 𝑂 (𝑈 select (𝑧 > 0, 1/𝑧, 0)) .
+
+Here cast 𝑂 converts to the output element type. We omit the auxiliary log-sum-exp output from this selected-row contract. 
+
+A.3 Forward Value Analysis 
+
+The analysis tracks index predicates for known zero, one, negative-infinity, and Boolean values, plus provenance iden-tifying unchanged incoming state. Unclassified cells remain unknown. Masking and selection give 
+
+¬𝑀 𝑡 [𝑟, 𝑏 ] =⇒ b𝐺 [𝑟, 𝑏 ] = −∞ ,
+
+¬𝑀 𝑡 [𝑟, 𝑏 ] =⇒ 𝐴 [𝑟, 𝑏 ] = 0,
+
+(∀ 𝑏, ¬𝑀 𝑡 [𝑟, 𝑏 ]) =⇒ ℎ[𝑟 ] = false .
+
+The false selection arm establishes zero weights, preserved by the cast. When ℎ[𝑟 ] is false, the final selection copies the incoming state bit for bit, including when unused candidate intermediates contain exceptional values. 
+
+A.4 Backward Regional Dependencies 
+
+Backward analysis starts from the selected output’s 𝑈 and 𝑧 
+
+rows. For 𝑟 𝑋 = 𝑖 𝑋 − 𝑎 𝑋 , define the visible key lanes 
+
+𝐽 𝑋 𝑡 = {𝑏 | 0 ≤ 𝑏 < 𝐵 𝑁 ∧ 𝑀 𝑋 𝑡 [𝑟 𝑋 , 𝑏 ]} .
+
+Omitting 𝑋 again, the masked maximum and weights require scores only on 𝐽 𝑡 . The dot rule maps these dependencies to 𝑄 𝑡 [𝑟, :] and 𝐾 𝑡 [𝐽 𝑡 , :], preserving the full head-dimension reduction and its order. Zero weights outside 𝐽 𝑡 restrict dependencies to 𝑉 𝑡 [𝐽 𝑡 , :].This assumes finite entries in the loaded 𝑉 𝑡 , including masked lanes, and the trusted masked-dot rule’s bit-level treatment of zero products and accumulation. Finiteness is not checked at runtime. The rule removes equality obligations on masked values while retaining every executed lane. The verifier checks the raw query–key product and state update separately, aligning operators, operand order, and shared scalars. Z3 checks region and scalar obligations. Equal incoming state, selected queries, visible KV, and masks then give equal selected next state. 
+
+A.5 Relational Alignment and Composition 
+
+For full attention with corresponding queries at 𝑝 , both runs visit the first 𝐶 = ⌈( 𝑝 + 1)/ 𝐵 𝑁 ⌉ tiles in order. Their selected lanes 𝑟 𝐿 , 𝑟 𝑅 satisfy, for 0 ≤ 𝑡 < 𝐶 and 0 ≤ 𝑏 < 𝐵 𝑁 ,
+
+𝑀 𝐿 𝑡 [𝑟 𝐿 , 𝑏 ] = 𝑀 𝑅 𝑡 [𝑟 𝑅 , 𝑏 ] = (𝑡𝐵 𝑁 + 𝑏 ≤ 𝑝 ).
+
+Since 𝑝 < 𝑛 𝐿 , 𝑛 𝑅 , both masks agree despite different lengths and padding. Page mappings supply the required logical KV equalities. Extra tiles for later queries have 𝑡 ≥ 𝐶 and all-false se-lected masks, hence preserve selected state exactly. This gives control-flow correspondence up to identity steps: induction over paired updates establishes equal state, extra iterations preserve it, and common normalization gives equal outputs. Sliding-window attention adds 𝑗 > 𝑝 − 𝑤 for shared win-dow size 𝑤 > 0. The implemented traversal starts at 
+
+𝐿 𝑋 =
+
+ max (0, 𝑛 𝑋 − 𝑠 𝑋 + 𝑎 𝑋 − 𝑤 + 1)
+
+𝐵 𝑁 
+
+
+
+and ends at 𝑁 𝑋 − 1. Both runs include all tiles intersecting the selected window, from ⌊max (0, 𝑝 − 𝑤 + 1)/ 𝐵 𝑁 ⌋ through 
+
+𝐶 − 1, in order. Any extra leading or trailing tiles have all-false selected masks and preserve state exactly. Thus the same alignment argument applies even when the loop starts differ. The contract retains full-prefix equality and supplies no cache-eviction guarantee. Z3 checks the region, mask, and loop-geometry obliga-tions. Lifting these checks to bitwise value equality and com-posing the iteration argument rely on the trusted verifier reasoning and operation rules in §5.3, together with the com-piler/GPU assumptions. Tests support those assumptions on our configurations; input-dependent finiteness remains an explicit premise.
