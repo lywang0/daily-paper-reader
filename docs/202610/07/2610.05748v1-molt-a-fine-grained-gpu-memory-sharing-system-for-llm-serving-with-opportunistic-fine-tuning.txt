@@ -1,0 +1,645 @@
+Title: MOLT: A Fine-Grained GPU Memory Sharing System for LLM Serving with Opportunistic Fine-Tuning
+
+URL Source: https://arxiv.org/pdf/2610.05748v1
+
+Published Time: Tue, 06 Oct 2026 02:16:58 GMT
+
+Number of Pages: 15
+
+Markdown Content:
+# MOLT: A Fine-Grained GPU Memory Sharing System for LLM Serving with Opportunistic Fine-Tuning 
+
+## Jaehoon Yang 
+
+Seoul National University Seoul, Republic of Korea jaehoon.yang@snu.ac.kr 
+
+## Yongbeom Kim 
+
+Seoul National University Seoul, Republic of Korea kybs0627@snu.ac.kr 
+
+## Hojoon Kim 
+
+Seoul National University Seoul, Republic of Korea hojoon.kim@snu.ac.kr 
+
+## Seung Yul Lee 
+
+Seoul National University Seoul, Republic of Korea triomphant1@snu.ac.kr 
+
+## Jae W. Lee 
+
+Seoul National University Seoul, Republic of Korea jaewlee@snu.ac.kr 
+
+## Abstract 
+
+Large language model (LLM) serving scales its replica count with the request load, yet GPU memory still stands idle in-side the replicas. Adding a replica takes minutes, while the memory that a replica needs changes within seconds. Even instant autoscaling could not return this idle memory, be-cause the smallest unit that it can remove is a whole replica. Colocating parameter-efficient fine-tuning (PEFT) with in-ference can use this memory, but inference must be able to reclaim it within seconds, before requests that wait for memory exceed their latency service-level objective (SLO). Existing colocation systems either keep the tuning memory resident or let inference reclaim it at the coarse granularity of a whole training sample. Each such reclamation also dis-cards the running tuning step. To address these limitations, we present MOLT, a fine-grained memory sharing system that lets inference reclaim the memory of individual activa-tions that a running tuning step has saved for its backward pass. The step continues, and its backward pass recomputes those activations. Inference reclaims only memory that no in-flight GPU work can still access, even under CPU–GPU asynchrony and tensor parallelism. On four model deploy-ments (24B–70B) across H100 SXM and B200 GPUs under trace-driven workloads, MOLT keeps inference SLO attain-ment at or above 99.7% and completes 1.9–3.3 × the tuning work of discard-based memory sharing. 
+
+## 1 Introduction 
+
+Request load in large language model (LLM) serving fluctu-ates heavily. Provisioning enough GPUs to meet the latency service-level objective (SLO) at peak load leaves them under-utilized the rest of the time, so production systems autoscale. They add and remove replicas, each an independent serving instance that holds one copy of the model on one or more GPUs, as the load changes [8, 9]. Autoscaling follows the slow part of this fluctuation well, the daily cycle in which user-facing services peak during working hours and fall at night [45, 54], and removes the capacity that a lower load leaves idle [20]. The fast part of the fluctuation, however, GPU memory 
+
+(a) Discard-based memory handover   
+
+> discard restart discard
+> GPU memory
+
+(b) Handover without discarding  
+
+> tuning step KV cache discarded step
+
+Figure 1. Tuning work that discard-based handover discards and handover without discarding keeps. outpaces autoscaling, since the key-value (KV) cache of a replica, which dominates its dynamic memory use, can grow 3.2 × within ten seconds while bringing up a replica and load-ing the model takes up to several minutes [45]. Each replica must therefore keep headroom to absorb the load that arrives before new replicas come up. One production autoscaler tar-gets 60% GPU utilization by default, leaving each GPU idle 40% of the time [9]. A deployment thus runs at an autoscal-ing floor , the fewest replicas that keep this headroom, where GPU compute and memory stay idle even with autoscaling. This memory cannot be returned to the provider, because a replica is withdrawn only as a whole. Colocating another workload with inference can put this idle capacity to use. Parameter-efficient fine-tuning (PEFT) is a natural candidate. It is the standard way to adapt a deployed model [12], and demand keeps growing, with Hugging Face hosting 256,295 PEFT adapters published at a rising rate since 2024 [14]. It also fits colocation well. PEFT freezes the pretrained weights and trains only a small adapter [17], so when applied to the model that inference is serving it reuses the weights resident on the GPU. Its progress is measured in throughput rather than latency, so it can yield memory to inference during a burst and take it back afterwards. 
+
+> 1arXiv:2610.05748v1 [cs.DC] 5 Oct 2026 Yang et al.
+
+Existing colocation systems dynamically share either the compute or the memory of the GPU. LLMStation [14] shares compute by interleaving tuning operations with inference iterations, but its tuning memory stays resident. Memory, however, is what determines whether inference meets its SLO during a burst. Inference admits a request only when the KV cache has room for it [23, 56], so a shortage of mem-ory delays admission and lengthens the time to first token (TTFT). Likewise, a running request whose KV cache cannot grow for lack of memory stalls until memory frees up [23, 46]. SIRIUS [53] focuses on sharing memory, treating the training batch as elastic. When inference needs memory, it aborts the running step, restarts it with a smaller batch, and hands the freed memory to inference in a handover fast enough for the SLO. The memory boundary between the two workloads thus moves at runtime. SIRIUS uses the idle memory that autoscaling removes, the memory a fixed number of GPUs leaves free as the load changes over minutes and hours. At the autoscaling floor, however, resizing the training batch moves the boundary in increments too coarse and at a cost too high. First, the small-est increment is one training sample, whose memory is large relative to the idle memory. A one-sample Mistral-Small-24B-Instruct tuning step at 1024 tokens holds 15.8 GiB beside the frozen weights, against 20–31 GiB idle on one H100. Tuning halts once the idle memory cannot hold one sample. Second, each handover discards the running tuning step and restarts it with a smaller batch, losing the work already done (Fig-ure 1(a)). At the floor, this cost recurs whenever the KV cache outgrows the free memory, which happens within seconds. Avoiding both limitations requires a unit of memory finer than a training sample, one that inference can reclaim with-out discarding the running step. We observe that the saved activation is such a unit. A saved activation is a tensor that the forward pass keeps for the backward pass to compute gradients. Saved activations hold most of a PEFT step’s mem-ory [28] and can be recovered by recomputation [4, 19, 21]. When inference reclaims the memory of some of them, the step continues, and its backward pass recomputes them (Fig-ure 1(b)). Recomputation itself is well studied, but activation checkpointing fixes its memory budget before tuning starts. Here, the budget must change during the step, whenever inference reclaims memory. Based on this observation, we present MOLT, a fine-grained memory sharing system that lets inference reclaim memory from a running tuning step one saved activation at a time. MOLT places the KV cache and the saved activations in one shared pool of physical GPU memory, and binds each saved activation to a fixed virtual-address range, called a 
+
+slot . A slot is backed while physical pages of the pool are mapped behind it. When the KV cache needs more memory than the pool has free, MOLT unbacks slots and hands their pages to the KV cache while the tuning step continues. We call this mechanism continuous memory handover .Handing memory over inside a running step raises two challenges. First, the tuning step must remain correct al-though its slots can be unbacked at any point. With flexible activation checkpointing , MOLT checks whether a slot is backed before each kernel that uses it, saves activations only into backed slots, and recomputes every activation whose slot is unbacked. Second, a handover must never unback a slot that GPU work may still access. Because the CPU dis-patches kernels ahead of the GPU [30], a kernel dispatched several layers earlier may still access a slot when a handover arrives. With asynchronous-aware slot protection , MOLT pro-tects every such slot, limits how far CPU dispatch runs ahead to keep the protected slots few, and makes every rank of a tensor-parallel deployment unback the same slots. We evaluate MOLT on four model deployments (24B–70B) across H100 SXM and B200 GPUs under trace-driven work-loads, where it keeps inference SLO attainment at or above 99.7% while tuning continues. Colocation that shares only compute reaches an SLO attainment of at most 5.0%. Against the discard-based memory sharing of SIRIUS, which also lets inference reclaim memory, MOLT completes 1.9–3.3 ×
+
+the tuning work. On both Mistral-Small-24B-Instruct de-ployments, MOLT with step-level handover, which moves the boundary only between steps, attains the SLO less of-ten and completes less tuning work, which shows that the gain comes from the finer granularity rather than from the implementation. In summary, this paper makes the following contributions: 
+
+• We identify the GPU memory that autoscaling leaves idle in LLM serving, and show that existing memory sharing cannot use it, because its unit, one training sample, is too coarse and each handover discards the running tuning step. 
+
+• We propose MOLT, a fine-grained memory sharing sys-tem whose continuous memory handover lets inference reclaim memory from a running tuning step one saved activation at a time. 
+
+• We design flexible activation checkpointing, which keeps the tuning step correct, and asynchronous-aware slot pro-tection, which makes each handover safe under CPU–GPU asynchrony and tensor parallelism. 
+
+• We evaluate MOLT against compute sharing, discard-based memory sharing and MOLT with step-level han-dover, and show that it sustains inference SLO attainment while completing more tuning work than discard-based memory sharing. 
+
+## 2 Background 
+
+2.1 Parameter-Efficient Fine-Tuning 
+
+A deployed model is adapted continually [14, 43], and PEFT is how that adaptation is done [16, 17, 25, 26]. PEFT freezes the pretrained weights and trains a small set of added param-eters, an adapter , which is why it has become the standard 
+
+> 2MOLT: A Fine-Grained GPU Memory Sharing System for LLM Serving with Opportunistic Fine-Tuning
+
+0 1 2 3 4Time (hours) 432 256 Request rate  
+
+> (a) Request rate in the BurstGPT trace, requests per minute.
+
+0 50 100 150 200 Time (seconds) 040 80 GPU memory  one H100 weights KV cache idle  
+
+> (b) Memory on one H100 at TP=1, in GiB.
+
+0 20 40 60 Time (seconds) 040 80 GPU memory  one H100 weights KV cache idle  
+
+> (c) Memory on one H100 of two, at TP=2, in GiB.
+
+Figure 2. Request load over hours, and GPU memory over seconds. method for adapting large models [3, 6, 12, 42]. Hugging Face carries 256,295 repositories tagged as PEFT adapters, created between December 2023 and September 2026, and adapter publication has been rising since 2024 [14]. Llama models alone account for 37,606 of them [10]. PEFT reads the pretrained weights but never writes them. LoRA, its representative method, replaces the update to a weight matrix 𝑊 ∈ R𝑑 ×𝑘 with a low-rank product [17], 
+
+ℎ(𝑥 ) = 𝑊 𝑥 + Δ𝑊 𝑥 = 𝑊 𝑥 + 𝐵𝐴𝑥, 
+
+where 𝐵 ∈ R𝑑 ×𝑟 , 𝐴 ∈ R𝑟 ×𝑘 , and 𝑟 ≪ min (𝑑, 𝑘 ). Training updates only 𝐴 and 𝐵 , about 𝑟 (𝑑 + 𝑘 ) parameters instead of 
+
+𝑑 ×𝑘 , and the gradients and optimizer state shrink with them. A single copy of the model can therefore be shared between an inference process and a tuning process, rather than each holding its own [40]. 
+
+2.2 Idle GPU Resources in Autoscaled Serving 
+
+A serving deployment follows request load by autoscaling, adding and removing GPUs to hold a utilization or concur-rency target [8, 9, 48, 50]. Platforms set that target below full utilization, at 60% GPU utilization by default on one of them [9]. The load moves slowly enough for this to work. Consecutive five-minute intervals of the BurstGPT trace [54] differ in request rate by a median of 1.25 ×, and the rate steps between levels (Figure 2(a)). The variation that autoscaling absorbs is large. For instance, the load of user-facing services 010 20 Memory (GiB) Tuning (resident) KV cache 0 100 200 300 Time since fi rst arrival (s) 010 TTFT (s) TTFT SLO 
+
+Figure 3. Memory and TTFT on a Mistral-Small-24B-Instruct deployment with tuning resident, under bursty arrivals. peaks during working hours and falls at night [45, 54]. Over a week, peak load exceeds mean load by 4.1 × in BurstGPT, and by 1.7 × and 3.0 × in the conversation and code services of the Azure trace [45]. Autoscaling cannot follow the memory inside a replica, because that memory changes within seconds and adding ca-pacity takes minutes. The scaling decision itself is prompt [8, 49]. What takes minutes is bringing up a replica, whose GPUs hold the model split by tensor parallelism (TP) [44], and load-ing the model into it [7, 20, 45]. When load falls, a replica that served a peak is kept for five more minutes by default [8, 49]. In Figure 2(b), the KV cache of a Mistral-Small-24B-Instruct deployment covers 3.9–14.8 GiB over 227 s and can grow 3.2 × within ten seconds. Idle memory inside a replica cannot be returned to the provider, because scaling down removes a replica only as a whole, and its TP degree is fixed when it launches [55]. A deployment runs the smallest number of replicas that meets the SLO at the peak of any rise in load that autoscal-ing cannot follow. At that autoscaling floor, capacity stands idle between peaks. One H100 running Mistral-Small-24B-Instruct holds 43.9 GiB of weights and leaves 20–31 GiB of its memory unused (Figure 2(b)). Under the heavier load of Figure 2(c), the KV cache needs 51 GiB against the 25 GiB one GPU can offer beside the weights. The replica therefore spans two GPUs, which offer 87 GiB, and each of them holds 32–44 GiB unused. 
+
+2.3 Inference-first Tuning Colocation 
+
+A second workload colocated with inference can use the memory idle at the autoscaling floor, but only until inference needs it again. When load rises, inference must reclaim that memory within seconds, before the arriving requests wait for it [23, 56]. This move across the boundary between the two workloads is a handover. The second workload must there-fore tolerate interruption and hold a small resident footprint ,the memory that inference can never reclaim from it. PEFT meets both requirements (§2.1). Its progress is measured in 
+
+> 3Yang et al.
+
+512 768 1024 1536 2048 Input length (tokens) 020 Memory of one step (GiB) 8.2 12.0 15.8 23.6 31.4 persistent: 0.4 GiB at every length Persistent Transient 
+
+Figure 4. Memory of one batch-1 LoRA tuning step of Mistral-Small-24B-Instruct across input lengths, in live bytes. throughput rather than per-request latency, so it tolerates interruption. It shares the frozen weights inference already holds, so its resident footprint is small. One line of colocation work shares compute. LLMSta-tion [14] decomposes tuning execution into fine-grained units and interleaves them with inference iterations, which protects serving latency while tuning runs. Sharing compute leaves the memory boundary fixed. As arrivals rise, the KV cache grows until it fills the memory that tuning leaves free, and TTFT exceeds the SLO once it does (Figure 3). The other line shares memory. SIRIUS [53] moves the boundary at runtime by resizing the training batch, remov-ing samples when inference needs memory and adding them back once demand subsides. To make a handover fast enough for an inference SLO, it hands the freed pages straight to inference, bypassing the training framework’s caching allo-cator [37]. §3 examines whether a boundary that moves at the granularity of whole training samples can follow the KV cache at the autoscaling floor. 
+
+## 3 Motivation 
+
+3.1 Limitations of Existing Memory Sharing 
+
+SIRIUS uses the idle memory that autoscaling removes, not the memory autoscaling leaves behind. Its target is the mem-ory a fixed GPU count leaves free. This memory is large, so the boundary can move at the coarse granularity of whole training samples. It is also long-lived, so inference rarely takes it back and handovers are rare. Neither property holds at the autoscaling floor, where the idle memory is smaller and inference takes it back within seconds (§2.2). A first limitation is granularity. Within a batch, samples are independent, so adding or removing a whole sample cleanly adds or removes its memory. That memory is large relative to what the floor leaves idle. A Mistral-Small-24B-Instruct tuning step of one sample at 1024 tokens holds 15.8 GiB beside the frozen base weights (Figure 4), against the 20–31 GiB left idle on one H100 at the floor (Figure 2(b)). There is no setting below one sample, so tuning halts entirely once the idle memory cannot hold one. A second limitation is the cost of the handover itself. SIR-IUS reclaims memory by discarding the current tuning step and restarting it with a smaller batch, so a handover late in a step wastes every operation the step has performed. At the floor, the KV cache can grow 3.2 × in ten seconds (Fig-ure 2(b)), and each rise takes memory back from tuning. The cost of a discarded step is therefore paid at the rate the KV cache moves, not at the rate the day’s load changes. 
+
+3.2 Activation as the Unit of Memory Sharing 
+
+The limitations of SIRIUS point to two requirements for PEFT colocation. First, the sharing granularity must be much finer than a whole sample, so that idle GPU memory is used effi-ciently and tuning is not forced to halt the moment a single sample no longer fits. Second, a handover must preserve the progress of the running PEFT step rather than discard it, so that frequent handovers do not starve tuning. The saved activation meets both. A saved activation is a tensor that the forward pass keeps for the backward pass to compute gradients. It is the only unit in a PEFT step that meets both requirements. Persistent state, namely the adapter parameters, gradients and optimizer state, must stay resident to preserve progress, and only 0.4 GiB of a step’s memory is persistent, at every input length (Figure 4). In-termediate tensors live too briefly for their memory to be reclaimed. Saved activations dominate the rest of the step’s memory and can be recovered by recomputation [4, 19, 21, 39]. An activation is a fine-grained unit, because each one is small and can be dropped individually, at per-layer or per-operator granularity, rather than a whole sample at once. It also preserves progress, because a dropped activation is recomputed in the backward pass, and a handover then costs only that recomputation rather than the work that the step has already performed. 
+
+3.3 Key Challenges of Fine-grained Memory Sharing 
+
+Using the saved activation as the sharing unit raises two challenges. 
+
+C1. Adapting execution to a dynamically changing saved-activation set. Because activations are dropped dy-namically during the step, the backward pass cannot assume that a saved activation is still available. An activation may have been dropped at any point after it was produced, so reading it directly could lead to a memory fault. The system must therefore check, at each backward access, whether the activation is still in memory, and recompute it when it is not. 
+
+C2. Dropping activations safely during execution. 
+
+The CPU decides which activations to drop, but it dispatches GPU kernels asynchronously and runs far ahead of the GPU execution [30, 37], so a kernel it launched several layers back may still be reading or writing the activations of its layer. Freeing that memory would corrupt the kernel’s work, and the CPU must protect the activations of every kernel it has launched but not seen complete [32], which shrinks 
+
+> 4MOLT: A Fine-Grained GPU Memory Sharing System for LLM Serving with Opportunistic Fine-Tuning
+
+Inference process  Tuning process  
+
+> inference-side allocator tuning-side allocator
+
+MOLT 
+
+> §4.3 Flexible Activation
+> Checkpointing
+> §4.4 Asynchronous-aware
+> Slot Protection
+
+requests pages  read slot state                  
+
+> forward
+> backward
+> save
+> backed slot unbacked slot
+> read
+> not save
+> recompute
+> GPU CPU
+> protected evictable evictable
+> evictable set
+> enqueued flag backing state & cost
+> §4.2 Shared Memory Pool
+> slot state table
+> reclaimable
+> pool
+> slot backed cost enqueued
+> s0 no low yes
+> s1 yes high no
+> pinned pool
+> KV cache activations free pages
+> base model LoRA adapter optimizer state
+
+…
+
+Figure 5. MOLT overview. the set it can drop. Under tensor parallelism, the CPU’s lead over the GPU differs across ranks, so an activation can be safe to drop on one rank but not on another. Every rank must nevertheless drop the same activations, because tensor-parallel ranks must execute the same operators. The system must therefore make that decision at an arbitrary handover point. Dropping an activation that an in-flight kernel may still access causes a memory fault in the tuning step, and protecting one that no in-flight kernel can access withholds its memory from inference. 
+
+## 4 MOLT 
+
+4.1 Overview 
+
+MOLT provides continuous memory handover, which allows inference to reclaim memory from a running tuning step at the granularity of a single saved activation. The tuning step continues across a handover, and its backward pass recomputes each activation whose memory was reclaimed, so no completed work is discarded. MOLT is a fine-grained memory sharing system with three components (Figure 5). The inference-side allocator and the 
+
+tuning-side allocator run inside vLLM and PyTorch, respec-tively (§5.1). Each saved activation is bound to its slot, and the slot state table (SST) records whether physical pages back each slot. The handover controller manages the shared pool, which is preallocated and holds the KV cache and the pages of backed slots, the only memory a handover moves. When the KV cache exhausts the pool’s free pages, the inference-side allocator requests pages over inter-process communication (IPC), and the handover controller unbacks slots and hands their pages to the KV cache. Inference  Tuning 
+
+Memory 
+
+object 
+
+> KV cache
+> Base model
+> Workspace
+> Block tables
+> Logits
+> Communication buffers
+> Activations
+> Base model
+> LoRA adapters
+> Gradients
+> Optimizer state
+> Intermediates
+
+Physical 
+
+memory  Reclaimable pool 
+
+> Shared backbone
+> Private
+> memory
+> Pinned pool
+
+(a) Where each memory object lives 
+
+Save-path 
+
+Recompute-path 
+
+Large budget  Small budget 
+
+(b) Backed slots under a large and small budget              
+
+> LoRA W / ... / Intermediates LoRA W / ... / Intermediates
+> memory
+> handover
+> q-proj
+> out-proj
+> attn
+> ... N-1
+> ⋮
+> q-proj
+> out-proj
+> attn
+> 201
+> ... N-1 201
+> ... N-1 201
+> ... N-1 201
+> ... N-1 201
+> ... N-1 201
+
+Figure 6. Reclaimable and pinned pools, with the tuning budget as the set of backed slots. With flexible activation checkpointing, MOLT ensures that a tuning step remains correct when its slots are un-backed mid-step (C1, §3.3). The tuning-side allocator reads a slot’s backing state from the SST before each kernel that produces or consumes the slot’s activation (§4.3). The acti-vation is saved in the forward pass only if its slot is backed, and in the backward pass, it is read from its slot if the slot is backed and recomputed otherwise. Unlike prior recompu-tation schemes [4, 19, 21], MOLT decides which activations to recompute from backing state that changes whenever inference reclaims memory, while the step is still running. With asynchronous-aware slot protection, MOLT ensures that a handover unbacks no slot that in-flight GPU work may still access (C2, §3.3). The SST sets a slot’s enqueued flag while a kernel that uses the slot has been dispatched but has not completed, and the handover controller unbacks only slots whose flag is clear on every rank (§4.4). 
+
+4.2 Shared Memory Pool 
+
+MOLT divides physical GPU memory into a reclaimable pool ,the shared pool of §4.1, and a pinned pool for everything a handover does not move (Figure 6(a)). The pinned pool holds inference-side workspace and the frozen base-model weights, which inference and tuning read from the same physical pages. It also holds the LoRA parameters, gradients, optimizer state and intermediate tensors of tuning, and the activation of every unbacked slot, so each activation occupies 
+
+> 5
+
+Yang et al. qkv_proj 
+
+> S=0.5
+> Pinned pool
+> …
+
+0 1 2 6543
+
+> SAVE
+> RECOM
+> attn
+> S=5
+
+(a)  Two decisions for a handover  (b)  Backing state across a handover  (c) Forward and backward operators     
+
+> …
+> Before handover After handover FWD
+> gate
+> proj
+> attn ……
+> Q/K/V
+> proj
+
+0 1 2 N-1 N-2 …6543 
+
+> Protected by §4.4
+
+0 1 2 6543 
+
+> gate_proj
+> S=2.5
+
+0 1 2 6543 0 654 
+
+> Q/K/V
+> proj
+> Layer 5 Layer 6
+> BWD
+> Recompute Activations
+> Op using recompute-path Op using save-path
+> Inference-triggered handover
+> Allocation-path decision
+
+Inference  Tuning 
+
+> Slot-unbacking decision
+> Activation with
+> a backed slot?
+
+SAVE 
+
+RECOM 
+
+## Y
+
+## N                    
+
+> ✓Slot with low recompute cost
+> ✓Not protected by §4.4
+> attn
+> attn Q/K/V
+> proj …gate
+> proj …attn Q/K/V
+> proj
+> Layer 6 Layer 5
+> LoRA adapters Gradients Optimizer state
+> Intermediates
+> LoRA adapters Gradients Optimizer state
+> Intermediates Unbacked activations …
+> REQUIRE(M)
+
+0 1 2 6543 
+
+> N-1 N-2 …
+> N-1 N-2 N-1 N-2
+> N-1 N-2 N-1 N-2
+> ……
+> ……2
+
+1 3
+
+> …
+
+Figure 7. A handover in the middle of a step, which unbacks low-cost slots and switches only later operators to the recompute-path. exactly one pool. The pinned pool holds an unbacked slot’s activation only until its last use in the forward pass, and the backward pass recomputes it (§4.3). MOLT represents the tuning budget as the set of backed slots (Figure 6(b)). It reserves each slot once, before execu-tion, from an offline profile of activation sizes, because the execution order of a tuning step is stable [18, 39, 41]. Back-ing or unbacking a slot maps or unmaps the physical pages behind its fixed address range, so no activation is moved when the budget changes. The SST records three values for each slot (Figure 5). The handover controller writes the backing state when it maps or unmaps the slot’s pages, and the tuning-side allocator reads it before each kernel that uses the slot (§4.3). The recomputation cost ranks the slots for unbacking and is fixed for each activation before execution (§4.3). MOLT never unbacks a slot whose activation cannot be recomputed, such as the input of a layer. The third value is the enqueued flag of §4.1, which keeps a handover from unbacking a slot that in-flight GPU work may still access (§4.4). 
+
+4.3 Flexible Activation Checkpointing 
+
+MOLT lets a handover take effect at any point of a running tuning step and keeps the step correct (C1). A handover consists of two decisions, the slot-unbacking decision of the handover controller and the allocation-path decision of the tuning-side allocator (Figure 7(a)). When inference requests 𝑀 bytes ( REQUIRE(M) in Fig-ure 7(a)), the handover controller takes the slot-unbacking decision and unbacks slots until they cover 𝑀 bytes. It con-siders only evictable slots, which §4.4 leaves unprotected because no in-flight GPU work can still access them. Among the evictable slots, it unbacks the slots with the lowest re-computation cost first, because every unbacked slot adds recomputation to the backward pass. The tuning-side allocator takes the allocation-path deci-sion when it dispatches each operator that produces a saved activation. If the activation’s slot is backed, the activation follows the save-path (SAVE in the figure). The activation is allocated at the slot’s address in the reclaimable pool, where GPU  CPU  
+
+> FW BW
+
+(a) Training execution 
+
+(b) Discard-based memory handover          
+
+> Recompute Update 1NN-1 1234N··· ··· ··· ···
+
+(c) Continuous memory handover            
+
+> Wasted FW
+> Update 1NN-1 1234N··· ··· ··· 2
+> 123Idle ···
+
+Figure 8. Forward work that discard-based handover wastes and continuous memory handover keeps, at the cost of re-computation. the backward pass reads it if the slot is still backed. If the slot is unbacked, the activation follows the recompute-path 
+
+(RECOM in the figure). The activation is allocated in the pinned pool, freed after its last use in the forward pass, and recomputed in the backward pass [4, 19, 21, 22]. The alloca-tor reads the backing state again when it dispatches each backward operator, so an activation whose slot is unbacked after it was saved is recomputed as well. In Figure 7(b), each row holds one kind of saved activation, each box is the slot of that activation in one layer, and 𝑆 is the recomputation cost of the row. Before the handover, ev-ery slot is backed. When the handover arrives, the CPU has dispatched the layers up to 5, but the GPU is still executing layer 3. In-flight GPU work may therefore still access the slots of layers 3 to 5, inside the box, so they are not evictable. The handover unbacks every other slot, so only these three layers keep backed slots. The activations that layers 0 to 2 have already saved are recomputed in the backward pass, and layers 6 onward allocate their activations in the pinned pool. With a smaller handover request, the handover con-troller would stop earlier, and it would unback the slots of the qkv_proj row first, because that row has the lowest 𝑆 .Every operator dispatched after the handover follows the new backing state (Figure 7(c)). The handover controller only writes the backing state, and the tuning-side allocator 
+
+6MOLT: A Fine-Grained GPU Memory Sharing System for LLM Serving with Opportunistic Fine-Tuning (a) Asynchronous CPU-GPU execution gap 
+
+## CPU 
+
+## GPU              
+
+> 012345678910 …11
+> 012
+> gap=7
+> (b) CPU dispatch throttling
+
+## CPU 
+
+## GPU         
+
+> 0Wait 1Wait 2…
+> 012
+> gap=1
+> cap threshold
+> CPU dispatch
+> wait & drain
+> 3Wait
+
+Figure 9. Dispatch throttling narrows the CPU–GPU gap, leaving fewer slots protected. reads it when it dispatches an operator. Layers 3 to 5 were dispatched before the handover, so their slots remain backed, and the operators of layer 5 follow the save-path, drawn in blue. Layer 6 is dispatched after the handover, when its slots are already unbacked, so its operators follow the recompute-path, drawn in red. In the backward pass, layer 6 comes first, and MOLT recomputes its activations before its operators run. The operators of layer 5 then read their activations from their slots. Unlike discard-based handover, MOLT never restarts the step, and a handover costs only the recomputation of the activations whose slots it unbacks (Figure 8). Discard-based handover couples every memory-boundary change to abort-ing and restarting the running step (§3.1). In Figure 8(b), the forward work already done is discarded, and in Figure 8(c), it is kept and only the activations of unbacked slots are recom-puted in the backward pass. Pages reach inference through the same handover path that discard-based systems use [53]. Memory is handed back to tuning only at step bound-aries, by re-backing unbacked slots. At the start of each step, the handover controller maps free pages of the pool behind unbacked slots again, highest recomputation cost first, and stops when the pool has no free pages left. The remaining unbacked slots wait for a later step boundary. Re-backing a slot in the middle of a step would spare recomputation only for activations that the step has not produced yet. Waiting for the next step boundary therefore costs at most the ex-tra recomputation of the rest of the current step. Because re-backing discards nothing, MOLT re-backs at every step boundary at which the pool has free pages. A discard-based system instead waits until free memory exceeds a threshold, because it moves the boundary only at a coarse granular-ity [53]. (a) Divergent rank-local windows                                            
+
+> (b) Window shared by all ranks
+> Rank 0 01234567N-1
+> Rank 1 01234567N-1
+> Rank K-1 01234567N-1
+> Shared 01234567N-1
+> claimed evictable evictable
+> claimed evictable evictable
+> …
+> claimed evictable evictable
+> claimed evictable evictable
+> GPU CPU
+> GPU CPU
+> GPU CPU
+> …
+
+## …
+
+## …
+
+## …
+
+## …
+
+Figure 10. Every rank protects the union of the rank-local protection windows. 
+
+4.4 Asynchronous-aware Slot Protection 
+
+MOLT protects every slot that in-flight GPU work may still read or write, and a handover unbacks only the other slots (C2). Under TP, every rank must also unback the same slots (Figure 10). MOLT protects these slots without discarding the GPU work dispatched before the handover. MOLT classifies every slot by the enqueued flag that §4.1 defines. A slot is 
+
+claimed while the enqueued flag of the slot is set. A handover leaves the backing state of a claimed slot unchanged, whether the slot is backed or was unbacked by an earlier handover. A slot is evictable when the enqueued flag of the slot is clear. The set of claimed slots, the protection window , contains the slots of every layer from the layer before the completion frontier to the dispatch frontier (Figure 9(a)). The completion frontier is the layer that the GPU is executing, and the dis-patch frontier is the last layer that the CPU has dispatched. The window includes the layer before the completion fron-tier because the first operators of a layer read the output of the previous layer. MOLT tracks GPU completion with a host-side callback, a CPU function that runs once the GPU has completed a layer [33]. MOLT sets the enqueued flag of every slot of a layer when the CPU dispatches the first operator of the layer. The enqueued flag covers a whole layer rather than one operator, because a later operator of the same layer, such as a residual connection, may read a slot that an earlier operator wrote [51]. MOLT clears the flag of a layer only when the host-side callback of the next layer runs. The dispatch frontier usually runs several layers ahead of the completion frontier, because CPU dispatch is asynchronous to GPU execution. In Figure 9(a), the CPU has dispatched layer 8 while the GPU still executes layer 1. The protection window thus contains layers 0 to 8, drawn in orange. The 
+
+> 7Yang et al.
+
+CPU has not yet dispatched layers 9 onward, whose slots are evictable and drawn in yellow. When a handover request arrives, MOLT freezes the pro-tection window until the handover controller has decided which slots to unback and has unbacked those slots. We call this mechanism the protection snapshot . Without the pro-tection snapshot, the CPU could dispatch an operator that uses one of the slots to unback, and that operator would then access a slot that has no physical pages. The protection snapshot therefore pauses CPU dispatch and holds the dis-patch frontier in place. The pause has little effect on tuning, because the GPU continues to execute the operators already dispatched. The protection snapshot also defers the host-side callbacks that would advance the completion frontier, and thereby keeps every slot of the protection window claimed until the slots to unback are decided. A slot may remain claimed slightly longer than necessary, but no slot becomes evictable too early. After the handover controller has un-backed the chosen slots, MOLT runs the deferred callbacks and resumes CPU dispatch. MOLT keeps the protection window small by limiting how far CPU dispatch may run ahead of GPU execution, which leaves more slots evictable when a handover request arrives (Figure 9(b)). We refer to this mechanism as dispatch throt-tling . Without dispatch throttling, the protection window contains every layer that the CPU has dispatched ahead of the GPU, seven layers in Figure 9(a), and no slot in the pro-tection window can be unbacked. MOLT enables dispatch throttling by modifying the software GPU kernel manage-ment technique used in SIRIUS [53]. The technique holds dispatched operators in a queue until the GPU executes the operators, and MOLT adds a dispatch cap on the number of operators in the queue. When the queue reaches the dispatch cap, CPU dispatch waits until the GPU has executed enough operators to bring the queue below a threshold, which we set to half of the dispatch cap. In Figure 9(b), CPU dispatch waits after each layer, and the gap between the dispatch and completion frontiers shrinks from seven layers to one. MOLT chooses the dispatch cap by offline profiling, as the smallest dispatch cap that does not lengthen the tuning step. A larger dispatch cap only widens the protection window, and a smaller dispatch cap leaves the GPU waiting for the CPU. The chosen dispatch cap therefore keeps the protection window as small as possible without slowing tuning. Under TP, each rank keeps a separate protection win-dow, and the handover controller unbacks only slots that lie outside the union of the rank-local protection windows (Figure 10(b)). Collectives such as NCCL all-reduce [34] keep the GPUs of the ranks nearly aligned, but the dispatch fron-tiers of the ranks can differ (Figure 10(a)). In the figure, every GPU executes layer 3, but rank 0 has dispatched layer 6, rank 1 layer 5, and rank 𝐾 − 1 layer 4. The slots of layer 6 are therefore claimed on rank 0 but evictable on ranks 1 and 𝐾 − 1, and the slots of layer 5 are evictable only on 
+
+Table 1. Model and platform. Model GPU Layers TP Mistral-Small-24B-Instruct 1×H100 SXM 40 1Mistral-Small-24B-Instruct 2×H100 SXM 40 2Llama-3.1-70B-Instruct 4×H100 SXM 80 4Llama-3.1-70B-Instruct 1×B200 80 1100 200 300 
+
+be tt er 90% SLO 24B, H100 SXM 200 400 600 
+
+24B, 2×H100 SXM 0 50 100 20 40 60 80 
+
+70B, 4×H100 SXM 0 50 100 25 50 75 
+
+70B, B200 Inference SLO a tt ainment (%) Tuning throughput (tokens/s) LLMStation-only LLMStation+SIRIUS MOLT with step-level handover MOLT with continuous handover 
+
+Figure 11. Overview of the end-to-end results. rank 𝐾 − 1, drawn in red. The collectives of the ranks would no longer match if every rank unbacked the slots that are evictable on that rank alone, because the ranks would then recompute different operators. The union of the rank-local protection windows, drawn in green, contains layers 2 to 6 on every rank. When a handover request arrives, every rank takes a protection snapshot and publishes the rank-local protection window through shared memory, and every rank then chooses the same slots to unback from the same union, without exchanging the chosen slots. 
+
+## 5 Evaluation 
+
+We evaluate MOLT in inference-first colocation, where tun-ing uses the GPU memory that inference leaves idle and inference reclaims it whenever the KV cache needs more. The evaluation answers three questions. 1. Does inference keep its SLO attainment while MOLT com-pletes more tuning work than discard-based memory shar-ing (§5.2, §5.3)? 2. Is the gain caused by handover granularity rather than by the implementation that carries it (§5.2, §5.4)? 3. How much tuning speed does the dispatch cap cost, and how long does a handover delay inference (§5.5, §5.6)? 
+
+> 8MOLT: A Fine-Grained GPU Memory Sharing System for LLM Serving with Opportunistic Fine-Tuning
+
+Table 2. SLO attainment and tuning throughput under the BurstGPT trace. SLO ↑ Tuning ↑ TTFT (ms) ↓ TPOT (ms) ↓
+
+System (%) (tokens/s) p50 p75 p95 p50 p75 p95 
+
+Mistral-Small-24B-Instruct (1 ×H100 SXM) 
+
+LLMStation-only 0.0 285.1 18671.4 24154.1 26935.0 42.8 44.6 49.0 LLMStation+SIRIUS 99.2 127.7 384.9 465.7 723.6 39.7 43.1 55.4 MOLT with step-level handover 69.0 212.8 585.2 1208.0 3112.9 48.3 52.8 62.7 
+
+MOLT with continuous handover 99.7 242.6 368.5 449.2 619.7 47.0 51.1 56.6 
+
+Mistral-Small-24B-Instruct (2 ×H100 SXM) 
+
+LLMStation-only 5.0 606.1 6746.8 8188.0 10359.7 60.6 64.1 68.8 LLMStation+SIRIUS 95.5 242.5 278.4 385.1 674.6 49.3 58.4 83.3 MOLT with step-level handover 77.1 509.2 323.5 606.4 1544.0 62.6 71.6 85.8 
+
+MOLT with continuous handover 100.0 557.7 284.9 342.7 468.0 68.4 74.7 84.2 
+
+Llama-3.1-70B-Instruct (4 ×H100 SXM) 
+
+LLMStation-only 2.8 83.8 14030.5 20267.1 27178.1 101.1 106.0 113.8 LLMStation+SIRIUS 100.0 19.3 448.2 513.2 705.3 79.4 87.0 105.1 MOLT with step-level handover 74.3 64.5 558.9 1317.4 3543.5 106.9 118.2 142.5 
+
+MOLT with continuous handover 99.7 64.5 466.4 569.3 811.4 107.6 118.3 136.8 
+
+Llama-3.1-70B-Instruct (1 ×B200) 
+
+LLMStation-only 0.0 76.1 40556.2 52458.2 59190.3 56.1 58.9 63.4 LLMStation+SIRIUS 99.7 42.6 595.5 763.6 976.9 54.5 58.2 66.0 MOLT with step-level handover 74.3 69.6 825.2 1822.1 6219.3 61.4 67.7 82.1 
+
+MOLT with continuous handover 100.0 90.3 592.4 735.5 985.8 63.8 67.1 73.9 
+
+5.1 Experimental Setup Hardware. We run Mistral-Small-24B-Instruct on 1 ×H100 SXM and 2 ×H100 SXM [5], and Llama-3.1-70B-Instruct on 4×H100 SXM and 1 ×B200 [35] (Table 1). 
+
+Models and adapters. We tune rank-8 LoRA [17] adapters on Mistral-Small-24B-Instruct [29] and Llama-3.1-70B-Instruct [10]. 
+
+Datasets and traces. We use ShareGPT [1] prompts for inference and the Alpaca [47] dataset for tuning. A tuning se-quence has 768, 2048, 1024 and 512 tokens in the deployments of Table 1, respectively. Inference requests arrive according to the BurstGPT trace [54]. 
+
+Implementation. MOLT is implemented as a patch to vLLM v0.11.0 [23] and an extension library for LLMStation’s build of PyTorch 2.8.0 [37]. The patch changes 2.7K lines in 23 of vLLM’s files and adds a 9.7K-line module. The module ports LLMStation’s execution interleaving [14] to vLLM’s V1 engine [52] and integrates MOLT with it. The 13.1K-line library backs and unbacks slots through CUDA virtual memory management [31] on SIRIUS’s page pool [53]. 
+
+Baselines and ablation. We compare MOLT with con-tinuous handover, the full design, against two baselines and one ablation. The ablation, MOLT with step-level handover, differs from MOLT with continuous handover only in when the boundary may move, so it isolates handover granular-ity. LLMStation-only shares only compute. It keeps tuning memory resident by excluding the same amount of memory from KV cache admission. LLMStation+SIRIUS also shares memory. At each handover, it resizes the training batch and discards the running step [53]. Its shared pool is the same size as that of MOLT. At each step boundary, MOLT with step-level handover reserves memory for inference. The reserve is the KV cache that the waiting requests need, multiplied by a reserve factor, plus a fixed margin. We report the factor with the highest SLO attainment among five factors from 2.0 to 4.0 (§5.4). 
+
+Metrics and SLOs. We report SLO attainment and tuning throughput over a measurement window. SLO attainment is the fraction of requests arriving in the window that meet the SLO [27, 57]. Tuning throughput is the number of tokens in the tuning samples completed in the window, per second. A request meets the SLO when its TTFT and its time per output token (TPOT) are each within 3 × the mean for the same deployment running inference alone [2, 15, 24, 38]. 
+
+5.2 End-to-end Evaluation 
+
+MOLT with continuous handover is the only configuration whose SLO attainment and tuning throughput are both high on every deployment. In Figure 11, MOLT with continuous handover alone lies in the upper right on every deployment. The TTFT and TPOT percentiles in Table 2 are over the requests in the measurement window. 
+
+> 9Yang et al.
+
+0 20 40 60 020 LLMStation+SIRIUS 0 20 40 60 MOLT with step-level handover 0 20 40 60 24B H100 SXM MOLT with continuous handover 0 20 40 60 025 0 20 40 60 0 20 40 60 24B 2×H100 SXM 0 20 40 60 020 0 20 40 60 0 20 40 60 70B 4×H100 SXM 0 20 40 60 020 0 20 40 60 0 20 40 60 70B B200 Time (s) GPU memory (GiB) Inference KV Tuning backed unused SLO violation 
+
+Figure 12. Shared-pool usage under the BurstGPT trace, where LLMStation+SIRIUS leaves memory unused that MOLT with continuous handover gives to tuning. 
+
+SLO attainment. MOLT with continuous handover meets the SLO for at least 99.7% of requests on every deployment, at the right edge of Figure 11, and LLMStation-only for at most 5.0%, at the left edge. LLMStation+SIRIUS also meets it for at least 95.5 %, because it also moves memory to inference at each handover. LLMStation-only keeps tuning memory resident, so requests wait for the memory that tuning holds (§2.3). The TTFT p50 of LLMStation-only is at least 6746.8 ms on every deployment, against at most 592.4 ms under MOLT with continuous handover (Table 2). 
+
+Tuning throughput. Of the configurations that meet the SLO, MOLT with continuous handover completes the most tuning work. It completes 1.9–3.3 × the tuning work of LLMStation+SIRIUS on every deployment (Figure 11). The ratio is smallest on Mistral-Small-24B-Instruct at TP=1, 242.6 against 127.7 tokens/s, and largest on Llama-3.1-70B-Instruct at TP=4, 64.5 against 19.3 tokens/s (Table 2). At each han-dover, LLMStation+SIRIUS discards the running step, and MOLT with continuous handover preserves it. §5.3 counts the discarded steps. LLMStation-only tunes faster on both Mistral-Small-24B-Instruct deployments, at 285.1 and 606.1 tokens/s, because its tuning memory is never reclaimed. 
+
+Source of the gain. Handover granularity alone explains why MOLT with continuous handover outperforms MOLT with step-level handover on both Mistral-Small-24B-Instruct deployments. The two differ only in when the boundary may move (§5.1). On Mistral-Small-24B-Instruct at TP=1, MOLT with continuous handover meets the SLO for 99.7 % of requests at 242.6 tokens/s, against 69.0 % at 212.8 tokens/s for MOLT with step-level handover. At TP=2, MOLT with continuous handover also attains more and tunes faster. Its TTFT p95 at TP=1 is 619.7 ms against 3112.9 ms, and §5.3 shows where the requests of MOLT with step-level handover wait. On Llama-3.1-70B-Instruct at TP=4, the gap is in SLO attainment only. MOLT with continuous handover attains 99.7 % against 74.3 % at the same 64.5 tokens/s. 
+
+5.3 Memory Utilization 
+
+At the memory boundary, MOLT with continuous handover gives tuning most of the memory that inference leaves free, and inference rarely waits for memory. The end-to-end differ-ences of §5.2 arise there. Figure 12 draws how inference and tuning divide the shared pool over the first 80 s of each de-ployment’s measurement window, on one time axis. The in-ference KV cache is drawn up from zero. The tuning-backed 
+
+> 10 MOLT: A Fine-Grained GPU Memory Sharing System for LLM Serving with Opportunistic Fine-Tuning
+
+4 64 1K ∞050 100 Percent (%)  24B, H100 SXM 
+
+4 64 1K ∞24B, 2×H100 SXM 
+
+4 64 1K ∞70B, 4×H100 SXM 
+
+4 64 1K ∞70B, B200 
+
+Dispatch cap (outstanding GPU operators) Evictable memory Tuning speed retained 
+
+Figure 13. Evictable memory and tuning speed retained against the dispatch cap, both high at the dashed cap. 16 32 64 128 256 05Handover latency (ms) max 1.0% of a step 24B, H100 SXM 816 32 64 128 max 1.3% of a step 24B, 2×H100 SXM 816 32 64 128 max 0.7% of a step 70B, 4×H100 SXM 16 32 64 128 256 512 max 0.8% of a step 70B, B200 Handover size per GPU (MiB) IPC request Slot unbacking IPC ack Page alloc Other 
+
+Figure 14. Mean handover latency by stage against handover size, growing with inference-side page allocation. memory is drawn down from the pool size, which is dashed. A tick above the pool marks the arrival of each request that misses the SLO. Every configuration of a deployment ran at one pool size, so a row compares them on one memory axis. The percentages below are over the whole measure-ment window, and the attainable budget is the pool minus the inference KV cache. 
+
+Memory use. MOLT with continuous handover uses most of the attainable budget for tuning, and LLMStation+SIRIUS leaves most of it unused, in every row of Figure 12. On Mistral-Small-24B-Instruct at TP=1, MOLT with continu-ous handover backs 86% of the attainable budget on average, and MOLT with step-level handover backs 81%. In contrast, LLMStation+SIRIUS leaves 87% of that budget unused. MOLT with continuous handover unbacks slots within a step, and it re-backs them only at a later step boundary, because waiting costs at most the recomputation of the rest of the step (§4.3). In Figure 12, its tuning-backed memory therefore shrinks within a step as the KV cache grows, and grows back only at step boundaries. The tuning-backed memory of MOLT with step-level handover, however, changes only at step bound-aries, in both directions. LLMStation+SIRIUS gives tuning a discarded step’s memory again only after free memory exceeds a threshold (§4.3), so it gives tuning either all of that memory or none of it. It discards 16.7% of its step attempts. 
+
+Waiting for memory. MOLT with continuous handover rarely makes inference wait for memory, and MOLT with step-level handover often does. We sample the inference engine’s request queue every 0.5 s. On every deployment, a request was waiting for memory in at most 1.4% of the samples under MOLT with continuous handover, against 27–47% under MOLT with step-level handover. Almost all SLO misses of MOLT with step-level handover exceed the TTFT limit, so its ticks in Figure 12 mark requests that waited for their first token. MOLT with continuous handover and LLMStation+SIRIUS both give inference memory within a step, and the handovers of MOLT with continuous handover give inference the requested memory within 1.6 ms at p99. MOLT with step-level handover gives inference memory only at step boundaries. A request whose KV cache does not fit in free memory therefore waits until the running step ends. 
+
+5.4 Granularity of the Memory Boundary 
+
+MOLT with continuous handover meets the SLO for more re-quests than MOLT with step-level handover at every reserve factor on every deployment (Figure 11). Only on Llama-3.1-70B-Instruct at TP=4 does a factor tune faster than MOLT with continuous handover. The factor sets how much mem-ory MOLT with step-level handover reserves for inference at each step boundary (§5.1). On Mistral-Small-24B-Instruct at TP=1, the middle factor, 3.0, is the best on both axes, and Table 2 reports it. The other four attain as little as 43.1 %, and neither axis is monotonic in the factor. 
+
+> 11 Yang et al.
+
+MOLT with continuous handover moves the boundary far more often than MOLT with step-level handover, and no reserve factor removes the waits for memory that follow. On Mistral-Small-24B-Instruct at TP=1, MOLT with continuous handover handed memory to inference 194 times over each whole run, against 24 for MOLT with step-level handover at factor 3.0. Even at factor 3.0, a request was waiting for mem-ory in 47% of the samples (§5.3). At the other four factors, this share is higher, at 54–64%. 
+
+5.5 Dispatch Throttling Analysis 
+
+A dispatch cap can leave most saved activations evictable without slowing tuning, on every deployment. The cap trades evictable memory against tuning speed (§4.4), and Figure 13 sweeps it on each deployment of Table 1. Each sweep runs tuning without inference at the deployment’s tuning se-quence length. Evictable memory is the share of layers out-side the protection window at its widest. Its base excludes the five layers that the backward pass keeps claimed at every cap, so it is 100% when the window is at its minimum. The point at ∞ is the unthrottled run, without a cap. Tuning speed retained is the tuning speed at the cap as a share of the unthrottled speed. The shaded band is ±5% of the unthrottled speed, a tolerance we set rather than a spread we measured. Each point is one run. The dashed line marks the smallest cap from which no larger cap falls below the band. At the dashed cap, tuning speed stays within the band, and the protection window at its widest spans 12.5, 12.5, 7.5 and 6.3% of all layers, close to its minimum, against 45, 65, 100 and 55% without a cap, in the order of Table 1. The dashed cap is 32, 64, 128 and 32. Tuning slows at the smallest caps. At a cap of 4, a step takes 13.1–24.6% longer than unthrottled. 
+
+5.6 Handover Overhead Analysis 
+
+A handover takes at most 1.3% of a tuning step, and only page allocation on the inference side grows with the handover size. A handover delays the inference request that needs its pages, from the page request of the inference-side allocator to the completion of page allocation. Under MOLT with step-level handover, that request waits instead until the running step ends (§5.3), so we state the latency as a share of a tuning step. In Figure 14, each bar is the mean latency of at least 19 handovers of one size, broken into four stages and Other, the time between them. In time order, the inference-side allocator requests pages over IPC (IPC request), and the handover controller takes the slot-unbacking decision and unbacks the chosen slots (Slot unbacking). The controller then acknowledges over IPC (IPC ack), and the allocator allocates their pages to the KV cache (Page alloc). At the largest size drawn for each deployment, 256, 128, 128 and 512 MiB in the order of Table 1, the mean handover takes 1.0, 1.3, 0.7 and 0.8% of a step. Three stages change little with the handover size: the IPC request, slot unbacking and the IPC acknowledgment. They take 0.64–0.87 ms on the two deployments at TP=1 and 1.09– 1.47 ms on the two with tensor parallelism, and they are more than half of a handover at the smallest size on every de-ployment. Of the three, slot unbacking grows the most with the tensor-parallel degree, yet it remains within 0.07% of a tuning step at every degree. It takes 0.05–0.12 ms at TP=1, 0.22–0.32 ms at TP=2 and 0.38–0.53 ms at TP=4. It grows be-cause, under tensor parallelism, the slot-unbacking decision also waits for every rank’s protection snapshot (§4.4). Page allocation changes little at small handover sizes and grows almost in proportion to the size at large ones. In Fig-ure 14, on both deployments at TP=1, allocation remains within 0.44–0.72 ms up to 64 MiB per GPU. Beyond that size, each doubling of the size multiplies it by 1.5–2.0. The growth comes from allocation taking each page from the free list of the shared pool and zero-filling it. At TP=2, allocation grows from the smallest size drawn. At TP=4, it rises at 64 MiB, the first size measured with a longer interval between han-dovers. 
+
+## 6 Related Work 
+
+Colocation of LLM inference and tuning. Unlike prior colocation systems, MOLT reclaims memory from a run-ning tuning step without discarding the step. FineInfer runs inference between tuning steps [13]. FlexLLM interleaves tuning and inference tokens in each iteration and reserves the KV cache statically [36]. LLMStation interleaves tuning operations with inference iterations while tuning memory remains resident (§2.3). SIRIUS moves the memory bound-ary by discarding the running step and restarting it with a smaller batch (§3.1). MOLT reuses LLMStation’s interleaving and SIRIUS’s page pool (§5.1), but its unit of memory sharing is a saved activation rather than a training sample. 
+
+Activation checkpointing. MOLT builds on activation checkpointing and differs from it in the memory budget, which inference changes while the tuning step runs (§4.1). Checkpointing chooses which activations to recompute un-der a budget fixed before training starts [4, 11, 19, 22]. DTR and Capuchin decide at run time under such a budget [21, 39]. Like DTR [21] and selective recomputation [22], MOLT gives up the activations that are cheapest to recompute first (§4.3). In these systems, the memory an activation gives up stays with the training job. In MOLT, inference reclaims it while dispatched kernels may still access it, which asynchronous-aware slot protection makes safe (§4.4). 
+
+## 7 Conclusion 
+
+Autoscaling leaves GPU memory idle inside LLM serving replicas, because it cannot follow a KV cache that changes within seconds and removes a replica only as a whole. Ex-isting colocation systems either keep the tuning memory resident or let inference reclaim it only in whole training samples, discarding the running tuning step each time. We 
+
+> 12
+
+MOLT: A Fine-Grained GPU Memory Sharing System for LLM Serving with Opportunistic Fine-Tuning 
+
+present MOLT, a fine-grained memory sharing system for colocating LLM inference and tuning. MOLT lets inference reclaim memory one saved activation at a time, safely un-der CPU–GPU asynchrony and tensor parallelism, while the running step continues and recomputes those activations. Experiments show that MOLT keeps inference SLO attain-ment at or above 99.7% while completing 1.9–3.3 × the tuning work of discard-based memory sharing. 
+
+## Acknowledgments 
+
+This work used Claude Code for code, language editing and text refinement. All technical content, experiments, and con-clusions were verified by the authors. 
+
+## References 
+
+[1] 2023. ShareGPT_Vicuna_unfiltered: ShareGPT Conversation Dataset. https://huggingface.co/datasets/anon8231489123/ShareGPT_ Vicuna_unfiltered . Accessed: 2026-06-11. [2] Amey Agrawal, Nitin Kedia, Ashish Panwar, Jayashree Mohan, Nipun Kwatra, Bhargav S. Gulavani, Alexey Tumanov, and Ramachandran Ramjee. 2024. Taming Throughput-Latency Tradeoff in LLM Inference with Sarathi-Serve. In 18th USENIX Symposium on Operating Systems Design and Implementation (OSDI 24) . USENIX Association, 117–134. 
+
+https://www.usenix.org/conference/osdi24/presentation/agrawal 
+
+[3] Lequn Chen, Zihao Ye, Yongji Wu, Danyang Zhuo, Luis Ceze, and Arvind Krishnamurthy. 2024. Punica: Multi-Tenant LoRA Serv-ing. In Proceedings of Machine Learning and Systems 6 (MLSys ’24) .1–13. https://proceedings.mlsys.org/paper_files/paper/2024/hash/ 054de805fcceb78a201f5e9d53c85908-Abstract-Conference.html 
+
+[4] Tianqi Chen, Bing Xu, Chiyuan Zhang, and Carlos Guestrin. 2016. Training Deep Nets with Sublinear Memory Cost. arXiv preprint arXiv:1604.06174 (2016). arXiv:1604.06174 https://arxiv.org/abs/1604. 06174 
+
+[5] Jack Choquette. 2023. NVIDIA Hopper H100 GPU: Scaling Perfor-mance. IEEE Micro 43, 3 (2023), 9–17. doi: 10.1109/MM.2023.3256796 
+
+[6] Tim Dettmers, Artidoro Pagnoni, Ari Holtzman, and Luke Zettle-moyer. 2023. QLoRA: Efficient Finetuning of Quantized LLMs. In 
+
+Advances in Neural Information Processing Systems 36 (NeurIPS ’23) .Curran Associates, Inc. https://proceedings.neurips.cc/paper_files/ paper/2023/hash/1feb87871436031bdc0f2beaa62a049b-Abstract-Conference.html 
+
+[7] Yao Fu, Leyang Xue, Yeqi Huang, Andrei-Octavian Brabete, Dmitrii Ustiugov, Yuvraj Patel, and Luo Mai. 2024. ServerlessLLM: Low-Latency Serverless Inference for Large Language Models. In 18th USENIX Symposium on Operating Systems Design and Implementa-tion (OSDI 24) . USENIX Association. [8] Google Cloud. 2026. Best Practices for Autoscaling Large Language Model (LLM) Inference Workloads with GPUs on GKE. https://cloud.google.com/kubernetes-engine/docs/best-practices/machine-learning/inference/autoscaling . Accessed: 2026-09-21. [9] Google Cloud. 2026. Scale Inference Nodes by Using Autoscaling. https: //cloud.google.com/vertex-ai/docs/predictions/autoscaling . Accessed: 2026-09-21. [10] Aaron Grattafiori et al. 2024. The Llama 3 Herd of Models. arXiv preprint arXiv:2407.21783 (2024). arXiv:2407.21783 [cs.AI] https://arxiv. org/abs/2407.21783 
+
+[11] Audrunas Gruslys, Remi Munos, Ivo Danihelka, Marc Lanctot, and Alex Graves. 2016. Memory-Efficient Backpropagation Through Time. In Advances in Neural Information Processing Systems 29 (NIPS ’16) . Cur-ran Associates, Inc. https://proceedings.neurips.cc/paper_files/paper/ 2016/hash/a501bebf79d570651ff601788ea9d16d-Abstract.html 
+
+[12] Zeyu Han, Chao Gao, Jinyang Liu, Jeff Zhang, and Sai Qian Zhang. 2024. Parameter-Efficient Fine-Tuning for Large Models: A Compre-hensive Survey. Transactions on Machine Learning Research (2024). 
+
+https://openreview.net/forum?id=lIsCS8b6zj 
+
+[13] Yongjun He, Yao Lu, and Gustavo Alonso. 2024. Deferred Continuous Batching in Resource-Efficient Large Language Model Serving. In 
+
+Proceedings of the 4th Workshop on Machine Learning and Systems (EuroMLSys ’24) . ACM, Athens, Greece, 98–106. doi: 10.1145/3642970. 3655835 
+
+[14] Yongjun He, Haofeng Yang, Yao Lu, Ana Klimovic, and Gustavo Alonso. 2025. Resource Multiplexing in Tuning and Serving Large Language Models. In 2025 USENIX Annual Technical Conference (USENIX ATC 25) .USENIX Association, Boston, MA, 1639–1655. https://www.usenix. org/conference/atc25/presentation/he-yongjun 
+
+[15] Ke Hong, Xiuhong Li, Lufang Chen, Qiuli Mao, Guohao Dai, Xuefei Ning, Shengen Yan, Yun Liang, and Yu Wang. 2025. SOLA: Optimizing SLO Attainment for Large Language Model Serving with State-Aware Scheduling. In Proceedings of Machine Learning and Systems 7 (MLSys ’25) . https://openreview.net/forum?id=ubIvpetAd6 
+
+[16] Neil Houlsby, Andrei Giurgiu, Stanislaw Jastrzebski, Bruna Morrone, Quentin De Laroussilhe, Andrea Gesmundo, Mona Attariyan, and Sylvain Gelly. 2019. Parameter-Efficient Transfer Learning for NLP. In 
+
+Proceedings of the 36th International Conference on Machine Learning (ICML ’19) (Proceedings of Machine Learning Research, Vol. 97) . PMLR, 2790–2799. https://proceedings.mlr.press/v97/houlsby19a.html 
+
+[17] Edward J. Hu, Yelong Shen, Phillip Wallis, Zeyuan Allen-Zhu, Yuanzhi Li, Shean Wang, Lu Wang, and Weizhu Chen. 2022. LoRA: Low-Rank Adaptation of Large Language Models. In The Tenth International Conference on Learning Representations (ICLR ’22) . https://openreview. net/forum?id=nZeVKeeFYf9 
+
+[18] Chien-Chin Huang, Gu Jin, and Jinyang Li. 2020. SwapAdvisor: Push-ing Deep Learning Beyond the GPU Memory Limit via Smart Swap-ping. In Proceedings of the 25th International Conference on Archi-tectural Support for Programming Languages and Operating Systems (ASPLOS ’20) . ACM, 1341–1355. doi: 10.1145/3373376.3378530 
+
+[19] Paras Jain, Ajay Jain, Aniruddha Nrusimha, Amir Gholami, Pieter Abbeel, Joseph Gonzalez, Kurt Keutzer, and Ion Stoica. 2020. Check-mate: Breaking the Memory Wall with Optimal Tensor Rematerializa-tion. In Proceedings of Machine Learning and Systems 2 (MLSys ’20) .497–511. https://proceedings.mlsys.org/paper_files/paper/2020/hash/ 0b816ae8f06f8dd3543dc3d9ef196cab-Abstract.html 
+
+[20] Shashwat Jaiswal, Kunal Jain, Yogesh Simmhan, Anjaly Parayil, Ankur Mallick, Rujia Wang, Renee St. Amant, Chetan Bansal, Victor Ruhle, Anoop Kulkarni, Steve Kofsky, and Saravan Rajmohan. 2025. Sage-Serve: Optimizing LLM Serving on Cloud Data Centers with Forecast Aware Auto-Scaling. Proceedings of the ACM on Measurement and Analysis of Computing Systems 9, 3, Article 61 (Dec. 2025), 24 pages. doi: 10.1145/3771576 
+
+[21] Marisa Kirisame, Steven Lyubomirsky, Altan Haan, Jennifer Brennan, Mike He, Jared Roesch, Tianqi Chen, and Zachary Tatlock. 2021. Dy-namic Tensor Rematerialization. In The Ninth International Conference on Learning Representations (ICLR ’21) . https://openreview.net/forum? id=Vfs_2RnOD0H 
+
+[22] Vijay Anand Korthikanti, Jared Casper, Sangkug Lym, Lawrence McAfee, Michael Andersch, Mohammad Shoeybi, and Bryan Catan-zaro. 2023. Reducing Activation Recomputation in Large Transformer Models. In Proceedings of Machine Learning and Systems 5 (MLSys ’23) .341–353. https://proceedings.mlsys.org/paper_files/paper/2023/hash/ 80083951326cf5b35e5100260d64ed81-Abstract-mlsys2023.html 
+
+[23] Woosuk Kwon, Zhuohan Li, Siyuan Zhuang, Ying Sheng, Lianmin Zheng, Cody Hao Yu, Joseph E. Gonzalez, Hao Zhang, and Ion Stoica. 2023. Efficient Memory Management for Large Language Model Serving with PagedAttention. In Proceedings of the 29th Symposium on 
+
+13 Yang et al. 
+
+Operating Systems Principles (SOSP ’23) . ACM, 611–626. doi: 10.1145/ 3600006.3613165 
+
+[24] Haeun Lee, Omin Kwon, Yeonhong Park, and Jae W. Lee. 2025. Nest-edFP: High-Performance, Memory-Efficient Dual-Precision Floating Point Support for LLMs. arXiv preprint arXiv:2506.02024 (2025). arXiv:2506.02024 https://arxiv.org/abs/2506.02024 
+
+[25] Brian Lester, Rami Al-Rfou, and Noah Constant. 2021. The Power of Scale for Parameter-Efficient Prompt Tuning. In Proceedings of the 2021 Conference on Empirical Methods in Natural Language Processing (EMNLP ’21) . Association for Computational Linguistics, 3045–3059. doi: 10.18653/v1/2021.emnlp-main.243 
+
+[26] Xiang Lisa Li and Percy Liang. 2021. Prefix-Tuning: Optimizing Con-tinuous Prompts for Generation. In Proceedings of the 59th Annual Meeting of the Association for Computational Linguistics and the 11th International Joint Conference on Natural Language Processing (Volume 1: Long Papers) (ACL ’21) . Association for Computational Linguistics, 4582–4597. doi: 10.18653/v1/2021.acl-long.353 
+
+[27] Zhuohan Li, Lianmin Zheng, Yinmin Zhong, Vincent Liu, Ying Sheng, Xin Jin, Yanping Huang, Zhifeng Chen, Hao Zhang, Joseph E. Gonzalez, and Ion Stoica. 2023. AlpaServe: Statistical Multiplexing with Model Parallelism for Deep Learning Serving. In 17th USENIX Symposium on Operating Systems Design and Implementation (OSDI 23) . USENIX Association, 663–679. https://www.usenix.org/conference/osdi23/ presentation/li-zhouhan 
+
+[28] Baohao Liao, Shaomu Tan, and Christof Monz. 2023. Make Pre-trained Model Reversible: From Parameter to Memory Efficient Fine-Tuning. In Advances in Neural Information Processing Systems 36 (NeurIPS ’23) .Curran Associates, Inc., 15186–15209. doi: 10.52202/075280-0668 
+
+[29] Mistral AI. 2025. Mistral Small 3. https://mistral.ai/news/mistral-small-3 . Accessed: 2026-06-11. [30] NVIDIA Corporation. 2026. CUDA C++ Programming Guide: Asynchronous Execution. https://docs.nvidia.com/cuda/cuda-programming-guide/02-basics/asynchronous-execution.html . Ac-cessed: 2026-06-11. [31] NVIDIA Corporation. 2026. CUDA Driver API: Virtual Memory Man-agement. https://docs.nvidia.com/cuda/cuda-driver-api/cuda_driver_ api/group__CUDA__VA.html . Accessed: 2026-09-25. [32] NVIDIA Corporation. 2026. CUDA Programming Guide: Stream-Ordered Memory Allocator. https://docs.nvidia.com/cuda/cuda-programming-guide/04-special-topics/stream-ordered-memory-allocation.html . Accessed: 2026-09-25. [33] NVIDIA Corporation. 2026. CUDA Runtime API Reference Manual: Execution Control. https://docs.nvidia.com/cuda/cuda-runtime-api/ cuda_runtime_api/group__CUDART__EXECUTION.html . Accessed: 2026-09-25. [34] NVIDIA Corporation. 2026. NVIDIA Collective Communication Li-brary (NCCL) Documentation. https://docs.nvidia.com/deeplearning/ nccl/user-guide/docs/index.html . Accessed: 2026-06-11. [35] NVIDIA Corporation. 2026. NVIDIA DGX B200. https://www.nvidia. com/en-us/data-center/dgx-b200/ . Accessed: 2026-06-11. [36] Gabriele Oliaro, Xupeng Miao, Xinhao Cheng, Vineeth Kada, Mengdi Wu, Ruohan Gao, Yingyi Huang, Remi Delacourt, April Yang, Yingcheng Wang, Colin Unger, and Zhihao Jia. 2026. FlexLLM: Token-Level Co-Serving of LLM Inference and Finetuning with SLO Guar-antees. In 23rd USENIX Symposium on Networked Systems Design and Implementation (NSDI 26) . USENIX Association, Renton, WA, 1359– 1379. https://www.usenix.org/conference/nsdi26/presentation/oliaro 
+
+[37] Adam Paszke, Sam Gross, Francisco Massa, Adam Lerer, James Bradbury, Gregory Chanan, Trevor Killeen, Zeming Lin, Natalia Gimelshein, Luca Antiga, Alban Desmaison, Andreas Kopf, Edward Yang, Zachary DeVito, Martin Raison, Alykhan Tejani, Sasank Chil-amkurthy, Benoit Steiner, Lu Fang, Junjie Bai, and Soumith Chintala. 2019. PyTorch: An Imperative Style, High-Performance Deep Learn-ing Library. In Advances in Neural Information Processing Systems 32 (NeurIPS ’19) . Curran Associates, Inc. https://proceedings.neurips.cc/ paper/2019/hash/bdbca288fee7f92f2bfa9f7012727740-Abstract.html 
+
+[38] Pratyush Patel, Esha Choukse, Chaojie Zhang, Aashaka Shah, Íñigo Goiri, Saeed Maleki, and Ricardo Bianchini. 2024. Splitwise: Efficient Generative LLM Inference Using Phase Splitting. In Proceedings of the 51st Annual International Symposium on Computer Architecture (ISCA ’24) . IEEE, 118–132. doi: 10.1109/ISCA59077.2024.00019 
+
+[39] Xuan Peng, Xuanhua Shi, Hulin Dai, Hai Jin, Weiliang Ma, Qian Xiong, Fan Yang, and Xuehai Qian. 2020. Capuchin: Tensor-based GPU Memory Management for Deep Learning. In Proceedings of the 25th International Conference on Architectural Support for Programming Languages and Operating Systems (ASPLOS ’20) . ACM, 891–905. doi: 10. 1145/3373376.3378505 
+
+[40] Samyam Rajbhandari, Jeff Rasley, Olatunji Ruwase, and Yuxiong He. 2020. ZeRO: Memory Optimizations Toward Training Trillion Param-eter Models. In Proceedings of the International Conference for High Performance Computing, Networking, Storage and Analysis (SC ’20) .IEEE Press. doi: 10.1109/SC41405.2020.00024 
+
+[41] Minsoo Rhu, Natalia Gimelshein, Jason Clemons, Arslan Zulfiqar, and Stephen W. Keckler. 2016. vDNN: Virtualized Deep Neural Networks for Scalable, Memory-Efficient Neural Network Design. In 2016 49th Annual IEEE/ACM International Symposium on Microarchitecture (MI-CRO) . IEEE, Taipei, Taiwan, 1–13. doi: 10.1109/MICRO.2016.7783721 
+
+[42] Ying Sheng, Shiyi Cao, Dacheng Li, Coleman Hooper, Nicholas Lee, Shuo Yang, Christopher Chou, Banghua Zhu, Lianmin Zheng, Kurt Keutzer, Joseph E. Gonzalez, and Ion Stoica. 2024. S-LoRA: Serving Thousands of Concurrent LoRA Adapters. In Pro-ceedings of Machine Learning and Systems 6 (MLSys ’24) . 296– 311. https://proceedings.mlsys.org/paper_files/paper/2024/hash/ 906419cd502575b617cc489a1a696a67-Abstract-Conference.html 
+
+[43] Haizhou Shi, Zihao Xu, Hengyi Wang, Weiyi Qin, Wenyuan Wang, Yibin Wang, Zifeng Wang, Sayna Ebrahimi, and Hao Wang. 2025. Continual Learning of Large Language Models: A Comprehensive Survey. Comput. Surveys 58, 5 (2025), 1–42. doi: 10.1145/3735633 
+
+[44] Mohammad Shoeybi, Mostofa Patwary, Raul Puri, Patrick LeGresley, Jared Casper, and Bryan Catanzaro. 2019. Megatron-LM: Training Multi-Billion Parameter Language Models Using Model Parallelism. 
+
+arXiv preprint arXiv:1909.08053 (2019). arXiv:1909.08053 https://arxiv. org/abs/1909.08053 
+
+[45] Jovan Stojkovic, Chaojie Zhang, Íñigo Goiri, Josep Torrellas, and Esha Choukse. 2025. DynamoLLM: Designing LLM Inference Clusters for Performance and Energy Efficiency. In 2025 IEEE International Symposium on High Performance Computer Architecture (HPCA) . IEEE. doi: 10.1109/HPCA61900.2025.00102 
+
+[46] Biao Sun, Ziming Huang, Hanyu Zhao, Wencong Xiao, Xinyi Zhang, Yong Li, and Wei Lin. 2024. Llumnix: Dynamic Scheduling for Large Language Model Serving. In 18th USENIX Symposium on Operating Systems Design and Implementation (OSDI 24) . USENIX Association, Santa Clara, CA, 173–191. https://www.usenix.org/conference/osdi24/ presentation/sun-biao 
+
+[47] Rohan Taori, Ishaan Gulrajani, Tianyi Zhang, Yann Dubois, Xuechen Li, Carlos Guestrin, Percy Liang, and Tatsunori B. Hashimoto. 2023. Stanford Alpaca: An Instruction-following LLaMA Model. https:// github.com/tatsu-lab/stanford_alpaca .[48] The KServe Authors. 2026. Autoscale InferenceService with LLM Met-rics. https://kserve.github.io/website/docs/model-serving/generative-inference/autoscaling . KServe 0.20 documentation. Accessed: 2026-09-21. [49] The Kubernetes Authors. 2026. Horizontal Pod Autoscal-ing. https://kubernetes.io/docs/concepts/workloads/autoscaling/ horizontal-pod-autoscale/ . Kubernetes documentation. Accessed: 2026-09-25. [50] The Ray Team. 2026. Ray Serve Autoscaling. https://docs.ray.io/ en/latest/serve/autoscaling-guide.html . Ray 2.58.0 documentation. 14 MOLT: A Fine-Grained GPU Memory Sharing System for LLM Serving with Opportunistic Fine-Tuning 
+
+Accessed: 2026-09-21. [51] Ashish Vaswani, Noam Shazeer, Niki Parmar, Jakob Uszkoreit, Llion Jones, Aidan N. Gomez, Łukasz Kaiser, and Illia Polo-sukhin. 2017. Attention Is All You Need. In Advances in Neural Information Processing Systems 30 (NIPS ’17) . Curran As-sociates, Inc. https://proceedings.neurips.cc/paper/2017/hash/ 3f5ee243547dee91fbd053c1c4a845aa-Abstract.html 
+
+[52] vLLM Team. 2025. vLLM V1: A Major Upgrade to vLLM’s Core Archi-tecture. https://vllm.ai/blog/2025-01-27-v1-alpha-release . Accessed: 2026-09-25. [53] Jiali Wang, Yankui Wang, Mingcong Han, and Rong Chen. 2025. Colocating ML Inference and Training with Fast GPU Memory Han-dover. In 2025 USENIX Annual Technical Conference (USENIX ATC 25) .USENIX Association, Boston, MA, 1657–1675. https://www.usenix. org/conference/atc25/presentation/wang-jiali 
+
+[54] Yuxin Wang, Yuhan Chen, Zeyu Li, Xueze Kang, Yuchu Fang, Yeju Zhou, Yang Zheng, Zhenheng Tang, Xin He, Rui Guo, Xin Wang, Qiang Wang, Amelie Chi Zhou, and Xiaowen Chu. 2025. BurstGPT: A Real-world Workload Dataset to Optimize LLM Serving Systems. In Proceedings of the 31st ACM SIGKDD Conference on Knowledge Discovery and Data Mining V.2 (KDD ’25) . ACM. doi: 10.1145/3711896. 3737413 
+
+[55] Bingyang Wu, Shengyu Liu, Yinmin Zhong, Peng Sun, Xuanzhe Liu, and Xin Jin. 2024. LoongServe: Efficiently Serving Long-Context Large Language Models with Elastic Sequence Parallelism. In Proceedings of the ACM SIGOPS 30th Symposium on Operating Systems Principles (SOSP ’24) . ACM, 640–654. doi: 10.1145/3694715.3695948 
+
+[56] Gyeong-In Yu, Joo Seong Jeong, Geon-Woo Kim, Soojeong Kim, and Byung-Gon Chun. 2022. Orca: A Distributed Serving System for Transformer-Based Generative Models. In 16th USENIX Symposium on Operating Systems Design and Implementation (OSDI 22) . USENIX Association, 521–538. https://www.usenix.org/conference/osdi22/ presentation/yu 
+
+[57] Yinmin Zhong, Shengyu Liu, Junda Chen, Jianbo Hu, Yibo Zhu, Xu-anzhe Liu, Xin Jin, and Hao Zhang. 2024. DistServe: Disaggregating Prefill and Decoding for Goodput-optimized Large Language Model Serving. In 18th USENIX Symposium on Operating Systems Design and Implementation (OSDI 24) . USENIX Association, 193–210. https: //www.usenix.org/conference/osdi24/presentation/zhong-yinmin 
+
+15

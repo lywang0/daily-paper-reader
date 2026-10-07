@@ -6,56 +6,61 @@
 </div>
 
 ## 每次日报
-- 最新运行日期：2026-10-06
-- 运行时间：2026-10-06 23:11:09 UTC
+- 最新运行日期：2026-10-07
+- 运行时间：2026-10-07 23:51:35 UTC
 - 运行状态：成功
-- 本次总论文数：12
-- 精读区：4
+- 本次总论文数：13
+- 精读区：5
 - 速读区：8
 
 ### 今日简报（AI）
-今日筛出 12 篇 LLM 系统论文，精读 4 篇、速读 8 篇，聚焦端侧推理与稀疏量化。最值得看的是《EdgeAgent》用 CPU-GPU 统一内存编排端侧多智能体（9.0 分），以及面向万亿级 MoE 的硬件原生联合稀疏量化（8.0 分）。普通读者可先关注端侧多智能体与 MoE 压缩这两条线，后续留意它们在真实设备上的落地效果。
-- 详情：[/202610/06/README](/202610/06/README)
+今日完成13篇论文筛选，精读5篇、速读8篇，主线聚焦LLM/Transformer推理加速与边缘部署。  
+最值得看的是两篇9分精读：边缘-云协同LLM推理的动态分片与深度同步批处理，以及面向边缘AI的RISC-V Transformer推理加速。  
+普通读者可先读这两篇精读，再按兴趣速览GPU显存共享、分段式MoE路由和三元GEMM稀疏加速。
+- 详情：[/202610/07/README](/202610/07/README)
 
 ### 精读区论文标签
-1. [EdgeAgent: Orchestrating On-Device LLM inference for End-User Multi-Agent Systems on CPU-GPU Unified Memory Architectures](/202610/06/2610.03394v1-edgeagent-orchestrating-on-device-llm-inference-for-end-user-multi-agent-systems-on-cpu-gpu-unified-memory-architectures)  
+1. [DySCo: Dynamic Sharding for Collaborative Edge-Cloud LLM Inference with Depth-Synchronized Batching](/202610/07/2610.08268v1-dysco-dynamic-sharding-for-collaborative-edge-cloud-llm-inference-with-depth-synchronized-batching)  
    标签：评分：9.0/10、query:edge-llm
-   evidence：面向端侧CPU-GPU统一内存的跨层LLM推理协同设计
-2. [Hardware-Native Joint Sparse-Quantization for Trillion-Scale Mixture-of-Experts](/202610/06/2610.02241v1-hardware-native-joint-sparse-quantization-for-trillion-scale-mixture-of-experts)  
+   evidence：边缘-云协同LLM推理运行时，动态分片与深度同步批处理
+2. [A Framework for Accelerating Transformer Inference on RISC-V for Edge AI](/202610/07/2610.08688v1-a-framework-for-accelerating-transformer-inference-on-risc-v-for-edge-ai)  
+   标签：评分：9.0/10、query:edge-llm
+   evidence：面向边缘AI的RISC-V Transformer推理加速框架，定制指令集扩展
+3. [BitNest: Bit-Nested Speculative Decoding for Memory-Efficient LLM Inference Acceleration](/202610/07/2610.02800v2-bitnest-bit-nested-speculative-decoding-for-memory-efficient-llm-inference-acceleration)  
    标签：评分：8.0/10、query:edge-llm
-   evidence：面向稀疏MoE加速的端到端软硬协同设计
-3. [BitNest: Bit-Nested Speculative Decoding for Memory-Efficient LLM Inference Acceleration](/202610/06/2610.02800v1-bitnest-bit-nested-speculative-decoding-for-memory-efficient-llm-inference-acceleration)  
+   evidence：资源受限设备上的内存高效LLM推理加速
+4. [Agentic Design Space Exploration for Joint Hardware Configuration Selection and Mapping of AI Inference Workloads on Heterogeneous Edge SoCs](/202610/07/2610.07191v1-agentic-design-space-exploration-for-joint-hardware-configuration-selection-and-mapping-of-ai-inference-workloads-on-heterogeneous-edge-socs)  
    标签：评分：8.0/10、query:edge-llm
-   evidence：面向资源受限设备的内存高效投机解码
-4. [PhaseGate: Phase-Aware CPU Retrieval Scheduling for On-Device LLMs on Unified Memory](/202610/06/2610.04537v1-phasegate-phase-aware-cpu-retrieval-scheduling-for-on-device-llms-on-unified-memory)  
+   evidence：面向CPU/GPU/NPU异构边缘SoC的AI推理硬件配置与映射联合优化
+5. [A Shape-Adaptive Architecture with Disaggregated Quantization for Efficient LLM Serving](/202610/07/2610.07443v1-a-shape-adaptive-architecture-with-disaggregated-quantization-for-efficient-llm-serving)  
    标签：评分：8.0/10、query:edge-llm
-   evidence：统一内存上端侧大模型的阶段感知检索调度
+   evidence：面向高效LLM服务的系统-架构协同设计
 
 ### 速读区论文标签
-1. [From Overloaded to Guaranteed: High-Throughput Multi-SLO Enforcement for LoRA-Assisted On-Premise LLM Deployment](/202610/06/2610.04956v1-from-overloaded-to-guaranteed-high-throughput-multi-slo-enforcement-for-lora-assisted-on-premise-llm-deployment)  
+1. [MOLT: A Fine-Grained GPU Memory Sharing System for LLM Serving with Opportunistic Fine-Tuning](/202610/07/2610.05748v1-molt-a-fine-grained-gpu-memory-sharing-system-for-llm-serving-with-opportunistic-fine-tuning)  
    标签：评分：7.0/10、query:edge-llm
-   evidence：面向本地LoRA LLM服务的硬件感知调度
-2. [Robust Parameter-Efficient LLM Adaptation on Analog Hardware](/202610/06/2610.05318v1-robust-parameter-efficient-llm-adaptation-on-analog-hardware)  
+   evidence：面向LLM服务的细粒度GPU显存共享系统，支持机会式微调
+2. [Stepped MoE: Segment-Level Routing with Configurable Inference Complexity](/202610/07/2610.07348v1-stepped-moe-segment-level-routing-with-configurable-inference-complexity)  
    标签：评分：7.0/10、query:edge-llm
-   evidence：面向模拟存内LLM部署的硬件感知参数高效适配
-3. [Characterizing High Bandwidth Flash for LLM Serving](/202610/06/2609.39131v2-characterizing-high-bandwidth-flash-for-llm-serving)  
+   evidence：面向端侧边缘推理，满足设备内存与算力限制的弹性稀疏门控
+3. [SSR: Sparse Segment Reduction for Ternary GEMM Acceleration](/202610/07/2610.08403v1-ssr-sparse-segment-reduction-for-ternary-gemm-acceleration)  
+   标签：评分：7.0/10、query:edge-llm
+   evidence：面向受限硬件的三值GEMM算子加速
+4. [JOVE: Joint Execution and Verification for Resource-Aware LLM Task Graphs](/202610/07/2610.03296v1-jove-joint-execution-and-verification-for-resource-aware-llm-task-graphs)  
    标签：评分：6.0/10、query:edge-llm
-   evidence：评估高带宽闪存容量与调度对LLM服务的影响
-4. [TopK-Guided: Adaptive, Budget-Aware Activation Sparsity for Efficient LLM Inference](/202610/06/2610.01763v1-topk-guided-adaptive-budget-aware-activation-sparsity-for-efficient-llm-inference)  
+   evidence：异构LLM上的资源感知任务图执行
+5. [Sibyl: An Efficient Small-large Model Collaboration Framework for Long-horizon Tasks](/202610/07/2610.05383v1-sibyl-an-efficient-small-large-model-collaboration-framework-for-long-horizon-tasks)  
    标签：评分：6.0/10、query:edge-llm
-   evidence：通过激活稀疏化加速LLM推理
-5. [ServeTwin: A Benchmark-Validated Simulator for Distributed LLM Architecture Exploration](/202610/06/2610.02732v1-servetwin-a-benchmark-validated-simulator-for-distributed-llm-architecture-exploration)  
+   evidence：端侧小模型资源高效推理
+6. [StagQ: Constraint-Driven Multi-Precision Weight Quantization for LLMs](/202610/07/2610.05977v1-stagq-constraint-driven-multi-precision-weight-quantization-for-llms)  
    标签：评分：6.0/10、query:edge-llm
-   evidence：面向分布式LLM服务架构探索的模拟器
-6. [Page-EntroKV: Hardware-Aligned, Entropy-Weighted KV-Cache Eviction under Grouped-Query Attention](/202610/06/2610.03135v1-page-entrokv-hardware-aligned-entropy-weighted-kv-cache-eviction-under-grouped-query-attention)  
+   evidence：面向LLM多部署的多精度权重量化
+7. [AlignQuant: Tile-Aligned Mixed-Precision Quantization for Efficient LLM Generation](/202610/07/2610.07457v1-alignquant-tile-aligned-mixed-precision-quantization-for-efficient-llm-generation)  
    标签：评分：6.0/10、query:edge-llm
-   evidence：分组查询注意力下硬件对齐的KV缓存淘汰
-7. [Beyond LLM Serving: Characterizing Vision-Language-Action Workloads for Embodied AI System Design](/202610/06/2610.05062v1-beyond-llm-serving-characterizing-vision-language-action-workloads-for-embodied-ai-system-design)  
+   evidence：硬件对齐的混合精度量化加速LLM推理
+8. [HintKD: Hint Knowledge Distillation for Bandwidth-Constrained Cloud-Edge Inference](/202610/07/2610.08412v1-hintkd-hint-knowledge-distillation-for-bandwidth-constrained-cloud-edge-inference)  
    标签：评分：6.0/10、query:edge-llm
-   evidence：面向边缘执行的批次1控制推理负载刻画
-8. [Characterizing Parallelism Strategies in LLM Inference: Fundamental Compute-Communication Trade-offs](/202610/06/2610.05305v1-characterizing-parallelism-strategies-in-llm-inference-fundamental-compute-communication-trade-offs)  
-   标签：评分：6.0/10、query:edge-llm
-   evidence：LLM推理服务的并行策略
+   evidence：带宽受限的云边协同推理，通过压缩离散提示进行蒸馏
 
 
 <div class="dpr-home-promo-card">
