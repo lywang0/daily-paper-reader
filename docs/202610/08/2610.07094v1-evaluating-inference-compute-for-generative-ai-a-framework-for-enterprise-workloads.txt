@@ -1,0 +1,472 @@
+Title: Evaluating Inference Compute for Generative AI: A Framework for Enterprise Workloads
+
+URL Source: https://arxiv.org/pdf/2610.07094v1
+
+Published Time: Wed, 07 Oct 2026 00:08:47 GMT
+
+Number of Pages: 12
+
+Markdown Content:
+## Evaluating Inference Compute for Generative AI: A Framework for Enterprise Workloads 
+
+Abbas Raza Ali * 1 Muhammad Ajmal Siddiqui 2 Moona Zahid 3
+
+Abstract 
+
+LLM deployment is shifting from single-turn completion to agentic trajectories in which a model plans, calls tools, reads results and reasons at test time before acting. This inverts the economics of inference hardware: chat serving amortises weight reads across large batches, whereas agent trajectories are sequentially dependent, run at effective batch one, and make per-token decode latency (TPOT) the dominant term in task completion time. Using a roofline analysis and a closed-form episode-latency model, we show why this regime favours accelerators that keep weights in on-die SRAM (Cerebras WSE-3/3T, Groq/NVIDIA LPU) or compiler-managed tiered memory (SambaNova SN40L/SN50), and why three vendor ecosystems converged in 2026 on disaggregated prefill/decode serving. We show that per-step reliability compounds exponentially in trajectory length-a 2% per-step failure rate erases a 2× decode advantage for a 20-step agent-so determinism and tail latency are first-order performance variables. We then propose a four-layer evaluation framework (silicon, serving system, agent episode, enterprise) with a metric set built on goodput at an agentic SLO and cost per successful episode, a six-axis benchmark protocol over six task families, a paired-bootstrap statistical design, an attestation protocol for vendor-run benchmarks, and TCO, availability and adoption-timing models with explicit break-even conditions. All performance figures are public and labelled by evidence class; we state seven falsifiable hypotheses and the experiments that test them, and argue that the most likely original result is that token-throughput rankings diverge from cost-per-successful-task rankings on long-horizon work. 
+
+1. Introduction 
+
+Inference has become the dominant cost of deployed AI [D] : Cerebras’s 2026 registration statement discloses a 750 MW inference agreement with OpenAI (Cerebras Systems, 2026b), and NVIDIA paid US$20 B for a non-exclusive licence to Groq’s inference-only architecture (Groq, 2025; NVIDIA, 2026a). Neither transaction con-cerns training. A second shift has changed what is inferred. Chat com-pletion is one forward pass followed by a token stream; a serving system batches hundreds of independent users to amortise reading model weights (Yu et al., 2022; Kwon et al., 2023). Agentic systems are different in kind [E] (Yao et al., 2023; Wang et al., 2024; Yehudai et al., 2025). A cod-ing agent (Jimenez et al., 2024) or a customer-operations agent (Yao et al., 2024) executes a trajectory : it reasons-often emitting thousands of hidden tokens (Snell et al., 2024; 
+
+> 1
+
+Citigroup Inc., London, United Kingdom 2Ernst & Young LLP, London, United Kingdom 3NVIDIA Corporation, London, United Kingdom. Correspondence to: Abbas Raza Ali <ab-bas.raza.ali@gmail.com >.Preprint. Under review at the Conference on Machine Learning and Systems (MLSys 2027) 
+
+DeepSeek-AI, 2025; OpenAI, 2024)-emits a structured tool call, waits, appends the result to its context and repeats for tens to thousands of steps (Kapoor et al., 2024; Xu et al., 2024). Each step depends on the previous one; the effective batch of a trajectory is one; latency compounds; the KV cache grows monotonically. These properties collide with how GPU inference has been made efficient. Continuous batching (Yu et al., 2022), paged KV memory (Kwon et al., 2023) and chunked pre-fill (Agrawal et al., 2024) raise throughput by increasing concurrent sequences per weight read; they do nothing for an individual sequential trajectory and in the limit trade it away. The metric governing agent task time-single-stream decode latency-is precisely where HBM GPUs are weak-est relative to SRAM-resident accelerators. The industry has moved decisively toward this reading [D] : Cerebras runs CS-3 as a decode tier behind AWS Trainium3 prefill (Ama-zon Web Services & Cerebras Systems, 2026); NVIDIA’s first Groq-derived product, the Groq 3 LPX rack, is posi-tioned as a decode co-processor for Vera Rubin (NVIDIA, 2026a); SambaNova launched SN50 “for agentic inference” with an Intel Xeon 6 heterogeneous design and was selected by JPMorganChase for on-premises inference (SambaNova Systems, 2026). Disaggregated, phase-specialised serving went from OSDI/ISCA prototype (Zhong et al., 2024; Patel arXiv:2610.07094v1 [cs.AR] 5 Oct 2026 Evaluating Inference Compute for Generative AI: A Framework for Enterprise Workloads 
+
+et al., 2024) to the default architecture of three ecosystems within eighteen months. Existing benchmarks measure silicon (roofline, peak speci-fications), serving systems (MLPerf, API probes) or agents (SWE-bench, τ -bench) in isolation; enterprise decisions need all three plus the layer at which money and regulatory risk are accounted. This paper contributes: 1. a workload characterisation of agentic inference (tax-onomy A1–A5) with a closed-form episode-latency model and a failure-amplification model showing that reliability compounds exponentially in trajectory length; 2. an architectural taxonomy of 2026 inference acceler-ators on two axes (weight residency, execution model) that explains the convergence on disaggregation (§4); 3. a four-layer evaluation framework : layer-specific metrics, six task families × six sensitivity axes, a paired-bootstrap statistical design, and an attestation protocol for vendor-run benchmarks; 4. TCO, availability and adoption-timing models yield-ing explicit break-even conditions for high-capital single-appliance decode hardware in regulated enter-prises (§6); 5. seven falsifiable hypotheses with the experiments that test them (§7). We tag claims by evidence class: [E] established research,  
+
+> [D]
+
+documented industry evidence (sub-classified as pub-lished specification, independent measurement, or vendor-reported), [P] proposed here, [H] hypothesis. We report no original measurements; §7 specifies the experiments that would make this an empirical paper. 
+
+2. Background 
+
+Two phases, opposite bottlenecks [E] . Autoregressive Transformer inference (Vaswani et al., 2017) has two phases (Fig. 1a). Prefill processes all c prompt tokens in parallel, reusing each weight c times; it is compute-bound. Decode 
+
+produces one token per step and must re-read all W bytes of weights plus the KV cache to perform a matrix–vector product; with batch B each weight byte yields only 2B
+
+FLOPs, so decode is bandwidth-bound unless B is large (Pope et al., 2023; Gholami et al., 2024). The per-token latency is bounded by 
+
+TPOT ≥ max 
+
+ W + KV( c)
+
+BW , 2N B Fpeak 
+
+
+
+, (1) where N is the parameter count, Fpeak peak arithmetic throughput and BW weight-tier bandwidth. For a 70B FP8 model on one H100 (3.35 TB/s) the first term is ≈ 21 ms, i.e. 
+
+≤ 48 tokens/s per stream before any tensor-parallel intercon-nect cost. On a device holding the same weights in on-die SRAM at 10 2–10 4 TB/s the bound is two to three orders of magnitude smaller [D] . The KV cache grows linearly: for L
+
+layers, nkv KV heads (Ainslie et al., 2023), head dimension 
+
+dh and s bytes per element, 
+
+KV( c) = 2 L n kv dh s c, (2) 
+
+≈ 160 kB/token for Llama-3.1-70B in FP8, so a 128k-token agent context occupies ≈ 20 GB-larger than any single chip’s SRAM. IO-aware attention kernels (Dao et al., 2022; Dao, 2024) address the KV term but not the weight term. 
+
+Roofline and the memory wall [E] . On a roofline (Williams et al., 2009) (Fig. 1b), batch-1–8 decode sits at 1–8 FLOP/byte, far left of any HBM device’s ridge point (≈ 300 FLOP/byte for H100 at FP8). The memory wall (Wulf & McKee, 1995; Gholami et al., 2024)-peak FLOPs growing ∼ 3× faster than DRAM bandwidth over two decades-is therefore the first-order determinant of single-stream decode speed. Three responses exist: raise B (batch-ing, at a latency cost), raise BW (HBM3e →HBM4, or on-die SRAM), or reduce W per step (quantisation, MoE spar-sity (Fedus et al., 2022), speculative decoding (Leviathan et al., 2023)). GPUs pursue all three; SRAM accelerators bet on BW .
+
+Batching, Little’s law and goodput [E] . Little’s law (Lit-tle, 1961) ties in-flight requests N = λW to arrival rate and residence time: higher λ forces larger batches and, via Eq. 1 and queueing, higher per-token latency. The latency– throughput frontier (Fig. 7) is intrinsic. DistServe and Split-wise (Zhong et al., 2024; Patel et al., 2024) introduced good-put , the maximum request rate at which a stated fraction meets both a TTFT and a TPOT SLO: 
+
+G(θ1, θ 2) = max λ s.t. P (TTFT ≤ θ1) ≥ 0.99 ,P (TPOT ≤ θ2) ≥ 0.99 . (3) MLPerf Inference added an Interactive scenario with tighter TTFT/TPOT limits in v5.0 and reports it separately from Offline and Server in v6.0 (Reddi et al., 2020; MLCommons, 2026); a submission that leads Offline can be irrelevant to interactive deployment. 
+
+Disaggregated serving [E] →[D] . Because the phases have opposite bottlenecks, co-locating them wastes one resource at any instant. Separating them onto different pools with KV transfer raised goodput 2–7× at fixed SLOs (Zhong et al., 2024; Patel et al., 2024). The 2026 vendor archi-tectures (Fig. 5) are the industrial instantiation; we treat disaggregation as the reference architecture against which single-vendor appliances are evaluated. Evaluating Inference Compute for Generative AI: A Framework for Enterprise Workloads Prompt (c tokens) PREFILL c tokens in parallel compute-bound KV cache (2 L d c values) DECODE step t 1 token; reads all weights + KV: memory-bound 
+
+> token t repeat n_out times (sequential)
+
+a Two phases of autoregressive inference      
+
+> 10 −1 10 010 110 210 310 4
+> Arithmetic intensity (FLOP / byte)
+> 10 0
+> 10 1
+> 10 2
+> 10 3
+> Attainable TFLOP/s
+> decode batch 1-8 prefill / large batch
+
+b Roofline view (FP8 dense peaks, indicative) 
+
+> H100 SXM (3.35 TB/s) B200 (8 TB/s) SRAM-resident (~150 TB/s)
+
+Figure 1. Prefill and decode have opposite bottlenecks. (a) Prefill is compute-bound; decode re-reads all weights per token and is memory-bound. (b) Roofline (Williams et al., 2009) for three memory systems (FP8 dense peaks, indicative): at low-batch decode intensities (red) attainable throughput is set entirely by bandwidth; peak compute matters only at prefill/large-batch intensities (green). Device parameters are vendor specifications [D] .
+
+3. Characterising Inference 
+
+Episode-latency model [P] . Let an episode have K se-quential steps; at step i the context is ci, the model emits ni
+
+tokens (visible plus hidden), the environment takes τi to ex-ecute the tool call, qi is queueing delay and ωi orchestration overhead (serialisation, schema validation, KV hand-off). Then 
+
+Tep =
+
+> K
+
+X
+
+> i=1
+
+TTFT( ci) + ni TPOT( ci) + τi + qi + ωi
+
+,ci+1 = ci + ni + oi,
+
+(4) with oi the tool-result length and TTFT( c) ≈ t0+c/R prefill 
+
+(prefix caching reduces c to the uncached suffix). Three consequences: (i) since ni multiplies TPOT and K multi-plies everything, decode dominates for any reasoning agent (ni ≳ 100 ); (ii) the benefit saturates when ni TPOT < τ i-the tool-latency floor is the agentic Amdahl fraction; (iii) because context grows, capacity-tier bandwidth, not only weight bandwidth, sets late-episode TPOT. 
+
+Reliability compounds [P] . Suppose each step fails in-dependently with probability p (timeout, malformed call, transient fault, non-deterministic divergence rejected by a verifier). If failure forces restart from scratch, an episode completes on one attempt with probability (1 − p)K ; with per-step checkpointing only the failed step repeats: 
+
+E[W ]
+
+K =
+
+(
+
+(1 − p)−K restart from scratch ,
+
+(1 − p)−1 per-step checkpointing . (5) At p = 1% a 50-step agent without checkpointing does 65% more work than ideal; at 2% , 2.7×; a 100-step agent at 2% does 7× (Fig. 2a). Fig. 2b shows the iso-time consequence: a decode engine twice as fast but with 2% per-step failures (an immature compiler path, a flaky KV hand-off) is slower in expectation for a 20-step agent than a half-speed reliable one. Hence tail latency and failure rate belong beside TPOT in Layer-1/2 measurement, and the determinism of statically scheduled designs (Abts et al., 2020) is a performance claim whose value scales with K (hypothesis H4). 
+
+4. Architectural Landscape, 2026 
+
+Two axes [P] . The domain-specific era (Hennessy & Patter-son, 2019) and the hardware lottery (Hooker, 2021) are both visible in Fig. 3, which places accelerators on two axes: 
+
+weight residency (off-package HBM/DRAM; compiler-managed SRAM+HBM+DDR tiers; on-die SRAM), which sets BW in Eq. 1; and execution model (dynamic SIMT; compiler-mapped spatial dataflow; fully static determinis-tic schedule (Abts et al., 2020; 2022)), which sets flexibil-ity, batch-1 utilisation and latency variance. Table 1 gives public specifications; Fig. 4 plots the capacity–bandwidth landscape. 
+
+How each design pays for bandwidth [D] . Wafer-scale spatial dataflow (Cerebras): a 46,225 mm 2 wafer with 
+
+≈900k cores, 44 GB SRAM and 21 PB/s on a 2-D mesh (Lie, 2023; Cerebras Systems, 2024); models beyond SRAM stream from MemoryX. Costs: a single fault domain, a 23– 25 kW liquid-cooled chassis and a compiler that maps each model onto the fabric. CS-4 (Aug 2026) runs the same 5 nm silicon at a higher operating point-power delivery 0.5 mm Evaluating Inference Compute for Generative AI: A Framework for Enterprise Workloads 0 20 40 60 80 100 
+
+Trajectory length K (steps) 
+
+10 0
+
+2 × 10 0
+
+3 × 10 0
+
+4 × 10 0
+
+6 × 10 0
+
+> Expected work multiplier E[W]/K
+
+dashed: per-step checkpointing, 1/(1-p) 
+
+a Failure amplification (Eq. 5) 
+
+p = 0.1% per step, restart from scratch p = 0.5% per step, restart from scratch p = 1% per step, restart from scratch p = 2% per step, restart from scratch 
+
+10 0 10 1
+
+TPOT (ms) 
+
+050 100 150 200 250 
+
+> Expected episode time (s)
+
+2x slower with 0% failures beats 2x faster with 2% 
+
+b Speed vs reliability (K=20, n=150) 
+
+per-step failure prob. p = 0% p = 1% p = 2% 
+
+Figure 2. Reliability compounds along a trajectory [P] . (a) Expected work multiplier (Eq. 5) versus trajectory length for p=0 .1–2% ,with and without per-step checkpointing. (b) Expected episode time for a 20-step agent versus TPOT and p: a faster, less reliable engine can lose to a slower, reliable one. Illustrative. Control-flow SIMT (dynamic scheduling) Reconfigurable dataflow (compiler-mapped graph) Static schedule (deterministic, no runtime arbitration) 
+
+> Execution model
+> Weights in off-package DRAM/HBM Tiered: on-die SRAM + HBM + DDR Weights resident in on-die SRAM
+> Primary weight residency
+> NVIDIA H100/H200/B200/Rubin AMD MI355X Intel Gaudi 3 Intel Crescent Island (LPDDR5X) SambaNova SN40L / SN50 Google TPU / AWS Trainium Cerebras WSE-3 / WSE-3T (+MemoryX) Groq LPU / NVIDIA Groq 3 LPX d-Matrix (digital in-memory)
+> Decode-specialised region: high bandwidth, low capacity - pairs with a prefill engine
+> Architectural taxonomy of high-end inference accelerators (positions qualitative)
+
+Figure 3. Architectural taxonomy [P] (positions qualitative). The upper-right region is decode-specialised: extreme bandwidth, lim-ited capacity, near-full utilisation at batch 1-a natural partner for an HBM-rich prefill engine rather than a replacement. 
+
+from the wafer, redesigned cooling-to double stated com-pute and bandwidth per wafer, with three wafers per rack at 2 μs wafer-to-wafer latency; the vendor reports >4,400 tok/s/user on GPT-OSS-120B and announces prefill part-nerships with AWS Trainium and AMD Helios (Cerebras Systems, 2026a). Operating as a decode tier concedes that prefill on wafer-scale SRAM is not the economic optimum. 
+
+Static tensor streaming (Groq →NVIDIA LPU): a single VLIW-style core with a compile-time schedule, no caches and no arbitration, so every run takes the same cycles (Abts et al., 2020; 2022); weights in SRAM (230 MB v1; 500 MB Groq 3) mean a 70B model spans hundreds of chips; batch-1 utilisation is near-complete, which is why the architecture led single-stream leaderboards (Artificial Analysis, 2026). Limits are capacity (Eq. 2) and prefill; NVIDIA ships Groq 3 strictly as a decode co-processor, with later generations adopting NVLink and NVFP4 (NVIDIA, 2026a). Tiered dataflow (SambaNova): a CGRA with 520 MB scratchpad SRAM, 64 GB HBM and up to 1.5 TB DDR per socket (Prabhakar et al., 2024); spatial operator placement keeps 10 0 10 1 10 2 10 3    
+
+> Weight-tier memory capacity per device (GB)
+> 10 0
+> 10 1
+> 10 2
+> 10 3
+> 10 4
+> 10 5
+> Bandwidth to that tier (TB/s)
+> SambaNova SN40L SRAM tier Groq LPU v1 SRAM NVIDIA Groq 3 LPU SRAM Cerebras WSE-3 SRAM Cerebras WSE-3T SRAM HBM / DRAM devices (see inset) 70B @ FP8 405B @ FP8
+> Memory capacity-bandwidth landscape (public vendor specifications)
+> 50 100 200 400 248
+> H100 SXM (HBM3) H200 (HBM3e) B200 (HBM3e) B300 (HBM3e) AMD MI355X Intel Gaudi 3 (HBM2e) AWS Trainium3 Google TPU v7 Ironwood SambaNova SN40L HBM tier
+> HBM / DRAM cluster (GB vs TB/s)
+
+Figure 4. Capacity–bandwidth landscape [D] (public specifica-tions; log–log). No SRAM device holds a 70B FP8 model on one chip except the wafer-scale WSE-3; others shard across hundreds of chips or pair with a capacity tier. The 2–3 orders of bandwidth separating the clusters is the source of the decode-speed gap in Fig. 6. 
+
+activations on-chip while the DDR tier makes many models-or a trillion-parameter MoE-resident and hot-swappable (“composition of experts”), which maps directly onto multi-agent topologies. SN50 keeps the hierarchy, adds FP8, quin-tuples throughput and scales the shared memory space to 256 sockets (SambaNova Systems, 2026). HBM GPUs and hyperscaler ASICs : the general-purpose baseline with the richest ecosystem and the only platform on which train-ing, fine-tuning, multimodal and inference coexist. Rack-scale NVLink domains (GB200/GB300 NVL72: 72 GPUs, 13.4 TB HBM3e, 130 TB/s aggregate NVLink (NVIDIA, 2026b)) deserve treatment as a distinct class: they reduce the interconnect bound that Pope et al. (Pope et al., 2023) identify and shift the break-even of §6 for very large models. AMD MI355X and TPU v7 / Trainium3 (Jouppi et al., 2023) occupy the same cell. The GPU vendors are nonetheless Evaluating Inference Compute for Generative AI: A Framework for Enterprise Workloads 
+
+Table 1. Public specifications of 2026 inference accelerators [D] (vendor-stated; SRAM bandwidths are aggregate on-die and not directly comparable to HBM). Sources: (NVIDIA, 2026a;b; Groq, 2025; Intel, 2025; Cerebras Systems, 2024; 2026a; Prabhakar et al., 2024; SambaNova Systems, 2026; Amazon Web Services & Cerebras Systems, 2026; MLCommons, 2026). 
+
+Device Weight tier / capacity Bandwidth Peak (dense, stated) Execution Status 
+
+NVIDIA H100 / H200 HBM3/3e, 80 / 141 GB 3.35 / 4.8 TB/s ≈1 PFLOPS FP8 SIMT Installed base NVIDIA B200 / B300 HBM3e, 192 / 288 GB ≈8 TB/s ≈4.5 PFLOPS FP8, FP4 SIMT Volume NVIDIA GB200 NVL72 rack 72 GPUs; 13.4 TB HBM3e 130 TB/s NVLink aggregate rack-scale single NVLink domain 
+
+≈120–140 kW liquid rack NVIDIA Rubin HBM4, 288 GB ≈20+ TB/s ∼50 PFLOPS FP4 (claim) SIMT Ramp H2 2026 Groq 3 LPU / LPX rack (NVIDIA) on-die SRAM 0.5 GB/LPU; 128 GB/256-LPU rack 
+
+≈150 TB/s per LPU n/d static TSP Decode co-processor, Q3 2026 Groq LPU v1 (GroqCloud) on-die SRAM 230 MB 80 TB/s 188 TFLOPS FP16 static TSP Cloud only Cerebras WSE-3 / CS-3 on-die SRAM 44 GB (+MemoryX) 21 PB/s 125 PFLOPS FP16 (sparse) spatial dataflow Public; AWS decode tier Cerebras WSE-3T / CS-4 (3 wafers) 3×44 GB per rack 43.2 PB/s per wafer 250 PFLOPS/wafer dataflow; 2 μs wafer link Announced Aug 2026 SambaNova SN40L 520 MB SRAM + 64 GB HBM + 1.5 TB DDR per socket; 16/rack HBM ≈2 TB/s 638 TFLOPS BF16 CGRA dataflow Shipping; JPMC on-prem SambaNova SN50 same 3-tier; 256 sockets n/d 5× SN40L; FP8 CGRA dataflow H2 2026 Intel Gaudi 3 / Crescent Island HBM2e 128 GB / LPDDR5X 160 GB 3.7 TB/s / low 1.8 PFLOPS FP8 / n/d tensor cores / Xe3P Available (de-emphasised) / sampling AMD MI355X HBM3e 288 GB 8 TB/s ≈5 PFLOPS FP8 SIMT Leads MLPerf v6.0 Llama-2-70B AWS Trainium3; Google TPU v7 HBM3e 144 GB; HBM 192 GB ≈4.9; 7.4 TB/s 2.5; 4.6 PFLOPS FP8 systolic Prefill partner to CS-3; GCP Agent runtime (orchestrator, tools, memory) PREFILL POOL compute-dense, HBM-rich (GPU / Trainium3 / Xeon+RDU) DECODE POOL SRAM-resident, bandwidth-rich (CS-3/CS-4 / Groq 3 LPX / SN50) KV-cache transfer fabric (EFA / NVLink / RDMA) Router / SLO-aware scheduler 
+
+> prompt + tool results streamed tokens
+> Industry instances (2026): AWS Trainium3 -> CS-3 (Bedrock); NVIDIA Vera Rubin -> Groq 3 LPX; Intel Xeon 6 + SambaNova RDU; AMD Helios -> CS-4
+> Disaggregated prefill/decode serving (pattern adopted by three vendor ecosystems in 2026)
+
+Figure 5. Disaggregated prefill/decode serving : established in research (Zhong et al., 2024; Patel et al., 2024); adopted in 2026 by AWS+Cerebras (Amazon Web Services & Cerebras Systems, 2026), NVIDIA Rubin+Groq 3 LPX (NVIDIA, 2026a) and In-tel+SambaNova (SambaNova Systems, 2026). 
+
+adding SRAM decode tiers rather than closing the single-stream gap with HBM alone. 
+
+Convergence on disaggregation [D] . The three 2026 an-nouncements share the structure of Fig. 5. AWS states ∼ 5×
+
+more high-speed token capacity in the same footprint (Ama-zon Web Services & Cerebras Systems, 2026); NVIDIA claims 35 × decode throughput per megawatt for LPX over HBM GPUs (NVIDIA, 2026a)-vendor claims, untested by us. For an evaluator the unit of comparison is no longer a chip but a phase-specialised pool pair , and the KV-transfer fabric is a component whose bandwidth and latency must be benchmarked (axis A5). 
+
+5. Documented Evidence and Its Limits 
+
+Fig. 6 and Table 2 collect public single-user decode figures, labelled by sub-class. 10 2 10 3 10 4                                    
+
+> Single-stream decode throughput (tokens/s per user, log scale)
+> Llama 3.1 8B |Cerebras CS-3 Llama 3.1 70B |Cerebras CS-3 Llama 3.1 405B |Cerebras CS-3 Llama 4 Scout |Cerebras CS-3 Kimi K2.6 (~1T) |Cerebras CS-3 GPT-OSS-120B |Cerebras CS-4 Llama 3 70B |Groq LPU v1 (2024) Llama 3 8B |Groq LPU v1 (2024) Llama 3.1 70B |SambaNova SN40L Llama 3.1 405B |SambaNova SN40L DeepSeek-R1 671B |SambaNova SN40L x16 70B-class (typical) |GPU API providers (H100/B200)
+> 1,800 [vendor-reported] 2,100 [vendor-reported] 969 [vendor-reported] 2,600 [independent] 1,000 [independent] 4,400 [vendor-reported] 284 [independent] 800 [independent] 461 [vendor-reported] 132 [vendor-reported] 198 [vendor-reported] 90 [independent]
+> Documented single-user decode speeds, 2024-2026 (not author-measured)
+
+Figure 6. Documented single-user decode throughput, 2024– 2026 [D] (log scale; sources in Table 2). Not measured by the authors; not a common protocol. 
+
+These numbers come from at least four incompatible regimes: vendor lab runs with unstated batch and preci-sion; public endpoints whose operators choose their own batching point; MLPerf submissions that fix model, ac-curacy and latency limits but report aggregate throughput (Reddi et al., 2020); and comparisons against unspecified “leading GPUs”. Two biases follow. Single-stream speed on an SRAM device is a hardware property; on a GPU end-point it is a policy property (Fig. 7)-an operator can always shrink batches-so a fair comparison must hold goodput or cost constant. And none of the figures measure Eq. 4 under realistic context growth and tool interleaving. Our protocol is designed to close both gaps. 
+
+Cost and energy identities [P] . With success rate S, mean tokens Tin , T out per attempt at effective prices pin , p out and Evaluating Inference Compute for Generative AI: A Framework for Enterprise Workloads 
+
+Table 2. Documented decode-speed evidence [D] . D-indep: Artifi-cial Analysis or MLCommons; D-vendor: press releases. 
+
+Model Hardware tok/s/user Source, class 
+
+Llama 3.1 8B / 70B Cerebras CS-3 1,800 / 2,100 (Cerebras Systems, 2024) D-vendor Llama 3.1 405B Cerebras CS-3 969 (Cerebras Systems, 2024) D-vendor Llama 4 Scout Cerebras CS-3 >2,600 (Artificial Analysis, 2026) D-indep Kimi K2.6 (∼1T) Cerebras CS-3 ≈1,000 (Cerebras Systems, 2026b; Artificial Analysis, 2026) D-indep GPT-OSS-120B Cerebras CS-4 >4,400 (Cerebras Systems, 2026a) D-vendor Llama 3 70B Groq LPU v1 284 (TTFT 0.3 s) (Groq, 2024) D-indep Llama 3 8B Groq LPU v1 ≈800 (Artificial Analysis, 2026) D-indep Llama 3.1 70B / 405B SambaNova SN40L 461 / 132 (SambaNova Systems, 2026) D-vendor DeepSeek-R1 671B SN40L ×16 198 (SambaNova Systems, 2026) D-vendor 70B-class GPU API providers 
+
+≈30–200 (Artificial Analysis, 2026) D-indep Llama 2 70B AMD MI355X ×8aggregate only (MLCommons, 2026) D-indep 10 3 10 4 10 5
+
+> Aggregate throughput (tokens/s); batch size grows left to right
+> 10 −1
+> 10 0
+> 10 1
+> Per-token latency, TPOT (ms)
+> MLPerf 'Interactive' TPOT <= 40 ms agentic target TPOT <= 5 ms (H2)
+> Latency-throughput frontier from the bandwidth model (Eq. 1); illustrative
+> 8x H100 (70B FP8, TP8) 8x B200 (70B FP8, TP8) SRAM-resident appliance (70B, ~1 PB/s effective)
+
+Figure 7. The latency–throughput frontier is intrinsic to batch-ing [E] (bandwidth model of Eq. 1, 70B FP8; illustrative). GPUs reach high aggregate throughput only by moving right, raising TPOT; an SRAM pool sits below the MLPerf Interactive limit (MLCommons, 2026) at all batch sizes. A single-stream compari-son that does not fix the operating point is under-specified. 
+
+tool cost Ctool ,
+
+Cep = Tin pin + Tout pout + Ctool 
+
+S ,η = SEdecode + Eprefill + Etools 
+
+(6) (Cep : cost per successful episode; η: successful episodes per kWh). A faster but less accurate configuration can raise cost, and hidden reasoning tokens are a first-order cost term. 
+
+Protocol: task families × sensitivity axes [P] . A pro-tocol needs two orthogonal specifications-what the agent does and which variable is swept; conflating them is why most published comparisons cannot separate a hardware effect from an agent-policy effect. Table 4 defines six task 
+
+Table 3. Metric set by layer (E established, P proposed). 
+
+Layer Metric Definition / why 
+
+L1 weight-tier BW, capacity Eq. 1–2; STREAM-style kernel EL1 tokens/J (batch 1, 8) wall-plug energy (Luccioni et al., 2024; Samsi et al., 2023) EL1 determinism CoV of TPOT over 10 3 identical runs PL2 TTFT, TPOT P50/P99 vs context MLPerf Interactive definitions EL2 goodput G(θ1, θ 2) Eq. 3 at the agent SLO EL2 prefix-cache hit rate; KV-transfer P99 context grows each step; disaggregation adds a hop PL2 structured-decoding overhead TPOT constrained / unconstrained PL2 per-step failure p;recovery time enters Eq. 5 with exponent K PL2 ω, q wall-clock minus (TTFT +n TPOT 
+
++τ )PL3 Tep P50/P95 Eq. 4 on a fixed harness PL3 success S;tokens/successful task (Kapoor et al., 2024; Yao et al., 2024) EL3 tool-interleave efficiency decode idle fraction (Amdahl floor) PL4 cost per successful episode Eq. 6 PL4 time-to-reproducible-evidence months to in-house benchmark PL4 availability-adjusted capacity Eq. 10 EL4 third-party-risk score, exit cost Appendix Table A2 instruments D
+
+Table 4. Task families [P] (add enterprise-private sets to avoid over-fitting). 
+
+Family Tax. Stress Outputs; reference envs 
+
+S1 single-step A1 1k–128k in; 64–2k out TTFT, TPOT, tok/J; MLPerf Interactive S2 long-context RAG A1–2 2k–128k retrieved TTFT, KV footprint, accuracy (Liu et al., 2024) S3 tool-augmented agent A2 5–30 steps, 1–8 tools 
+
+Tep , S, tool share; 
+
+τ -bench, GAIA S4 long-horizon agent A5 20–200 steps, retries 0–3 
+
+S, time-to-success, P99, p;SWE-bench, WebArena, TheAgentCompany S5 concurrent agents A2 ×conc.1–256 trajectories goodput, P95/P99, fairness S6 multi-agent A3 2–8 agents; shared vs private KV completion, ω, network bytes; (Wu et al., 2023; Cemri et al., 2025) 
+
+families spanning A1–A5 and Table 5 six axes, each var-ied at a stated baseline. A minimum credible study cov-ers S1, S3, S4 against A1, A3, A5 (plus A6 for reliability claims). The protocol is executable against a cloud endpoint, a loaner appliance or a production pool; a cloud-agnostic enterprise Generative AI (GenAI) platform that exposes models through a single provider-independent gateway (Ali et al., 2024) is a convenient harness. 
+
+Statistical design [P] . Cross-platform inference compar-isons are routinely under-powered and confounded. We re-quire: paired, not pooled -every task instance runs on every system with identical checkpoint hash, tokenizer, precision, sampling and agent policy; report paired mean/median dif-ferences with bootstrap 95% intervals ( ≥2,000 resamples) and a Wilcoxon statistic (Efron & Tibshirani, 1993); two Evaluating Inference Compute for Generative AI: A Framework for Enterprise Workloads 
+
+Table 5. Sensitivity axes [P] . Baseline: ReAct loop (Yao et al., 2023) over a fixed tool set, run identically on every system.                 
+
+> Axis Levels Metrics Hypothesis
+> A1 context 2k, 8k, 32k, 128k TTFT, TPOT vs
+> c
+> H1 A2 output length 16, 128, 1k, 8k TPOT stability, tok/J static devices flat A3 concurrency 1–256 agents Gat θ2=10 ,40 ms; P99 H2 A4 format text / JSON-schema / code TPOT ratio, validity overhead in runtime, not silicon A5 tool interleave
+> K=5 ,20 ,50 ;
+> τ=50 ms, 0.3 s, 2 s
+> Tep , idle fraction, KV-transfer P99 H3 A6 faults & reasoning budget injected
+> p=0 /0.5/1/2% ;budget 1/2/4 ×
+> measured p,
+> E[W]/K , CoV, Eq. 6 H4
+
+configurations per platform -a capability-equivalent con-figuration (identical model/precision/features everywhere) measures architecture, a system-optimised one (each ven-dor’s best path: FP4, speculation, fused kernels) mea-sures the product; reporting only one measures software effort and calls it silicon; factorial sweeps with interac-tions -at minimum concurrency ×trajectory length, because a platform that wins short independent requests can col-lapse when many long-lived agents contend for KV capac-ity (Montgomery, 2019); tails and variance components -P50/P95/P99, timeout and failure rates, run-to-run CoV, variance by task family, since aggregate leaderboards hide platform-by-task interactions (Kapoor et al., 2024; Yehudai et al., 2025); warm-up, repetition and interleaving -≥30 repetitions per latency cell, ≥50–100 trajectories per family, systems interleaved in time to control endpoint load and soft-ware drift; and a provenance record (Appendix Table A5) with every result. 
+
+Attestation of vendor-run benchmarks [P] . In regulated firms the first evidence is almost always produced off-premises by the vendor (§6); this is legitimate if attested .Following model-risk practice (Board of Governors of the Federal Reserve System & Office of the Comptroller of the Currency, 2011), a result that cannot be reproduced from its documentation is an assertion. Required arte-facts: (1) checkpoint hash, precision, quantisation and speculative configuration; (2) per-request timestamps at request, first token and every token, so the enterprise re-computes TTFT/TPOT/goodput itself; (3) batching and concurrency policy on the vendor system and any base-line (fixing the point on Fig. 7); (4) the enterprise’s own sanitised prompt/trajectory set; (5) PDU or wall power at 
+
+≥1 Hz; (6) software versions and a statement of what differs on-premises; (7) independent witness for material procure-ments. “ N × faster than GPUs” without these is marketing; with them it is recomputable evidence. 
+
+From measurement to decision [P] . We recommend a gated funnel: workload definition (trajectory traces, SLOs) 
+
+→ capability screen (model coverage, both configurations definable) → performance (A1/A3/A5, paired Tep gain) →
+
+reliability (A6: p, CoV, P99) → economics (Eqs 6,9,10; capacity ratio > capital ratio at realistic utilisation) → gov-ernance (Appendix Table A2; Eq. 8) → on-premises pilot. Cheap gates run against vendor endpoints first. Where a scalar is demanded, apply it only to gate survivors: 
+
+U = wS S − wT ˜Tep − wC ˜C − wE ˜E − wR ˜R − wD ˜D, (7) with normalised episode time, cost, energy, reliability penalty (Eqs 5,10) and deployment friction (Eq. 8), and published weights. The quantities are incommensurable; the lexicographic gates dominate when score and gates disagree. 
+
+6. Enterprise Deployment and Economics 
+
+Time-to-reproducible-evidence [D] →[P] . Financial insti-tutions treat a new hardware vendor-especially one with a management plane, remote-support path or telemetry-as an ICT third-party arrangement subject to due diligence, contractual controls, concentration-risk assessment and exit planning (European Banking Authority, 2019); the AI-specific instruments (National Institute of Standards and Technology, 2024) add logging and robustness duties (mapped in Appendix Table A2). Indicatively, vendor-run evidence is available within ∼3 months and reproducible in-house evidence after ∼9 (Appendix Fig. A1). Let uc, u i
+
+be the per-month value of challenger and incumbent once in production, τc, τ i their times to production and T the hori-zon; ignoring discounting the challenger is justified only if 
+
+uc (T − τc) > u i (T − τi) ⇐⇒ uc
+
+ui
+
+> T − τi
+
+T − τc
+
+. (8) For T =36 , τi=1 , τc=9 months the challenger must deliver 
+
+≥ 1.3× realised value to break even-more with discounting and onboarding-failure risk. Equation 8 makes lead time a performance variable and explains why hyperscaler chan-nels that reuse an existing third-party arrangement can be decisive even when not the fastest route to the silicon. Exit cost is bounded because HBM GPUs remain a universal fallback: any decode-tier workload runs, more slowly, on GPUs, so exit is latency regression plus re-tuning, priced via Eq. 4. 
+
+TCO with explicit break-even [P] . Let CapEx be acqui-sition cost, H accounting life in hours, OpEx h hourly op-erating cost, R sustainable decode goodput at the SLO and 
+
+U ∈ (0 , 1] utilisation: 
+
+Ctok = 10 6 CapEx /H + OpEx h
+
+R U . (9) At equal utilisation and OpEx an appliance ( a) beats a GPU node ( g) iff Ra/R g > CapEx a/CapEx g (Fig. 8b). Three Evaluating Inference Compute for Generative AI: A Framework for Enterprise Workloads 20 40 60 80 100         
+
+> Sustained utilisation (%)
+> 10 0
+> 10 1
+> Relative cost per token (GPU node at 100% = 1)
+> aCost per token vs utilisation (Eq. 10)
+> SRAM appliance (10x CapEx, 15x decode capacity vs GPU node) GPU node baseline (1x, 1x) GPU node, 2x throughput via batching (latency up)
+> 0510 15 20 25 30
+> Decode-capacity ratio vs GPU node (x)
+> 0123456
+> Cost-per-token advantage (x)
+> break-even (equal utilisation)
+> bBreak-even condition
+> CapEx ratio 5x CapEx ratio 10x CapEx ratio 20x
+
+Figure 8. TCO model [P] (Eq. 9; illustrative). (a) Relative cost per token vs utilisation for a GPU node and an appliance with 10 ×
+
+CapEx and 15 × decode goodput at the agentic SLO. (b) Break-even: advantage = capacity ratio / capital ratio. 2024 public price points ( ≈US$2–3 M per CS-3 vs US$0.3–0.6 M per 8-GPU server) imply a capital ratio near 5–10 ×; the required capacity ratio is then a measurable threshold. 
+
+points: R must be measured at the agentic SLO, where GPUs cannot batch and the capacity ratio is largest; be-cause CapEx /H dominates for expensive single-purpose hardware, utilisation is decisive (Fig. 8a)-an appliance at 30% can cost more per token than GPUs at 80% regard-less of speed; and consumption pricing (Bedrock, Groq-Cloud, SambaCloud) converts CapEx /H into a token price and removes utilisation risk at the cost of data-residency assessment. Power, not floor space, is the scarce facility resource (International Energy Agency, 2025; Barroso et al., 2018); liquid cooling no longer differentiates wafer-scale from Blackwell/Rubin racks (Appendix Table A3). 
+
+Concentration risk [E] →[P] . A 15U appliance replacing four GPU racks concentrates their failure exposure. With 
+
+A = MTBF /(MTBF + MTTR) ,
+
+AN +1 = 1 −(1 −A)2, lost capacity-h/yr ≈ 8760 (1 −A) f, 
+
+(10) where f is the capacity fraction one failure removes (1 for a lone appliance; 1/N for an N -node pool). A lone appli-ance with 24 h MTTR loses ≈24 capacity-hours per failure-year all at once; an 8-node pool loses one-eighth for the same period (Appendix Fig. A2). The remedy-a second appliance-doubles CapEx in Eq. 9. Wafer-scale designs tolerate manufacturing defects with spare cores (Lie, 2023) but not field failures of power, cooling or the single fabric; field MTBF data are not public [H] . A GPU fallback is thus the availability strategy that keeps the appliance economical, and operational-resilience regimes (European Parliament and Council, 2022; Prudential Regulation Authority, 2021) expect it documented. 
+
+Vendor landscape, Sept 2026 [D] . The stand-alone-startup risk of 2024 has largely resolved: Cerebras is public (Nas-daq: CBRS) with OpenAI and AWS as anchors, disclosing customer concentration, wafer-yield and export-licence risks (Cerebras Systems, 2026b); Groq’s team and IP licence sit 
+
+Table 6. Hypotheses and the experiments that test them [H] .
+
+Hypothesis Test / falsifier 
+
+H1 On SRAM decode engines TPOT is flat in context until KV exceeds on-die capacity, then step-wise; on HBM GPUs it rises smoothly. A1, batch 1 / smooth SRAM degradation H2 At θ2 ≤ 10 ms P99, SRAM pools reach ≥ 5× the goodput per rack of Blackwell-class pools; at 
+
+θ2 ≥ 100 ms < 2×.A3 sweep / ratio invariant to θ2
+
+H3 Episode-time gains saturate once 
+
+n TPOT < τ tool ; for 
+
+τ ≈ 0.3–2 s the value of TPOT 
+
+< 2 ms is negligible. A5 / continued gains below 2 ms H4 Deterministic execution yields lower 
+
+p and TPOT CoV, hence lower 
+
+E[W ]/K , on S4/S6. A6 fault injection / no difference H5 Disaggregated pairs give lower cost per successful episode than either homogeneous pool for A2–A4, not A1. Eq. 6 across classes / homogeneous wins H6 In regulated firms time-to-reproducible-evidence, not peak throughput, predicts adoption (Eq. 8). Retrospective procurement analysis H7 Token-throughput and cost-per-successful-task rankings diverge on S4 once p and reasoning budget are included. Spearman ρ between rankings / ρ ≈ 1
+
+inside NVIDIA, with GroqCloud continuing independently and the licence structure under Senate/FTC scrutiny (Groq, 2025); SambaNova raised US$350 M and then US$1 B at US$11 B after Intel acquisition talks lapsed, with JPMor-ganChase as a named on-premises customer (SambaNova Systems, 2026); Intel de-emphasised Gaudi for Crescent Island and heterogeneous designs (Intel, 2025). Every path to SRAM decode now also runs through a hyperscaler or incumbent channel, shortening the regulated onboarding path (Eq. 8) at the price of cloud residency assessments (Appendix Table A4). 
+
+7. Hypotheses and Threats to Validity 
+
+Table 6 states falsifiable predictions and their tests; Ap-pendix Table A6 gives the full workload ×architecture ma-trix as signed predictions of the paired difference. H7 is the single result most likely to constitute an original systems contribution: it would show that trajectory-level evaluation changes conclusions that appear stable under token-level benchmarks. Threats to validity : no origi-nal measurements (all figures public and heterogeneous); vendor-stated specifications for products not yet shipping in volume (Groq 3 LPX, SN50, Rubin, CS-4); Eq. 4 treats step counts and token lengths as exogenous, whereas faster inference changes agent behaviour (more sampling, more reflection); strict capability-equivalent configurations may not exist for every platform pair, which is why both con-figurations are reported; public agent environments encode assumptions that may not match enterprise workflows and an agent policy can over-fit a toolchain, so cross-policy validation is required; and measurement boundaries (de-Evaluating Inference Compute for Generative AI: A Framework for Enterprise Workloads 
+
+vice/PDU/wall power; API-path vs in-rack latency) are not interchangeable and must be stated. The minimum exper-iment that converts this framework into an empirical pa-per is small: three OpenAI-compatible endpoints (a GPU provider, an SRAM appliance cloud, and a disaggregated path), families S3–S4, axes A1/A3/A5/A6, paired design with bootstrap intervals, fitting Eq. 4 and testing H1–H3 and H7. 
+
+8. Conclusion 
+
+Agentic AI turns inference from batchable completions into sequential trajectories, moving the hardware bottle-neck from throughput to single-stream decode latency-a quantity governed by weight-tier bandwidth, not peak com-pute. SRAM-resident accelerators exploit this directly, and by 2026 the industry, including the GPU incumbent, has converged on pairing them with HBM-rich prefill engines. Reliability compounds exponentially in trajectory length, so determinism and tail latency are performance variables. The evaluation question is therefore no longer “GPU or specialised?” but which prefill/decode pair, through which channel, at what utilisation-measured as goodput at an agen-tic SLO and cost per successful episode, with paired statis-tics, attested vendor evidence, and break-even conditions on capital ratio, utilisation and adoption lead time. The framework is built so that its placeholders, once populated, yield a reproducible cross-platform study; H7 is the result worth running it for. 
+
+References 
+
+Abts, D., Ross, J., Sparling, J., and et al. Think fast: A tensor streaming processor (TSP) for accelerating deep learning workloads. In Proceedings of the 47th ACM/IEEE Inter-national Symposium on Computer Architecture (ISCA) ,pp. 145–158, 2020. Abts, D., Kimmell, G., Ling, A., and et al. A software-defined tensor streaming multiprocessor for large-scale machine learning. In Proceedings of the 49th ACM/IEEE International Symposium on Computer Architecture (ISCA) , pp. 567–580, 2022. Agrawal, A., Kedia, N., Panwar, A., and et al. Tam-ing throughput-latency tradeoff in LLM inference with Sarathi-Serve. In Proceedings of the 18th USENIX Sympo-sium on Operating Systems Design and Implementation (OSDI) , pp. 117–134, 2024. Ainslie, J., Lee-Thorp, J., de Jong, M., and et al. GQA: Training generalized multi-query transformer models from multi-head checkpoints. In Proceedings of the Con-ference on Empirical Methods in Natural Language Pro-cessing (EMNLP) , pp. 4895–4901, 2023. Ali, A. R., Kumar, K., Siddiqui, M. A., and Zahid, M. An open-source cross-industry and cloud-agnostic generative ai platform. In 2024 International Joint Conference on Neural Networks (IJCNN) , pp. 1–10, 2024. doi: 10.1109/ IJCNN60899.2024.10650688. Amazon Web Services and Cerebras Systems. Disaggre-gated inference combining Trainium-based prefill and CS-3 decode on Amazon Bedrock. Announcement, March 2026. https://aws.amazon.com , 2026. Artificial Analysis. Independent benchmarks of LLM API providers: Output speed, time-to-first-token and price. 
+
+https://artificialanalysis.ai , 2026. Barroso, L. A., H¨ olzle, U., and Ranganathan, P. The Data-center as a Computer: Designing Warehouse-Scale Ma-chines . Morgan & Claypool, 3rd edition, 2018. Board of Governors of the Federal Reserve System and Office of the Comptroller of the Currency. Supervisory guidance on model risk management, SR 11-7 / OCC Bulletin 2011-12, 2011. Cemri, M., Pan, M. Z., Yang, S., and et al. Why do multi-agent LLM systems fail? arXiv preprint arXiv:2503.13657 , 2025. Cerebras Systems. WSE-3 and CS-3 announcement; Cere-bras inference launch; Llama 3.1 405B at 969 tokens per second. Press releases, March, August and November 2024. https://www.cerebras.ai , 2024. Cerebras Systems. Cerebras unveils CS-4: Up to 30 times faster than GPU-based solutions. Press release, 18 Au-gust 2026. https://investors.cerebras.ai ,2026a. Cerebras Systems. Form S-1 registration statement and first-quarter 2026 results. US Securities and Exchange Commission filing and investor release. https:// investors.cerebras.ai , 2026b. Dao, T. FlashAttention-2: Faster attention with better par-allelism and work partitioning. In Proceedings of the International Conference on Learning Representations (ICLR) , 2024. Dao, T., Fu, D. Y., Ermon, S., and et al. FlashAttention: Fast and memory-efficient exact attention with IO-awareness. In Advances in Neural Information Processing Systems (NeurIPS) 35 , 2022. DeepSeek-AI. DeepSeek-R1 incentivizes reasoning in LLMs through reinforcement learning. Nature , 645:633– 638, 2025. Efron, B. and Tibshirani, R. J. An Introduction to the Boot-strap . Chapman & Hall/CRC, 1993. Evaluating Inference Compute for Generative AI: A Framework for Enterprise Workloads 
+
+European Banking Authority. Guidelines on outsourcing arrangements, EBA/GL/2019/02, 2019. European Parliament and Council. Regulation (EU) 2022/2554 on digital operational resilience for the finan-cial sector (DORA). Official Journal of the European Union, L 333, 1–79, 2022. Fedus, W., Zoph, B., and Shazeer, N. Switch transformers: Scaling to trillion parameter models with simple and ef-ficient sparsity. Journal of Machine Learning Research ,23:1–39, 2022. Gholami, A., Yao, Z., Kim, S., and et al. AI and memory wall. IEEE Micro , 44(3):33–39, 2024. Groq. Llama 3 Instruct 8B/70B on the LPU inference en-gine: Artificial Analysis results; Llama 3.3 70B model documentation. Blog and documentation, 2024–2026. 
+
+https://groq.com , 2024. Groq. Statement on non-exclusive licensing agreement with NVIDIA. Company statement, 24 December 2025. 
+
+https://groq.com , 2025. Hennessy, J. L. and Patterson, D. A. A new golden age for computer architecture. Communications of the ACM , 62 (2):48–60, 2019. Hooker, S. The hardware lottery. Communications of the ACM , 64(12):58–65, 2021. Intel. Gaudi 3 AI accelerator white paper; Crescent Island data-centre GPU announcement, OCP global summit. Technical documentation and announcement, 2024–2025. 
+
+https://www.intel.com , 2025. International Energy Agency. Energy and AI. Technical report, IEA, Paris, 2025. Jimenez, C. E., Yang, J., Wettig, A., and et al. SWE-bench: Can language models resolve real-world GitHub issues? In Proceedings of the International Conference on Learn-ing Representations (ICLR) , 2024. Jouppi, N. P., Kurian, G., Li, S., and et al. TPU v4: An opti-cally reconfigurable supercomputer for machine learning with hardware support for embeddings. In Proceedings of the 50th ACM/IEEE International Symposium on Com-puter Architecture (ISCA) , 2023. Kapoor, S., Stroebl, B., Siegel, Z. S., and et al. AI agents that matter. arXiv preprint arXiv:2407.01502 , 2024. Kwon, W., Li, Z., Zhuang, S., and et al. Efficient memory management for large language model serving with Page-dAttention. In Proceedings of the 29th ACM Symposium on Operating Systems Principles (SOSP) , pp. 611–626, 2023. Leviathan, Y., Kalman, M., and Matias, Y. Fast inference from transformers via speculative decoding. In Proceed-ings of the 40th International Conference on Machine Learning (ICML) , pp. 19274–19286, 2023. Lie, S. Cerebras architecture deep dive: First look inside the hardware/software co-design for deep learning. IEEE Micro , 43(3):18–30, 2023. Little, J. D. C. A proof for the queuing formula: L = λW .
+
+Operations Research , 9(3):383–387, 1961. Liu, N. F., Lin, K., Hewitt, J., and et al. Lost in the middle: How language models use long contexts. Transactions of the Association for Computational Linguistics , 12:157– 173, 2024. Luccioni, S., Jernite, Y., and Strubell, E. Power hungry processing: Watts driving the cost of AI deployment? In Proceedings of the ACM Conference on Fairness, Ac-countability, and Transparency (FAccT) , pp. 85–99, 2024. MLCommons. MLPerf inference v5.0–v6.0 results and rules, including the interactive scenario for Llama 2 70B. 
+
+https://mlcommons.org , 2026. Montgomery, D. C. Design and Analysis of Experiments .Wiley, 10th edition, 2019. National Institute of Standards and Technology. Artificial intelligence risk management framework: Generative ar-tificial intelligence profile. Technical Report NIST AI 600-1, NIST, 2024. NVIDIA. H100 and H200 datasheets; Blackwell architec-ture technical brief; GTC 2026 keynote: Vera Rubin plat-form and Groq 3 LPX. Technical documentation and keynote, 2024–2026. https://www.nvidia.com ,2026a. NVIDIA. GB200 NVL72 and GB300 NVL72 rack-scale platform specifications. https://www.nvidia. com/en-us/data-center/gb200-nvl72/ ,2026b. OpenAI. OpenAI o1 system card. Technical report, OpenAI, 2024. Patel, P., Choukse, E., Zhang, C., and et al. Splitwise: Ef-ficient generative LLM inference using phase splitting. In Proceedings of the 51st ACM/IEEE International Sym-posium on Computer Architecture (ISCA) , pp. 118–132, 2024. Pope, R., Douglas, S., Chowdhery, A., and et al. Efficiently scaling transformer inference. In Proceedings of Machine Learning and Systems (MLSys) , 2023. Evaluating Inference Compute for Generative AI: A Framework for Enterprise Workloads 
+
+Prabhakar, R., Sivaramakrishnan, R., Gandhi, D., and et al. SambaNova SN40L: Scaling the AI memory wall with dataflow and composition of experts. In Proceed-ings of the 57th IEEE/ACM International Symposium on Microarchitecture (MICRO) , 2024. Prudential Regulation Authority. Supervisory statement SS2/21: Outsourcing and third party risk management. Bank of England, 2021. Reddi, V. J., Cheng, C., Kanter, D., and et al. MLPerf inference benchmark. In Proceedings of the 47th ACM/IEEE International Symposium on Computer Ar-chitecture (ISCA) , pp. 446–459, 2020. SambaNova Systems. SambaNova announcements: DeepSeek-R1 at 198 tokens per second (2025); SN50, intel collaboration and series E (february 2026); series F and JPMorganChase partnership (july 2026). Press releases. https://sambanova.ai , 2026. Samsi, S., Zhao, D., McDonald, J., and et al. From words to watts: Benchmarking the energy costs of large lan-guage model inference. In Proceedings of the IEEE High Performance Extreme Computing Conference (HPEC) ,2023. Snell, C., Lee, J., Xu, K., and et al. Scaling LLM test-time compute optimally can be more effective than scal-ing model parameters. arXiv preprint arXiv:2408.03314 ,2024. Vaswani, A., Shazeer, N., Parmar, N., and et al. Atten-tion is all you need. In Advances in Neural Information Processing Systems (NeurIPS) 30 , 2017. Wang, L., Ma, C., Feng, X., and et al. A survey on large language model based autonomous agents. Frontiers of Computer Science , 18:186345, 2024. Williams, S., Waterman, A., and Patterson, D. Roofline: An insightful visual performance model for multicore architectures. Communications of the ACM , 52(4):65–76, 2009. Wu, Q., Bansal, G., Zhang, J., and et al. AutoGen: Enabling next-gen LLM applications via multi-agent conversation. 
+
+arXiv preprint arXiv:2308.08155 , 2023. Wulf, W. A. and McKee, S. A. Hitting the memory wall: Implications of the obvious. ACM SIGARCH Computer Architecture News , 23(1):20–24, 1995. Xu, F. F., Song, Y., Li, B., Tang, Y., Jain, K., Bao, M., Wang, Z. Z., Zhou, X., Guo, Z., Cao, M., Yang, M., Lu, H. Y., Martin, A., Su, Z., Maben, L., Mehta, R., Chi, W., Jang, L., Xie, Y., Zhou, S., and Neubig, G. TheAgentCompany: Benchmarking LLM agents on consequential real world tasks. arXiv preprint arXiv:2412.14161 , 2024. Yao, S., Zhao, J., Yu, D., and et al. ReAct: Synergizing reasoning and acting in language models. In Proceedings of the International Conference on Learning Representa-tions (ICLR) , 2023. Yao, S., Shinn, N., Razavi, P., and et al. τ -bench: Abenchmark for tool-agent-user interaction in real-world domains. arXiv preprint arXiv:2406.12045 , 2024. Yehudai, A., Eden, L., Li, A., Uziel, G., Zhao, Y., Bar-Haim, R., Cohan, A., and Shmueli-Scheuer, M. A sur-vey on evaluation of LLM-based agents. arXiv preprint arXiv:2503.16416 , 2025. Yu, G.-I., Jeong, J. S., Kim, G.-W., and et al. Orca: A dis-tributed serving system for transformer-based generative models. In Proceedings of the 16th USENIX Sympo-sium on Operating Systems Design and Implementation (OSDI) , pp. 521–538, 2022. Zhong, Y., Liu, S., Chen, J., and et al. DistServe: Dis-aggregating prefill and decoding for goodput-optimized large language model serving. In Proceedings of the 18th USENIX Symposium on Operating Systems Design and Implementation (OSDI) , pp. 193–210, 2024. 
+
+Supplementary Appendix 
+
+A. Facility Characteristics 
+
+Table 7 summarises power and cooling characteristics. Two observations matter more than the figures: liquid cooling no longer differentiates wafer-scale from Blackwell- or Rubin-class GPU racks, and rack-level power densities converge, so the discriminating quantity is tokens per kilowatt-hour under the agentic workload, which only measurement can supply. 
+
+Table 7. Facility characteristics (vendor-stated or widely reported).                 
+
+> System Power Cooling / footprint
+> Cerebras CS-3 ≈23-25 kW, 15U liquid; 2 per rack ≈50 kW Cerebras CS-4 rack n/d (3 wafers) liquid; rack-scale DGX H100 / B200 ≈10-14 kW and above air (H100) / liquid (B200) GB200 / GB300 NVL72 ≈120-140 kW liquid, mandatory Groq 3 LPX rack n/d liquid, dense SambaRack 16 ×SN40L ∼10-15 kW air, high airflow Gaudi 3 (8 OAM) ≈8-10 kW air or liquid
+
+B. Vendor Readiness and Security Questions 
+
+Vendor viability is a formal input to third-party-risk assess-ment. Table 8 records the landscape at the time of writing (September 2026); sources are the regulatory filings and press releases cited in the main text. 
+
+Security-architecture questions specific to inference ap-pliances. (i) Management and telemetry planes: outbound Evaluating Inference Compute for Generative AI: A Framework for Enterprise Workloads 
+
+Table 8. Vendor readiness matrix, September 2026. 
+
+Vendor Status; anchors and channels; access modes; residual risks 
+
+Cerebras Status: public (Nasdaq: CBRS, May 2026); 2025 revenue US$510 M; CS-4 announced Aug 2026. Anchors: OpenAI 750 MW; AWS Bedrock decode tier; G42/MBZUAI concentration. Access: appliance; Cerebras Cloud; Bedrock; HPE and Supermicro. Risks: customer concentration; wafer yield; export licences; single-appliance availability. NVIDIA (incl. Groq LPU) 
+
+Status: incumbent; US$20 B non-exclusive Groq licence; Groq 3 LPX ships Q3 2026. Anchors: universal. Access: Vera Rubin racks with LPX decode tier; Dynamo disaggregated serving. 
+
+Risks: licence-structure scrutiny; LPX capacity; premium pricing. Groq (independent) 
+
+Status: GroqCloud continues; core team departed. Anchors: 
+
+developer cloud. Access: API only. Risks: roadmap and talent for on-prem hardware. SambaNova Status: private; US$1 B Series F at US$11 B (Jul 2026). Anchors: 
+
+JPMorganChase on-prem; SoftBank SN50; US DOE labs. Access: 
+
+SambaRack; managed co-location; SambaCloud; Xeon 6 heterogeneous design. Risks: SN50 execution; support scale; proprietary stack. Intel Status: Gaudi 3 de-emphasised; Crescent Island sampling H2 2026. Anchors: IBM Cloud, Dell. Access: OEM. Risks: roadmap credibility. AMD Status: MI355X shipping; leads MLPerf v6.0 Llama-2-70B rows. 
+
+Anchors: hyperscalers; OpenAI (reported). Access: OEM; ROCm. 
+
+Risks: ecosystem maturity. 
+
+connectivity, air-gapped operation and offline update ca-dence. (ii) Remote support: access path, authentication, session recording, and whether break-glass access can be disabled. (iii) Identity and isolation: enterprise identity inte-gration and tenancy or memory isolation on a single wafer or dataflow fabric, which GPUs provide through hardware memory protection and virtualisation. (iv) Data residency in disaggregated mode: the KV cache in transit between prefill and decode pools is customer data; its encryption, residency and retention must be specified. (v) Supply chain: fabri-cation location, firmware provenance and export-licence exposure. 
+
+C. Internal Measurement Templates 
+
+Result templates keyed to protocol axes A1, A3 and A5 are provided as CSV skeletons in the artifact repository: con-text × TTFT/TPOT P50/P99 and KV footprint per system; concurrency × goodput at θ2 = 10 /40 ms, P99 TPOT, wall power and tok/J; and K × τtool × Tep P50/P95, decode idle fraction, prefix-cache hit rate, KV-transfer P99 and success 
+
+S. No illustrative numbers are given, to avoid their being mistaken for data.
